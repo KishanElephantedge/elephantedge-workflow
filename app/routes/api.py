@@ -1,8 +1,13 @@
 from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
-from app.db.models import Batch, Credential, Parameter
+from app.db.models import Batch, Company, Credential, Parameter
 from app.db.session import get_db
+from app.heyreach_client import HeyReachError
+from app.outreach.heyreach import HeyReachChannel
+from app.phases.campaign_execution import run_campaign_execution
+from app.phases.decision_maker import run_decision_maker_id
 
 router = APIRouter()
 
@@ -64,8 +69,91 @@ def get_batch(batch_id: int, db: Session = Depends(get_db)):
         "name": batch.name,
         "current_phase": batch.current_phase,
         "status": batch.status,
-        "companies": [],  # no discovery logic built yet -- see ARCHITECTURE.md status checklist
+        "companies": [
+            {
+                "id": c.id,
+                "name": c.name,
+                "domain": c.domain,
+                "contact_count": len(c.contacts),
+            }
+            for c in batch.companies
+        ],
     }
+
+
+# ---- Manual company import (hand-picked companies, Discovery/Qualification skipped) ----
+# For a batch like the 10 companies the team lead sent directly -- these are already
+# hand-vetted, so Phase 2 (Discovery) and Phase 3 (Qualification) don't apply. Companies
+# are seeded straight in, ready for Phase 6 (Decision Maker) to run against them.
+
+class CompanyImport(BaseModel):
+    name: str
+    domain: str
+
+
+@router.post("/batches/{batch_id}/companies/import")
+def import_companies(batch_id: int, companies: list[CompanyImport], db: Session = Depends(get_db)):
+    batch = (
+        db.query(Batch)
+        .filter(Batch.id == batch_id)
+        .filter(Batch.tenant_id == ELEPHANT_EDGE_TENANT_ID)
+        .first()
+    )
+    if not batch:
+        raise HTTPException(status_code=404, detail="Batch not found")
+
+    created = []
+    for c in companies:
+        company = Company(batch_id=batch_id, name=c.name, domain=c.domain)
+        db.add(company)
+        created.append(company)
+    batch.current_phase = "companies_imported"
+    db.commit()
+    for c in created:
+        db.refresh(c)
+    return {"imported": len(created), "companies": [{"id": c.id, "name": c.name, "domain": c.domain} for c in created]}
+
+
+# ---- Phase 6: Decision Maker Intelligence ----
+
+@router.post("/batches/{batch_id}/phases/decision-maker")
+def execute_decision_maker_id(batch_id: int, db: Session = Depends(get_db)):
+    batch = (
+        db.query(Batch)
+        .filter(Batch.id == batch_id)
+        .filter(Batch.tenant_id == ELEPHANT_EDGE_TENANT_ID)
+        .first()
+    )
+    if not batch:
+        raise HTTPException(status_code=404, detail="Batch not found")
+    result = run_decision_maker_id(batch_id, db)
+    batch.current_phase = "decision_maker_done"
+    db.commit()
+    return result
+
+
+# ---- Phase 11: Campaign Execution ----
+# The channel is chosen here, at the call site -- HeyReachChannel is passed in as an
+# OutreachChannel implementation; run_campaign_execution itself has no idea HeyReach exists.
+
+@router.post("/batches/{batch_id}/phases/outreach")
+def execute_outreach_push(batch_id: int, db: Session = Depends(get_db)):
+    batch = (
+        db.query(Batch)
+        .filter(Batch.id == batch_id)
+        .filter(Batch.tenant_id == ELEPHANT_EDGE_TENANT_ID)
+        .first()
+    )
+    if not batch:
+        raise HTTPException(status_code=404, detail="Batch not found")
+    channel = HeyReachChannel(db, ELEPHANT_EDGE_TENANT_ID)
+    try:
+        result = run_campaign_execution(batch_id, db, channel)
+    except HeyReachError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    batch.current_phase = "outreach_done"
+    db.commit()
+    return result
 
 
 # ---- Credentials (Settings page) ----
