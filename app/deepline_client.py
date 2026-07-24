@@ -17,7 +17,9 @@ def execute_tool(tool_id: str, payload: dict) -> dict:
         timeout=120,
     )
     if result.returncode != 0:
-        raise DeeplineError(f"{tool_id} failed: {result.stderr or result.stdout}")
+        raise DeeplineError(
+            f"{tool_id} failed (exit {result.returncode}): stdout={result.stdout!r} stderr={result.stderr!r}"
+        )
     stdout = result.stdout
     brace_index = stdout.find("{")
     if brace_index == -1:
