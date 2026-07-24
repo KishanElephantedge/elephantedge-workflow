@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Body, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
@@ -75,6 +75,7 @@ def get_batch(batch_id: int, db: Session = Depends(get_db)):
                 "name": c.name,
                 "domain": c.domain,
                 "contact_count": len(c.contacts),
+                "decision_maker_searched": c.decision_maker_searched_at is not None,
             }
             for c in batch.companies
         ],
@@ -117,7 +118,7 @@ def import_companies(batch_id: int, companies: list[CompanyImport], db: Session 
 # ---- Phase 6: Decision Maker Intelligence ----
 
 @router.post("/batches/{batch_id}/phases/decision-maker")
-def execute_decision_maker_id(batch_id: int, db: Session = Depends(get_db)):
+def execute_decision_maker_id(batch_id: int, retry_company_ids: list[int] | None = Body(default=None), db: Session = Depends(get_db)):
     batch = (
         db.query(Batch)
         .filter(Batch.id == batch_id)
@@ -126,7 +127,7 @@ def execute_decision_maker_id(batch_id: int, db: Session = Depends(get_db)):
     )
     if not batch:
         raise HTTPException(status_code=404, detail="Batch not found")
-    result = run_decision_maker_id(batch_id, db)
+    result = run_decision_maker_id(batch_id, db, retry_company_ids=retry_company_ids)
     batch.current_phase = "decision_maker_done"
     db.commit()
     return result

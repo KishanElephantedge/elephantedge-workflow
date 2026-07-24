@@ -52,6 +52,11 @@ class Company(Base):
     employee_count = Column(Integer, nullable=True)
     location = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
+    # Set the moment a Decision Maker search runs for this company, regardless of outcome.
+    # Distinguishes "searched, found nothing" from "never searched" -- without this, a company
+    # with no findable contact gets re-billed on every re-run (including a future autonomous
+    # daily cycle) forever, since it never acquires a Contact row to skip on.
+    decision_maker_searched_at = Column(DateTime, nullable=True)
 
     batch = relationship("Batch", back_populates="companies")
     signals = relationship("Signal", back_populates="company", cascade="all, delete-orphan")

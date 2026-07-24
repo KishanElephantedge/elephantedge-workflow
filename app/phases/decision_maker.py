@@ -1,15 +1,14 @@
 """
 Phase 6 — Decision Maker Intelligence.
 
-Single-threaded target, not multi-persona simultaneous search like Synefi's. This is a
-direct, confirmed decision (not assumed): at Elephant Edge's SMB-scale ICP, there is no real
-buying committee -- Gokul confirmed the founder/CEO is the actual decision-maker, with a
-Head of Sales/GTM person (where one even exists) acting as an influencer at most, not a
-parallel target. Phase 5 (Buying Committee Discovery) is effectively answered by this single
-fact, not separately built out.
+Single-threaded target, not multi-persona simultaneous search like Synefi's. Per Gokul's
+confirmed guidance: Founder/CEO/Co-Founder is the primary target; a Head of Sales/VP Sales/
+Head of GTM person is a secondary target, tried only when no primary contact exists at all
+(not pursued in parallel) -- covers companies with no findable founder/CEO record (e.g. no
+public leadership data indexed for that domain) rather than leaving them with zero contact.
 
-One search_contact call per company, using a boolean title filter rather than a sequence of
-exact-title steps. Real-world titles are frequently compound free text ("CEO and Co-Founder",
+One search_contact call per target tier, using a boolean title filter rather than a sequence
+of exact-title steps. Real-world titles are frequently compound free text ("CEO and Co-Founder",
 "Founder & CEO") that an exact title_lists match misses entirely -- confirmed live on the
 first real company run (GoZen's "Ambi Moorthy, CEO and Co-Founder" matched only the broad
 filter, not any single exact-title step). search_contact already ranks its own results by
@@ -17,12 +16,20 @@ relevance, so running exact-title steps first before falling back to the same fi
 was pure wasted cost: up to 4 billed calls to land on a result the 1st call would have found.
 """
 
+from datetime import datetime
+
 from sqlalchemy.orm import Session
 
 from app.db.models import Company, Contact
 from app.deepline_client import execute_tool, extract_rows
 
 CEO_FILTER = "CEO OR Chief Executive Officer OR Founder OR Co-Founder OR Owner OR Managing Director OR President"
+
+SALES_LEADER_FILTER = (
+    "Head of Sales OR VP Sales OR VP of Sales OR Head of GTM OR Head of Growth OR "
+    "Director of Sales OR Director of Business Development OR Head of Business Development OR "
+    "Chief Revenue Officer OR CRO"
+)
 
 
 def _run_search_contact(company: Company, extra_payload: dict) -> list[dict]:
@@ -41,7 +48,7 @@ def _run_search_contact(company: Company, extra_payload: dict) -> list[dict]:
     return extract_rows(response, "persons")
 
 
-def _make_contact(company: Company, db: Session, persons: list[dict], reasoning: str) -> Contact:
+def _make_contact(company: Company, db: Session, persons: list[dict], reasoning: str, thread_role: str) -> Contact:
     person = persons[0]
     contact = Contact(
         company_id=company.id,
@@ -49,7 +56,7 @@ def _make_contact(company: Company, db: Session, persons: list[dict], reasoning:
         last_name=person.get("last_name"),
         title=person.get("title"),
         linkedin_url=person.get("linkedin_url") or person.get("linkedin"),
-        thread_role="founder_ceo",
+        thread_role=thread_role,
         matched_title_reasoning=reasoning,
     )
     db.add(contact)
@@ -61,27 +68,43 @@ def _make_contact(company: Company, db: Session, persons: list[dict], reasoning:
 def find_decision_maker(company: Company, db: Session) -> Contact | None:
     persons = _run_search_contact(company, {"title_filters": [{"name": "ceo_filter", "filter": CEO_FILTER}]})
     if persons:
-        return _make_contact(company, db, persons, f"title_filter={CEO_FILTER}")
+        return _make_contact(company, db, persons, f"title_filter={CEO_FILTER}", "founder_ceo")
+
+    # No primary (founder/CEO) contact exists at all for this domain -- try the secondary
+    # sales-leader target rather than leaving the company with zero contact.
+    persons = _run_search_contact(company, {"title_filters": [{"name": "sales_leader_filter", "filter": SALES_LEADER_FILTER}]})
+    if persons:
+        return _make_contact(company, db, persons, f"title_filter={SALES_LEADER_FILTER}", "sales_leader")
+
     return None
 
 
-def run_decision_maker_id(batch_id: int, db: Session) -> dict:
+def run_decision_maker_id(batch_id: int, db: Session, retry_company_ids: list[int] | None = None) -> dict:
     """Phase 6 entrypoint. No tier/score gate here -- this batch's companies were hand-picked
     (Phase 3 Qualification doesn't apply), so every company in the batch is searched.
 
-    Skips companies that already have a Contact -- this runs again whenever new companies are
-    added to an existing batch, and search_contact bills real credits per call, so re-searching
-    an already-resolved company on every re-run would silently double-bill it."""
+    By default, skips any company already searched -- whether it found a contact or not.
+    search_contact bills real credits per call regardless of outcome, and a company with
+    genuinely no findable record would otherwise get re-billed on every single re-run forever,
+    including a future autonomous daily cycle, since a "not found" result never produces a
+    Contact row to skip on its own.
+
+    retry_company_ids overrides the skip for those specific companies only -- an explicit,
+    deliberate re-attempt (e.g. after correcting a wrong domain), never an automatic one."""
+    retry_ids = set(retry_company_ids or [])
     companies = db.query(Company).filter(Company.batch_id == batch_id).all()
 
     found = 0
     not_found = 0
     skipped = 0
     for company in companies:
-        if company.contacts:
+        already_done = company.contacts or company.decision_maker_searched_at
+        if already_done and company.id not in retry_ids:
             skipped += 1
             continue
         contact = find_decision_maker(company, db)
+        company.decision_maker_searched_at = datetime.utcnow()
+        db.commit()
         if contact:
             found += 1
         else:
