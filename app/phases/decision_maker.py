@@ -79,12 +79,20 @@ def find_decision_maker(company: Company, db: Session) -> Contact | None:
 
 def run_decision_maker_id(batch_id: int, db: Session) -> dict:
     """Phase 6 entrypoint. No tier/score gate here -- this batch's companies were hand-picked
-    (Phase 3 Qualification doesn't apply), so every company in the batch is searched."""
+    (Phase 3 Qualification doesn't apply), so every company in the batch is searched.
+
+    Skips companies that already have a Contact -- this runs again whenever new companies are
+    added to an existing batch, and search_contact bills real credits per call, so re-searching
+    an already-resolved company on every re-run would silently double-bill it."""
     companies = db.query(Company).filter(Company.batch_id == batch_id).all()
 
     found = 0
     not_found = 0
+    skipped = 0
     for company in companies:
+        if company.contacts:
+            skipped += 1
+            continue
         contact = find_decision_maker(company, db)
         if contact:
             found += 1
@@ -95,4 +103,5 @@ def run_decision_maker_id(batch_id: int, db: Session) -> dict:
         "companies_checked": len(companies),
         "decision_makers_found": found,
         "companies_with_no_contact": not_found,
+        "companies_skipped_already_resolved": skipped,
     }
