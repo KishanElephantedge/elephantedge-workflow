@@ -7,7 +7,7 @@ FROM python:3.11-slim
 RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates && \
     curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
     apt-get install -y --no-install-recommends nodejs && \
-    npm install -g deepline && \
+    npm install -g deepline@0.1.254 && \
     apt-get purge -y curl && apt-get autoremove -y && \
     rm -rf /var/lib/apt/lists/*
 
@@ -20,6 +20,10 @@ COPY app/ ./app/
 
 # Deepline auth is env-var based (DEEPLINE_API_KEY, DEEPLINE_HOST_URL) -- set as Render
 # environment variables, not baked into this image or committed to the repo.
+#
+# deepline is pinned to 0.1.254, not "latest" -- 0.1.271 (published 2026-07-24) has a
+# regression that fails auth with a valid API key (401 AUTH_ERROR). Found live during this
+# service's first deploy, since it was the first build to pull past that version.
 
 EXPOSE 8000
 CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
