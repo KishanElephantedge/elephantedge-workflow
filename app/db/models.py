@@ -110,6 +110,9 @@ class Contact(Base):
     thread_role = Column(String, nullable=True)
     matched_title_reasoning = Column(Text, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
+    # Set once this contact + its company have been pushed to HubSpot -- prevents creating
+    # duplicate Company/Contact records in HubSpot on a re-run.
+    hubspot_synced_at = Column(DateTime, nullable=True)
 
     company = relationship("Company", back_populates="contacts")
     campaign_pushes = relationship("CampaignPush", back_populates="contact", cascade="all, delete-orphan")

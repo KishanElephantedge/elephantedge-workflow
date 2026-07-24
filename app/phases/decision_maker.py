@@ -22,6 +22,8 @@ from sqlalchemy.orm import Session
 
 from app.db.models import Company, Contact
 from app.deepline_client import execute_tool, extract_rows
+from app.hubspot_client import HubSpotError
+from app.phases.hubspot_sync import sync_to_hubspot
 
 CEO_FILTER = "CEO OR Chief Executive Officer OR Founder OR Co-Founder OR Owner OR Managing Director OR President"
 
@@ -79,7 +81,7 @@ def find_decision_maker(company: Company, db: Session) -> Contact | None:
     return None
 
 
-def run_decision_maker_id(batch_id: int, db: Session, retry_company_ids: list[int] | None = None) -> dict:
+def run_decision_maker_id(batch_id: int, db: Session, tenant_id: int, retry_company_ids: list[int] | None = None) -> dict:
     """Phase 6 entrypoint. No tier/score gate here -- this batch's companies were hand-picked
     (Phase 3 Qualification doesn't apply), so every company in the batch is searched.
 
@@ -97,6 +99,8 @@ def run_decision_maker_id(batch_id: int, db: Session, retry_company_ids: list[in
     found = 0
     not_found = 0
     skipped = 0
+    hubspot_synced = 0
+    hubspot_errors = []
     for company in companies:
         already_done = company.contacts or company.decision_maker_searched_at
         if already_done and company.id not in retry_ids:
@@ -107,6 +111,15 @@ def run_decision_maker_id(batch_id: int, db: Session, retry_company_ids: list[in
         db.commit()
         if contact:
             found += 1
+            # HubSpot sync is a side effect of a successful search, not a precondition for
+            # it -- a HubSpot outage or bad token must never fail the Decision Maker phase.
+            # The error is still surfaced in the response, not swallowed silently, so a bad
+            # token doesn't go unnoticed.
+            try:
+                sync_to_hubspot(company, contact, db, tenant_id)
+                hubspot_synced += 1
+            except HubSpotError as e:
+                hubspot_errors.append(f"{company.name}: {e}")
         else:
             not_found += 1
 
@@ -114,5 +127,7 @@ def run_decision_maker_id(batch_id: int, db: Session, retry_company_ids: list[in
         "companies_checked": len(companies),
         "decision_makers_found": found,
         "companies_with_no_contact": not_found,
+        "hubspot_synced": hubspot_synced,
+        "hubspot_errors": hubspot_errors,
         "companies_skipped_already_resolved": skipped,
     }

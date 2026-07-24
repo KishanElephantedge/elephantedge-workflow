@@ -127,7 +127,7 @@ def execute_decision_maker_id(batch_id: int, retry_company_ids: list[int] | None
     )
     if not batch:
         raise HTTPException(status_code=404, detail="Batch not found")
-    result = run_decision_maker_id(batch_id, db, retry_company_ids=retry_company_ids)
+    result = run_decision_maker_id(batch_id, db, ELEPHANT_EDGE_TENANT_ID, retry_company_ids=retry_company_ids)
     batch.current_phase = "decision_maker_done"
     db.commit()
     return result
