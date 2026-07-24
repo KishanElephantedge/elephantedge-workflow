@@ -1,15 +1,20 @@
 """
 Phase 6 — Decision Maker Intelligence.
 
-Single-threaded waterfall, not multi-persona simultaneous search like Synefi's. This is a
+Single-threaded target, not multi-persona simultaneous search like Synefi's. This is a
 direct, confirmed decision (not assumed): at Elephant Edge's SMB-scale ICP, there is no real
 buying committee -- Gokul confirmed the founder/CEO is the actual decision-maker, with a
 Head of Sales/GTM person (where one even exists) acting as an influencer at most, not a
 parallel target. Phase 5 (Buying Committee Discovery) is effectively answered by this single
 fact, not separately built out.
 
-Reaches, in order, stopping at the first hit: CEO -> Founder -> Co-Founder. A broader
-boolean-phrase fallback runs only if all three exact-title steps miss.
+One search_contact call per company, using a boolean title filter rather than a sequence of
+exact-title steps. Real-world titles are frequently compound free text ("CEO and Co-Founder",
+"Founder & CEO") that an exact title_lists match misses entirely -- confirmed live on the
+first real company run (GoZen's "Ambi Moorthy, CEO and Co-Founder" matched only the broad
+filter, not any single exact-title step). search_contact already ranks its own results by
+relevance, so running exact-title steps first before falling back to the same filter's superset
+was pure wasted cost: up to 4 billed calls to land on a result the 1st call would have found.
 """
 
 from sqlalchemy.orm import Session
@@ -17,18 +22,7 @@ from sqlalchemy.orm import Session
 from app.db.models import Company, Contact
 from app.deepline_client import execute_tool, extract_rows
 
-CEO_WATERFALL = [
-    ["CEO", "Chief Executive Officer"],
-    ["Founder"],
-    ["Co-Founder", "Cofounder"],
-]
-
-# Tried only after every exact-title step above has missed. Uses search_contact's
-# title_filters mode (boolean phrase matching) rather than exact title_lists, since the
-# point is to catch title variance the exact list doesn't anticipate (e.g. "Owner",
-# "Managing Director", "President") -- same fallback principle as Synefi's persona search,
-# adapted to a single-target waterfall instead of a persona set.
-CEO_FALLBACK_FILTER = "CEO OR Chief Executive Officer OR Founder OR Co-Founder OR Owner OR Managing Director OR President"
+CEO_FILTER = "CEO OR Chief Executive Officer OR Founder OR Co-Founder OR Owner OR Managing Director OR President"
 
 
 def _run_search_contact(company: Company, extra_payload: dict) -> list[dict]:
@@ -65,15 +59,9 @@ def _make_contact(company: Company, db: Session, persons: list[dict], reasoning:
 
 
 def find_decision_maker(company: Company, db: Session) -> Contact | None:
-    for step_index, titles in enumerate(CEO_WATERFALL):
-        persons = _run_search_contact(company, {"title_lists": [{"name": f"ceo_step_{step_index}", "titles": titles}]})
-        if persons:
-            return _make_contact(company, db, persons, f"step={step_index}, titles={titles}")
-
-    persons = _run_search_contact(company, {"title_filters": [{"name": "ceo_fallback", "filter": CEO_FALLBACK_FILTER}]})
+    persons = _run_search_contact(company, {"title_filters": [{"name": "ceo_filter", "filter": CEO_FILTER}]})
     if persons:
-        return _make_contact(company, db, persons, f"fallback title_filter={CEO_FALLBACK_FILTER}")
-
+        return _make_contact(company, db, persons, f"title_filter={CEO_FILTER}")
     return None
 
 
