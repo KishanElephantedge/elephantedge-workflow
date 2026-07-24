@@ -1,4 +1,5 @@
 import json
+import os
 import subprocess
 
 from app.config import settings
@@ -6,6 +7,17 @@ from app.config import settings
 
 class DeeplineError(Exception):
     pass
+
+
+def _masked_env_debug() -> str:
+    """Masked view of what this process actually sees for the two Deepline env vars --
+    diagnostic only, for a live 401 that a known-good key doesn't reproduce locally
+    (suggests the value reaching this container differs from the intended one, e.g. a
+    stray whitespace/newline from how it was pasted into Render)."""
+    key = os.environ.get("DEEPLINE_API_KEY", "")
+    host = os.environ.get("DEEPLINE_HOST_URL", "")
+    key_view = f"len={len(key)} repr_ends={key[-6:]!r}" if key else "UNSET"
+    return f"DEEPLINE_API_KEY[{key_view}] DEEPLINE_HOST_URL={host!r}"
 
 
 def execute_tool(tool_id: str, payload: dict) -> dict:
@@ -18,7 +30,8 @@ def execute_tool(tool_id: str, payload: dict) -> dict:
     )
     if result.returncode != 0:
         raise DeeplineError(
-            f"{tool_id} failed (exit {result.returncode}): stdout={result.stdout!r} stderr={result.stderr!r}"
+            f"{tool_id} failed (exit {result.returncode}): stdout={result.stdout!r} stderr={result.stderr!r} "
+            f"env={_masked_env_debug()}"
         )
     stdout = result.stdout
     brace_index = stdout.find("{")
