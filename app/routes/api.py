@@ -2,12 +2,14 @@ from fastapi import APIRouter, Body, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
-from app.db.models import Batch, Company, Credential, Parameter
+from app.db.models import Batch, Company, Contact, Credential, Parameter
 from app.db.session import get_db
 from app.heyreach_client import HeyReachError
+from app.hubspot_client import HubSpotError
 from app.outreach.heyreach import HeyReachChannel
 from app.phases.campaign_execution import run_campaign_execution
 from app.phases.decision_maker import run_decision_maker_id
+from app.phases.hubspot_sync import sync_to_hubspot
 
 router = APIRouter()
 
@@ -131,6 +133,39 @@ def execute_decision_maker_id(batch_id: int, retry_company_ids: list[int] | None
     batch.current_phase = "decision_maker_done"
     db.commit()
     return result
+
+
+@router.post("/batches/{batch_id}/hubspot-backfill")
+def backfill_hubspot_sync(batch_id: int, db: Session = Depends(get_db)):
+    """Syncs any contact in this batch found before the HubSpot integration existed and
+    never got pushed. Reuses the same sync_to_hubspot logic (dedup-by-domain, per-contact
+    tracking) as the live Decision Maker phase -- not a separate one-off path."""
+    batch = (
+        db.query(Batch)
+        .filter(Batch.id == batch_id)
+        .filter(Batch.tenant_id == ELEPHANT_EDGE_TENANT_ID)
+        .first()
+    )
+    if not batch:
+        raise HTTPException(status_code=404, detail="Batch not found")
+
+    contacts = (
+        db.query(Contact)
+        .join(Company)
+        .filter(Company.batch_id == batch_id)
+        .filter(Contact.hubspot_synced_at.is_(None))
+        .all()
+    )
+    synced = 0
+    errors = []
+    for contact in contacts:
+        try:
+            sync_to_hubspot(contact.company, contact, db, ELEPHANT_EDGE_TENANT_ID)
+            synced += 1
+        except HubSpotError as e:
+            errors.append(f"{contact.company.name}: {e}")
+
+    return {"contacts_checked": len(contacts), "synced": synced, "errors": errors}
 
 
 # ---- Phase 11: Campaign Execution ----
