@@ -43,6 +43,26 @@ def execute_tool(tool_id: str, payload: dict) -> dict:
         raise DeeplineError(f"{tool_id} returned malformed JSON: {stdout[:500]}") from e
 
 
+def get_credit_balance_usd() -> float:
+    """Current Deepline account balance in USD, used to enforce the daily spend cap -- same
+    pattern as Synefi's version, checked before/after paid phases rather than trusting a
+    per-call cost estimate."""
+    result = subprocess.run(
+        [settings.deepline_cli_path, "billing", "balance", "--json"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    if result.returncode != 0:
+        raise DeeplineError(f"billing balance failed: {result.stderr or result.stdout}")
+    stdout = result.stdout
+    brace_index = stdout.find("{")
+    if brace_index == -1:
+        raise DeeplineError(f"billing balance returned no JSON output: {stdout[:500]}")
+    data = json.loads(stdout[brace_index:])
+    return float(data["rough_usd_balance"])
+
+
 def extract_rows(response: dict, *keys: str) -> list[dict]:
     """Pull the row list out of a tool response. Deepline tools are inconsistent about
     shape: `raw` is sometimes the list itself, sometimes a dict with the list under a

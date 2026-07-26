@@ -2,14 +2,21 @@ from fastapi import APIRouter, Body, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
-from app.db.models import Batch, Company, Contact, Credential, Parameter
+from app.db.models import AutonomousRun, Batch, Company, Contact, Credential, Parameter
 from app.db.session import get_db
 from app.heyreach_client import HeyReachError
 from app.hubspot_client import HubSpotError
-from app.outreach.heyreach import HeyReachChannel
+from app.outreach.selector import get_outreach_channel
+from app.phases.autonomous_orchestrator import cancel_run, get_daily_budget_usd, get_daily_company_cap, is_autonomous_enabled, resume_pending_approvals, run_daily_autonomous_cycle
+from app.phases.buying_signal import run_buying_signal_check
 from app.phases.campaign_execution import run_campaign_execution
 from app.phases.decision_maker import run_decision_maker_id
+from app.phases.discovery import run_discovery
+from app.phases.jd_first_discovery import run_jd_first_discovery
 from app.phases.hubspot_sync import sync_to_hubspot
+from app.phases.scoring import run_scoring
+from app.phases.tech_stack import run_tech_stack_check
+from app.salesrobot_client import SalesRobotError
 
 router = APIRouter()
 
@@ -21,10 +28,9 @@ ELEPHANT_EDGE_TENANT_ID = 2
 
 
 # ---- Batches ----
-# Generic batch CRUD only -- no phase-execution endpoints yet. Phase 1 (ICP) is blocked on
-# Gokul's confirmation call (see ARCHITECTURE.md); building Discovery/Qualification/etc.
-# endpoints ahead of a confirmed ICP would be exactly the kind of premature implementation
-# this project's own "Discovery is not Qualification" discipline argues against.
+# ICP (Phase 2) is confirmed -- see phase2-icp.md. Discovery/Qualification/Signal/Scoring
+# endpoints below implement that confirmed spec; Phase 4 (Qualification) has no endpoint of its
+# own, per its own finding (absorbed into Discovery's query filters and Phase 6's thread_role).
 
 @router.post("/batches")
 def create_batch(name: str, db: Session = Depends(get_db)):
@@ -78,6 +84,20 @@ def get_batch(batch_id: int, db: Session = Depends(get_db)):
                 "domain": c.domain,
                 "contact_count": len(c.contacts),
                 "decision_maker_searched": c.decision_maker_searched_at is not None,
+                "active_head_of_sales_posting": c.active_head_of_sales_posting,
+                "score": c.score.total_score if c.score else None,
+                "tier": c.score.tier if c.score else None,
+                "score_breakdown": c.score.breakdown if c.score else None,
+                "sales_headcount_percent": c.sales_headcount_percent,
+                "marketing_headcount_percent": c.marketing_headcount_percent,
+                "geography_tier": c.geography_tier,
+                "industry_classification": c.industry_classification,
+                "hiring_signal_role": c.hiring_signal_role,
+                "hiring_signal_hire_type": c.hiring_signal_hire_type,
+                "hiring_signal_strength": c.hiring_signal_strength,
+                "hiring_signal_reasoning": c.hiring_signal_reasoning,
+                "has_outbound_tooling": c.has_outbound_tooling,
+                "has_ai_sdr_tool": c.has_ai_sdr_tool,
             }
             for c in batch.companies
         ],
@@ -115,6 +135,96 @@ def import_companies(batch_id: int, companies: list[CompanyImport], db: Session 
     for c in created:
         db.refresh(c)
     return {"imported": len(created), "companies": [{"id": c.id, "name": c.name, "domain": c.domain} for c in created]}
+
+
+# ---- Phase 3: Company Discovery ----
+
+@router.post("/batches/{batch_id}/phases/discovery")
+def execute_discovery(batch_id: int, target: int = 10, db: Session = Depends(get_db)):
+    batch = (
+        db.query(Batch)
+        .filter(Batch.id == batch_id)
+        .filter(Batch.tenant_id == ELEPHANT_EDGE_TENANT_ID)
+        .first()
+    )
+    if not batch:
+        raise HTTPException(status_code=404, detail="Batch not found")
+    result = run_discovery(batch_id, db, ELEPHANT_EDGE_TENANT_ID, target=target)
+    batch.current_phase = "discovery_done"
+    db.commit()
+    return result
+
+
+# ---- JD-First Discovery (flow inversion -- job postings first, firmographics second) ----
+
+@router.post("/batches/{batch_id}/phases/discovery-jd-first")
+def execute_jd_first_discovery(batch_id: int, target: int = 10, db: Session = Depends(get_db)):
+    batch = (
+        db.query(Batch)
+        .filter(Batch.id == batch_id)
+        .filter(Batch.tenant_id == ELEPHANT_EDGE_TENANT_ID)
+        .first()
+    )
+    if not batch:
+        raise HTTPException(status_code=404, detail="Batch not found")
+    result = run_jd_first_discovery(batch_id, db, ELEPHANT_EDGE_TENANT_ID, target=target)
+    batch.current_phase = "discovery_done"
+    db.commit()
+    return result
+
+
+# ---- Phase 5/8: Buying Signal Intelligence ----
+
+@router.post("/batches/{batch_id}/phases/buying-signal")
+def execute_buying_signal_check(batch_id: int, db: Session = Depends(get_db)):
+    batch = (
+        db.query(Batch)
+        .filter(Batch.id == batch_id)
+        .filter(Batch.tenant_id == ELEPHANT_EDGE_TENANT_ID)
+        .first()
+    )
+    if not batch:
+        raise HTTPException(status_code=404, detail="Batch not found")
+    result = run_buying_signal_check(batch_id, db)
+    batch.current_phase = "buying_signal_done"
+    db.commit()
+    return result
+
+
+# ---- Tech Stack / Outbound Maturity check (Signal Framework v2) ----
+
+@router.post("/batches/{batch_id}/phases/tech-stack")
+def execute_tech_stack_check(batch_id: int, db: Session = Depends(get_db)):
+    batch = (
+        db.query(Batch)
+        .filter(Batch.id == batch_id)
+        .filter(Batch.tenant_id == ELEPHANT_EDGE_TENANT_ID)
+        .first()
+    )
+    if not batch:
+        raise HTTPException(status_code=404, detail="Batch not found")
+    result = run_tech_stack_check(batch_id, db)
+    batch.current_phase = "tech_stack_done"
+    db.commit()
+    return result
+
+
+# ---- Phase 9: Opportunity Scoring ----
+
+@router.post("/batches/{batch_id}/phases/scoring")
+def execute_scoring(batch_id: int, db: Session = Depends(get_db)):
+    batch = (
+        db.query(Batch)
+        .filter(Batch.id == batch_id)
+        .filter(Batch.tenant_id == ELEPHANT_EDGE_TENANT_ID)
+        .first()
+    )
+    if not batch:
+        raise HTTPException(status_code=404, detail="Batch not found")
+    result = run_scoring(batch_id, db)
+    batch.current_phase = "scoring_done"
+    db.commit()
+    return result
 
 
 # ---- Phase 6: Decision Maker Intelligence ----
@@ -168,9 +278,9 @@ def backfill_hubspot_sync(batch_id: int, db: Session = Depends(get_db)):
     return {"contacts_checked": len(contacts), "synced": synced, "errors": errors}
 
 
-# ---- Phase 11: Campaign Execution ----
-# The channel is chosen here, at the call site -- HeyReachChannel is passed in as an
-# OutreachChannel implementation; run_campaign_execution itself has no idea HeyReach exists.
+# ---- Phase 12: Campaign Execution ----
+# The channel is chosen by get_outreach_channel (tenant's own "outreach_channel" Parameter,
+# defaults to HeyReach) -- run_campaign_execution itself has no idea which channel it's using.
 
 @router.post("/batches/{batch_id}/phases/outreach")
 def execute_outreach_push(batch_id: int, db: Session = Depends(get_db)):
@@ -182,10 +292,10 @@ def execute_outreach_push(batch_id: int, db: Session = Depends(get_db)):
     )
     if not batch:
         raise HTTPException(status_code=404, detail="Batch not found")
-    channel = HeyReachChannel(db, ELEPHANT_EDGE_TENANT_ID)
+    channel = get_outreach_channel(db, ELEPHANT_EDGE_TENANT_ID)
     try:
         result = run_campaign_execution(batch_id, db, channel)
-    except HeyReachError as e:
+    except (HeyReachError, SalesRobotError) as e:
         raise HTTPException(status_code=400, detail=str(e))
     batch.current_phase = "outreach_done"
     db.commit()
@@ -231,7 +341,7 @@ def delete_credential(name: str, db: Session = Depends(get_db)):
     return {"deleted": name}
 
 
-# ---- Parameters (ICP config, once Phase 1 unblocks) ----
+# ---- Parameters (autonomous_enabled, daily_credit_budget_usd, daily_company_cap) ----
 
 @router.get("/parameters")
 def list_parameters(db: Session = Depends(get_db)):
@@ -255,3 +365,116 @@ def upsert_parameter(key: str, value: dict, description: str = "", db: Session =
         db.add(param)
     db.commit()
     return {"key": key, "value": value}
+
+
+# ---- Autonomous system control ----
+# Same generic control surface as Synefi's (status/toggle/runs/weekly-report/trigger-now) --
+# reused because it's tenant-agnostic scheduling/reporting infrastructure, not business logic.
+
+@router.get("/autonomous/status")
+def get_autonomous_status(db: Session = Depends(get_db)):
+    last_run = (
+        db.query(AutonomousRun)
+        .join(Batch)
+        .filter(Batch.tenant_id == ELEPHANT_EDGE_TENANT_ID)
+        .order_by(AutonomousRun.started_at.desc())
+        .first()
+    )
+    return {
+        "enabled": is_autonomous_enabled(db, ELEPHANT_EDGE_TENANT_ID),
+        "daily_budget_usd": get_daily_budget_usd(db, ELEPHANT_EDGE_TENANT_ID),
+        "daily_company_cap": get_daily_company_cap(db, ELEPHANT_EDGE_TENANT_ID),
+        "last_run": {
+            "id": last_run.id,
+            "batch_id": last_run.batch_id,
+            "run_date": last_run.run_date,
+            "status": last_run.status,
+            "companies_selected": last_run.companies_selected,
+            "contacts_pushed": last_run.contacts_pushed,
+            "awaiting_approval_until": last_run.awaiting_approval_until,
+        } if last_run else None,
+    }
+
+
+@router.post("/autonomous/toggle")
+def toggle_autonomous(enabled: bool, db: Session = Depends(get_db)):
+    param = (
+        db.query(Parameter)
+        .filter(Parameter.tenant_id == ELEPHANT_EDGE_TENANT_ID)
+        .filter(Parameter.key == "autonomous_enabled")
+        .first()
+    )
+    if param:
+        param.value = {"enabled": enabled}
+    else:
+        param = Parameter(tenant_id=ELEPHANT_EDGE_TENANT_ID, key="autonomous_enabled", value={"enabled": enabled},
+                           description="Start/pause the daily autonomous cycle")
+        db.add(param)
+    db.commit()
+    return {"enabled": enabled}
+
+
+@router.get("/autonomous/runs")
+def list_autonomous_runs(db: Session = Depends(get_db)):
+    runs = (
+        db.query(AutonomousRun)
+        .join(Batch)
+        .filter(Batch.tenant_id == ELEPHANT_EDGE_TENANT_ID)
+        .order_by(AutonomousRun.started_at.desc())
+        .all()
+    )
+    return [
+        {
+            "id": r.id,
+            "run_date": r.run_date,
+            "batch_id": r.batch_id,
+            "status": r.status,
+            "companies_discovered": r.companies_discovered,
+            "companies_selected": r.companies_selected,
+            "contacts_found": r.contacts_found,
+            "contacts_pushed": r.contacts_pushed,
+            "credits_spent_usd": r.credits_spent_usd,
+            "budget_stopped_early": r.budget_stopped_early,
+            "error_message": r.error_message,
+        }
+        for r in runs
+    ]
+
+
+@router.get("/autonomous/weekly-report")
+def get_weekly_report(db: Session = Depends(get_db)):
+    runs = (
+        db.query(AutonomousRun)
+        .join(Batch)
+        .filter(Batch.tenant_id == ELEPHANT_EDGE_TENANT_ID)
+        .filter(AutonomousRun.status == "completed")
+        .all()
+    )
+    return {
+        "days_run": len(runs),
+        "total_companies_discovered": sum(r.companies_discovered for r in runs),
+        "total_companies_selected": sum(r.companies_selected for r in runs),
+        "total_contacts_found": sum(r.contacts_found for r in runs),
+        "total_contacts_pushed": sum(r.contacts_pushed for r in runs),
+    }
+
+
+@router.post("/autonomous/trigger-now")
+def trigger_autonomous_now(db: Session = Depends(get_db)):
+    """Manual override to run today's cycle immediately instead of waiting for the 24h
+    scheduler tick -- e.g. for testing before going live."""
+    return run_daily_autonomous_cycle(db, tenant_id=ELEPHANT_EDGE_TENANT_ID)
+
+
+@router.post("/autonomous/runs/{run_id}/cancel")
+def cancel_autonomous_run(run_id: int, db: Session = Depends(get_db)):
+    """Cancels a run still in its 1-hour approval window -- the periodic sweep checks this
+    before ever pushing to the outreach channel. Not cancellable once it's already resumed."""
+    return cancel_run(run_id, db, ELEPHANT_EDGE_TENANT_ID)
+
+
+@router.post("/autonomous/resume-check")
+def manual_resume_check(db: Session = Depends(get_db)):
+    """Manual override to run the approval-window sweep immediately, instead of waiting for
+    the 5-minute scheduler tick -- e.g. for testing."""
+    return resume_pending_approvals(db, ELEPHANT_EDGE_TENANT_ID)

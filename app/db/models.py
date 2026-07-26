@@ -58,6 +58,36 @@ class Company(Base):
     # daily cycle) forever, since it never acquires a Contact row to skip on.
     decision_maker_searched_at = Column(DateTime, nullable=True)
 
+    # Phase 3 (Discovery) -- captured free, same Crustdata query, per phase5's Finding 1 addendum.
+    estimated_revenue_lower_usd = Column(Integer, nullable=True)
+    estimated_revenue_higher_usd = Column(Integer, nullable=True)
+    last_funding_round_type = Column(String, nullable=True)
+    last_funding_date = Column(DateTime, nullable=True)
+    crunchbase_total_investment_usd = Column(Float, nullable=True)
+    headcount_growth_12m_percent = Column(Float, nullable=True)
+    source = Column(String, nullable=True)
+
+    # Phase 5/8 -- Buying Signal Intelligence. Stage 1 (discovery-time) fields; Stage 2 lives on
+    # Contact.thread_role (Phase 4's finding), combined at scoring time, not stored redundantly here.
+    active_head_of_sales_posting = Column(Boolean, nullable=True)
+    buying_signal_checked_at = Column(DateTime, nullable=True)
+
+    # Signal Framework v2 (from Gokul) -- org-composition data, captured free from the same
+    # Crustdata Discovery response (role_distribution_percent), no separate paid call needed.
+    sales_headcount_percent = Column(Float, nullable=True)
+    marketing_headcount_percent = Column(Float, nullable=True)
+    geography_tier = Column(String, nullable=True)  # "tier_1" | "tier_2"
+    industry_classification = Column(String, nullable=True)  # "tech" | "non_tech"
+    active_job_title = Column(String, nullable=True)  # title of the matched posting, if any
+    hiring_signal_role = Column(String, nullable=True)  # head_of_sales | sdr | ae | marketing | gtm
+    hiring_signal_hire_type = Column(String, nullable=True)  # first_hire | multiple_hire
+    hiring_signal_strength = Column(String, nullable=True)  # strong | medium | weak
+    hiring_signal_reasoning = Column(Text, nullable=True)
+    detected_tech_stack = Column(JSON, nullable=True)
+    has_outbound_tooling = Column(Boolean, nullable=True)
+    has_ai_sdr_tool = Column(Boolean, nullable=True)
+    tech_stack_checked_at = Column(DateTime, nullable=True)
+
     batch = relationship("Batch", back_populates="companies")
     signals = relationship("Signal", back_populates="company", cascade="all, delete-orphan")
     score = relationship("Score", back_populates="company", uselist=False, cascade="all, delete-orphan")
@@ -89,6 +119,9 @@ class Score(Base):
     compliance_complexity = Column(Float, default=0)
     greenfield_legacy = Column(Float, default=0)
     stacking_bonus = Column(Float, default=0)
+    # Elephant Edge only (Phase 9, Component C) -- Synefi has no equivalent, since its
+    # decision-maker search isn't two-tiered the way Elephant Edge's is.
+    decision_maker_match = Column(Float, default=0)
     total_score = Column(Float, default=0)
     tier = Column(String, default="excluded")
     passed_industry_gate = Column(Boolean, default=False)
@@ -113,6 +146,9 @@ class Contact(Base):
     # Set once this contact + its company have been pushed to HubSpot -- prevents creating
     # duplicate Company/Contact records in HubSpot on a re-run.
     hubspot_synced_at = Column(DateTime, nullable=True)
+    # Phase 11 (Personalization) -- dynamically-chosen opening line, pushed to HeyReach as a
+    # customUserFields value merged into the sequence template's {{personalization_hook}} tag.
+    personalization_hook = Column(Text, nullable=True)
 
     company = relationship("Company", back_populates="contacts")
     campaign_pushes = relationship("CampaignPush", back_populates="contact", cascade="all, delete-orphan")
@@ -147,6 +183,11 @@ class AutonomousRun(Base):
     error_message = Column(Text, nullable=True)
     started_at = Column(DateTime, default=datetime.utcnow)
     completed_at = Column(DateTime, nullable=True)
+    # Elephant Edge only -- pre-outreach approval window (Signal Framework v2 follow-up
+    # request): the cycle pauses here after Decision Maker, sends a review email, and waits
+    # this long before actually pushing to the outreach channel, unless cancelled.
+    awaiting_approval_until = Column(DateTime, nullable=True)
+    cancelled = Column(Boolean, default=False)
 
     batch = relationship("Batch")
 
