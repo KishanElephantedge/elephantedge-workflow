@@ -11,9 +11,15 @@ One search_contact call per target tier, using a boolean title filter rather tha
 of exact-title steps. Real-world titles are frequently compound free text ("CEO and Co-Founder",
 "Founder & CEO") that an exact title_lists match misses entirely -- confirmed live on the
 first real company run (GoZen's "Ambi Moorthy, CEO and Co-Founder" matched only the broad
-filter, not any single exact-title step). search_contact already ranks its own results by
-relevance, so running exact-title steps first before falling back to the same filter's superset
-was pure wasted cost: up to 4 billed calls to land on a result the 1st call would have found.
+filter, not any single exact-title step).
+
+search_contact's own top-ranked result is NOT trusted blindly -- confirmed live (Gulf &
+Western Industries) that a broad OR-filter like ours can rank the wrong person #1 (an
+Executive Vice President, when the real President & CEO also exists in the same company's
+data, per a manual LinkedIn Sales Navigator check). Each call now requests a few candidates
+(CANDIDATES_PER_SEARCH) in the SAME billed call -- not a second call -- and locally picks
+whichever one's actual title contains one of our target keywords, rather than accepting
+whatever the provider's relevance ranking put first.
 """
 
 from datetime import datetime
@@ -27,19 +33,39 @@ from app.hubspot_client import HubSpotError
 from app.phases.hubspot_sync import sync_to_hubspot
 
 CEO_FILTER = "CEO OR Chief Executive Officer OR Founder OR Co-Founder OR Owner OR Managing Director OR President"
+# "president" deliberately excluded from this plain list -- it's a substring of "Vice
+# President"/"Executive Vice President"/"Assistant Vice President", which are NOT what we
+# want (confirmed live: this exact substring bug initially made the matcher accept an
+# Executive Vice President too). Handled separately below with an explicit exclusion check.
+CEO_TITLE_KEYWORDS = ["ceo", "chief executive officer", "founder", "owner", "managing director"]
+CEO_TITLE_PRESIDENT_EXCLUSIONS = ["vice president", "svp", "avp", "evp"]
 
 SALES_LEADER_FILTER = (
     "Head of Sales OR VP Sales OR VP of Sales OR Head of GTM OR Head of Growth OR "
     "Director of Sales OR Director of Business Development OR Head of Business Development OR "
     "Chief Revenue Officer OR CRO"
 )
+SALES_LEADER_TITLE_KEYWORDS = [
+    "head of sales", "vp sales", "vp of sales", "head of gtm", "head of growth",
+    "director of sales", "director of business development", "head of business development",
+    "chief revenue officer", "cro",
+]
+
+# search_contact's own tool guidance: broad OR-filters like ours rank less precisely than
+# narrow ones, and recommends a small page_size (1-3) specifically "so you can inspect
+# candidate quality" -- confirmed live (Gulf & Western Industries: the #1-ranked result was
+# an Executive Vice President, not the actual President & CEO who also exists in the same
+# company's data, verified manually on LinkedIn Sales Navigator). Requesting a few
+# candidates in the SAME billed call (not a second call -- $0.056/result, so 3 costs
+# ~$0.17 instead of ~$0.056) and picking the one whose title actually contains one of our
+# target words fixes this without any wasted/duplicate spend.
+CANDIDATES_PER_SEARCH = 3
 
 
 def _run_search_contact(company: Company, extra_payload: dict) -> list[dict]:
     payload = {
         "domain": company.domain,
-        # Billed per result returned; only ever use persons[0], so request exactly 1.
-        "page_size": 1,
+        "page_size": CANDIDATES_PER_SEARCH,
         **extra_payload,
     }
     response = execute_tool("search_contact", payload)
@@ -51,8 +77,25 @@ def _run_search_contact(company: Company, extra_payload: dict) -> list[dict]:
     return extract_rows(response, "persons")
 
 
-def _make_contact(company: Company, db: Session, persons: list[dict], reasoning: str, thread_role: str) -> Contact:
-    person = persons[0]
+def _best_matching_person(persons: list[dict], title_keywords: list[str], require_bare_president: bool = False) -> dict | None:
+    """Picks the first candidate whose actual title contains one of our target keywords,
+    rather than blindly trusting persons[0]'s relevance rank -- the rank can and does put
+    the wrong person first (e.g. an Executive Vice President ranked above the real CEO).
+
+    require_bare_president=True additionally accepts a title containing "president" on its
+    own (the CEO tier's case) -- but only if it's NOT one of the "Vice President" family,
+    since "president" is a substring of "Vice President"/"Executive Vice President" and a
+    naive `in` check would otherwise accept those too (confirmed live: this exact bug)."""
+    for person in persons:
+        title = (person.get("title") or "").lower()
+        if any(keyword in title for keyword in title_keywords):
+            return person
+        if require_bare_president and "president" in title and not any(excl in title for excl in CEO_TITLE_PRESIDENT_EXCLUSIONS):
+            return person
+    return None
+
+
+def _make_contact(company: Company, db: Session, person: dict, reasoning: str, thread_role: str) -> Contact:
     contact = Contact(
         company_id=company.id,
         first_name=person.get("first_name"),
@@ -70,14 +113,16 @@ def _make_contact(company: Company, db: Session, persons: list[dict], reasoning:
 
 def find_decision_maker(company: Company, db: Session) -> Contact | None:
     persons = _run_search_contact(company, {"title_filters": [{"name": "ceo_filter", "filter": CEO_FILTER}]})
-    if persons:
-        return _make_contact(company, db, persons, f"title_filter={CEO_FILTER}", "founder_ceo")
+    person = _best_matching_person(persons, CEO_TITLE_KEYWORDS, require_bare_president=True)
+    if person:
+        return _make_contact(company, db, person, f"title_filter={CEO_FILTER}, verified_title={person.get('title')!r}", "founder_ceo")
 
     # No primary (founder/CEO) contact exists at all for this domain -- try the secondary
     # sales-leader target rather than leaving the company with zero contact.
     persons = _run_search_contact(company, {"title_filters": [{"name": "sales_leader_filter", "filter": SALES_LEADER_FILTER}]})
-    if persons:
-        return _make_contact(company, db, persons, f"title_filter={SALES_LEADER_FILTER}", "sales_leader")
+    person = _best_matching_person(persons, SALES_LEADER_TITLE_KEYWORDS)
+    if person:
+        return _make_contact(company, db, person, f"title_filter={SALES_LEADER_FILTER}, verified_title={person.get('title')!r}", "sales_leader")
 
     return None
 
@@ -96,7 +141,8 @@ def run_decision_maker_id(batch_id: int, db: Session, tenant_id: int, retry_comp
     deliberate re-attempt (e.g. after correcting a wrong domain), never an automatic one.
 
     budget_guard, if given, is checked after every company -- this is the single most
-    expensive phase per company (search_contact, ~$0.256), so this is the loop where a hard
+    expensive phase per company (search_contact, ~$0.17 at CANDIDATES_PER_SEARCH=3, real
+    per-result price is $0.056), so this is the loop where a hard
     spend cap matters most. Stops the loop (rather than raising out of it) the moment this
     run's cap is reached, leaving already-resolved companies' contacts in place."""
     retry_ids = set(retry_company_ids or [])
