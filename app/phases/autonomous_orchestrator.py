@@ -107,6 +107,28 @@ def _dedupe_against_prior_days(batch: Batch, db: Session) -> int:
 
 
 def _select_top_companies(batch: Batch, db: Session, cap: int) -> int:
+    """Real quality gate, not just a volume cap: a company scoring below Cool (tier ==
+    "excluded", total_score < 70) never proceeds past this point, regardless of the daily
+    cap -- firmographic fit + a bare hiring-signal match alone was previously enough to
+    reach Decision Maker and Outreach (real batches showed this happen), even though the
+    company's own computed score said it wasn't a good fit. This is the fix: the score
+    that was already being calculated is now actually enforced, not just recorded.
+
+    Excluded-tier companies are removed unconditionally first. Among the rest (hot/warm/
+    cool), only hot/warm are capped to the day's target count -- cool-tier companies pass
+    through uncapped, since the cap exists to bound *volume* of the best prospects, not to
+    additionally restrict companies that already cleared the real quality bar."""
+    excluded_companies = (
+        db.query(Company)
+        .join(Score)
+        .filter(Company.batch_id == batch.id)
+        .filter(Score.tier == "excluded")
+        .all()
+    )
+    for company in excluded_companies:
+        db.delete(company)
+    db.commit()
+
     scored = (
         db.query(Company)
         .join(Score)
