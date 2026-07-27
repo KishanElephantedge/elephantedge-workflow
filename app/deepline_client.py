@@ -1,5 +1,6 @@
 import json
 import os
+import signal
 import subprocess
 
 from app.config import settings
@@ -7,6 +8,35 @@ from app.config import settings
 
 class DeeplineError(Exception):
     pass
+
+
+def _run_deepline_cli(args: list[str], timeout_seconds: float) -> subprocess.CompletedProcess:
+    """subprocess.run(timeout=...), but killing the WHOLE process group on timeout, not
+    just the immediate child. Found live: a stuck run with 0 progress for 6+ minutes,
+    with the app process itself still healthy -- subprocess.run's own timeout only
+    signals the direct child (the `deepline` Node process); if that process has itself
+    spawned children holding the stdout/stderr pipes open, killing just the parent
+    leaves those pipes open and communicate() hangs indefinitely waiting for EOF,
+    completely bypassing the timeout. start_new_session=True puts the child (and
+    anything it spawns) in its own process group, so os.killpg can take the entire
+    tree down on timeout."""
+    proc = subprocess.Popen(
+        args,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout_seconds)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        proc.communicate()  # reap now that the whole group is dead
+        raise
+    return subprocess.CompletedProcess(args, proc.returncode, stdout, stderr)
 
 
 def _masked_env_debug() -> str:
@@ -23,11 +53,9 @@ def _masked_env_debug() -> str:
 def execute_tool(tool_id: str, payload: dict) -> dict:
     """Run `deepline tools execute <tool_id> --input '<json>' --json` and return the parsed response."""
     try:
-        result = subprocess.run(
+        result = _run_deepline_cli(
             [settings.deepline_cli_path, "tools", "execute", tool_id, "--input", json.dumps(payload), "--json"],
-            capture_output=True,
-            text=True,
-            timeout=120,
+            timeout_seconds=120,
         )
     except subprocess.TimeoutExpired as e:
         raise DeeplineError(f"{tool_id} timed out after 120s") from e
@@ -48,11 +76,9 @@ def execute_tool(tool_id: str, payload: dict) -> dict:
 
 def _get_credit_balance_usd_once(timeout_seconds: float) -> float:
     try:
-        result = subprocess.run(
+        result = _run_deepline_cli(
             [settings.deepline_cli_path, "billing", "balance", "--json"],
-            capture_output=True,
-            text=True,
-            timeout=timeout_seconds,
+            timeout_seconds=timeout_seconds,
         )
     except subprocess.TimeoutExpired as e:
         raise DeeplineError(f"billing balance timed out after {timeout_seconds}s") from e
