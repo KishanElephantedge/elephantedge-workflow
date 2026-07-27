@@ -22,12 +22,15 @@ def _masked_env_debug() -> str:
 
 def execute_tool(tool_id: str, payload: dict) -> dict:
     """Run `deepline tools execute <tool_id> --input '<json>' --json` and return the parsed response."""
-    result = subprocess.run(
-        [settings.deepline_cli_path, "tools", "execute", tool_id, "--input", json.dumps(payload), "--json"],
-        capture_output=True,
-        text=True,
-        timeout=120,
-    )
+    try:
+        result = subprocess.run(
+            [settings.deepline_cli_path, "tools", "execute", tool_id, "--input", json.dumps(payload), "--json"],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    except subprocess.TimeoutExpired as e:
+        raise DeeplineError(f"{tool_id} timed out after 120s") from e
     if result.returncode != 0:
         raise DeeplineError(
             f"{tool_id} failed (exit {result.returncode}): stdout={result.stdout!r} stderr={result.stderr!r} "
@@ -43,16 +46,16 @@ def execute_tool(tool_id: str, payload: dict) -> dict:
         raise DeeplineError(f"{tool_id} returned malformed JSON: {stdout[:500]}") from e
 
 
-def get_credit_balance_usd() -> float:
-    """Current Deepline account balance in USD, used to enforce the daily spend cap -- same
-    pattern as Synefi's version, checked before/after paid phases rather than trusting a
-    per-call cost estimate."""
-    result = subprocess.run(
-        [settings.deepline_cli_path, "billing", "balance", "--json"],
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
+def _get_credit_balance_usd_once(timeout_seconds: float) -> float:
+    try:
+        result = subprocess.run(
+            [settings.deepline_cli_path, "billing", "balance", "--json"],
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired as e:
+        raise DeeplineError(f"billing balance timed out after {timeout_seconds}s") from e
     if result.returncode != 0:
         raise DeeplineError(f"billing balance failed: {result.stderr or result.stdout}")
     stdout = result.stdout
@@ -61,6 +64,22 @@ def get_credit_balance_usd() -> float:
         raise DeeplineError(f"billing balance returned no JSON output: {stdout[:500]}")
     data = json.loads(stdout[brace_index:])
     return float(data["rough_usd_balance"])
+
+
+def get_credit_balance_usd() -> float:
+    """Current Deepline account balance in USD, used to enforce the daily spend cap -- same
+    pattern as Synefi's version, checked before/after paid phases rather than trusting a
+    per-call cost estimate.
+
+    This call has shown itself intermittently slow/hanging in production (observed: 2 of 3
+    real calls fast and correct in ~3s, 1 of 3 hung the full timeout) -- one retry on failure
+    smooths over that without masking a persistent problem, since BudgetGuard's caller still
+    sees a real DeeplineError (and fails the run safely, per its own docstring) if both
+    attempts fail."""
+    try:
+        return _get_credit_balance_usd_once(timeout_seconds=20)
+    except DeeplineError:
+        return _get_credit_balance_usd_once(timeout_seconds=20)
 
 
 def extract_rows(response: dict, *keys: str) -> list[dict]:
