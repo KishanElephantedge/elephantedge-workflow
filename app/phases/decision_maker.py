@@ -30,6 +30,7 @@ from app.budget_guard import BudgetExceededError, BudgetGuard
 from app.db.models import Company, Contact
 from app.deepline_client import execute_tool, extract_rows
 from app.hubspot_client import HubSpotError
+from app.phases.hiring_signal import has_qualifying_hiring_signal
 from app.phases.hubspot_sync import sync_to_hubspot
 
 CEO_FILTER = "CEO OR Chief Executive Officer OR Founder OR Co-Founder OR Owner OR Managing Director OR President"
@@ -128,8 +129,14 @@ def find_decision_maker(company: Company, db: Session) -> Contact | None:
 
 
 def run_decision_maker_id(batch_id: int, db: Session, tenant_id: int, retry_company_ids: list[int] | None = None, budget_guard: BudgetGuard | None = None) -> dict:
-    """Phase 6 entrypoint. No tier/score gate here -- this batch's companies were hand-picked
-    (Phase 3 Qualification doesn't apply), so every company in the batch is searched.
+    """Phase 6 entrypoint.
+
+    Real gate, added after finding real batches (e.g. batch 21) where every company had zero
+    hiring signal, yet all were searched and contacts got pushed to a real campaign anyway:
+    a company only reaches search_contact if has_qualifying_hiring_signal() is true -- a
+    role-title match OR real JD-content evidence, either is enough. Firmographic fit alone
+    (passing Discovery) is not sufficient; a company showing no evidence at all of needing what
+    our product does gets excluded here, before the most expensive phase runs for it.
 
     By default, skips any company already searched -- whether it found a contact or not.
     search_contact bills real credits per call regardless of outcome, and a company with
@@ -151,6 +158,7 @@ def run_decision_maker_id(batch_id: int, db: Session, tenant_id: int, retry_comp
     found = 0
     not_found = 0
     skipped = 0
+    excluded_no_signal = 0
     hubspot_synced = 0
     hubspot_errors = []
     budget_stopped_early = False
@@ -158,6 +166,9 @@ def run_decision_maker_id(batch_id: int, db: Session, tenant_id: int, retry_comp
         already_done = company.contacts or company.decision_maker_searched_at
         if already_done and company.id not in retry_ids:
             skipped += 1
+            continue
+        if not has_qualifying_hiring_signal(company):
+            excluded_no_signal += 1
             continue
         contact = find_decision_maker(company, db)
         company.decision_maker_searched_at = datetime.utcnow()
@@ -190,5 +201,6 @@ def run_decision_maker_id(batch_id: int, db: Session, tenant_id: int, retry_comp
         "hubspot_synced": hubspot_synced,
         "hubspot_errors": hubspot_errors,
         "companies_skipped_already_resolved": skipped,
+        "companies_excluded_no_hiring_signal": excluded_no_signal,
         "budget_stopped_early": budget_stopped_early,
     }

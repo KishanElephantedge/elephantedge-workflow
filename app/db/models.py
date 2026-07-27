@@ -83,6 +83,7 @@ class Company(Base):
     hiring_signal_hire_type = Column(String, nullable=True)  # first_hire | multiple_hire
     hiring_signal_strength = Column(String, nullable=True)  # strong | medium | weak
     hiring_signal_reasoning = Column(Text, nullable=True)
+    product_fit_jd_categories = Column(JSON, nullable=True)  # list of PRODUCT_FIT_KEYWORD_CATEGORIES names matched in the JD
     detected_tech_stack = Column(JSON, nullable=True)
     has_outbound_tooling = Column(Boolean, nullable=True)
     has_ai_sdr_tool = Column(Boolean, nullable=True)

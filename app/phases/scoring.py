@@ -82,6 +82,12 @@ def _buying_intent_score(company: Company) -> float:
         points += 4
     if company.active_head_of_sales_posting:
         points += 2
+    # A JD describing our own product's job (ICP/list-building, decision-maker research,
+    # outbound execution, AI-native prospecting) is a sharper buying-intent signal than a bare
+    # role-title match -- the company is describing the exact problem we solve as a headcount
+    # line item. Weighted by how many distinct categories matched, not just "any match".
+    product_fit_categories = company.product_fit_jd_categories or []
+    points += min(len(product_fit_categories) * 3, 9)
     return min(points, 10)
 
 
@@ -127,6 +133,7 @@ def score_company(company: Company, db: Session) -> Score:
         "tier_label": {"hot": "Tier A", "warm": "Tier B", "cool": "Tier C", "excluded": "Low priority/nurture"}[tier],
         "hiring_signal_role": company.hiring_signal_role,
         "hiring_signal_reasoning": company.hiring_signal_reasoning,
+        "product_fit_jd_categories": company.product_fit_jd_categories,
     }
     db.commit()
     db.refresh(score)

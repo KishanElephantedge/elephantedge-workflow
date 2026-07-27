@@ -15,17 +15,43 @@ from app.db.models import Company
 from app.deepline_client import execute_tool, extract_rows
 
 ROLE_KEYWORDS = {
-    "head_of_sales": ["head of sales", "vp sales", "vp of sales", "director of sales", "sales manager", "cro", "chief revenue officer"],
-    "sdr": ["sdr", "sales development representative", "bdr", "business development representative"],
+    # Expanded from real, observed title-frequency data (a Jobo agent SQL query surfaced
+    # e.g. "Business Development Manager" at 11,690 occurrences and "Sales Director" at 1,659 --
+    # titles our original narrow list would have completely missed) -- not exhaustive, since
+    # companies phrase this differently, but broadened to catch the common real variants rather
+    # than only the handful of titles we originally guessed.
+    "head_of_sales": [
+        "head of sales", "vp sales", "vp of sales", "director of sales", "sales director",
+        "sales manager", "cro", "chief revenue officer", "director, sales",
+    ],
+    "sdr": [
+        "sdr", "sales development representative", "bdr", "business development representative",
+        "business development manager", "business development executive", "business development specialist",
+        "business development associate", "business development director", "business development lead",
+        "business development consultant", "business development coordinator", "business development officer",
+        "director of business development", "director, business development", "sales development manager",
+        "outbound sales representative", "outbound sales development representative",
+        "lead generation specialist", "lead generation representative",
+    ],
     "ae": ["account executive", " ae "],
-    "marketing": ["head of marketing", "marketing manager", "growth marketing"],
+    "marketing": [
+        "head of marketing", "marketing manager", "growth marketing", "performance marketing",
+        "digital marketing manager", "field marketing manager", "regional marketing manager",
+        "head of growth marketing",
+    ],
     "gtm": ["head of gtm", "gtm engineer", "gtm operations"],
 }
 
 COMBINED_JOB_KEYWORD = (
-    "Head of Sales OR VP Sales OR VP of Sales OR Director of Sales OR Sales Manager OR CRO OR "
+    "Head of Sales OR VP Sales OR VP of Sales OR Director of Sales OR Sales Director OR "
+    "Sales Manager OR CRO OR Chief Revenue Officer OR "
     "SDR OR Sales Development Representative OR BDR OR Business Development Representative OR "
-    "Account Executive OR Head of Marketing OR Marketing Manager OR Growth Marketing OR "
+    "Business Development Manager OR Business Development Executive OR Business Development Specialist OR "
+    "Business Development Associate OR Business Development Director OR Business Development Lead OR "
+    "Director of Business Development OR Sales Development Manager OR Outbound Sales Representative OR "
+    "Outbound Sales Development Representative OR Lead Generation Specialist OR Lead Generation Representative OR "
+    "Account Executive OR Head of Marketing OR Marketing Manager OR Growth Marketing OR Performance Marketing OR "
+    "Digital Marketing Manager OR Field Marketing Manager OR Regional Marketing Manager OR Head of Growth Marketing OR "
     "Head of GTM OR GTM Engineer OR GTM Operations"
 )
 
@@ -35,10 +61,80 @@ FIRST_HIRE_PHRASES = ["first sales hire", "first-ever", "build from scratch", "f
 
 TOFU_KEYWORD = "top of the funnel"
 
+# Product-fit JD language -- direct textual evidence the role being hired is manually doing what
+# Elephant Edge automates (company/ICP research, decision-maker identification, outbound
+# campaign execution, AI-native prospecting). A company describing THIS in its own JD is a much
+# sharper buying-intent signal than a bare role-title match: they're describing our own product's
+# job description as a headcount line item. Grouped by category (not one flat list) so scoring
+# can weight "matched N distinct categories" rather than just "matched one keyword somewhere" --
+# companies phrase this very differently, so the list is intentionally broad, not the literal
+# phrasing of any one real JD it was built from.
+PRODUCT_FIT_KEYWORD_CATEGORIES: dict[str, list[str]] = {
+    "outbound_motion_building": [
+        "outbound motion", "outbound engine", "outbound strategy", "outbound process",
+        "outbound function", "own our outbound", "own the outbound", "build outbound",
+        "outbound from scratch", "outbound from the ground up", "outbound playbook",
+    ],
+    "icp_and_list_building": [
+        "icp", "ideal customer profile", "target account", "target list", "targeted list",
+        "targeted lists", "prospect list", "prospecting list", "build a list", "build lists",
+        "list building", "list-building", "list coverage", "research and build", "target companies",
+        "priority verticals", "account list", "segment target accounts", "build large",
+    ],
+    "decision_maker_identification": [
+        "identify decision-makers", "identify decision makers", "identify the right decision",
+        "find the right contacts", "source contact information", "source accurate contact",
+        "key stakeholders", "right person to contact", "decision maker research", "contact data",
+    ],
+    "outbound_campaign_execution": [
+        "outbound campaign", "outbound campaigns", "sequencing", "cold email", "cold outreach",
+        "outreach cadence", "multi-channel outreach", "outreach at volume", "personalized outreach",
+        "messaging and iteration", "cold calling", "email sequences", "outreach activity",
+    ],
+    "ai_native_automation": [
+        "ai-native", "ai native", "signal-based prospecting", "automated research", "leverage ai",
+        "use ai tools", "ai agents", "ai tools to accelerate", "automation-first", "scale outbound",
+        "genuinely ai-native", "automate the repetitive", "ai-powered", "ai and search tools",
+    ],
+    "revops_crm_setup": [
+        "revops", "crm", "pipeline stages", "hubspot", "salesforce", "pipedrive",
+        "clean and up to date", "deduplicated", "data hygiene", "reporting that tells us",
+    ],
+    "tool_stack_mentioned": [
+        "apollo", "clay", "sales navigator", "zoominfo", "outreach.io", "salesloft", "lemlist",
+        "instantly", "smartlead",
+    ],
+}
+
 # Sales headcount % below this is treated as "no team or a small team exists" for
 # hire-type inference (Signal Framework v2's own wording), consistent with Discovery's
 # 2-10% qualifying band -- near the low end of that band counts as "small team".
 SMALL_TEAM_THRESHOLD_PERCENT = 4.0
+
+
+def has_qualifying_hiring_signal(company: Company) -> bool:
+    """The real gate: a company only qualifies for Decision Maker / Outreach if it's actually
+    shown some form of GTM-hiring evidence -- either a role-title match (hiring_signal_role) OR
+    real JD-content evidence it needs what our product does (product_fit_jd_categories), not
+    just firmographic fit. Either one is enough (OR, not AND) -- a company describing our exact
+    product's job in a JD is real evidence even if the title itself didn't match one of our
+    known role buckets, and vice versa. Companies with neither get excluded before the most
+    expensive phase (Decision Maker) ever runs for them."""
+    return company.hiring_signal_role is not None or bool(company.product_fit_jd_categories)
+
+
+def _detect_product_fit_signals(description: str) -> list[str]:
+    """Returns every PRODUCT_FIT_KEYWORD_CATEGORIES category with at least one phrase match in
+    this JD's body text -- the count of distinct categories matched (not raw phrase count) is
+    what scoring treats as signal strength, since a JD hitting many different categories reads
+    much more like "this role is literally our product" than one hitting the same category
+    repeatedly."""
+    description_lower = description.lower()
+    matched_categories = []
+    for category, phrases in PRODUCT_FIT_KEYWORD_CATEGORIES.items():
+        if any(phrase in description_lower for phrase in phrases):
+            matched_categories.append(category)
+    return matched_categories
 
 
 def _classify_role(title: str) -> str | None:
@@ -115,6 +211,7 @@ def classify_hiring_signal(company: Company, db: Session) -> dict:
     best_reasoning = None
     best_title = None
     tofu_found = False
+    product_fit_categories: set[str] = set()
 
     strength_rank = {"strong": 3, "medium": 2, "weak": 1}
     for job in jobs:
@@ -122,6 +219,10 @@ def classify_hiring_signal(company: Company, db: Session) -> dict:
         description = job.get("description") or ""
         if TOFU_KEYWORD in description.lower():
             tofu_found = True
+        # Checked across every posting fetched, not just the one that ends up "best" for role
+        # classification -- product-fit language can appear in a posting whose title didn't
+        # match a role keyword cleanly, and it's still real evidence worth capturing.
+        product_fit_categories.update(_detect_product_fit_signals(description))
         role = _classify_role(title) or _classify_role(job.get("normalized_job_title") or "")
         if not role:
             continue
@@ -134,7 +235,13 @@ def classify_hiring_signal(company: Company, db: Session) -> dict:
     company.hiring_signal_role = best_role
     company.hiring_signal_hire_type = best_hire_type
     company.hiring_signal_strength = best_strength
-    company.hiring_signal_reasoning = (best_reasoning or "") + (" [TOFU pipeline keyword found in JD]" if tofu_found else "")
+    company.product_fit_jd_categories = sorted(product_fit_categories) or None
+    reasoning_suffix = ""
+    if tofu_found:
+        reasoning_suffix += " [TOFU pipeline keyword found in JD]"
+    if product_fit_categories:
+        reasoning_suffix += f" [JD describes our product's own job: {', '.join(sorted(product_fit_categories))}]"
+    company.hiring_signal_reasoning = (best_reasoning or "") + reasoning_suffix
     db.commit()
 
     return {
@@ -142,5 +249,6 @@ def classify_hiring_signal(company: Company, db: Session) -> dict:
         "hire_type": best_hire_type,
         "strength": best_strength,
         "reasoning": company.hiring_signal_reasoning,
+        "product_fit_categories": sorted(product_fit_categories),
         "postings_checked": len(jobs),
     }
