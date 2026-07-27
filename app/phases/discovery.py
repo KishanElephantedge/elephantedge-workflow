@@ -100,20 +100,27 @@ def discover_company_page(batch_id: int, cursor: str | None, page_size: int, db:
     rejection_counts is mutated in place with a reason for every row NOT kept -- every row
     here already matched the hard query filters (employee count/revenue/geography/type), so
     this is the only visibility into why a row that matched those still wasn't saved (no
-    public domain listed, already seen, or outside the sales-headcount range) -- the previous
-    version of this code billed for these rows without ever recording why they were dropped."""
-    payload = {
-        "filters": [
-            {"filter_type": "hq_country", "type": "=", "value": "USA"},
-            {"filter_type": "employee_metrics.latest_count", "type": "=>", "value": EMPLOYEE_COUNT_MIN},
-            {"filter_type": "employee_metrics.latest_count", "type": "=<", "value": EMPLOYEE_COUNT_MAX},
-            {"filter_type": "estimated_revenue_lower_bound_usd", "type": "=>", "value": REVENUE_MIN_USD},
-            {"filter_type": "estimated_revenue_higher_bound_usd", "type": "=<", "value": REVENUE_MAX_USD},
-            {"filter_type": "acquisition_status", "type": "!=", "value": "acquired"},
-            {"filter_type": "company_type", "type": "not_in", "value": EXCLUDED_COMPANY_TYPES},
-        ],
-        "limit": page_size,
-    }
+    public domain listed, or outside the sales-headcount range) -- the previous version of
+    this code billed for these rows without ever recording why they were dropped.
+
+    seen_domains is now ALSO passed as a company_website_domain not_in filter, not just used
+    for a client-side post-fetch check -- Crustdata excludes them server-side, so a domain we
+    already have never gets returned (and never billed) again at all. Found live: with heavy
+    repeat testing, up to 12 of 13 rows in one page were already-seen duplicates, each one
+    billed anyway under the old client-side-only dedup."""
+    filters = [
+        {"filter_type": "hq_country", "type": "=", "value": "USA"},
+        {"filter_type": "employee_metrics.latest_count", "type": "=>", "value": EMPLOYEE_COUNT_MIN},
+        {"filter_type": "employee_metrics.latest_count", "type": "=<", "value": EMPLOYEE_COUNT_MAX},
+        {"filter_type": "estimated_revenue_lower_bound_usd", "type": "=>", "value": REVENUE_MIN_USD},
+        {"filter_type": "estimated_revenue_higher_bound_usd", "type": "=<", "value": REVENUE_MAX_USD},
+        {"filter_type": "acquisition_status", "type": "!=", "value": "acquired"},
+        {"filter_type": "company_type", "type": "not_in", "value": EXCLUDED_COMPANY_TYPES},
+    ]
+    if seen_domains:
+        filters.append({"filter_type": "company_website_domain", "type": "not_in", "value": sorted(seen_domains)})
+
+    payload = {"filters": filters, "limit": page_size}
     if cursor:
         payload["cursor"] = cursor
 
