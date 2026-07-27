@@ -88,14 +88,20 @@ def _industry_classification(industries: list[str]) -> str:
     return "tech" if any(kw in combined for kw in TECH_INDUSTRY_KEYWORDS) else "non_tech"
 
 
-def discover_company_page(batch_id: int, cursor: str | None, page_size: int, db: Session, tenant_id: int, seen_domains: set[str]) -> tuple[list[Company], str | None, int]:
+def discover_company_page(batch_id: int, cursor: str | None, page_size: int, db: Session, tenant_id: int, seen_domains: set[str], rejection_counts: dict) -> tuple[list[Company], str | None, int]:
     """One page of Crustdata's companydb_search, mapped to Elephant Edge's ICP + exclusions.
     Retains the funding/growth/role-distribution fields confirmed returned for free in the same
     response, so no separate paid call is needed for those signals.
 
     Sales headcount % is applied as a post-fetch gate here (not a query filter, since Crustdata
     doesn't support filtering on role_distribution_percent) -- a company outside 2-10% sales
-    headcount is not persisted, same treatment as a company missing a domain."""
+    headcount is not persisted, same treatment as a company missing a domain.
+
+    rejection_counts is mutated in place with a reason for every row NOT kept -- every row
+    here already matched the hard query filters (employee count/revenue/geography/type), so
+    this is the only visibility into why a row that matched those still wasn't saved (no
+    public domain listed, already seen, or outside the sales-headcount range) -- the previous
+    version of this code billed for these rows without ever recording why they were dropped."""
     payload = {
         "filters": [
             {"filter_type": "hq_country", "type": "=", "value": "USA"},
@@ -122,21 +128,21 @@ def discover_company_page(batch_id: int, cursor: str | None, page_size: int, db:
     for row in rows:
         domain = row.get("company_website_domain") or (row.get("domains") or [None])[0]
         if not domain:
+            rejection_counts["no_public_domain"] = rejection_counts.get("no_public_domain", 0) + 1
             continue
         if domain.lower() in seen_domains:
+            rejection_counts["already_seen_duplicate"] = rejection_counts.get("already_seen_duplicate", 0) + 1
             continue
 
         role_distribution_percent = row.get("role_distribution_percent") or {}
         sales_pct = role_distribution_percent.get("Sales", 0) + role_distribution_percent.get("Business Development", 0)
         marketing_pct = role_distribution_percent.get("Marketing", 0)
 
-        # Sales headcount % is a real hard gate -- but only enforced when role_distribution
-        # data actually exists for this company (Crustdata doesn't guarantee it for every
-        # record); a company with no role-distribution data isn't penalized for missing data.
-        if role_distribution_percent and not (SALES_HEADCOUNT_PERCENT_MIN <= sales_pct <= SALES_HEADCOUNT_PERCENT_MAX):
-            seen_domains.add(domain.lower())  # still mark seen -- don't re-fetch/re-bill for it later
-            continue
-
+        # Sales headcount % is NOT a gate for now, per explicit instruction -- 92% of
+        # rows were being rejected on this alone (real diagnostic run, batch 20), and
+        # it was unclear whether that reflected a genuinely narrow ICP or too strict a
+        # band. Still captured and stored below (useful for scoring/visibility), just
+        # no longer used to reject a company outright.
         seen_domains.add(domain.lower())
         industries = row.get("linkedin_industries") or []
         employee_metrics = row.get("employee_metrics") or {}
@@ -190,10 +196,11 @@ def run_discovery(batch_id: int, db: Session, tenant_id: int, target: int = 10, 
     raw_seen = 0  # every row examined, duplicate or not -- what's actually billed
     cursor = None
     budget_stopped_early = False
+    rejection_counts: dict = {}
 
     while len(kept) < target and raw_seen < max_checked:
         remaining = min(page_size, target - len(kept), max_checked - raw_seen)
-        page, cursor, raw_count = discover_company_page(batch_id, cursor, remaining, db, tenant_id, seen_domains)
+        page, cursor, raw_count = discover_company_page(batch_id, cursor, remaining, db, tenant_id, seen_domains, rejection_counts)
         raw_seen += raw_count
 
         if raw_count == 0:
@@ -218,4 +225,5 @@ def run_discovery(batch_id: int, db: Session, tenant_id: int, target: int = 10, 
         "companies_checked": raw_seen,
         "companies_discovered": len(kept),
         "budget_stopped_early": budget_stopped_early,
+        "rejection_breakdown": rejection_counts,
     }
