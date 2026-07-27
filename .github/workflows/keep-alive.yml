@@ -1,0 +1,21 @@
+name: Keep Render service warm
+
+# Render's free/hobby tier sleeps a service after ~15 minutes with no incoming traffic,
+# and the next request has to cold-start the container -- this showed up as a 502 on the
+# dashboard's Autonomous page. Pinging the health endpoint every 10 minutes keeps it warm.
+# GitHub Actions is the free, repo-native way to run this on a schedule -- no separate
+# uptime service or Render plan upgrade needed.
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch: {} # allows a manual run from the Actions tab, for testing
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping health endpoint
+        run: |
+          curl -sS -m 30 -w "\nHTTP %{http_code} in %{time_total}s\n" \
+            https://elephantedge-workflow-1.onrender.com/api/health
