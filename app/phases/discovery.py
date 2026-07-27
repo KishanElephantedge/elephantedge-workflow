@@ -18,6 +18,7 @@ from datetime import datetime
 
 from sqlalchemy.orm import Session
 
+from app.budget_guard import BudgetExceededError, BudgetGuard
 from app.db.models import Batch, Company
 from app.deepline_client import execute_tool, extract_rows
 
@@ -166,7 +167,7 @@ def discover_company_page(batch_id: int, cursor: str | None, page_size: int, db:
     return companies, next_cursor, len(rows)
 
 
-def run_discovery(batch_id: int, db: Session, tenant_id: int, target: int = 10, page_size: int = 10, max_checked: int = 100) -> dict:
+def run_discovery(batch_id: int, db: Session, tenant_id: int, target: int = 10, page_size: int = 10, max_checked: int = 100, budget_guard: BudgetGuard | None = None) -> dict:
     """Phase 3 entrypoint. Pages through Crustdata until `target` companies are found or
     `max_checked` total have been checked (safety cap), matching Synefi's proven
     target-seeking pagination pattern.
@@ -179,11 +180,16 @@ def run_discovery(batch_id: int, db: Session, tenant_id: int, target: int = 10, 
     Deduplicates against every domain already saved for this tenant (any batch, any prior
     call) -- found live: two separate Discovery calls each start their own cursor from
     scratch, so without this, re-running Discovery re-fetches and re-saves the same leading
-    companies every time."""
+    companies every time.
+
+    budget_guard, if given, is checked after every single page -- stops the loop (rather
+    than raising out of it) the moment this run's hard spend cap is reached, so a runaway
+    page loop can burn through at most one more page's worth of credits past the cap."""
     seen_domains = _existing_domains(tenant_id, db)
     kept: list[Company] = []
     raw_seen = 0  # every row examined, duplicate or not -- what's actually billed
     cursor = None
+    budget_stopped_early = False
 
     while len(kept) < target and raw_seen < max_checked:
         remaining = min(page_size, target - len(kept), max_checked - raw_seen)
@@ -198,10 +204,18 @@ def run_discovery(batch_id: int, db: Session, tenant_id: int, target: int = 10, 
             if len(kept) >= target:
                 break
 
+        if budget_guard is not None:
+            try:
+                budget_guard.check()
+            except BudgetExceededError:
+                budget_stopped_early = True
+                break
+
         if not cursor:
             break  # provider says there's no next page, even if target wasn't reached
 
     return {
         "companies_checked": raw_seen,
         "companies_discovered": len(kept),
+        "budget_stopped_early": budget_stopped_early,
     }

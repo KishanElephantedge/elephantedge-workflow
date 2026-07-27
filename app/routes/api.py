@@ -4,6 +4,7 @@ from sqlalchemy.orm import Session
 
 from app.db.models import AutonomousRun, Batch, Company, Contact, Credential, Parameter
 from app.db.session import get_db
+from app.deepline_client import DeeplineError, get_credit_balance_usd
 from app.heyreach_client import HeyReachError
 from app.hubspot_client import HubSpotError
 from app.outreach.selector import get_outreach_channel
@@ -478,3 +479,15 @@ def manual_resume_check(db: Session = Depends(get_db)):
     """Manual override to run the approval-window sweep immediately, instead of waiting for
     the 5-minute scheduler tick -- e.g. for testing."""
     return resume_pending_approvals(db, ELEPHANT_EDGE_TENANT_ID)
+
+
+@router.get("/deepline/balance")
+def deepline_balance():
+    """Free (no billed call) sanity check for the exact mechanism BudgetGuard depends on --
+    lets this specific call be verified against this deployment's real auth (env-var API key,
+    no interactive CLI session to fall back on) without spending anything or running a full
+    cycle first."""
+    try:
+        return {"ok": True, "rough_usd_balance": get_credit_balance_usd()}
+    except DeeplineError as e:
+        return {"ok": False, "error": str(e)}

@@ -20,6 +20,7 @@ from datetime import datetime
 
 from sqlalchemy.orm import Session
 
+from app.budget_guard import BudgetExceededError, BudgetGuard
 from app.db.models import Company, Contact
 from app.deepline_client import execute_tool, extract_rows
 from app.hubspot_client import HubSpotError
@@ -81,7 +82,7 @@ def find_decision_maker(company: Company, db: Session) -> Contact | None:
     return None
 
 
-def run_decision_maker_id(batch_id: int, db: Session, tenant_id: int, retry_company_ids: list[int] | None = None) -> dict:
+def run_decision_maker_id(batch_id: int, db: Session, tenant_id: int, retry_company_ids: list[int] | None = None, budget_guard: BudgetGuard | None = None) -> dict:
     """Phase 6 entrypoint. No tier/score gate here -- this batch's companies were hand-picked
     (Phase 3 Qualification doesn't apply), so every company in the batch is searched.
 
@@ -92,7 +93,12 @@ def run_decision_maker_id(batch_id: int, db: Session, tenant_id: int, retry_comp
     Contact row to skip on its own.
 
     retry_company_ids overrides the skip for those specific companies only -- an explicit,
-    deliberate re-attempt (e.g. after correcting a wrong domain), never an automatic one."""
+    deliberate re-attempt (e.g. after correcting a wrong domain), never an automatic one.
+
+    budget_guard, if given, is checked after every company -- this is the single most
+    expensive phase per company (search_contact, ~$0.256), so this is the loop where a hard
+    spend cap matters most. Stops the loop (rather than raising out of it) the moment this
+    run's cap is reached, leaving already-resolved companies' contacts in place."""
     retry_ids = set(retry_company_ids or [])
     companies = db.query(Company).filter(Company.batch_id == batch_id).all()
 
@@ -101,6 +107,7 @@ def run_decision_maker_id(batch_id: int, db: Session, tenant_id: int, retry_comp
     skipped = 0
     hubspot_synced = 0
     hubspot_errors = []
+    budget_stopped_early = False
     for company in companies:
         already_done = company.contacts or company.decision_maker_searched_at
         if already_done and company.id not in retry_ids:
@@ -123,6 +130,13 @@ def run_decision_maker_id(batch_id: int, db: Session, tenant_id: int, retry_comp
         else:
             not_found += 1
 
+        if budget_guard is not None:
+            try:
+                budget_guard.check()
+            except BudgetExceededError:
+                budget_stopped_early = True
+                break
+
     return {
         "companies_checked": len(companies),
         "decision_makers_found": found,
@@ -130,4 +144,5 @@ def run_decision_maker_id(batch_id: int, db: Session, tenant_id: int, retry_comp
         "hubspot_synced": hubspot_synced,
         "hubspot_errors": hubspot_errors,
         "companies_skipped_already_resolved": skipped,
+        "budget_stopped_early": budget_stopped_early,
     }

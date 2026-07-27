@@ -11,6 +11,7 @@ from datetime import datetime
 
 from sqlalchemy.orm import Session
 
+from app.budget_guard import BudgetExceededError, BudgetGuard
 from app.db.models import Company
 from app.deepline_client import DeeplineError, execute_tool, extract_rows
 
@@ -59,11 +60,12 @@ def check_tech_stack(company: Company, db: Session) -> dict:
     }
 
 
-def run_tech_stack_check(batch_id: int, db: Session) -> dict:
+def run_tech_stack_check(batch_id: int, db: Session, budget_guard: BudgetGuard | None = None) -> dict:
     companies = db.query(Company).filter(Company.batch_id == batch_id).all()
     checked = 0
     skipped = 0
     errors = []
+    budget_stopped_early = False
     for company in companies:
         if company.tech_stack_checked_at:
             skipped += 1
@@ -72,4 +74,16 @@ def run_tech_stack_check(batch_id: int, db: Session) -> dict:
         checked += 1
         if result["error"]:
             errors.append(f"{company.name}: {result['error']}")
-    return {"companies_checked": checked, "companies_skipped_already_checked": skipped, "errors": errors}
+
+        if budget_guard is not None:
+            try:
+                budget_guard.check()
+            except BudgetExceededError:
+                budget_stopped_early = True
+                break
+    return {
+        "companies_checked": checked,
+        "companies_skipped_already_checked": skipped,
+        "errors": errors,
+        "budget_stopped_early": budget_stopped_early,
+    }

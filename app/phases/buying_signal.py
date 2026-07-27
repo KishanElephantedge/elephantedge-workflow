@@ -11,6 +11,7 @@ from datetime import datetime, timedelta
 
 from sqlalchemy.orm import Session
 
+from app.budget_guard import BudgetExceededError, BudgetGuard
 from app.db.models import Company
 from app.deepline_client import DeeplineError
 from app.phases.hiring_signal import classify_hiring_signal
@@ -64,16 +65,21 @@ def check_buying_signal(company: Company, db: Session) -> dict:
     }
 
 
-def run_buying_signal_check(batch_id: int, db: Session) -> dict:
+def run_buying_signal_check(batch_id: int, db: Session, budget_guard: BudgetGuard | None = None) -> dict:
     """Phase 5 entrypoint. Skips companies already checked -- the job-posting check is billed
     (free when no match, but still a real call), so re-checking on every re-run would waste
-    calls on companies whose signal status won't have meaningfully changed same-day."""
+    calls on companies whose signal status won't have meaningfully changed same-day.
+
+    budget_guard, if given, is checked after every company -- stops the loop (rather than
+    raising out of it) the moment this run's hard spend cap is reached, leaving already-checked
+    companies' results in place."""
     companies = db.query(Company).filter(Company.batch_id == batch_id).all()
 
     checked = 0
     signal_present = 0
     skipped = 0
     job_posting_errors = []
+    budget_stopped_early = False
     for company in companies:
         if company.buying_signal_checked_at:
             skipped += 1
@@ -85,9 +91,17 @@ def run_buying_signal_check(batch_id: int, db: Session) -> dict:
         if result["job_posting_check_error"]:
             job_posting_errors.append(f"{company.name}: {result['job_posting_check_error']}")
 
+        if budget_guard is not None:
+            try:
+                budget_guard.check()
+            except BudgetExceededError:
+                budget_stopped_early = True
+                break
+
     return {
         "companies_checked": checked,
         "companies_with_signal": signal_present,
         "companies_skipped_already_checked": skipped,
         "job_posting_check_errors": job_posting_errors,
+        "budget_stopped_early": budget_stopped_early,
     }

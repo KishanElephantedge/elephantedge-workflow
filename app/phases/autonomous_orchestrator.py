@@ -18,8 +18,8 @@ from datetime import datetime, timedelta
 
 from sqlalchemy.orm import Session
 
+from app.budget_guard import BudgetGuard
 from app.db.models import AutonomousRun, Batch, Company, Parameter, Score
-from app.deepline_client import get_credit_balance_usd
 from app.email_client import EmailError, send_email
 from app.export import generate_decision_makers_csv
 from app.phases.buying_signal import run_buying_signal_check
@@ -198,29 +198,26 @@ def run_daily_autonomous_cycle(db: Session, tenant_id: int) -> dict:
     db.refresh(run)
 
     budget_usd = get_daily_budget_usd(db, tenant_id)
-    try:
-        start_balance = get_credit_balance_usd()
-    except Exception:
-        start_balance = None
 
     try:
+        guard = BudgetGuard(budget_usd)  # one guard for the whole run -- shared cap across every phase
         cap = get_daily_company_cap(db, tenant_id)
-        discovery_result = run_discovery(batch.id, db, tenant_id, target=cap, page_size=DISCOVERY_PAGE_SIZE, max_checked=DISCOVERY_MAX_CHECKED)
+        discovery_result = run_discovery(batch.id, db, tenant_id, target=cap, page_size=DISCOVERY_PAGE_SIZE, max_checked=DISCOVERY_MAX_CHECKED, budget_guard=guard)
         removed_dupes = _dedupe_against_prior_days(batch, db)
-        run_buying_signal_check(batch.id, db)
-        run_tech_stack_check(batch.id, db)
+        run_buying_signal_check(batch.id, db, budget_guard=guard)
+        run_tech_stack_check(batch.id, db, budget_guard=guard)
         run_scoring(batch.id, db)
         selected = _select_top_companies(batch, db, cap)
 
-        spent_so_far = (start_balance - get_credit_balance_usd()) if start_balance is not None else None
-        budget_stopped_early = spent_so_far is not None and spent_so_far >= budget_usd
+        budget_stopped_early = guard.spent_so_far_usd() >= budget_usd
 
         if budget_stopped_early:
-            decision_maker_result = {"companies_checked": 0, "decision_makers_found": 0, "companies_with_no_contact": 0, "companies_skipped_already_resolved": 0, "hubspot_synced": 0, "hubspot_errors": []}
+            decision_maker_result = {"companies_checked": 0, "decision_makers_found": 0, "companies_with_no_contact": 0, "companies_skipped_already_resolved": 0, "hubspot_synced": 0, "hubspot_errors": [], "budget_stopped_early": True}
         else:
-            decision_maker_result = run_decision_maker_id(batch.id, db, tenant_id)
+            decision_maker_result = run_decision_maker_id(batch.id, db, tenant_id, budget_guard=guard)
+            budget_stopped_early = budget_stopped_early or decision_maker_result["budget_stopped_early"]
 
-        final_spend = (start_balance - get_credit_balance_usd()) if start_balance is not None else None
+        final_spend = guard.spent_so_far_usd()
 
         run.companies_discovered = discovery_result["companies_discovered"]
         run.companies_selected = selected
