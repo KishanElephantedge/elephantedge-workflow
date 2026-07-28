@@ -107,28 +107,17 @@ def _dedupe_against_prior_days(batch: Batch, db: Session) -> int:
 
 
 def _select_top_companies(batch: Batch, db: Session, cap: int) -> int:
-    """Real quality gate, not just a volume cap: a company scoring below Cool (tier ==
-    "excluded", total_score < 70) never proceeds past this point, regardless of the daily
-    cap -- firmographic fit + a bare hiring-signal match alone was previously enough to
-    reach Decision Maker and Outreach (real batches showed this happen), even though the
-    company's own computed score said it wasn't a good fit. This is the fix: the score
-    that was already being calculated is now actually enforced, not just recorded.
+    """Volume cap only, not a quality gate -- the real quality gate (excluded-tier
+    companies never reach Decision Maker) lives in decision_maker.py's own per-company
+    check now, not here. This used to also hard-delete excluded-tier companies, which
+    had a real cost: once deleted, there was no way to review afterward which company got
+    filtered out or why. Excluded companies now simply stay in the batch, fully visible,
+    with their score/tier intact -- Decision Maker's own gate is what actually stops them
+    from being searched, so deleting them here was both destructive and redundant.
 
-    Excluded-tier companies are removed unconditionally first. Among the rest (hot/warm/
-    cool), only hot/warm are capped to the day's target count -- cool-tier companies pass
-    through uncapped, since the cap exists to bound *volume* of the best prospects, not to
-    additionally restrict companies that already cleared the real quality bar."""
-    excluded_companies = (
-        db.query(Company)
-        .join(Score)
-        .filter(Company.batch_id == batch.id)
-        .filter(Score.tier == "excluded")
-        .all()
-    )
-    for company in excluded_companies:
-        db.delete(company)
-    db.commit()
-
+    Among hot/warm/cool companies, only hot/warm are capped to the day's target count --
+    cool-tier companies pass through uncapped, since the cap bounds *volume* of the best
+    prospects, not an additional restriction on companies that already cleared the bar."""
     scored = (
         db.query(Company)
         .join(Score)

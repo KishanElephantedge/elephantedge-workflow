@@ -138,6 +138,13 @@ def run_decision_maker_id(batch_id: int, db: Session, tenant_id: int, retry_comp
     (passing Discovery) is not sufficient; a company showing no evidence at all of needing what
     our product does gets excluded here, before the most expensive phase runs for it.
 
+    A company's score tier is checked here too, not just hiring-signal presence -- a company
+    can have a weak hiring signal (enough to pass has_qualifying_hiring_signal) yet still
+    score "excluded" overall once ability-to-pay/outbound-maturity/product-fit are factored
+    in. Excluded companies are never deleted (see _select_top_companies in
+    autonomous_orchestrator.py -- kept fully visible for review), so this check has to
+    happen here, at the point of the expensive action, not rely on the row being absent.
+
     By default, skips any company already searched -- whether it found a contact or not.
     search_contact bills real credits per call regardless of outcome, and a company with
     genuinely no findable record would otherwise get re-billed on every single re-run forever,
@@ -159,6 +166,7 @@ def run_decision_maker_id(batch_id: int, db: Session, tenant_id: int, retry_comp
     not_found = 0
     skipped = 0
     excluded_no_signal = 0
+    excluded_low_score = 0
     hubspot_synced = 0
     hubspot_errors = []
     budget_stopped_early = False
@@ -166,6 +174,9 @@ def run_decision_maker_id(batch_id: int, db: Session, tenant_id: int, retry_comp
         already_done = company.contacts or company.decision_maker_searched_at
         if already_done and company.id not in retry_ids:
             skipped += 1
+            continue
+        if company.score is not None and company.score.tier == "excluded":
+            excluded_low_score += 1
             continue
         if not has_qualifying_hiring_signal(company):
             excluded_no_signal += 1
@@ -202,5 +213,6 @@ def run_decision_maker_id(batch_id: int, db: Session, tenant_id: int, retry_comp
         "hubspot_errors": hubspot_errors,
         "companies_skipped_already_resolved": skipped,
         "companies_excluded_no_hiring_signal": excluded_no_signal,
+        "companies_excluded_low_score": excluded_low_score,
         "budget_stopped_early": budget_stopped_early,
     }
