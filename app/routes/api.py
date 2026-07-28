@@ -97,6 +97,7 @@ def get_batch(batch_id: int, db: Session = Depends(get_db)):
                 "hiring_signal_hire_type": c.hiring_signal_hire_type,
                 "hiring_signal_strength": c.hiring_signal_strength,
                 "hiring_signal_reasoning": c.hiring_signal_reasoning,
+                "product_fit_jd_categories": c.product_fit_jd_categories,
                 "has_outbound_tooling": c.has_outbound_tooling,
                 "has_ai_sdr_tool": c.has_ai_sdr_tool,
             }
