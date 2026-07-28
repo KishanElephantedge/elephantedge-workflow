@@ -3,7 +3,6 @@ from sqlalchemy.orm import Session
 from app.db.models import Contact, Parameter
 from app.heyreach_client import HeyReachError, add_leads_to_campaign, get_campaign
 from app.outreach.base import OutreachChannel
-from app.phases.personalization import compute_personalization_hook
 
 
 class HeyReachChannel(OutreachChannel):
@@ -61,15 +60,6 @@ class HeyReachChannel(OutreachChannel):
             lead["position"] = contact.title
         if contact.company and contact.company.name:
             lead["companyName"] = contact.company.name
-
-        # Phase 11 -- merges into the HeyReach sequence's {{personalization_hook}} placeholder.
-        # Requires that placeholder to actually be added to the sequence template in HeyReach's
-        # own UI (a one-time manual step); this is what supplies the value for it.
-        if contact.company:
-            hook = compute_personalization_hook(contact.company, contact)
-            contact.personalization_hook = hook
-            self.db.commit()
-            lead["customUserFields"] = [{"name": "personalization_hook", "value": hook}]
 
         try:
             add_leads_to_campaign(

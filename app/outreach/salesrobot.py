@@ -2,7 +2,6 @@ from sqlalchemy.orm import Session
 
 from app.db.models import Contact, Parameter
 from app.outreach.base import OutreachChannel
-from app.phases.personalization import compute_personalization_hook
 from app.salesrobot_client import SalesRobotError, add_single_prospect
 
 
@@ -47,12 +46,6 @@ class SalesRobotChannel(OutreachChannel):
             prospect["jobTitle"] = contact.title
         if contact.company and contact.company.name:
             prospect["companyName"] = contact.company.name
-
-        if contact.company:
-            hook = compute_personalization_hook(contact.company, contact)
-            contact.personalization_hook = hook
-            self.db.commit()
-            prospect["customMap"] = {"personalization_hook": hook}
 
         try:
             add_single_prospect(campaign_uuid, linkedin_account_uuid, prospect, self.db, self.tenant_id)
