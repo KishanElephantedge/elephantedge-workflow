@@ -30,7 +30,7 @@ from app.budget_guard import BudgetExceededError, BudgetGuard
 from app.db.models import Company, Contact
 from app.deepline_client import execute_tool, extract_rows
 from app.hubspot_client import HubSpotError
-from app.phases.hiring_signal import has_qualifying_hiring_signal
+from app.phases.hiring_signal import assess_team_composition, has_qualifying_hiring_signal
 from app.phases.hubspot_sync import sync_to_hubspot
 
 CEO_FILTER = "CEO OR Chief Executive Officer OR Founder OR Co-Founder OR Owner OR Managing Director OR President"
@@ -167,6 +167,7 @@ def run_decision_maker_id(batch_id: int, db: Session, tenant_id: int, retry_comp
     skipped = 0
     excluded_no_signal = 0
     excluded_low_score = 0
+    excluded_full_team = 0
     hubspot_synced = 0
     hubspot_errors = []
     budget_stopped_early = False
@@ -180,6 +181,15 @@ def run_decision_maker_id(batch_id: int, db: Session, tenant_id: int, retry_comp
             continue
         if not has_qualifying_hiring_signal(company):
             excluded_no_signal += 1
+            continue
+        # Team-composition gate -- a company can pass has_qualifying_hiring_signal (a real
+        # posting exists) yet already have a full GTM team or have GTM covered internally by
+        # the hiring role's own occupant (found live: SmartWinnr, 12 sales + 10 marketing,
+        # whose "Sr. Program Manager" hire personally does GTM per her own profile). Checked
+        # here, before the expensive search_contact call, same as the score-tier gate above.
+        team_fit = assess_team_composition(company, db)
+        if team_fit["tier"] == "excluded":
+            excluded_full_team += 1
             continue
         contact = find_decision_maker(company, db)
         company.decision_maker_searched_at = datetime.utcnow()
@@ -214,5 +224,6 @@ def run_decision_maker_id(batch_id: int, db: Session, tenant_id: int, retry_comp
         "companies_skipped_already_resolved": skipped,
         "companies_excluded_no_hiring_signal": excluded_no_signal,
         "companies_excluded_low_score": excluded_low_score,
+        "companies_excluded_full_team": excluded_full_team,
         "budget_stopped_early": budget_stopped_early,
     }

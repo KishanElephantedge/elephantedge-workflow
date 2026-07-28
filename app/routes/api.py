@@ -100,6 +100,8 @@ def get_batch(batch_id: int, db: Session = Depends(get_db)):
                 "product_fit_jd_categories": c.product_fit_jd_categories,
                 "has_outbound_tooling": c.has_outbound_tooling,
                 "has_ai_sdr_tool": c.has_ai_sdr_tool,
+                "team_fit_tier": c.team_fit_tier,
+                "team_fit_reasoning": c.team_fit_reasoning,
             }
             for c in batch.companies
         ],

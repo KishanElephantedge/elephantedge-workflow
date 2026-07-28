@@ -123,6 +123,77 @@ def has_qualifying_hiring_signal(company: Company) -> bool:
     return company.hiring_signal_role is not None or bool(company.product_fit_jd_categories)
 
 
+# Team-composition gate -- added after Kishan manually reviewed real hits (batch 32) and found
+# SmartWinnr was a false positive despite passing has_qualifying_hiring_signal: it has 12
+# real Sales & Revenue people (confirmed via a department-filtered total_count -- an
+# unfiltered sample of 30 people badly undercounted this, returning mostly unrelated
+# departments like Customer Service). Thresholds are set from today's small real sample
+# (SmartWinnr 12 sales = excluded, NetSfere ~9 sales = secondary/still-acceptable, Operant
+# AI/Gizmeon ~1-3 = clear gap/primary) and should be revisited once more real data comes in.
+#
+# Note: an earlier version of this also tried to detect "does an existing employee already
+# personally cover GTM" by scanning every employee's headline for the word "gtm" -- dropped
+# after a real false positive (a Channel Partnerships person at Operant AI whose headline
+# listed "GTM Strategy" as one of several buzzwords, unrelated to the specific open role).
+# That's a genuinely harder problem (comparing the open JD against what an existing person
+# already does) than a keyword scan can solve, so it's not automated here -- headcount is
+# the reliable signal, and borderline "secondary" cases still get human review before outreach.
+FULL_TEAM_SALES_THRESHOLD = 10
+FULL_TEAM_MARKETING_THRESHOLD = 8
+SECONDARY_TEAM_SALES_THRESHOLD = 6
+
+
+def assess_team_composition(company: Company, db: Session) -> dict:
+    """Real, per-company GTM team-composition check via crustdata_v3_person_search, scoped to
+    the exact domain (no cross-company attribution risk, since this is domain-exact, not the
+    broken crustdata_v3_job_search). Uses a department-filtered total_count per query (cheap,
+    limit=1 -- total_count reflects the true total regardless of how many profiles are
+    returned) rather than counting over an arbitrary, unrepresentative sample. Returns one of
+    three tiers:
+      - "excluded": already has a full GTM team by real headcount -- doesn't need us even
+        though has_qualifying_hiring_signal was true.
+      - "secondary": a moderate existing sales team (still hiring, but not clearly understaffed)
+        -- real candidate, but lower priority than a cleaner team-gap company; never skipped,
+        just ranked after "primary" companies when picking the target count.
+      - "primary": a clear team gap -- best fit, matches what Kishan called "in need."
+    Persists the result directly on the Company row."""
+    if not company.domain:
+        company.team_fit_tier = "primary"
+        company.team_fit_reasoning = "no domain to verify team composition against"
+        db.commit()
+        return {"tier": "primary", "reasoning": company.team_fit_reasoning}
+
+    def _department_count(department: str) -> int:
+        filters = {
+            "op": "and",
+            "conditions": [
+                {"field": "experience.employment_details.current.company_website_domain", "type": "=", "value": company.domain},
+                {"field": "basic_profile.normalized_title.department", "type": "=", "value": department},
+            ],
+        }
+        response = execute_tool("crustdata_v3_person_search", {"filters": filters, "limit": 1})
+        raw = response.get("toolResponse", {}).get("raw", {})
+        return raw.get("total_count", 0) if isinstance(raw, dict) else 0
+
+    sales_count = _department_count("Sales & Revenue")
+    marketing_count = _department_count("Marketing")
+
+    if sales_count >= FULL_TEAM_SALES_THRESHOLD or marketing_count >= FULL_TEAM_MARKETING_THRESHOLD:
+        tier = "excluded"
+        reasoning = f"Full GTM team already: {sales_count} sales + {marketing_count} marketing people"
+    elif sales_count >= SECONDARY_TEAM_SALES_THRESHOLD:
+        tier = "secondary"
+        reasoning = f"Existing sales team ({sales_count} people) but still hiring, no clear hierarchy seen -- deprioritize unless no primary candidates"
+    else:
+        tier = "primary"
+        reasoning = f"Real team gap: {sales_count} sales, {marketing_count} marketing people"
+
+    company.team_fit_tier = tier
+    company.team_fit_reasoning = reasoning
+    db.commit()
+    return {"tier": tier, "reasoning": reasoning, "sales_count": sales_count, "marketing_count": marketing_count}
+
+
 def _detect_product_fit_signals(description: str) -> list[str]:
     """Returns every PRODUCT_FIT_KEYWORD_CATEGORIES category with at least one phrase match in
     this JD's body text -- the count of distinct categories matched (not raw phrase count) is

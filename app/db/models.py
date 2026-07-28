@@ -89,6 +89,12 @@ class Company(Base):
     has_ai_sdr_tool = Column(Boolean, nullable=True)
     tech_stack_checked_at = Column(DateTime, nullable=True)
 
+    # Team-composition gate (added after Kishan's manual review of batch 32 -- SmartWinnr had
+    # a "gap" by role-slot count alone but was actually a real 12-sales/10-marketing full team
+    # whose own hiring manager already covers GTM personally). primary | secondary | excluded.
+    team_fit_tier = Column(String, nullable=True)
+    team_fit_reasoning = Column(Text, nullable=True)
+
     batch = relationship("Batch", back_populates="companies")
     signals = relationship("Signal", back_populates="company", cascade="all, delete-orphan")
     score = relationship("Score", back_populates="company", uselist=False, cascade="all, delete-orphan")

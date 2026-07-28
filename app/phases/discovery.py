@@ -88,7 +88,7 @@ def _industry_classification(industries: list[str]) -> str:
     return "tech" if any(kw in combined for kw in TECH_INDUSTRY_KEYWORDS) else "non_tech"
 
 
-def discover_company_page(batch_id: int, cursor: str | None, page_size: int, db: Session, tenant_id: int, seen_domains: set[str], rejection_counts: dict) -> tuple[list[Company], str | None, int]:
+def discover_company_page(batch_id: int, cursor: str | None, page_size: int, db: Session, tenant_id: int, seen_domains: set[str], rejection_counts: dict, query_exclude_domains: frozenset[str]) -> tuple[list[Company], str | None, int]:
     """One page of Crustdata's companydb_search, mapped to Elephant Edge's ICP + exclusions.
     Retains the funding/growth/role-distribution fields confirmed returned for free in the same
     response, so no separate paid call is needed for those signals.
@@ -103,11 +103,19 @@ def discover_company_page(batch_id: int, cursor: str | None, page_size: int, db:
     public domain listed, or outside the sales-headcount range) -- the previous version of
     this code billed for these rows without ever recording why they were dropped.
 
-    seen_domains is now ALSO passed as a company_website_domain not_in filter, not just used
-    for a client-side post-fetch check -- Crustdata excludes them server-side, so a domain we
-    already have never gets returned (and never billed) again at all. Found live: with heavy
-    repeat testing, up to 12 of 13 rows in one page were already-seen duplicates, each one
-    billed anyway under the old client-side-only dedup."""
+    query_exclude_domains (every domain already saved for this tenant from PRIOR batches,
+    frozen once at the start of run_discovery) is passed as a company_website_domain not_in
+    filter, so Crustdata excludes them server-side and we're never billed for seeing them
+    again -- found live: with heavy repeat testing, up to 12 of 13 rows in one page were
+    already-seen duplicates, each one billed anyway under the old client-side-only dedup.
+
+    This list is deliberately NOT grown with companies kept during this same run (that's
+    what seen_domains, mutated per-call below, is for) -- found live that changing the
+    filters between pages while reusing the same pagination cursor breaks the cursor
+    entirely ("Cursor is invalid for this query"), since Crustdata ties a cursor to the
+    exact filter set it was issued for. seen_domains still protects the (very unlikely)
+    case of the same row appearing twice across pages, client-side, without touching the
+    query itself mid-pagination."""
     filters = [
         {"filter_type": "hq_country", "type": "=", "value": "USA"},
         {"filter_type": "employee_metrics.latest_count", "type": "=>", "value": EMPLOYEE_COUNT_MIN},
@@ -117,8 +125,8 @@ def discover_company_page(batch_id: int, cursor: str | None, page_size: int, db:
         {"filter_type": "acquisition_status", "type": "!=", "value": "acquired"},
         {"filter_type": "company_type", "type": "not_in", "value": EXCLUDED_COMPANY_TYPES},
     ]
-    if seen_domains:
-        filters.append({"filter_type": "company_website_domain", "type": "not_in", "value": sorted(seen_domains)})
+    if query_exclude_domains:
+        filters.append({"filter_type": "company_website_domain", "type": "not_in", "value": sorted(query_exclude_domains)})
 
     payload = {"filters": filters, "limit": page_size}
     if cursor:
@@ -199,6 +207,7 @@ def run_discovery(batch_id: int, db: Session, tenant_id: int, target: int = 10, 
     than raising out of it) the moment this run's hard spend cap is reached, so a runaway
     page loop can burn through at most one more page's worth of credits past the cap."""
     seen_domains = _existing_domains(tenant_id, db)
+    query_exclude_domains = frozenset(seen_domains)  # frozen for the whole pagination sequence -- see discover_company_page's docstring for why
     kept: list[Company] = []
     raw_seen = 0  # every row examined, duplicate or not -- what's actually billed
     cursor = None
@@ -207,7 +216,7 @@ def run_discovery(batch_id: int, db: Session, tenant_id: int, target: int = 10, 
 
     while len(kept) < target and raw_seen < max_checked:
         remaining = min(page_size, target - len(kept), max_checked - raw_seen)
-        page, cursor, raw_count = discover_company_page(batch_id, cursor, remaining, db, tenant_id, seen_domains, rejection_counts)
+        page, cursor, raw_count = discover_company_page(batch_id, cursor, remaining, db, tenant_id, seen_domains, rejection_counts, query_exclude_domains)
         raw_seen += raw_count
 
         if raw_count == 0:
