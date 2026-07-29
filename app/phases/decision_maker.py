@@ -176,9 +176,12 @@ def run_decision_maker_id(batch_id: int, db: Session, tenant_id: int, retry_comp
         if already_done and company.id not in retry_ids:
             skipped += 1
             continue
-        if company.score is not None and company.score.tier == "excluded":
-            excluded_low_score += 1
-            continue
+        # NOTE: the old score.tier == "excluded" gate was removed here -- under the new
+        # 18-variable GTM Fit Score, "excluded" is the default outcome for most real
+        # companies (four variables score 0 until built, so max achievable is below the
+        # "cool" threshold), so this would have rejected almost everything before the real
+        # gates below even ran. Score is now a ranking signal, not a pass/fail gate -- the
+        # real gates are has_qualifying_hiring_signal and the team-composition check.
         if not has_qualifying_hiring_signal(company):
             excluded_no_signal += 1
             continue

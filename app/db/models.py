@@ -37,6 +37,11 @@ class Batch(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     current_phase = Column(String, default="signal_discovery")
     status = Column(String, default="in_progress")
+    # Which discovery pipeline created this batch -- "deepline" (Crustdata+TheirStack, the
+    # automated flow) or "jobo" (Jobo's job-search API, its own separate credit system).
+    # Batches are never mixed-source: every company in a batch comes from the same pipeline,
+    # so the dashboard can show them in fully independent tabs.
+    source = Column(String, default="deepline", nullable=False)
 
     companies = relationship("Company", back_populates="batch", cascade="all, delete-orphan")
 

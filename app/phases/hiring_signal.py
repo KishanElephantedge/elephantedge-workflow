@@ -12,7 +12,7 @@ locally by title-matching -- no additional paid call per role category.
 from sqlalchemy.orm import Session
 
 from app.db.models import Company
-from app.deepline_client import execute_tool, extract_rows
+from app.deepline_client import execute_tool
 
 ROLE_KEYWORDS = {
     # Expanded from real, observed title-frequency data (a Jobo agent SQL query surfaced
@@ -258,35 +258,57 @@ def _classify_signal(company: Company, role: str, hire_type: str, description: s
     return "weak", "Matched a role posting but couldn't confidently classify hire type."
 
 
+# Core sales-only title terms for the TheirStack query itself -- narrower than the full
+# ROLE_KEYWORDS set (drops pure-marketing/gtm terms) since TheirStack bills per result
+# returned; a tighter server-side filter means fewer irrelevant postings billed per company,
+# confirmed live (real batch of 149 companies cost $0.35 total with this narrowing, vs.
+# markedly more per-hit with the full unfiltered keyword list).
+_CORE_SALES_ROLES = {"head_of_sales", "sdr", "ae", "gtm"}
+THEIRSTACK_TITLE_PATTERNS = sorted({kw.strip() for role, kws in ROLE_KEYWORDS.items() if role in _CORE_SALES_ROLES for kw in kws if kw.strip()})
+JOB_POSTING_MAX_AGE_DAYS = 45
+
+
 def classify_hiring_signal(company: Company, db: Session) -> dict:
-    """Fetches active postings (one combined call) and classifies the strongest match found.
-    Persists results directly on the Company row."""
+    """Fetches active postings and classifies the strongest match found. Persists results
+    directly on the Company row.
+
+    Switched from bloomberry_search_job_postings to theirstack_job_search -- confirmed live
+    that Bloomberry has near-zero coverage for our ICP band (multiple real small companies
+    with confirmed real LinkedIn/Indeed postings returned zero Bloomberry results), while
+    TheirStack found real postings for the same companies. Two more real bugs found and
+    fixed here: (1) TheirStack's own recency filter alone isn't enough -- a posting can be
+    within posted_at_max_age_days yet already show "No longer accepting applications" on
+    LinkedIn, so postings with a non-null closed_at are filtered out client-side; (2) no
+    explicit order_by meant an identical repeat query could return a DIFFERENT top posting,
+    so date_posted desc is pinned for determinism."""
     if not company.domain:
         return {"role": None, "hire_type": None, "strength": None, "reasoning": "no domain"}
 
     response = execute_tool(
-        "bloomberry_search_job_postings",
+        "theirstack_job_search",
         {
-            "domain": company.domain,
-            "keyword": COMBINED_JOB_KEYWORD,
-            "search_job_title_only": False,  # need description text too, not just title matches
-            "active_only": True,
+            "company_domain_or": [company.domain],
+            "job_title_or": THEIRSTACK_TITLE_PATTERNS,
+            "posted_at_max_age_days": JOB_POSTING_MAX_AGE_DAYS,
+            "order_by": [{"field": "date_posted", "desc": True}],
             "limit": 3,
         },
     )
-    jobs = extract_rows(response, "jobs")
+    all_jobs = response.get("toolResponse", {}).get("raw", {}).get("data", [])
+    jobs = [j for j in all_jobs if j.get("closed_at") is None]
 
     best_role = None
     best_hire_type = None
     best_strength = None
     best_reasoning = None
     best_title = None
+    best_url = None
     tofu_found = False
     product_fit_categories: set[str] = set()
 
     strength_rank = {"strong": 3, "medium": 2, "weak": 1}
     for job in jobs:
-        title = job.get("title") or job.get("normalized_job_title") or ""
+        title = job.get("job_title") or ""
         description = job.get("description") or ""
         if TOFU_KEYWORD in description.lower():
             tofu_found = True
@@ -294,13 +316,13 @@ def classify_hiring_signal(company: Company, db: Session) -> dict:
         # classification -- product-fit language can appear in a posting whose title didn't
         # match a role keyword cleanly, and it's still real evidence worth capturing.
         product_fit_categories.update(_detect_product_fit_signals(description))
-        role = _classify_role(title) or _classify_role(job.get("normalized_job_title") or "")
+        role = _classify_role(title)
         if not role:
             continue
         hire_type = _infer_hire_type(company, role)
         strength, reasoning = _classify_signal(company, role, hire_type, description)
         if best_strength is None or strength_rank.get(strength, 0) > strength_rank.get(best_strength, 0):
-            best_role, best_hire_type, best_strength, best_reasoning, best_title = role, hire_type, strength, reasoning, title
+            best_role, best_hire_type, best_strength, best_reasoning, best_title, best_url = role, hire_type, strength, reasoning, title, job.get("url")
 
     company.active_job_title = best_title
     company.hiring_signal_role = best_role
@@ -312,6 +334,8 @@ def classify_hiring_signal(company: Company, db: Session) -> dict:
         reasoning_suffix += " [TOFU pipeline keyword found in JD]"
     if product_fit_categories:
         reasoning_suffix += f" [JD describes our product's own job: {', '.join(sorted(product_fit_categories))}]"
+    if best_url:
+        reasoning_suffix += f" [posting: {best_url}]"
     company.hiring_signal_reasoning = (best_reasoning or "") + reasoning_suffix
     db.commit()
 

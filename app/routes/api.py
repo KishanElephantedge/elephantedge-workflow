@@ -8,12 +8,14 @@ from app.deepline_client import DeeplineError, get_credit_balance_usd
 from app.heyreach_client import HeyReachError
 from app.hubspot_client import HubSpotError
 from app.outreach.selector import get_outreach_channel
-from app.phases.autonomous_orchestrator import cancel_run, get_daily_budget_usd, get_daily_company_cap, is_autonomous_enabled, resume_pending_approvals, run_daily_autonomous_cycle
+from app.phases.autonomous_orchestrator import cancel_run, get_autonomous_discovery_source, get_daily_budget_usd, get_daily_company_cap, is_autonomous_enabled, resume_pending_approvals, run_daily_autonomous_cycle
 from app.phases.buying_signal import run_buying_signal_check
 from app.phases.campaign_execution import run_campaign_execution
 from app.phases.decision_maker import run_decision_maker_id
 from app.phases.discovery import run_discovery
 from app.phases.jd_first_discovery import run_jd_first_discovery
+from app.phases.jobo_discovery import run_jobo_discovery
+from app.jobo_client import JoboError
 from app.phases.hubspot_sync import sync_to_hubspot
 from app.phases.scoring import run_scoring
 from app.phases.tech_stack import run_tech_stack_check
@@ -34,26 +36,29 @@ ELEPHANT_EDGE_TENANT_ID = 2
 # own, per its own finding (absorbed into Discovery's query filters and Phase 6's thread_role).
 
 @router.post("/batches")
-def create_batch(name: str, db: Session = Depends(get_db)):
-    batch = Batch(tenant_id=ELEPHANT_EDGE_TENANT_ID, name=name)
+def create_batch(name: str, source: str = "deepline", db: Session = Depends(get_db)):
+    if source not in ("deepline", "jobo"):
+        raise HTTPException(status_code=400, detail="source must be 'deepline' or 'jobo'")
+    batch = Batch(tenant_id=ELEPHANT_EDGE_TENANT_ID, name=name, source=source)
     db.add(batch)
     db.commit()
     db.refresh(batch)
-    return {"id": batch.id, "name": batch.name, "status": batch.status}
+    return {"id": batch.id, "name": batch.name, "source": batch.source, "status": batch.status}
 
 
 @router.get("/batches")
-def list_batches(db: Session = Depends(get_db)):
-    batches = (
-        db.query(Batch)
-        .filter(Batch.tenant_id == ELEPHANT_EDGE_TENANT_ID)
-        .order_by(Batch.created_at.desc())
-        .all()
-    )
+def list_batches(source: str | None = None, db: Session = Depends(get_db)):
+    query = db.query(Batch).filter(Batch.tenant_id == ELEPHANT_EDGE_TENANT_ID)
+    if source is not None:
+        if source not in ("deepline", "jobo"):
+            raise HTTPException(status_code=400, detail="source must be 'deepline' or 'jobo'")
+        query = query.filter(Batch.source == source)
+    batches = query.order_by(Batch.created_at.desc()).all()
     return [
         {
             "id": b.id,
             "name": b.name,
+            "source": b.source,
             "created_at": b.created_at,
             "current_phase": b.current_phase,
             "status": b.status,
@@ -76,6 +81,7 @@ def get_batch(batch_id: int, db: Session = Depends(get_db)):
     return {
         "id": batch.id,
         "name": batch.name,
+        "source": batch.source,
         "current_phase": batch.current_phase,
         "status": batch.status,
         "companies": [
@@ -83,6 +89,7 @@ def get_batch(batch_id: int, db: Session = Depends(get_db)):
                 "id": c.id,
                 "name": c.name,
                 "domain": c.domain,
+                "source": c.source,
                 "contact_count": len(c.contacts),
                 "decision_maker_searched": c.decision_maker_searched_at is not None,
                 "active_head_of_sales_posting": c.active_head_of_sales_posting,
@@ -143,6 +150,18 @@ def import_companies(batch_id: int, companies: list[CompanyImport], db: Session 
 
 # ---- Phase 3: Company Discovery ----
 
+def _require_batch_source(batch: Batch, expected: str) -> None:
+    """Hard guard so a Deepline-only phase can never run against a Jobo batch and vice
+    versa -- the two pipelines are fully independent (separate credit systems, separate
+    company/decision-maker logic), and running the wrong one against a batch would silently
+    mix sources or double-charge the wrong credit account."""
+    if batch.source != expected:
+        raise HTTPException(
+            status_code=400,
+            detail=f"This batch's source is {batch.source!r}, not {expected!r} -- this phase can't run against it.",
+        )
+
+
 @router.post("/batches/{batch_id}/phases/discovery")
 def execute_discovery(batch_id: int, target: int = 10, db: Session = Depends(get_db)):
     batch = (
@@ -153,6 +172,7 @@ def execute_discovery(batch_id: int, target: int = 10, db: Session = Depends(get
     )
     if not batch:
         raise HTTPException(status_code=404, detail="Batch not found")
+    _require_batch_source(batch, "deepline")
     result = run_discovery(batch_id, db, ELEPHANT_EDGE_TENANT_ID, target=target)
     batch.current_phase = "discovery_done"
     db.commit()
@@ -171,7 +191,30 @@ def execute_jd_first_discovery(batch_id: int, target: int = 10, db: Session = De
     )
     if not batch:
         raise HTTPException(status_code=404, detail="Batch not found")
+    _require_batch_source(batch, "deepline")
     result = run_jd_first_discovery(batch_id, db, ELEPHANT_EDGE_TENANT_ID, target=target)
+    batch.current_phase = "discovery_done"
+    db.commit()
+    return result
+
+
+# ---- Jobo Discovery -- fully independent pipeline, own credit system, own gates ----
+
+@router.post("/batches/{batch_id}/phases/jobo-discovery")
+def execute_jobo_discovery(batch_id: int, target: int = 5, budget_usd: float = 1.5, db: Session = Depends(get_db)):
+    batch = (
+        db.query(Batch)
+        .filter(Batch.id == batch_id)
+        .filter(Batch.tenant_id == ELEPHANT_EDGE_TENANT_ID)
+        .first()
+    )
+    if not batch:
+        raise HTTPException(status_code=404, detail="Batch not found")
+    _require_batch_source(batch, "jobo")
+    try:
+        result = run_jobo_discovery(batch_id, db, ELEPHANT_EDGE_TENANT_ID, target=target, budget_usd=budget_usd)
+    except JoboError as e:
+        raise HTTPException(status_code=502, detail=str(e))
     batch.current_phase = "discovery_done"
     db.commit()
     return result
@@ -189,6 +232,7 @@ def execute_buying_signal_check(batch_id: int, db: Session = Depends(get_db)):
     )
     if not batch:
         raise HTTPException(status_code=404, detail="Batch not found")
+    _require_batch_source(batch, "deepline")
     result = run_buying_signal_check(batch_id, db)
     batch.current_phase = "buying_signal_done"
     db.commit()
@@ -207,6 +251,7 @@ def execute_tech_stack_check(batch_id: int, db: Session = Depends(get_db)):
     )
     if not batch:
         raise HTTPException(status_code=404, detail="Batch not found")
+    _require_batch_source(batch, "deepline")
     result = run_tech_stack_check(batch_id, db)
     batch.current_phase = "tech_stack_done"
     db.commit()
@@ -225,6 +270,7 @@ def execute_scoring(batch_id: int, db: Session = Depends(get_db)):
     )
     if not batch:
         raise HTTPException(status_code=404, detail="Batch not found")
+    _require_batch_source(batch, "deepline")
     result = run_scoring(batch_id, db)
     batch.current_phase = "scoring_done"
     db.commit()
@@ -243,6 +289,7 @@ def execute_decision_maker_id(batch_id: int, retry_company_ids: list[int] | None
     )
     if not batch:
         raise HTTPException(status_code=404, detail="Batch not found")
+    _require_batch_source(batch, "deepline")
     result = run_decision_maker_id(batch_id, db, ELEPHANT_EDGE_TENANT_ID, retry_company_ids=retry_company_ids)
     batch.current_phase = "decision_maker_done"
     db.commit()
@@ -388,6 +435,7 @@ def get_autonomous_status(db: Session = Depends(get_db)):
         "enabled": is_autonomous_enabled(db, ELEPHANT_EDGE_TENANT_ID),
         "daily_budget_usd": get_daily_budget_usd(db, ELEPHANT_EDGE_TENANT_ID),
         "daily_company_cap": get_daily_company_cap(db, ELEPHANT_EDGE_TENANT_ID),
+        "discovery_source": get_autonomous_discovery_source(db, ELEPHANT_EDGE_TENANT_ID),
         "last_run": {
             "id": last_run.id,
             "batch_id": last_run.batch_id,
@@ -416,6 +464,29 @@ def toggle_autonomous(enabled: bool, db: Session = Depends(get_db)):
         db.add(param)
     db.commit()
     return {"enabled": enabled}
+
+
+@router.post("/autonomous/discovery-source")
+def set_autonomous_discovery_source(source: str, db: Session = Depends(get_db)):
+    """Which pipeline the daily autonomous trigger uses -- validated here (not just in the
+    generic /parameters endpoint) so a typo can't silently disable the source check in
+    run_daily_autonomous_cycle and fall through to the deepline default unexpectedly."""
+    if source not in ("deepline", "jobo"):
+        raise HTTPException(status_code=400, detail="source must be 'deepline' or 'jobo'")
+    param = (
+        db.query(Parameter)
+        .filter(Parameter.tenant_id == ELEPHANT_EDGE_TENANT_ID)
+        .filter(Parameter.key == "autonomous_discovery_source")
+        .first()
+    )
+    if param:
+        param.value = {"source": source}
+    else:
+        param = Parameter(tenant_id=ELEPHANT_EDGE_TENANT_ID, key="autonomous_discovery_source", value={"source": source},
+                           description="Which pipeline (deepline or jobo) the daily autonomous trigger uses")
+        db.add(param)
+    db.commit()
+    return {"discovery_source": source}
 
 
 @router.get("/autonomous/runs")

@@ -34,9 +34,9 @@ def _parse_date(value) -> datetime | None:
 
 # Phase 2's confirmed hard gates.
 EMPLOYEE_COUNT_MIN = 11
-EMPLOYEE_COUNT_MAX = 50
-REVENUE_MIN_USD = 2_500_000
-REVENUE_MAX_USD = 5_000_000
+EMPLOYEE_COUNT_MAX = 200  # widened from 50 -- yesterday's real test (149 checked, 6 qualified) used this band, not the old 11-50 one
+REVENUE_MIN_USD = 0
+REVENUE_MAX_USD = 10_000_000  # widened from $5M -- same real test, revenue <$10M
 
 # Signal Framework v2 -- Sales headcount as a % of total headcount is now a real hard gate,
 # computed post-fetch (Crustdata's query filters don't support filtering on
