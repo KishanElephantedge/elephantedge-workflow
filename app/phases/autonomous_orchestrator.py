@@ -21,6 +21,7 @@ from sqlalchemy.orm import Session
 from app.budget_guard import BudgetExceededError, BudgetGuard
 from app.db.models import AutonomousRun, Batch, Company, Parameter, Score
 from app.email_client import EmailError, send_email
+from app.slack_client import SlackError, send_slack_message
 from app.export import generate_decision_makers_csv
 from app.phases.buying_signal import run_buying_signal_check
 from app.phases.campaign_execution import run_campaign_execution
@@ -158,18 +159,20 @@ def _select_top_companies(batch: Batch, db: Session, cap: int) -> int:
 
 def _send_approval_notification(batch: Batch, run: AutonomousRun, decision_maker_result: dict, db: Session, tenant_id: int) -> str | None:
     """Sent right after Decision Maker completes, before anything reaches the outreach
-    channel. Returns an error string if sending failed -- never raised, since a failed
-    notification must not prevent the approval window itself from being real and honored."""
+    channel. Sends BOTH email and Slack (if configured) -- either or both can fail without
+    ever blocking the approval window itself from being real and honored; failures from
+    either channel are combined into one error string, not raised."""
+    errors = []
+    body = (
+        f"Elephant Edge autonomous run for batch #{batch.id} found "
+        f"{decision_maker_result['decision_makers_found']} decision-maker(s) across "
+        f"{decision_maker_result['companies_checked']} companies checked today.\n\n"
+        f"These will be pushed to the configured outreach channel in {APPROVAL_WINDOW_MINUTES} minutes "
+        f"unless this run is cancelled first (Autonomous page in the dashboard).\n\n"
+        f"See the attached CSV for the full list of companies and decision-makers found."
+    )
     try:
         csv_bytes = generate_decision_makers_csv(batch.id, db)
-        body = (
-            f"Elephant Edge autonomous run for batch #{batch.id} found "
-            f"{decision_maker_result['decision_makers_found']} decision-maker(s) across "
-            f"{decision_maker_result['companies_checked']} companies checked today.\n\n"
-            f"These will be pushed to the configured outreach channel in {APPROVAL_WINDOW_MINUTES} minutes "
-            f"unless this run is cancelled first (Autonomous page in the dashboard).\n\n"
-            f"See the attached CSV for the full list of companies and decision-makers found."
-        )
         send_email(
             subject=f"Elephant Edge: {decision_maker_result['decision_makers_found']} decision-maker(s) ready for review (batch #{batch.id})",
             body=body,
@@ -178,9 +181,21 @@ def _send_approval_notification(batch: Batch, run: AutonomousRun, decision_maker
             attachment_bytes=csv_bytes,
             attachment_filename=f"batch-{batch.id}-decision-makers.csv",
         )
-        return None
     except EmailError as e:
-        return str(e)
+        errors.append(f"email: {e}")
+
+    try:
+        send_slack_message(
+            f":mag: *Elephant Edge* -- batch #{batch.id} found {decision_maker_result['decision_makers_found']} "
+            f"decision-maker(s) across {decision_maker_result['companies_checked']} companies checked.\n"
+            f"Pushes to the outreach channel in {APPROVAL_WINDOW_MINUTES} minutes unless cancelled "
+            f"(Autonomous page in the dashboard).",
+            db, tenant_id,
+        )
+    except SlackError as e:
+        errors.append(f"slack: {e}")
+
+    return "; ".join(errors) if errors else None
 
 
 def _send_success_notification(batch: Batch, outreach_result: dict, db: Session, tenant_id: int) -> str | None:

@@ -164,6 +164,9 @@ class Contact(Base):
 
     personalized_message = relationship("PersonalizedMessage", back_populates="contact", uselist=False, cascade="all, delete-orphan")
 
+    company = relationship("Company", back_populates="contacts")
+    campaign_pushes = relationship("CampaignPush", back_populates="contact", cascade="all, delete-orphan")
+
 
 class PersonalizedMessage(Base):
     """Phase 13 -- deep-research personalized outreach message, per the lead's 4-module spec:
@@ -184,9 +187,6 @@ class PersonalizedMessage(Base):
     generated_at = Column(DateTime, nullable=True)
 
     contact = relationship("Contact", back_populates="personalized_message")
-
-    company = relationship("Company", back_populates="contacts")
-    campaign_pushes = relationship("CampaignPush", back_populates="contact", cascade="all, delete-orphan")
 
 
 class CampaignPush(Base):
