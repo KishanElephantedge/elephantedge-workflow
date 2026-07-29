@@ -162,6 +162,29 @@ class Contact(Base):
     # customUserFields value merged into the sequence template's {{personalization_hook}} tag.
     personalization_hook = Column(Text, nullable=True)
 
+    personalized_message = relationship("PersonalizedMessage", back_populates="contact", uselist=False, cascade="all, delete-orphan")
+
+
+class PersonalizedMessage(Base):
+    """Phase 13 -- deep-research personalized outreach message, per the lead's 4-module spec:
+    company research, contact/LinkedIn research, fit analysis, message synthesis. Every
+    module's raw structured output is kept (not just the final message) so a human can review
+    or edit any stage, per the spec's own requirement ("Return the message plus the structured
+    context objects so a human can review or edit if needed")."""
+    __tablename__ = "personalized_messages"
+
+    id = Column(Integer, primary_key=True)
+    contact_id = Column(Integer, ForeignKey("contacts.id"), nullable=False, unique=True)
+    company_research = Column(JSON, nullable=True)
+    contact_research = Column(JSON, nullable=True)
+    fit_analysis = Column(JSON, nullable=True)
+    generated_message = Column(Text, nullable=True)
+    status = Column(String, default="draft")  # draft | approved | rejected
+    error_message = Column(Text, nullable=True)
+    generated_at = Column(DateTime, nullable=True)
+
+    contact = relationship("Contact", back_populates="personalized_message")
+
     company = relationship("Company", back_populates="contacts")
     campaign_pushes = relationship("CampaignPush", back_populates="contact", cascade="all, delete-orphan")
 

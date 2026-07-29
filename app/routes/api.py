@@ -17,6 +17,7 @@ from app.phases.jd_first_discovery import run_jd_first_discovery
 from app.phases.jobo_discovery import run_jobo_discovery
 from app.jobo_client import JoboError
 from app.phases.hubspot_sync import sync_to_hubspot
+from app.phases.personalized_outreach import generate_personalized_message
 from app.phases.scoring import run_scoring
 from app.phases.tech_stack import run_tech_stack_check
 from app.salesrobot_client import SalesRobotError
@@ -109,6 +110,17 @@ def get_batch(batch_id: int, db: Session = Depends(get_db)):
                 "has_ai_sdr_tool": c.has_ai_sdr_tool,
                 "team_fit_tier": c.team_fit_tier,
                 "team_fit_reasoning": c.team_fit_reasoning,
+                "contacts": [
+                    {
+                        "id": ct.id,
+                        "first_name": ct.first_name,
+                        "last_name": ct.last_name,
+                        "title": ct.title,
+                        "linkedin_url": ct.linkedin_url,
+                        "message_status": ct.personalized_message.status if ct.personalized_message else None,
+                    }
+                    for ct in c.contacts
+                ],
             }
             for c in batch.companies
         ],
@@ -327,6 +339,88 @@ def backfill_hubspot_sync(batch_id: int, db: Session = Depends(get_db)):
             errors.append(f"{contact.company.name}: {e}")
 
     return {"contacts_checked": len(contacts), "synced": synced, "errors": errors}
+
+
+# ---- Phase 13: Personalized Outreach Message Synthesis ----
+# Company research (free scrape + Claude) -> contact/LinkedIn research (Aviato + Claude) ->
+# fit analysis (Claude) -> message synthesis (Claude). Every module's raw output is returned
+# so a human can review/edit any stage, not just the final message.
+
+@router.post("/contacts/{contact_id}/generate-message")
+def generate_message(contact_id: int, db: Session = Depends(get_db)):
+    contact = (
+        db.query(Contact)
+        .join(Company)
+        .filter(Contact.id == contact_id)
+        .filter(Company.batch_id.in_(db.query(Batch.id).filter(Batch.tenant_id == ELEPHANT_EDGE_TENANT_ID)))
+        .first()
+    )
+    if not contact:
+        raise HTTPException(status_code=404, detail="Contact not found")
+    pm = generate_personalized_message(contact_id, db, ELEPHANT_EDGE_TENANT_ID)
+    return {
+        "contact_id": contact_id,
+        "status": pm.status,
+        "company_research": pm.company_research,
+        "contact_research": pm.contact_research,
+        "fit_analysis": pm.fit_analysis,
+        "generated_message": pm.generated_message,
+        "error_message": pm.error_message,
+        "generated_at": pm.generated_at,
+    }
+
+
+@router.get("/contacts/{contact_id}/message")
+def get_message(contact_id: int, db: Session = Depends(get_db)):
+    contact = (
+        db.query(Contact)
+        .join(Company)
+        .filter(Contact.id == contact_id)
+        .filter(Company.batch_id.in_(db.query(Batch.id).filter(Batch.tenant_id == ELEPHANT_EDGE_TENANT_ID)))
+        .first()
+    )
+    if not contact:
+        raise HTTPException(status_code=404, detail="Contact not found")
+    pm = contact.personalized_message
+    if not pm:
+        return {"contact_id": contact_id, "status": "not_generated"}
+    return {
+        "contact_id": contact_id,
+        "status": pm.status,
+        "company_research": pm.company_research,
+        "contact_research": pm.contact_research,
+        "fit_analysis": pm.fit_analysis,
+        "generated_message": pm.generated_message,
+        "error_message": pm.error_message,
+        "generated_at": pm.generated_at,
+    }
+
+
+class MessageEdit(BaseModel):
+    generated_message: str | None = None
+    status: str | None = None
+
+
+@router.post("/contacts/{contact_id}/message/edit")
+def edit_message(contact_id: int, body: MessageEdit, db: Session = Depends(get_db)):
+    contact = (
+        db.query(Contact)
+        .join(Company)
+        .filter(Contact.id == contact_id)
+        .filter(Company.batch_id.in_(db.query(Batch.id).filter(Batch.tenant_id == ELEPHANT_EDGE_TENANT_ID)))
+        .first()
+    )
+    if not contact or not contact.personalized_message:
+        raise HTTPException(status_code=404, detail="No generated message for this contact yet")
+    pm = contact.personalized_message
+    if body.generated_message is not None:
+        pm.generated_message = body.generated_message
+    if body.status is not None:
+        if body.status not in ("draft", "approved", "rejected"):
+            raise HTTPException(status_code=400, detail="status must be draft, approved, or rejected")
+        pm.status = body.status
+    db.commit()
+    return {"contact_id": contact_id, "status": pm.status, "generated_message": pm.generated_message}
 
 
 # ---- Phase 12: Campaign Execution ----
