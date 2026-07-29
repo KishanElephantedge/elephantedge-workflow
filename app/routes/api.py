@@ -1,8 +1,8 @@
-from fastapi import APIRouter, Body, Depends, HTTPException
+from fastapi import APIRouter, Body, Depends, HTTPException, Request
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
-from app.db.models import AutonomousRun, Batch, Company, Contact, Credential, Parameter
+from app.db.models import AutonomousRun, Batch, CampaignEvent, Company, Contact, Credential, Parameter
 from app.db.session import get_db
 from app.deepline_client import DeeplineError, get_credit_balance_usd
 from app.heyreach_client import HeyReachError
@@ -421,6 +421,86 @@ def edit_message(contact_id: int, body: MessageEdit, db: Session = Depends(get_d
         pm.status = body.status
     db.commit()
     return {"contact_id": contact_id, "status": pm.status, "generated_message": pm.generated_message}
+
+
+# ---- SalesRobot outcome webhook ----
+# SalesRobot pushes events to us (confirmed live -- no pull/status API exists); this receives
+# them. The secret path segment is the only protection available, since SalesRobot's webhook
+# config has no signing-secret field. The exact payload shape is unknown until a real event
+# arrives, so this stores the FULL raw body unconditionally and only best-effort matches it to
+# a known contact by scanning for a linkedin.com URL anywhere in the payload -- refine the
+# matching logic once a real payload has been inspected, but never lose data in the meantime.
+SALESROBOT_WEBHOOK_SECRET = "xD9rl4qgzeVc9vaZAkJr8vdDXxs0xX3u"
+
+
+def _find_linkedin_url_in_payload(obj) -> str | None:
+    if isinstance(obj, str):
+        return obj if "linkedin.com" in obj else None
+    if isinstance(obj, dict):
+        for value in obj.values():
+            found = _find_linkedin_url_in_payload(value)
+            if found:
+                return found
+    if isinstance(obj, list):
+        for item in obj:
+            found = _find_linkedin_url_in_payload(item)
+            if found:
+                return found
+    return None
+
+
+@router.post("/webhooks/salesrobot/{secret}")
+async def salesrobot_webhook(secret: str, request: Request, db: Session = Depends(get_db)):
+    if secret != SALESROBOT_WEBHOOK_SECRET:
+        raise HTTPException(status_code=404, detail="Not found")
+
+    payload = await request.json()
+    linkedin_url = _find_linkedin_url_in_payload(payload)
+    contact = None
+    if linkedin_url:
+        contact = (
+            db.query(Contact)
+            .filter(Contact.linkedin_url.ilike(f"%{linkedin_url.rstrip('/').split('/')[-1]}%"))
+            .first()
+        )
+
+    event_type = None
+    for key in ("event", "event_type", "type", "action"):
+        if isinstance(payload, dict) and payload.get(key):
+            event_type = str(payload[key])
+            break
+
+    event = CampaignEvent(
+        contact_id=contact.id if contact else None,
+        event_type=event_type,
+        raw_payload=payload,
+    )
+    db.add(event)
+    db.commit()
+    return {"ok": True}
+
+
+@router.get("/campaign-events")
+def list_campaign_events(db: Session = Depends(get_db)):
+    events = (
+        db.query(CampaignEvent)
+        .join(Contact, CampaignEvent.contact_id == Contact.id, isouter=True)
+        .order_by(CampaignEvent.received_at.desc())
+        .limit(200)
+        .all()
+    )
+    return [
+        {
+            "id": e.id,
+            "event_type": e.event_type,
+            "contact_id": e.contact_id,
+            "contact_name": f"{e.contact.first_name} {e.contact.last_name}" if e.contact else None,
+            "company_name": e.contact.company.name if e.contact and e.contact.company else None,
+            "raw_payload": e.raw_payload,
+            "received_at": e.received_at,
+        }
+        for e in events
+    ]
 
 
 # ---- Phase 12: Campaign Execution ----

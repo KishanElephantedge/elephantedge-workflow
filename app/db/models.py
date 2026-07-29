@@ -202,6 +202,24 @@ class CampaignPush(Base):
     contact = relationship("Contact", back_populates="campaign_pushes")
 
 
+class CampaignEvent(Base):
+    """Outcome tracking, received via SalesRobot's own outbound webhook (confirmed live --
+    SalesRobot pushes events to us, there is no pull/status API). contact_id is nullable
+    because the very first real payload's shape is unknown until it arrives -- matched
+    best-effort by LinkedIn URL against known contacts, but the full raw payload is always
+    kept regardless of whether matching succeeds, so nothing is lost while the matching
+    logic gets refined against real data."""
+    __tablename__ = "campaign_events"
+
+    id = Column(Integer, primary_key=True)
+    contact_id = Column(Integer, ForeignKey("contacts.id"), nullable=True)
+    event_type = Column(String, nullable=True)  # e.g. "connection_accepted", "reply" -- raw value from SalesRobot, not yet normalized
+    raw_payload = Column(JSON, nullable=False)
+    received_at = Column(DateTime, default=datetime.utcnow)
+
+    contact = relationship("Contact")
+
+
 class AutonomousRun(Base):
     __tablename__ = "autonomous_runs"
 
