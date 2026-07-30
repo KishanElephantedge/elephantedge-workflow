@@ -655,6 +655,49 @@ def recover_run_to_awaiting_approval(run_id: int, db: Session, tenant_id: int) -
     return {"status": "recovered", "awaiting_approval_until": run.awaiting_approval_until}
 
 
+def resend_approval_notification(run_id: int, db: Session, tenant_id: int) -> dict:
+    """Re-sends the approval email/Slack notification for a run using messages ALREADY
+    generated and stored in the DB -- no new Aviato/Gemini/Claude calls, so this never
+    re-spends money. Needed for exactly the case just hit live: the notification-layer bug
+    meant a genuinely successful run's email/Slack never went out at all the first time."""
+    run = (
+        db.query(AutonomousRun)
+        .join(Batch)
+        .filter(AutonomousRun.id == run_id)
+        .filter(Batch.tenant_id == tenant_id)
+        .first()
+    )
+    if not run:
+        return {"status": "not_found"}
+    batch = run.batch
+
+    contacts = db.query(Contact).join(Company).filter(Company.batch_id == batch.id).all()
+    messages = []
+    for contact in contacts:
+        pm = contact.personalized_message
+        messages.append({
+            "company_name": contact.company.name,
+            "contact_name": f"{contact.first_name or ''} {contact.last_name or ''}".strip(),
+            "contact_title": contact.title,
+            "linkedin_url": contact.linkedin_url,
+            "message": pm.generated_message if pm else None,
+            "error": (pm.error_message if pm else None) or ("Not generated" if not pm else None),
+        })
+
+    decision_maker_result = {
+        "companies_checked": run.companies_discovered or 0,
+        "decision_makers_found": run.contacts_found or 0,
+        "companies_with_no_contact": (run.companies_discovered or 0) - (run.contacts_found or 0),
+        "companies_skipped_already_resolved": 0,
+        "hubspot_synced": 0,
+        "hubspot_errors": [],
+        "budget_stopped_early": run.budget_stopped_early or False,
+    }
+
+    notification_error = _send_approval_notification(batch, run, decision_maker_result, db, tenant_id, messages=messages)
+    return {"status": "sent" if notification_error is None else "sent_with_errors", "notification_error": notification_error, "contacts_included": len(messages)}
+
+
 def resume_pending_approvals(db: Session, tenant_id: int) -> dict:
     """Periodic sweep (called every few minutes, not just once) -- resumes any run whose
     approval window has elapsed and wasn't cancelled. Checking on every tick rather than

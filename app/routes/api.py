@@ -10,7 +10,7 @@ from app.deepline_client import DeeplineError, get_credit_balance_usd
 from app.heyreach_client import HeyReachError
 from app.hubspot_client import HubSpotError
 from app.outreach.selector import get_outreach_channel
-from app.phases.autonomous_orchestrator import cancel_run, get_autonomous_discovery_source, get_daily_budget_usd, get_daily_company_cap, is_autonomous_enabled, recover_run_to_awaiting_approval, resume_pending_approvals, run_daily_autonomous_cycle
+from app.phases.autonomous_orchestrator import cancel_run, get_autonomous_discovery_source, get_daily_budget_usd, get_daily_company_cap, is_autonomous_enabled, recover_run_to_awaiting_approval, resend_approval_notification, resume_pending_approvals, run_daily_autonomous_cycle
 from app.phases.buying_signal import run_buying_signal_check
 from app.phases.campaign_execution import run_campaign_execution
 from app.phases.decision_maker import run_decision_maker_id
@@ -830,6 +830,14 @@ def recover_autonomous_run(run_id: int, db: Session = Depends(get_db)):
     notification-layer bug after it had already genuinely reached awaiting_approval -- see
     recover_run_to_awaiting_approval's docstring."""
     return recover_run_to_awaiting_approval(run_id, db, ELEPHANT_EDGE_TENANT_ID)
+
+
+@router.post("/autonomous/runs/{run_id}/resend-notification")
+def resend_run_notification(run_id: int, db: Session = Depends(get_db)):
+    """Re-sends the approval email/Slack using messages already generated and stored -- no
+    new Aviato/Gemini/Claude calls. Needed when the original notification attempt failed
+    outright (see resend_approval_notification's docstring)."""
+    return resend_approval_notification(run_id, db, ELEPHANT_EDGE_TENANT_ID)
 
 
 @router.post("/autonomous/resume-check")
