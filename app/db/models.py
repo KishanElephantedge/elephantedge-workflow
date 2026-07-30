@@ -212,7 +212,7 @@ class CampaignEvent(Base):
     __tablename__ = "campaign_events"
 
     id = Column(Integer, primary_key=True)
-    contact_id = Column(Integer, ForeignKey("contacts.id"), nullable=True)
+    contact_id = Column(Integer, ForeignKey("contacts.id"), nullable=True, index=True)
     event_type = Column(String, nullable=True)  # e.g. "connection_accepted", "reply" -- raw value from SalesRobot, not yet normalized
     raw_payload = Column(JSON, nullable=False)
     received_at = Column(DateTime, default=datetime.utcnow)

@@ -1,4 +1,4 @@
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 
 from app.config import settings
@@ -16,3 +16,12 @@ def get_db():
         yield db
     finally:
         db.close()
+
+
+# Indexes for the tables this backend owns (campaign_events -- the SalesRobot webhook table).
+# Shared-table indexes (companies, contacts, etc.) are ensured by Synefi's backend, the schema
+# owner -- see synefi/app/db/session.py for why this is CREATE INDEX IF NOT EXISTS rather than
+# an Alembic migration.
+def ensure_indexes():
+    with engine.begin() as conn:
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_campaign_events_contact_id ON campaign_events (contact_id)"))

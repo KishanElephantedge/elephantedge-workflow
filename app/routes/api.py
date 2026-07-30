@@ -3,7 +3,8 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session, selectinload
 from sqlalchemy import func
 
-from app.db.models import AutonomousRun, Batch, CampaignEvent, Company, Contact, Credential, Parameter
+from app.cache import active_keys, bump_batch_version, cache_get, cache_set, get_batch_version, mark_active
+from app.db.models import AutonomousRun, Batch, CampaignEvent, Company, Contact, Credential, Parameter, Score
 from app.db.session import get_db
 from app.deepline_client import DeeplineError, get_credit_balance_usd
 from app.heyreach_client import HeyReachError
@@ -77,23 +78,59 @@ def list_batches(source: str | None = None, db: Session = Depends(get_db)):
     ]
 
 
-@router.get("/batches/{batch_id}")
-def get_batch(batch_id: int, db: Session = Depends(get_db)):
+CACHE_TTL_SECONDS = 600  # generous -- the background refresher (main.py) keeps active
+# batches' cache fresh well before this expires; it's just a ceiling for abandoned pages.
+
+
+def _build_batch_payload(batch_id: int, page: int, page_size: int, db: Session) -> dict | None:
+    """The actual DB work behind GET /batches/{id} -- factored out so both the request
+    handler (cache miss / ?fresh=true) and the background refresher (main.py) can produce
+    the exact same shape without duplicating the query logic."""
     batch = (
         db.query(Batch)
         .filter(Batch.id == batch_id)
         .filter(Batch.tenant_id == ELEPHANT_EDGE_TENANT_ID)
-        .options(
-            selectinload(Batch.companies).selectinload(Company.score),
-            selectinload(Batch.companies)
-            .selectinload(Company.contacts)
-            .selectinload(Contact.personalized_message),
-        )
         .first()
     )
     if not batch:
-        raise HTTPException(status_code=404, detail="Batch not found")
+        return None
+
+    # Summary counts computed over the WHOLE batch via SQL aggregates, independent of which
+    # page is loaded -- the step-progress flags (has scoring run? has a decision maker been
+    # found for anyone?) need to see the whole batch, not just whatever page happens to be
+    # showing. See synefi/app/routes/api.py's get_batch for the same reasoning.
+    total_companies = db.query(func.count(Company.id)).filter(Company.batch_id == batch.id).scalar()
+    scored_count = (
+        db.query(func.count(Score.id))
+        .join(Company, Company.id == Score.company_id)
+        .filter(Company.batch_id == batch.id)
+        .scalar()
+    )
+    contacts_count = (
+        db.query(func.count(Contact.id))
+        .join(Company, Company.id == Contact.company_id)
+        .filter(Company.batch_id == batch.id)
+        .scalar()
+    )
+
+    companies = (
+        db.query(Company)
+        .filter(Company.batch_id == batch.id)
+        .options(
+            selectinload(Company.score),
+            selectinload(Company.contacts).selectinload(Contact.personalized_message),
+        )
+        .order_by(Company.id)
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+        .all()
+    )
+
     return {
+        "page": page,
+        "page_size": page_size,
+        "total_companies": total_companies,
+        "summary": {"scored_count": scored_count, "contacts_count": contacts_count},
         "id": batch.id,
         "name": batch.name,
         "source": batch.source,
@@ -136,9 +173,49 @@ def get_batch(batch_id: int, db: Session = Depends(get_db)):
                     for ct in c.contacts
                 ],
             }
-            for c in batch.companies
+            for c in companies
         ],
     }
+
+
+def _batch_cache_key(batch_id: int, page: int, page_size: int) -> str:
+    version = get_batch_version(batch_id)
+    return f"batch:{batch_id}:v{version}:p{page}:s{page_size}"
+
+
+def refresh_active_batch_caches(db: Session):
+    """Runs every few minutes (see main.py's scheduler) -- re-fetches and re-caches every
+    batch page anyone actually loaded recently, so a real user's next click almost always
+    hits a warm cache instead of racing a cold DB query. Cheap: only touches pages someone
+    looked at in the last 30 minutes (see app/cache.py's active_keys)."""
+    for logical_key in active_keys():
+        try:
+            batch_id_str, page_str, page_size_str = logical_key.split(":")
+            batch_id, page, page_size = int(batch_id_str), int(page_str), int(page_size_str)
+        except ValueError:
+            continue
+        payload = _build_batch_payload(batch_id, page, page_size, db)
+        if payload is None:
+            continue
+        cache_set(_batch_cache_key(batch_id, page, page_size), payload, CACHE_TTL_SECONDS)
+
+
+@router.get("/batches/{batch_id}")
+def get_batch(batch_id: int, page: int = 1, page_size: int = 50, fresh: bool = False, db: Session = Depends(get_db)):
+    page = max(page, 1)
+    page_size = min(max(page_size, 1), 200)
+    mark_active(f"{batch_id}:{page}:{page_size}")
+
+    if not fresh:
+        cached = cache_get(_batch_cache_key(batch_id, page, page_size))
+        if cached is not None:
+            return cached
+
+    payload = _build_batch_payload(batch_id, page, page_size, db)
+    if payload is None:
+        raise HTTPException(status_code=404, detail="Batch not found")
+    cache_set(_batch_cache_key(batch_id, page, page_size), payload, CACHE_TTL_SECONDS)
+    return payload
 
 
 # ---- Manual company import (hand-picked companies, Discovery/Qualification skipped) ----
@@ -169,6 +246,7 @@ def import_companies(batch_id: int, companies: list[CompanyImport], db: Session 
         created.append(company)
     batch.current_phase = "companies_imported"
     db.commit()
+    bump_batch_version(batch_id)
     for c in created:
         db.refresh(c)
     return {"imported": len(created), "companies": [{"id": c.id, "name": c.name, "domain": c.domain} for c in created]}
@@ -202,6 +280,7 @@ def execute_discovery(batch_id: int, target: int = 10, db: Session = Depends(get
     result = run_discovery(batch_id, db, ELEPHANT_EDGE_TENANT_ID, target=target)
     batch.current_phase = "discovery_done"
     db.commit()
+    bump_batch_version(batch_id)
     return result
 
 
@@ -221,6 +300,7 @@ def execute_jd_first_discovery(batch_id: int, target: int = 10, db: Session = De
     result = run_jd_first_discovery(batch_id, db, ELEPHANT_EDGE_TENANT_ID, target=target)
     batch.current_phase = "discovery_done"
     db.commit()
+    bump_batch_version(batch_id)
     return result
 
 
@@ -243,6 +323,7 @@ def execute_jobo_discovery(batch_id: int, target: int = 5, budget_usd: float = 1
         raise HTTPException(status_code=502, detail=str(e))
     batch.current_phase = "discovery_done"
     db.commit()
+    bump_batch_version(batch_id)
     return result
 
 
@@ -262,6 +343,7 @@ def execute_buying_signal_check(batch_id: int, db: Session = Depends(get_db)):
     result = run_buying_signal_check(batch_id, db)
     batch.current_phase = "buying_signal_done"
     db.commit()
+    bump_batch_version(batch_id)
     return result
 
 
@@ -281,6 +363,7 @@ def execute_tech_stack_check(batch_id: int, db: Session = Depends(get_db)):
     result = run_tech_stack_check(batch_id, db)
     batch.current_phase = "tech_stack_done"
     db.commit()
+    bump_batch_version(batch_id)
     return result
 
 
@@ -300,6 +383,7 @@ def execute_scoring(batch_id: int, db: Session = Depends(get_db)):
     result = run_scoring(batch_id, db)
     batch.current_phase = "scoring_done"
     db.commit()
+    bump_batch_version(batch_id)
     return result
 
 
@@ -319,6 +403,7 @@ def execute_decision_maker_id(batch_id: int, retry_company_ids: list[int] | None
     result = run_decision_maker_id(batch_id, db, ELEPHANT_EDGE_TENANT_ID, retry_company_ids=retry_company_ids)
     batch.current_phase = "decision_maker_done"
     db.commit()
+    bump_batch_version(batch_id)
     return result
 
 
@@ -372,6 +457,7 @@ def generate_message(contact_id: int, db: Session = Depends(get_db)):
     if not contact:
         raise HTTPException(status_code=404, detail="Contact not found")
     pm = generate_personalized_message(contact_id, db, ELEPHANT_EDGE_TENANT_ID)
+    bump_batch_version(contact.company.batch_id)
     return {
         "contact_id": contact_id,
         "status": pm.status,
@@ -434,6 +520,7 @@ def edit_message(contact_id: int, body: MessageEdit, db: Session = Depends(get_d
             raise HTTPException(status_code=400, detail="status must be draft, approved, or rejected")
         pm.status = body.status
     db.commit()
+    bump_batch_version(contact.company.batch_id)
     return {"contact_id": contact_id, "status": pm.status, "generated_message": pm.generated_message}
 
 
@@ -538,6 +625,7 @@ def execute_outreach_push(batch_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=400, detail=str(e))
     batch.current_phase = "outreach_done"
     db.commit()
+    bump_batch_version(batch_id)
     return result
 
 

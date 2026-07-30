@@ -2,10 +2,10 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.db.session import SessionLocal
+from app.db.session import SessionLocal, ensure_indexes
 from app.phases.autonomous_orchestrator import resume_pending_approvals, run_daily_autonomous_cycle
 from app.routes import api
-from app.routes.api import ELEPHANT_EDGE_TENANT_ID
+from app.routes.api import ELEPHANT_EDGE_TENANT_ID, refresh_active_batch_caches
 
 app = FastAPI(title="Elephant Edge ABM System")
 
@@ -47,10 +47,23 @@ def _scheduled_approval_sweep():
         db.close()
 
 
+def _scheduled_cache_refresh():
+    """Keeps the Redis cache behind GET /batches/{id} warm for every batch page someone's
+    actually viewing, so a real click almost never waits on a cold DB query -- see
+    app/cache.py and refresh_active_batch_caches in routes/api.py."""
+    db = SessionLocal()
+    try:
+        refresh_active_batch_caches(db)
+    finally:
+        db.close()
+
+
 @app.on_event("startup")
 def on_startup():
+    ensure_indexes()
     scheduler.add_job(_scheduled_autonomous_tick, "interval", hours=24, id="autonomous_daily_cycle")
     scheduler.add_job(_scheduled_approval_sweep, "interval", minutes=5, id="approval_window_sweep")
+    scheduler.add_job(_scheduled_cache_refresh, "interval", minutes=3, id="batch_cache_refresh")
     scheduler.start()
 
 
