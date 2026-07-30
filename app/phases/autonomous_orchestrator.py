@@ -584,8 +584,13 @@ def _run_jd_first_autonomous_cycle(batch: Batch, run: AutonomousRun, db: Session
 
 
 def cancel_run(run_id: int, db: Session, tenant_id: int) -> dict:
-    """Marks a run cancelled while it's still in its approval window -- the periodic resume
-    sweep checks this flag before ever pushing to the outreach channel."""
+    """Marks a run cancelled -- normally while it's still in its approval window (the
+    periodic resume sweep checks this flag before ever pushing to the outreach channel), but
+    also allowed for a run stuck in "running": confirmed live that an uncaught exception right
+    at cycle start (before this fix -- see run_daily_autonomous_cycle) can leave a run's row
+    stuck showing "running" forever with nothing actually still executing behind it, and the
+    automatic stale-run sweep doesn't clear that for STALE_RUN_TIMEOUT_MINUTES. This is the
+    manual equivalent for when you don't want to wait that long."""
     run = (
         db.query(AutonomousRun)
         .join(Batch)
@@ -595,8 +600,8 @@ def cancel_run(run_id: int, db: Session, tenant_id: int) -> dict:
     )
     if not run:
         return {"status": "not_found"}
-    if run.status != "awaiting_approval":
-        return {"status": "not_cancellable", "reason": f"run status is '{run.status}', not 'awaiting_approval'"}
+    if run.status not in ("awaiting_approval", "running"):
+        return {"status": "not_cancellable", "reason": f"run status is '{run.status}', not 'awaiting_approval' or 'running'"}
     run.cancelled = True
     run.status = "cancelled"
     run.completed_at = datetime.utcnow()
