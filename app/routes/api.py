@@ -4,7 +4,8 @@ from sqlalchemy.orm import Session, selectinload
 from sqlalchemy import func
 
 from app.cache import active_keys, bump_batch_version, cache_get, cache_set, get_batch_version, mark_active
-from app.db.models import AutonomousRun, Batch, CampaignEvent, Company, Contact, Credential, Parameter, Score
+from app.db.models import AutonomousRun, Batch, CalendarBooking, CampaignEvent, Company, Contact, Credential, Parameter, Score
+from app.google_calendar_client import GoogleCalendarError
 from app.db.session import get_db
 from app.deepline_client import DeeplineError, get_credit_balance_usd
 from app.heyreach_client import HeyReachError
@@ -19,6 +20,7 @@ from app.phases.jd_first_discovery import run_jd_first_discovery
 from app.phases.jobo_discovery import run_jobo_discovery
 from app.jobo_client import JoboError
 from app.phases.hubspot_sync import sync_to_hubspot
+from app.phases.calendar_sync import sync_calendar_bookings
 from app.phases.personalized_outreach import generate_personalized_message
 from app.phases.scoring import run_scoring
 from app.phases.tech_stack import run_tech_stack_check
@@ -635,6 +637,36 @@ def list_campaign_events(db: Session = Depends(get_db)):
         }
         for e in events
     ]
+
+
+# ---- Google Calendar appointment-booking sync ----
+# Pulled, not pushed -- Calendar has no webhook for Appointment Schedule bookings specifically,
+# so this is a periodic pull (see main.py's scheduler) plus a manual trigger for testing.
+
+@router.get("/calendar-bookings")
+def list_calendar_bookings(db: Session = Depends(get_db)):
+    bookings = db.query(CalendarBooking).order_by(CalendarBooking.start_time.desc()).limit(200).all()
+    return [
+        {
+            "id": b.id,
+            "booker_name": b.booker_name,
+            "booker_email": b.booker_email,
+            "start_time": b.start_time,
+            "end_time": b.end_time,
+            "status": b.status,
+            "raw_payload": b.raw_payload,
+            "synced_at": b.synced_at,
+        }
+        for b in bookings
+    ]
+
+
+@router.post("/calendar-bookings/sync")
+def trigger_calendar_sync(db: Session = Depends(get_db)):
+    try:
+        return sync_calendar_bookings(db, ELEPHANT_EDGE_TENANT_ID)
+    except GoogleCalendarError as e:
+        raise HTTPException(status_code=502, detail=str(e))
 
 
 # ---- Phase 12: Campaign Execution ----

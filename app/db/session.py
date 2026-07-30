@@ -18,10 +18,23 @@ def get_db():
         db.close()
 
 
-# Indexes for the tables this backend owns (campaign_events -- the SalesRobot webhook table).
-# Shared-table indexes (companies, contacts, etc.) are ensured by Synefi's backend, the schema
-# owner -- see synefi/app/db/session.py for why this is CREATE INDEX IF NOT EXISTS rather than
-# an Alembic migration.
+# Indexes/tables this backend owns (campaign_events -- the SalesRobot webhook table;
+# calendar_bookings -- Google Calendar appointment sync). Shared-table indexes (companies,
+# contacts, etc.) are ensured by Synefi's backend, the schema owner -- see
+# synefi/app/db/session.py for why this is raw SQL rather than an Alembic migration.
 def ensure_indexes():
     with engine.begin() as conn:
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_campaign_events_contact_id ON campaign_events (contact_id)"))
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS calendar_bookings (
+                id SERIAL PRIMARY KEY,
+                google_event_id VARCHAR NOT NULL UNIQUE,
+                booker_name VARCHAR,
+                booker_email VARCHAR,
+                start_time TIMESTAMP,
+                end_time TIMESTAMP,
+                status VARCHAR,
+                raw_payload JSON NOT NULL,
+                synced_at TIMESTAMP
+            )
+        """))

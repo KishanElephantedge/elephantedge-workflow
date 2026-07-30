@@ -3,7 +3,9 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.db.session import SessionLocal, ensure_indexes
+from app.google_calendar_client import GoogleCalendarError
 from app.phases.autonomous_orchestrator import resume_pending_approvals, run_daily_autonomous_cycle
+from app.phases.calendar_sync import sync_calendar_bookings
 from app.routes import api
 from app.routes.api import ELEPHANT_EDGE_TENANT_ID, refresh_active_batch_caches
 
@@ -58,12 +60,29 @@ def _scheduled_cache_refresh():
         db.close()
 
 
+def _scheduled_calendar_sync():
+    """Pulls new/changed Appointment Schedule bookings every 15 minutes -- a no-op until the
+    google_calendar_* credentials are set (Settings), since OAuth setup is a manual one-time
+    step done outside this codebase. Failures here (e.g. credentials not set yet, or Google's
+    API being temporarily unreachable) are swallowed -- this is a background convenience sync,
+    never something that should crash the scheduler or spam logs on every tick before setup
+    is done."""
+    db = SessionLocal()
+    try:
+        sync_calendar_bookings(db, tenant_id=ELEPHANT_EDGE_TENANT_ID)
+    except GoogleCalendarError:
+        pass
+    finally:
+        db.close()
+
+
 @app.on_event("startup")
 def on_startup():
     ensure_indexes()
     scheduler.add_job(_scheduled_autonomous_tick, "interval", hours=24, id="autonomous_daily_cycle")
     scheduler.add_job(_scheduled_approval_sweep, "interval", minutes=5, id="approval_window_sweep")
     scheduler.add_job(_scheduled_cache_refresh, "interval", minutes=3, id="batch_cache_refresh")
+    scheduler.add_job(_scheduled_calendar_sync, "interval", minutes=15, id="calendar_booking_sync")
     scheduler.start()
 
 

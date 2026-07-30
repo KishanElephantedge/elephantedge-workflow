@@ -229,6 +229,24 @@ class CampaignEvent(Base):
     contact = relationship("Contact")
 
 
+class CalendarBooking(Base):
+    """A call booked through the lead's Google Calendar Appointment Schedule (clients book
+    directly off the website). Pulled via Google Calendar's events.list, not a webhook --
+    Calendar has no equivalent push mechanism for appointment-schedule bookings, so this is
+    populated by a periodic sync (see google_calendar_client.py) rather than received live."""
+    __tablename__ = "calendar_bookings"
+
+    id = Column(Integer, primary_key=True)
+    google_event_id = Column(String, nullable=False, unique=True)  # dedupe key across syncs
+    booker_name = Column(String, nullable=True)
+    booker_email = Column(String, nullable=True)
+    start_time = Column(DateTime, nullable=True)
+    end_time = Column(DateTime, nullable=True)
+    status = Column(String, nullable=True)  # confirmed | cancelled, from Google's own event status
+    raw_payload = Column(JSON, nullable=False)
+    synced_at = Column(DateTime, default=datetime.utcnow)
+
+
 class AutonomousRun(Base):
     __tablename__ = "autonomous_runs"
 
