@@ -20,9 +20,7 @@ from sqlalchemy.orm import Session
 
 from app.budget_guard import BudgetExceededError, BudgetGuard
 from app.db.models import AutonomousRun, Batch, Company, Contact, Parameter, Score
-from app.email_client import EmailError, send_email
 from app.slack_client import SlackError, send_slack_message
-from app.export import generate_decision_makers_csv
 from app.phases.buying_signal import run_buying_signal_check
 from app.phases.campaign_execution import run_campaign_execution
 from app.phases.decision_maker import run_decision_maker_id
@@ -204,11 +202,11 @@ def _generate_messages_for_batch(batch_id: int, db: Session, tenant_id: int, gua
 
 def _send_approval_notification(batch: Batch, run: AutonomousRun, decision_maker_result: dict, db: Session, tenant_id: int, messages: list[dict] | None = None) -> str | None:
     """Sent right after Decision Maker (and Phase 13 message drafting) completes, before
-    anything reaches the outreach channel. Sends BOTH email and Slack (if configured) -- either
-    or both can fail without ever blocking the approval window itself from being real and
-    honored; failures from either channel are combined into one error string, not raised."""
+    anything reaches the outreach channel. Slack-only -- email over raw SMTP is blocked at
+    the network level on Render (confirmed live, consistent "Network is unreachable" on every
+    attempt, a known PaaS restriction on outbound SMTP ports, not a flaky bug). Revisit if
+    email delivery moves to an HTTP API (e.g. Resend/SendGrid) instead of raw SMTP."""
     messages = messages or []
-    errors = []
 
     message_block_lines = []
     for m in messages:
@@ -219,28 +217,6 @@ def _send_approval_notification(batch: Batch, run: AutonomousRun, decision_maker
             message_block_lines.append(f"{header}\n[No message drafted: {m['error'] or 'unknown reason'}]\n")
     message_block = "\n---\n".join(message_block_lines)
 
-    body = (
-        f"Elephant Edge autonomous run for batch #{batch.id} found "
-        f"{decision_maker_result['decision_makers_found']} decision-maker(s) across "
-        f"{decision_maker_result['companies_checked']} companies checked today.\n\n"
-        f"These will be pushed to the configured outreach channel in {APPROVAL_WINDOW_MINUTES} minutes "
-        f"unless this run is cancelled first (Autonomous page in the dashboard).\n\n"
-        f"See the attached CSV for the full list of companies and decision-makers found.\n\n"
-        f"Drafted outreach messages:\n\n{message_block}"
-    )
-    try:
-        csv_bytes = generate_decision_makers_csv(batch.id, db)
-        send_email(
-            subject=f"Elephant Edge: {decision_maker_result['decision_makers_found']} decision-maker(s) ready for review (batch #{batch.id})",
-            body=body,
-            db=db,
-            tenant_id=tenant_id,
-            attachment_bytes=csv_bytes,
-            attachment_filename=f"batch-{batch.id}-decision-makers.csv",
-        )
-    except EmailError as e:
-        errors.append(f"email: {e}")
-
     slack_text = (
         f":mag: *Elephant Edge* -- batch #{batch.id} found {decision_maker_result['decision_makers_found']} "
         f"decision-maker(s) across {decision_maker_result['companies_checked']} companies checked.\n"
@@ -249,27 +225,22 @@ def _send_approval_notification(batch: Batch, run: AutonomousRun, decision_maker
     )
     try:
         send_slack_message(slack_text, db, tenant_id)
+        return None
     except SlackError as e:
-        errors.append(f"slack: {e}")
-
-    return "; ".join(errors) if errors else None
+        return f"slack: {e}"
 
 
 def _send_success_notification(batch: Batch, outreach_result: dict, db: Session, tenant_id: int) -> str | None:
+    """Slack-only -- see _send_approval_notification's docstring for why email is dropped."""
     try:
-        body = (
-            f"Batch #{batch.id}: {outreach_result['pushed']} contact(s) successfully added to the "
-            f"outreach campaign. ({outreach_result['failed']} failed, {outreach_result['skipped']} skipped "
-            f"as already pushed.)"
-        )
-        send_email(
-            subject=f"Elephant Edge: {outreach_result['pushed']} lead(s) successfully added to campaign (batch #{batch.id})",
-            body=body,
-            db=db,
-            tenant_id=tenant_id,
+        send_slack_message(
+            f":white_check_mark: *Elephant Edge* -- batch #{batch.id}: {outreach_result['pushed']} contact(s) "
+            f"successfully added to the outreach campaign. ({outreach_result['failed']} failed, "
+            f"{outreach_result['skipped']} skipped as already pushed.)",
+            db, tenant_id,
         )
         return None
-    except EmailError as e:
+    except SlackError as e:
         return str(e)
 
 
