@@ -498,31 +498,28 @@ def _run_jobo_autonomous_cycle(batch: Batch, run: AutonomousRun, db: Session, te
 
 def _run_jd_first_autonomous_cycle(batch: Batch, run: AutonomousRun, db: Session, tenant_id: int, budget_usd: float) -> dict:
     """jd_first's autonomous branch -- the jobs-first approach validated live today (~$1.40
-    for 10 real companies, vs. the old deepline branch's $3.22 for 4). run_jd_first_discovery
-    already does discovery + team-composition-gate in one pass (its own internal
-    assess_team_composition call), but NOT decision-maker resolution -- that's a separate
-    step here, sharing the SAME BudgetGuard across both so the cap is honored end-to-end,
-    same pattern as the old deepline branch above."""
-    guard = BudgetGuard(budget_usd)
+    for 10 real companies, vs. the old deepline branch's $3.22 for 4).
+
+    No BudgetGuard here -- confirmed live that Deepline's own balance-check endpoint
+    (subprocess call to the CLI) can hang/timeout on both its retry attempts, and since the
+    guard's whole design is "if we can't verify the balance, stop the run" (see
+    budget_guard.py), that flakiness was blocking real runs entirely, twice in a row. The
+    company cap (target=cap below) already bounds total work/spend to a known ceiling on its
+    own -- a fixed number of companies means a fixed number of paid API calls -- so the extra
+    balance-check layer wasn't buying real safety here, just fragility."""
     cap = get_daily_company_cap(db, tenant_id)
-    result = run_jd_first_discovery(batch.id, db, tenant_id, target=cap, jobs_per_page=min(cap, 10), budget_guard=guard)
+    result = run_jd_first_discovery(batch.id, db, tenant_id, target=cap, jobs_per_page=min(cap, 10))
 
     found = 0
-    if not result["budget_stopped_early"]:
-        companies = db.query(Company).filter(Company.batch_id == batch.id).all()
-        for company in companies:
-            try:
-                guard.check()
-            except BudgetExceededError:
-                result["budget_stopped_early"] = True
-                break
-            contact = find_decision_maker(company, db)
-            company.decision_maker_searched_at = datetime.utcnow()
-            db.commit()
-            if contact:
-                found += 1
+    companies = db.query(Company).filter(Company.batch_id == batch.id).all()
+    for company in companies:
+        contact = find_decision_maker(company, db)
+        company.decision_maker_searched_at = datetime.utcnow()
+        db.commit()
+        if contact:
+            found += 1
 
-    final_spend = guard.spent_so_far_usd()
+    final_spend = None  # no guard tracking this run -- see docstring above
     decision_maker_result = {
         "companies_checked": result["companies_discovered"],
         "decision_makers_found": found,
@@ -565,7 +562,7 @@ def _run_jd_first_autonomous_cycle(batch: Batch, run: AutonomousRun, db: Session
     run.awaiting_approval_until = datetime.utcnow() + timedelta(minutes=APPROVAL_WINDOW_MINUTES)
     db.commit()
 
-    messages = _generate_messages_for_batch(batch.id, db, tenant_id, guard=guard)
+    messages = _generate_messages_for_batch(batch.id, db, tenant_id)
     notification_error = _send_approval_notification(batch, run, decision_maker_result, db, tenant_id, messages=messages)
 
     return {
