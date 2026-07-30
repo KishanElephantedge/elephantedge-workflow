@@ -208,6 +208,15 @@ def _send_approval_notification(batch: Batch, run: AutonomousRun, decision_maker
     email delivery moves to an HTTP API (e.g. Resend/SendGrid) instead of raw SMTP."""
     messages = messages or []
 
+    # Was a CSV email attachment before email got dropped (see docstring) -- inlined as plain
+    # text here instead, since Incoming Webhooks don't support file attachments.
+    decision_maker_lines = [
+        f"- {m['contact_name']} ({m['contact_title'] or 'no title'}) @ {m['company_name']}"
+        + (f" -- {m['linkedin_url']}" if m['linkedin_url'] else "")
+        for m in messages
+    ]
+    decision_maker_block = "\n".join(decision_maker_lines) if decision_maker_lines else "(none)"
+
     message_block_lines = []
     for m in messages:
         header = f"{m['contact_name']} ({m['contact_title'] or 'no title'}) @ {m['company_name']}"
@@ -221,7 +230,9 @@ def _send_approval_notification(batch: Batch, run: AutonomousRun, decision_maker
         f":mag: *Elephant Edge* -- batch #{batch.id} found {decision_maker_result['decision_makers_found']} "
         f"decision-maker(s) across {decision_maker_result['companies_checked']} companies checked.\n"
         f"Pushes to the outreach channel in {APPROVAL_WINDOW_MINUTES} minutes unless cancelled "
-        f"(Autonomous page in the dashboard).\n\n*Drafted outreach messages:*\n\n{message_block}"
+        f"(Autonomous page in the dashboard).\n\n"
+        f"*Decision-makers found:*\n{decision_maker_block}\n\n"
+        f"*Drafted outreach messages:*\n\n{message_block}"
     )
     try:
         send_slack_message(slack_text, db, tenant_id)
