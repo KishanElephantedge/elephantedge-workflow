@@ -57,5 +57,12 @@ def send_email(subject: str, body: str, db: Session, tenant_id: int, attachment_
             server.starttls()
             server.login(smtp_username, smtp_password)
             server.sendmail(smtp_username, [notify_email], msg.as_string())
-    except smtplib.SMTPException as e:
+    except (smtplib.SMTPException, OSError) as e:
+        # OSError, not just SMTPException -- confirmed live: a raw socket-level failure
+        # ("Network is unreachable") during the connection itself isn't an SMTPException
+        # subclass, so it was propagating uncaught past this function entirely. Callers
+        # (autonomous_orchestrator's approval notification) only catch EmailError and are
+        # contractually never supposed to have a notification failure affect the run's own
+        # status -- an unwrapped OSError broke that contract and (via the orchestrator's
+        # exception safety net) incorrectly flipped an already-successful run to "failed".
         raise EmailError(f"Failed to send email: {e}") from e

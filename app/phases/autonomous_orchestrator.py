@@ -387,8 +387,16 @@ def run_daily_autonomous_cycle(db: Session, tenant_id: int) -> dict:
         run.awaiting_approval_until = datetime.utcnow() + timedelta(minutes=APPROVAL_WINDOW_MINUTES)
         db.commit()
 
-        messages = _generate_messages_for_batch(batch.id, db, tenant_id, guard=guard)
-        notification_error = _send_approval_notification(batch, run, decision_maker_result, db, tenant_id, messages=messages)
+        # The cycle itself already succeeded and is committed above -- confirmed live that an
+        # unwrapped network error in the notification step (email_client/slack_client) could
+        # otherwise propagate up to this function's own except block and retroactively flip an
+        # already-successful run to "failed". Isolated here so a notification-layer problem is
+        # reported but never overwrites real run status.
+        try:
+            messages = _generate_messages_for_batch(batch.id, db, tenant_id, guard=guard)
+            notification_error = _send_approval_notification(batch, run, decision_maker_result, db, tenant_id, messages=messages)
+        except Exception as e:
+            notification_error = f"message generation/notification step failed: {e}"
 
         return {
             "status": "awaiting_approval",
@@ -478,8 +486,13 @@ def _run_jobo_autonomous_cycle(batch: Batch, run: AutonomousRun, db: Session, te
     run.awaiting_approval_until = datetime.utcnow() + timedelta(minutes=APPROVAL_WINDOW_MINUTES)
     db.commit()
 
-    messages = _generate_messages_for_batch(batch.id, db, tenant_id)
-    notification_error = _send_approval_notification(batch, run, decision_maker_result, db, tenant_id, messages=messages)
+    # Isolated so a notification-layer failure is reported but never overwrites the already-
+    # successful run status -- see the deepline branch above for the full explanation.
+    try:
+        messages = _generate_messages_for_batch(batch.id, db, tenant_id)
+        notification_error = _send_approval_notification(batch, run, decision_maker_result, db, tenant_id, messages=messages)
+    except Exception as e:
+        notification_error = f"message generation/notification step failed: {e}"
 
     return {
         "status": "awaiting_approval",
@@ -562,8 +575,15 @@ def _run_jd_first_autonomous_cycle(batch: Batch, run: AutonomousRun, db: Session
     run.awaiting_approval_until = datetime.utcnow() + timedelta(minutes=APPROVAL_WINDOW_MINUTES)
     db.commit()
 
-    messages = _generate_messages_for_batch(batch.id, db, tenant_id)
-    notification_error = _send_approval_notification(batch, run, decision_maker_result, db, tenant_id, messages=messages)
+    # Isolated so a notification-layer failure is reported but never overwrites the already-
+    # successful run status -- see the deepline branch's docstring comment for the full
+    # explanation (confirmed live: this exact class of bug flipped a genuinely successful
+    # jd_first run to "failed" after the fact).
+    try:
+        messages = _generate_messages_for_batch(batch.id, db, tenant_id)
+        notification_error = _send_approval_notification(batch, run, decision_maker_result, db, tenant_id, messages=messages)
+    except Exception as e:
+        notification_error = f"message generation/notification step failed: {e}"
 
     return {
         "status": "awaiting_approval",

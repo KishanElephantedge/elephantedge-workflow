@@ -28,6 +28,14 @@ def send_slack_message(text: str, db: Session, tenant_id: int) -> None:
     don't support file attachments (unlike email's CSV) -- callers should inline any
     detail that matters directly into the message text."""
     webhook_url = _get_webhook_url(db, tenant_id)
-    response = httpx.post(webhook_url, json={"text": text}, timeout=15)
+    try:
+        response = httpx.post(webhook_url, json={"text": text}, timeout=15)
+    except httpx.HTTPError as e:
+        # Confirmed live (email_client.py hit the same class of bug): a raw network-level
+        # failure here wasn't wrapped at all, so it propagated uncaught past this function --
+        # callers (autonomous_orchestrator's approval notification) only catch SlackError and
+        # are contractually never supposed to have a notification failure affect the run's
+        # own status.
+        raise SlackError(f"Slack webhook post failed: {e}") from e
     if response.status_code != 200:
         raise SlackError(f"Slack webhook post failed ({response.status_code}): {response.text}")
