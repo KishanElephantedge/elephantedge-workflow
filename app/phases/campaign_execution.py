@@ -27,6 +27,17 @@ def run_campaign_execution(batch_id: int, db: Session, channel: OutreachChannel)
             skipped += 1
             continue
 
+        if contact.excluded_from_push:
+            skipped += 1
+            db.add(CampaignPush(
+                contact_id=contact.id,
+                heyreach_campaign_id=None,
+                status="skipped",
+                error_message="Excluded from push via dashboard",
+                pushed_at=None,
+            ))
+            continue
+
         result = channel.push_lead(contact)
         if result["status"] == "pushed":
             pushed += 1

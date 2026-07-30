@@ -161,6 +161,11 @@ class Contact(Base):
     # Phase 11 (Personalization) -- dynamically-chosen opening line, pushed to HeyReach as a
     # customUserFields value merged into the sequence template's {{personalization_hook}} tag.
     personalization_hook = Column(Text, nullable=True)
+    # Per-contact "don't push to the outreach campaign" flag -- separate from
+    # PersonalizedMessage.status (which only governs whether a message gets attached, not
+    # whether the contact gets pushed at all). Set via the dashboard during the approval
+    # window; run_campaign_execution skips any contact with this set.
+    excluded_from_push = Column(Boolean, default=False)
 
     personalized_message = relationship("PersonalizedMessage", back_populates="contact", uselist=False, cascade="all, delete-orphan")
 

@@ -47,6 +47,16 @@ class SalesRobotChannel(OutreachChannel):
         if contact.company and contact.company.name:
             prospect["companyName"] = contact.company.name
 
+        # Only an APPROVED Phase 13 message is ever sent -- draft/rejected/no-message
+        # contacts still get pushed (this gate is deliberately separate from message
+        # approval, see autonomous_orchestrator.py), just without a personalized note.
+        # SalesRobot's connection-request/first-message template has to reference this exact
+        # key (e.g. a {{personalizedMessage}} placeholder) for it to actually appear in what
+        # gets sent -- that's configured in SalesRobot's own campaign editor, not here.
+        pm = contact.personalized_message
+        if pm and pm.status == "approved" and pm.generated_message:
+            prospect["customMap"] = {"personalizedMessage": pm.generated_message}
+
         try:
             add_single_prospect(campaign_uuid, linkedin_account_uuid, prospect, self.db, self.tenant_id)
             return {"status": "pushed", "error_message": None, "channel_ref": campaign_uuid}

@@ -169,6 +169,7 @@ def _build_batch_payload(batch_id: int, page: int, page_size: int, db: Session) 
                         "title": ct.title,
                         "linkedin_url": ct.linkedin_url,
                         "message_status": ct.personalized_message.status if ct.personalized_message else None,
+                        "excluded_from_push": ct.excluded_from_push,
                     }
                     for ct in c.contacts
                 ],
@@ -522,6 +523,27 @@ def edit_message(contact_id: int, body: MessageEdit, db: Session = Depends(get_d
     db.commit()
     bump_batch_version(contact.company.batch_id)
     return {"contact_id": contact_id, "status": pm.status, "generated_message": pm.generated_message}
+
+
+@router.post("/contacts/{contact_id}/exclude-from-push")
+def set_contact_excluded_from_push(contact_id: int, excluded: bool, db: Session = Depends(get_db)):
+    """Separate from PersonalizedMessage.status -- this controls whether the contact gets
+    pushed to the outreach campaign at all, not just whether a message gets attached. Can be
+    set/unset any time before the approval window resumes (run_campaign_execution checks it
+    at push time)."""
+    contact = (
+        db.query(Contact)
+        .join(Company)
+        .filter(Contact.id == contact_id)
+        .filter(Company.batch_id.in_(db.query(Batch.id).filter(Batch.tenant_id == ELEPHANT_EDGE_TENANT_ID)))
+        .first()
+    )
+    if not contact:
+        raise HTTPException(status_code=404, detail="Contact not found")
+    contact.excluded_from_push = excluded
+    db.commit()
+    bump_batch_version(contact.company.batch_id)
+    return {"contact_id": contact_id, "excluded_from_push": contact.excluded_from_push}
 
 
 # ---- SalesRobot outcome webhook ----
