@@ -309,10 +309,27 @@ def run_daily_autonomous_cycle(db: Session, tenant_id: int) -> dict:
 
     budget_usd = get_daily_budget_usd(db, tenant_id)
 
-    if source == "jobo":
-        return _run_jobo_autonomous_cycle(batch, run, db, tenant_id, budget_usd)
-    if source == "jd_first":
-        return _run_jd_first_autonomous_cycle(batch, run, db, tenant_id, budget_usd)
+    if source in ("jobo", "jd_first"):
+        # Both branches can raise before they ever reach their own internal error handling
+        # (jd_first has none at all; jobo only catches JoboError specifically) -- confirmed
+        # live: BudgetGuard's Deepline balance check timed out on both its own retry attempts
+        # right at cycle start, the exception propagated uncaught, and the run row stayed
+        # "running" forever since nothing ever marked it failed. This is the safety net that
+        # was missing -- any exception here now always finalizes the run/batch as failed.
+        try:
+            if source == "jobo":
+                return _run_jobo_autonomous_cycle(batch, run, db, tenant_id, budget_usd)
+            return _run_jd_first_autonomous_cycle(batch, run, db, tenant_id, budget_usd)
+        except Exception as e:
+            db.rollback()
+            run.status = "failed"
+            run.error_message = str(e)
+            run.completed_at = datetime.utcnow()
+            batch.status = "failed"
+            db.add(run)
+            db.add(batch)
+            db.commit()
+            return {"status": "failed", "batch_id": batch.id, "source": source, "error": str(e)}
 
     try:
         guard = BudgetGuard(budget_usd)  # one guard for the whole run -- shared cap across every phase
