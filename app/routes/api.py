@@ -22,7 +22,7 @@ from app.phases.hubspot_sync import sync_to_hubspot
 from app.phases.personalized_outreach import generate_personalized_message
 from app.phases.scoring import run_scoring
 from app.phases.tech_stack import run_tech_stack_check
-from app.salesrobot_client import SalesRobotError
+from app.salesrobot_client import SalesRobotError, list_campaigns
 
 router = APIRouter()
 
@@ -570,6 +570,16 @@ def _find_linkedin_url_in_payload(obj) -> str | None:
             if found:
                 return found
     return None
+
+
+@router.get("/salesrobot/campaigns")
+def get_salesrobot_campaigns(db: Session = Depends(get_db)):
+    """Matches the real campaign name to the UUID stored in Settings (salesrobot_campaign_uuid) --
+    see salesrobot_client.list_campaigns."""
+    try:
+        return list_campaigns(db, ELEPHANT_EDGE_TENANT_ID)
+    except SalesRobotError as e:
+        raise HTTPException(status_code=502, detail=str(e))
 
 
 @router.post("/webhooks/salesrobot/{secret}")
