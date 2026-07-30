@@ -142,6 +142,7 @@ def _build_batch_payload(batch_id: int, page: int, page_size: int, db: Session) 
                 "name": c.name,
                 "domain": c.domain,
                 "source": c.source,
+                "linkedin_url": c.linkedin_url,
                 "contact_count": len(c.contacts),
                 "decision_maker_searched": c.decision_maker_searched_at is not None,
                 "active_head_of_sales_posting": c.active_head_of_sales_posting,

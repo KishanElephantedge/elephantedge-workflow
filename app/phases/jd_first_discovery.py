@@ -168,6 +168,10 @@ def run_jd_first_discovery(batch_id: int, db: Session, tenant_id: int, target: i
                 source="jd_first:theirstack_job_search+crustdata_v3_company_identify",
                 active_job_title=title or None,
                 product_fit_jd_categories=product_fit_categories or None,
+                # Free -- same crustdata_v3_company_identify call above already returns this,
+                # just wasn't being read before. Lets manual verification click straight
+                # through instead of copying the company name into LinkedIn's own search.
+                linkedin_url=firmographics.get("professional_network_url") or None,
             )
 
             if role:

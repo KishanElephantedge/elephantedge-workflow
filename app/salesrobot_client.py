@@ -38,7 +38,7 @@ def list_campaigns(db: Session, tenant_id: int) -> dict:
         except httpx.HTTPError as e:
             attempts.append({"path": path, "error": str(e)})
             continue
-        attempts.append({"path": path, "status": response.status_code})
+        attempts.append({"path": path, "status": response.status_code, "body": response.text[:300]})
         if response.status_code == 200:
             return {"working_path": path, "data": response.json()}
     raise SalesRobotError(f"No known campaigns endpoint responded 200. Attempts: {attempts}")

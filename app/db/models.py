@@ -71,6 +71,10 @@ class Company(Base):
     crunchbase_total_investment_usd = Column(Float, nullable=True)
     headcount_growth_12m_percent = Column(Float, nullable=True)
     source = Column(String, nullable=True)
+    # Company's own LinkedIn page (not a person's) -- captured free from the same Crustdata
+    # company-identify call already made for firmographics (professional_network_url field),
+    # so manual verification doesn't require copying the name into LinkedIn's search by hand.
+    linkedin_url = Column(String, nullable=True)
 
     # Phase 5/8 -- Buying Signal Intelligence. Stage 1 (discovery-time) fields; Stage 2 lives on
     # Contact.thread_role (Phase 4's finding), combined at scoring time, not stored redundantly here.
