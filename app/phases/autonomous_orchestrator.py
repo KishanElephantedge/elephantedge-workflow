@@ -19,7 +19,7 @@ from datetime import datetime, timedelta
 from sqlalchemy.orm import Session
 
 from app.budget_guard import BudgetExceededError, BudgetGuard
-from app.db.models import AutonomousRun, Batch, Company, Parameter, Score
+from app.db.models import AutonomousRun, Batch, Company, Contact, Parameter, Score
 from app.email_client import EmailError, send_email
 from app.slack_client import SlackError, send_slack_message
 from app.export import generate_decision_makers_csv
@@ -27,6 +27,7 @@ from app.phases.buying_signal import run_buying_signal_check
 from app.phases.campaign_execution import run_campaign_execution
 from app.phases.decision_maker import run_decision_maker_id
 from app.phases.discovery import run_discovery
+from app.phases.personalized_outreach import generate_personalized_message
 from app.phases.scoring import run_scoring
 from app.phases.tech_stack import run_tech_stack_check
 from app.phases.jobo_discovery import run_jobo_discovery
@@ -157,19 +158,75 @@ def _select_top_companies(batch: Batch, db: Session, cap: int) -> int:
     return len(keep)
 
 
-def _send_approval_notification(batch: Batch, run: AutonomousRun, decision_maker_result: dict, db: Session, tenant_id: int) -> str | None:
-    """Sent right after Decision Maker completes, before anything reaches the outreach
-    channel. Sends BOTH email and Slack (if configured) -- either or both can fail without
-    ever blocking the approval window itself from being real and honored; failures from
-    either channel are combined into one error string, not raised."""
+def _generate_messages_for_batch(batch_id: int, db: Session, tenant_id: int, guard: BudgetGuard | None = None) -> list[dict]:
+    """Runs Phase 13 for every contact found in this batch, right after Decision Maker and
+    before the approval notification -- so the reviewer sees the drafted outreach message
+    alongside who it's for, not just a bare name/title. One contact's failure (e.g. no
+    LinkedIn URL, a transient Gemini/Claude error) never blocks the others; that contact just
+    shows up without a message and decision-maker info is still visible.
+
+    Shares the SAME BudgetGuard as discovery/decision-maker when one is passed in (the
+    LinkedIn-research step here calls the same Deepline-billed Aviato tool), so the run's
+    overall spend cap still holds end-to-end -- contacts past the cap are simply skipped, not
+    generated unguarded."""
+    contacts = (
+        db.query(Contact)
+        .join(Company)
+        .filter(Company.batch_id == batch_id)
+        .all()
+    )
+    results = []
+    for contact in contacts:
+        entry = {
+            "company_name": contact.company.name,
+            "contact_name": f"{contact.first_name or ''} {contact.last_name or ''}".strip(),
+            "contact_title": contact.title,
+            "linkedin_url": contact.linkedin_url,
+            "message": None,
+            "error": None,
+        }
+        if guard is not None:
+            try:
+                guard.check()
+            except BudgetExceededError as e:
+                entry["error"] = f"Skipped: {e}"
+                results.append(entry)
+                continue
+        try:
+            pm = generate_personalized_message(contact.id, db, tenant_id)
+            entry["message"] = pm.generated_message
+            entry["error"] = pm.error_message
+        except Exception as e:  # noqa: BLE001 -- one contact's failure must never block the rest
+            entry["error"] = str(e)
+        results.append(entry)
+    return results
+
+
+def _send_approval_notification(batch: Batch, run: AutonomousRun, decision_maker_result: dict, db: Session, tenant_id: int, messages: list[dict] | None = None) -> str | None:
+    """Sent right after Decision Maker (and Phase 13 message drafting) completes, before
+    anything reaches the outreach channel. Sends BOTH email and Slack (if configured) -- either
+    or both can fail without ever blocking the approval window itself from being real and
+    honored; failures from either channel are combined into one error string, not raised."""
+    messages = messages or []
     errors = []
+
+    message_block_lines = []
+    for m in messages:
+        header = f"{m['contact_name']} ({m['contact_title'] or 'no title'}) @ {m['company_name']}"
+        if m["message"]:
+            message_block_lines.append(f"{header}\n{m['message']}\n")
+        else:
+            message_block_lines.append(f"{header}\n[No message drafted: {m['error'] or 'unknown reason'}]\n")
+    message_block = "\n---\n".join(message_block_lines)
+
     body = (
         f"Elephant Edge autonomous run for batch #{batch.id} found "
         f"{decision_maker_result['decision_makers_found']} decision-maker(s) across "
         f"{decision_maker_result['companies_checked']} companies checked today.\n\n"
         f"These will be pushed to the configured outreach channel in {APPROVAL_WINDOW_MINUTES} minutes "
         f"unless this run is cancelled first (Autonomous page in the dashboard).\n\n"
-        f"See the attached CSV for the full list of companies and decision-makers found."
+        f"See the attached CSV for the full list of companies and decision-makers found.\n\n"
+        f"Drafted outreach messages:\n\n{message_block}"
     )
     try:
         csv_bytes = generate_decision_makers_csv(batch.id, db)
@@ -184,14 +241,14 @@ def _send_approval_notification(batch: Batch, run: AutonomousRun, decision_maker
     except EmailError as e:
         errors.append(f"email: {e}")
 
+    slack_text = (
+        f":mag: *Elephant Edge* -- batch #{batch.id} found {decision_maker_result['decision_makers_found']} "
+        f"decision-maker(s) across {decision_maker_result['companies_checked']} companies checked.\n"
+        f"Pushes to the outreach channel in {APPROVAL_WINDOW_MINUTES} minutes unless cancelled "
+        f"(Autonomous page in the dashboard).\n\n*Drafted outreach messages:*\n\n{message_block}"
+    )
     try:
-        send_slack_message(
-            f":mag: *Elephant Edge* -- batch #{batch.id} found {decision_maker_result['decision_makers_found']} "
-            f"decision-maker(s) across {decision_maker_result['companies_checked']} companies checked.\n"
-            f"Pushes to the outreach channel in {APPROVAL_WINDOW_MINUTES} minutes unless cancelled "
-            f"(Autonomous page in the dashboard).",
-            db, tenant_id,
-        )
+        send_slack_message(slack_text, db, tenant_id)
     except SlackError as e:
         errors.append(f"slack: {e}")
 
@@ -313,7 +370,8 @@ def run_daily_autonomous_cycle(db: Session, tenant_id: int) -> dict:
         run.awaiting_approval_until = datetime.utcnow() + timedelta(minutes=APPROVAL_WINDOW_MINUTES)
         db.commit()
 
-        notification_error = _send_approval_notification(batch, run, decision_maker_result, db, tenant_id)
+        messages = _generate_messages_for_batch(batch.id, db, tenant_id, guard=guard)
+        notification_error = _send_approval_notification(batch, run, decision_maker_result, db, tenant_id, messages=messages)
 
         return {
             "status": "awaiting_approval",
@@ -403,7 +461,8 @@ def _run_jobo_autonomous_cycle(batch: Batch, run: AutonomousRun, db: Session, te
     run.awaiting_approval_until = datetime.utcnow() + timedelta(minutes=APPROVAL_WINDOW_MINUTES)
     db.commit()
 
-    notification_error = _send_approval_notification(batch, run, decision_maker_result, db, tenant_id)
+    messages = _generate_messages_for_batch(batch.id, db, tenant_id)
+    notification_error = _send_approval_notification(batch, run, decision_maker_result, db, tenant_id, messages=messages)
 
     return {
         "status": "awaiting_approval",
@@ -489,7 +548,8 @@ def _run_jd_first_autonomous_cycle(batch: Batch, run: AutonomousRun, db: Session
     run.awaiting_approval_until = datetime.utcnow() + timedelta(minutes=APPROVAL_WINDOW_MINUTES)
     db.commit()
 
-    notification_error = _send_approval_notification(batch, run, decision_maker_result, db, tenant_id)
+    messages = _generate_messages_for_batch(batch.id, db, tenant_id, guard=guard)
+    notification_error = _send_approval_notification(batch, run, decision_maker_result, db, tenant_id, messages=messages)
 
     return {
         "status": "awaiting_approval",
