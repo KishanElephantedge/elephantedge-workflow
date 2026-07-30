@@ -3,6 +3,7 @@ steps in Phase 13 (personalized outreach) are pure LLM calls with no data-provid
 and Deepline's own pricing for equivalent tools is opaque ("calculated at execution time").
 Real, published Anthropic pricing applies instead."""
 import json
+import logging
 
 import httpx
 from sqlalchemy.orm import Session
@@ -10,8 +11,22 @@ from sqlalchemy.orm import Session
 from app.db.models import Credential
 
 BASE_URL = "https://api.anthropic.com/v1/messages"
-DEFAULT_MODEL = "claude-sonnet-4-5-20250929"
+# Haiku, not Sonnet -- 3x cheaper ($1/$5 per MTok vs $3/$15) and this pipeline's 4 calls are
+# straightforward extraction/synthesis from already-scraped text, not the kind of deep
+# reasoning that needs a bigger model. Confirmed against Anthropic's published pricing page.
+DEFAULT_MODEL = "claude-haiku-4-5-20251001"
 ANTHROPIC_VERSION = "2023-06-01"
+
+# Published per-million-token pricing (input, output), by model -- used to compute the REAL
+# cost of every call from the actual usage Anthropic returns, not an estimate. There's no
+# BudgetGuard/ledger for this feature (it's a manual per-contact dashboard action, not a
+# budget-capped autonomous cycle), so a clear log line is the cost visibility mechanism here.
+MODEL_PRICING_PER_MTOK_USD = {
+    "claude-haiku-4-5-20251001": (1.0, 5.0),
+    "claude-sonnet-4-5-20250929": (3.0, 15.0),
+}
+
+logger = logging.getLogger("claude_client")
 
 
 class ClaudeError(Exception):
@@ -57,6 +72,17 @@ def call_claude(prompt: str, db: Session, tenant_id: int, system: str | None = N
     if response.status_code != 200:
         raise ClaudeError(f"Claude API call failed ({response.status_code}): {response.text}")
     data = response.json()
+
+    usage = data.get("usage", {})
+    input_tokens = usage.get("input_tokens", 0)
+    output_tokens = usage.get("output_tokens", 0)
+    input_price, output_price = MODEL_PRICING_PER_MTOK_USD.get(model, MODEL_PRICING_PER_MTOK_USD[DEFAULT_MODEL])
+    cost_usd = (input_tokens / 1_000_000 * input_price) + (output_tokens / 1_000_000 * output_price)
+    logger.warning(
+        "claude_client call: model=%s input_tokens=%d output_tokens=%d cost_usd=%.5f",
+        model, input_tokens, output_tokens, cost_usd,
+    )
+
     content = data.get("content", [])
     if not content or content[0].get("type") != "text":
         raise ClaudeError(f"Unexpected Claude response shape: {data}")

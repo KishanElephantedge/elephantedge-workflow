@@ -18,9 +18,10 @@ from datetime import datetime
 
 from sqlalchemy.orm import Session
 
-from app.claude_client import ClaudeError, call_claude, call_claude_json
+from app.claude_client import ClaudeError
 from app.db.models import Company, Contact, Parameter, PersonalizedMessage
 from app.deepline_client import DeeplineError, execute_tool
+from app.llm_client import generate_json, generate_text
 from app.website_scraper import ScrapeError, scrape_company_website
 
 DEFAULT_VALUE_PROPOSITION = {
@@ -139,7 +140,7 @@ def run_company_research(company: Company, db: Session, tenant_id: int) -> dict:
         raise ScrapeError("Company has no domain to research")
     website_text = scrape_company_website(company.domain)
     prompt = COMPANY_RESEARCH_PROMPT.format(website_text=website_text, company_name=company.name, domain=company.domain)
-    return call_claude_json(prompt, db, tenant_id, max_tokens=1000)
+    return generate_json(prompt, db, tenant_id, max_tokens=1000)
 
 
 def run_contact_research(contact: Contact, db: Session, tenant_id: int) -> dict:
@@ -154,7 +155,7 @@ def run_contact_research(contact: Contact, db: Session, tenant_id: int) -> dict:
         posts_text = "(no recent posts found)"
     contact_name = f"{contact.first_name or ''} {contact.last_name or ''}".strip()
     prompt = CONTACT_RESEARCH_PROMPT.format(contact_name=contact_name, contact_title=contact.title or "", posts_text=posts_text[:6000])
-    return call_claude_json(prompt, db, tenant_id, max_tokens=1000)
+    return generate_json(prompt, db, tenant_id, max_tokens=1000)
 
 
 def run_fit_analysis(company_research: dict, contact_research: dict, db: Session, tenant_id: int) -> dict:
@@ -164,7 +165,7 @@ def run_fit_analysis(company_research: dict, contact_research: dict, db: Session
         company_research_json=json.dumps(company_research, indent=2),
         contact_research_json=json.dumps(contact_research, indent=2),
     )
-    return call_claude_json(prompt, db, tenant_id, max_tokens=800)
+    return generate_json(prompt, db, tenant_id, max_tokens=800)
 
 
 def run_message_synthesis(contact: Contact, company_research: dict, contact_research: dict, fit_analysis: dict, db: Session, tenant_id: int) -> str:
@@ -174,7 +175,7 @@ def run_message_synthesis(contact: Contact, company_research: dict, contact_rese
         contact_research_json=json.dumps(contact_research, indent=2),
         fit_analysis_json=json.dumps(fit_analysis, indent=2),
     )
-    return call_claude(prompt, db, tenant_id, max_tokens=500)
+    return generate_text(prompt, db, tenant_id, max_tokens=500)
 
 
 def generate_personalized_message(contact_id: int, db: Session, tenant_id: int) -> PersonalizedMessage:
