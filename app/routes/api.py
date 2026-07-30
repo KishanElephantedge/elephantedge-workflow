@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Body, Depends, HTTPException, Request
 from pydantic import BaseModel
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
+from sqlalchemy import func
 
 from app.db.models import AutonomousRun, Batch, CampaignEvent, Company, Contact, Credential, Parameter
 from app.db.session import get_db
@@ -55,6 +56,13 @@ def list_batches(source: str | None = None, db: Session = Depends(get_db)):
             raise HTTPException(status_code=400, detail="source must be 'deepline' or 'jobo'")
         query = query.filter(Batch.source == source)
     batches = query.order_by(Batch.created_at.desc()).all()
+
+    counts = dict(
+        db.query(Company.batch_id, func.count(Company.id))
+        .filter(Company.batch_id.in_([b.id for b in batches]))
+        .group_by(Company.batch_id)
+        .all()
+    )
     return [
         {
             "id": b.id,
@@ -63,7 +71,7 @@ def list_batches(source: str | None = None, db: Session = Depends(get_db)):
             "created_at": b.created_at,
             "current_phase": b.current_phase,
             "status": b.status,
-            "company_count": len(b.companies),
+            "company_count": counts.get(b.id, 0),
         }
         for b in batches
     ]
@@ -75,6 +83,12 @@ def get_batch(batch_id: int, db: Session = Depends(get_db)):
         db.query(Batch)
         .filter(Batch.id == batch_id)
         .filter(Batch.tenant_id == ELEPHANT_EDGE_TENANT_ID)
+        .options(
+            selectinload(Batch.companies).selectinload(Company.score),
+            selectinload(Batch.companies)
+            .selectinload(Company.contacts)
+            .selectinload(Contact.personalized_message),
+        )
         .first()
     )
     if not batch:
