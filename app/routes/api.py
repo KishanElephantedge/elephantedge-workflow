@@ -10,7 +10,7 @@ from app.deepline_client import DeeplineError, get_credit_balance_usd
 from app.heyreach_client import HeyReachError
 from app.hubspot_client import HubSpotError
 from app.outreach.selector import get_outreach_channel
-from app.phases.autonomous_orchestrator import cancel_run, get_autonomous_discovery_source, get_daily_budget_usd, get_daily_company_cap, is_autonomous_enabled, resume_pending_approvals, run_daily_autonomous_cycle
+from app.phases.autonomous_orchestrator import cancel_run, get_autonomous_discovery_source, get_daily_budget_usd, get_daily_company_cap, is_autonomous_enabled, recover_run_to_awaiting_approval, resume_pending_approvals, run_daily_autonomous_cycle
 from app.phases.buying_signal import run_buying_signal_check
 from app.phases.campaign_execution import run_campaign_execution
 from app.phases.decision_maker import run_decision_maker_id
@@ -822,6 +822,14 @@ def cancel_autonomous_run(run_id: int, db: Session = Depends(get_db)):
     """Cancels a run still in its 1-hour approval window -- the periodic sweep checks this
     before ever pushing to the outreach channel. Not cancellable once it's already resumed."""
     return cancel_run(run_id, db, ELEPHANT_EDGE_TENANT_ID)
+
+
+@router.post("/autonomous/runs/{run_id}/recover")
+def recover_autonomous_run(run_id: int, db: Session = Depends(get_db)):
+    """One-off recovery for a run whose status was incorrectly flipped to 'failed' by a
+    notification-layer bug after it had already genuinely reached awaiting_approval -- see
+    recover_run_to_awaiting_approval's docstring."""
+    return recover_run_to_awaiting_approval(run_id, db, ELEPHANT_EDGE_TENANT_ID)
 
 
 @router.post("/autonomous/resume-check")

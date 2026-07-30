@@ -626,6 +626,35 @@ def cancel_run(run_id: int, db: Session, tenant_id: int) -> dict:
     return {"status": "cancelled"}
 
 
+def recover_run_to_awaiting_approval(run_id: int, db: Session, tenant_id: int) -> dict:
+    """One-off recovery for the notification-failure bug just fixed (see email_client.py/
+    autonomous_orchestrator.py commit history): a run that genuinely reached
+    awaiting_approval (real companies discovered, real decision-makers found, batch's own
+    current_phase already correctly "awaiting_approval") got its status incorrectly flipped
+    to "failed" by an unrelated notification-layer error afterward. Restoring status here
+    lets the normal resume_pending_approvals sweep pick it back up and push to the outreach
+    channel once its approval window elapses, exactly as if the bug had never happened. Only
+    allowed when the batch's own phase confirms the run really did get that far."""
+    run = (
+        db.query(AutonomousRun)
+        .join(Batch)
+        .filter(AutonomousRun.id == run_id)
+        .filter(Batch.tenant_id == tenant_id)
+        .first()
+    )
+    if not run:
+        return {"status": "not_found"}
+    if run.batch.current_phase != "awaiting_approval":
+        return {"status": "not_recoverable", "reason": f"batch's current_phase is '{run.batch.current_phase}', not 'awaiting_approval'"}
+    if run.awaiting_approval_until is None:
+        return {"status": "not_recoverable", "reason": "run has no awaiting_approval_until timestamp"}
+    run.status = "awaiting_approval"
+    run.error_message = None
+    run.completed_at = None
+    db.commit()
+    return {"status": "recovered", "awaiting_approval_until": run.awaiting_approval_until}
+
+
 def resume_pending_approvals(db: Session, tenant_id: int) -> dict:
     """Periodic sweep (called every few minutes, not just once) -- resumes any run whose
     approval window has elapsed and wasn't cancelled. Checking on every tick rather than
