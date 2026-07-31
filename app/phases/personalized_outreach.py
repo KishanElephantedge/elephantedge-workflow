@@ -129,8 +129,8 @@ Fit analysis:
 Structure:
 1. A short opening that proves you understand their company and the contact's current priorities (reference a real anchor phrase or recent initiative).
 2. One paragraph positioning our value proposition specifically in relation to what they're dealing with right now -- not a generic pitch.
-3. One line proposing a small, low-commitment next step (a short call, a specific narrow experiment) -- not a hard sell.
-4. If there are non-fit areas, explicitly and briefly acknowledge what we are NOT trying to be, so the message reads as genuinely tailored rather than a template.
+3. One line proposing a small, low-commitment next step (e.g. a short call, or piloting on a narrow slice of their pipeline first) -- not a hard sell. Frame it as confident and easy to say yes to, never as tentative or unproven -- avoid words like "experiment" or "test" that could imply we're not sure this works yet. The smallness is about THEIR commitment, not our confidence.
+4. If there are non-fit areas, acknowledge what we are NOT trying to be -- but only if it adds real clarity, and only as a natural, conversational aside (the kind a person would actually say), never as a formal disclaimer or a "just to be clear, we don't do X" clause. If it can't be phrased that way, leave it out rather than force it in.
 
 Keep it under 150 words. Return ONLY the message text, no subject line, no preamble, no explanation."""
 
