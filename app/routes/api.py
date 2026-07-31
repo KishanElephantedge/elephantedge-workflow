@@ -24,7 +24,7 @@ from app.phases.calendar_sync import sync_calendar_bookings
 from app.phases.personalized_outreach import generate_personalized_message
 from app.phases.scoring import run_scoring
 from app.phases.tech_stack import run_tech_stack_check
-from app.salesrobot_client import SalesRobotError, list_campaigns
+from app.salesrobot_client import SalesRobotError, add_single_prospect, list_campaigns
 
 router = APIRouter()
 
@@ -583,6 +583,34 @@ def get_salesrobot_campaigns(db: Session = Depends(get_db)):
         return list_campaigns(db, ELEPHANT_EDGE_TENANT_ID)
     except SalesRobotError as e:
         raise HTTPException(status_code=502, detail=str(e))
+
+
+@router.post("/salesrobot/test-push")
+def test_salesrobot_push(campaign_uuid: str, linkedin_url: str, personalized_message: str, first_name: str | None = None, db: Session = Depends(get_db)):
+    """One-off test utility -- pushes a single synthetic prospect to any campaign UUID with a
+    known customMap.personalizedMessage value, so we can confirm live whether a SalesRobot
+    campaign's message template actually uses an API-supplied custom field value (vs.
+    SalesRobot's own "AI Variable" generation) before trusting the real pipeline's push. Not
+    tied to a real Contact row -- doesn't touch CampaignPush/scoring/any real pipeline state."""
+    linkedin_account_uuid = (
+        db.query(Parameter)
+        .filter(Parameter.tenant_id == ELEPHANT_EDGE_TENANT_ID)
+        .filter(Parameter.key == "salesrobot_linkedin_account_uuid")
+        .first()
+    )
+    if not linkedin_account_uuid or not linkedin_account_uuid.value:
+        raise HTTPException(status_code=400, detail="salesrobot_linkedin_account_uuid parameter is not set")
+    account_uuid = linkedin_account_uuid.value.get("value") if isinstance(linkedin_account_uuid.value, dict) else linkedin_account_uuid.value
+
+    prospect = {"profileUrl": linkedin_url, "customMap": {"personalizedMessage": personalized_message}}
+    if first_name:
+        prospect["firstName"] = first_name
+
+    try:
+        result = add_single_prospect(campaign_uuid, account_uuid, prospect, db, ELEPHANT_EDGE_TENANT_ID)
+    except SalesRobotError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    return {"sent_customMap": prospect["customMap"], "salesrobot_response": result}
 
 
 @router.post("/webhooks/salesrobot/{secret}")
