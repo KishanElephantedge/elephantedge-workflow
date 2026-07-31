@@ -1,3 +1,5 @@
+from datetime import datetime
+
 from fastapi import APIRouter, Body, Depends, HTTPException, Request
 from pydantic import BaseModel
 from sqlalchemy.orm import Session, selectinload
@@ -254,6 +256,43 @@ def import_companies(batch_id: int, companies: list[CompanyImport], db: Session 
     for c in created:
         db.refresh(c)
     return {"imported": len(created), "companies": [{"id": c.id, "name": c.name, "domain": c.domain} for c in created]}
+
+
+class ContactImport(BaseModel):
+    first_name: str
+    last_name: str | None = None
+    title: str | None = None
+    linkedin_url: str | None = None
+
+
+@router.post("/companies/{company_id}/contacts/import")
+def import_contact(company_id: int, contact: ContactImport, db: Session = Depends(get_db)):
+    """Manually add a contact to a company, bypassing Decision Maker search entirely -- for
+    cases like testing the pipeline on a known contact (e.g. our own team) where an automated
+    search isn't the point."""
+    company = (
+        db.query(Company)
+        .join(Batch)
+        .filter(Company.id == company_id)
+        .filter(Batch.tenant_id == ELEPHANT_EDGE_TENANT_ID)
+        .first()
+    )
+    if not company:
+        raise HTTPException(status_code=404, detail="Company not found")
+    new_contact = Contact(
+        company_id=company_id,
+        first_name=contact.first_name,
+        last_name=contact.last_name,
+        title=contact.title,
+        linkedin_url=contact.linkedin_url,
+        matched_title_reasoning="Manually added, not found via Decision Maker search",
+    )
+    db.add(new_contact)
+    company.decision_maker_searched_at = datetime.utcnow()
+    db.commit()
+    db.refresh(new_contact)
+    bump_batch_version(company.batch_id)
+    return {"id": new_contact.id, "first_name": new_contact.first_name, "last_name": new_contact.last_name}
 
 
 # ---- Phase 3: Company Discovery ----
