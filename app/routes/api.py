@@ -26,7 +26,7 @@ from app.phases.calendar_sync import sync_calendar_bookings
 from app.phases.personalized_outreach import generate_personalized_message
 from app.phases.scoring import run_scoring
 from app.phases.tech_stack import run_tech_stack_check
-from app.salesrobot_client import SalesRobotError, add_single_prospect, list_campaigns
+from app.salesrobot_client import SalesRobotError, add_single_prospect, get_campaign_prospects, list_campaigns
 
 router = APIRouter()
 
@@ -620,6 +620,26 @@ def get_salesrobot_campaigns(db: Session = Depends(get_db)):
     see salesrobot_client.list_campaigns."""
     try:
         return list_campaigns(db, ELEPHANT_EDGE_TENANT_ID)
+    except SalesRobotError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+@router.get("/salesrobot/test-prospects")
+def test_get_campaign_prospects(campaign_uuid: str, db: Session = Depends(get_db)):
+    """One-off test utility -- confirms whether SalesRobot's documented campaign/prospects
+    endpoint actually works live, before building the real Campaigns->Leads->Activity UI
+    around it."""
+    linkedin_account_uuid = (
+        db.query(Parameter)
+        .filter(Parameter.tenant_id == ELEPHANT_EDGE_TENANT_ID)
+        .filter(Parameter.key == "salesrobot_linkedin_account_uuid")
+        .first()
+    )
+    if not linkedin_account_uuid or not linkedin_account_uuid.value:
+        raise HTTPException(status_code=400, detail="salesrobot_linkedin_account_uuid parameter is not set")
+    account_uuid = linkedin_account_uuid.value.get("value") if isinstance(linkedin_account_uuid.value, dict) else linkedin_account_uuid.value
+    try:
+        return get_campaign_prospects(campaign_uuid, account_uuid, db, ELEPHANT_EDGE_TENANT_ID)
     except SalesRobotError as e:
         raise HTTPException(status_code=502, detail=str(e))
 
