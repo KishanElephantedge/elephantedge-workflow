@@ -22,26 +22,20 @@ def _get_api_key(db: Session, tenant_id: int) -> str:
     return cred.value
 
 
-def list_campaigns(db: Session, tenant_id: int) -> dict:
-    """Looks up real campaign names from SalesRobot -- so a stored UUID (e.g.
-    salesrobot_campaign_uuid) can be matched to the human-readable name it refers to. The
-    exact endpoint path isn't documented anywhere available here, so this tries the handful
-    of plausible REST conventions and returns whichever one actually responds, tagged with
-    which path worked (temporary diagnostic detail, fine to simplify once confirmed)."""
+def list_campaigns(linkedin_account_uuid: str, db: Session, tenant_id: int, page: int = 0, size: int = 50) -> dict:
+    """Real, documented endpoint (docs.salesrobot.co/reference/getcampaigns) -- the earlier
+    version of this function guessed at paths and got a 400 from the correct one (/campaigns)
+    because linkedinAccountUuid is a required query param, not because the path was wrong."""
     api_key = _get_api_key(db, tenant_id)
-    headers = {"X-API-KEY": api_key, "content-type": "application/json;charset=UTF-8"}
-    candidate_paths = ["/campaigns", "/get-campaigns", "/campaign/list", "/list-campaigns", "/get-all-campaigns"]
-    attempts = []
-    for path in candidate_paths:
-        try:
-            response = httpx.get(f"{BASE_URL}{path}", headers=headers, timeout=15)
-        except httpx.HTTPError as e:
-            attempts.append({"path": path, "error": str(e)})
-            continue
-        attempts.append({"path": path, "status": response.status_code, "body": response.text[:300]})
-        if response.status_code == 200:
-            return {"working_path": path, "data": response.json()}
-    raise SalesRobotError(f"No known campaigns endpoint responded 200. Attempts: {attempts}")
+    response = httpx.get(
+        f"{BASE_URL}/campaigns",
+        params={"linkedinAccountUuid": linkedin_account_uuid, "page": page, "size": size},
+        headers={"X-API-KEY": api_key, "content-type": "application/json;charset=UTF-8"},
+        timeout=30,
+    )
+    if response.status_code != 200:
+        raise SalesRobotError(f"campaigns failed ({response.status_code}): {response.text}")
+    return response.json()
 
 
 def get_campaign_prospects(campaign_uuid: str, linkedin_account_uuid: str, db: Session, tenant_id: int, page: int = 0, size: int = 50) -> dict:

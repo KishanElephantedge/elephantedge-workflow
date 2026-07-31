@@ -1,3 +1,4 @@
+import json
 from datetime import datetime
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Request
@@ -614,34 +615,74 @@ def _find_linkedin_url_in_payload(obj) -> str | None:
     return None
 
 
-@router.get("/salesrobot/campaigns")
-def get_salesrobot_campaigns(db: Session = Depends(get_db)):
-    """Matches the real campaign name to the UUID stored in Settings (salesrobot_campaign_uuid) --
-    see salesrobot_client.list_campaigns."""
-    try:
-        return list_campaigns(db, ELEPHANT_EDGE_TENANT_ID)
-    except SalesRobotError as e:
-        raise HTTPException(status_code=502, detail=str(e))
-
-
-@router.get("/salesrobot/test-prospects")
-def test_get_campaign_prospects(campaign_uuid: str, db: Session = Depends(get_db)):
-    """One-off test utility -- confirms whether SalesRobot's documented campaign/prospects
-    endpoint actually works live, before building the real Campaigns->Leads->Activity UI
-    around it."""
-    linkedin_account_uuid = (
+def _get_salesrobot_linkedin_account_uuid(db: Session) -> str:
+    param = (
         db.query(Parameter)
         .filter(Parameter.tenant_id == ELEPHANT_EDGE_TENANT_ID)
         .filter(Parameter.key == "salesrobot_linkedin_account_uuid")
         .first()
     )
-    if not linkedin_account_uuid or not linkedin_account_uuid.value:
+    if not param or not param.value:
         raise HTTPException(status_code=400, detail="salesrobot_linkedin_account_uuid parameter is not set")
-    account_uuid = linkedin_account_uuid.value.get("value") if isinstance(linkedin_account_uuid.value, dict) else linkedin_account_uuid.value
+    return param.value.get("value") if isinstance(param.value, dict) else param.value
+
+
+@router.get("/salesrobot/campaigns")
+def get_salesrobot_campaigns(db: Session = Depends(get_db)):
+    """Level 1 of the Campaigns -> Leads -> Activity view -- real campaign list per
+    SalesRobot's own docs.salesrobot.co/reference/getcampaigns."""
+    account_uuid = _get_salesrobot_linkedin_account_uuid(db)
     try:
-        return get_campaign_prospects(campaign_uuid, account_uuid, db, ELEPHANT_EDGE_TENANT_ID)
+        result = list_campaigns(account_uuid, db, ELEPHANT_EDGE_TENANT_ID)
     except SalesRobotError as e:
         raise HTTPException(status_code=502, detail=str(e))
+    return result.get("data", {}).get("data", [])
+
+
+@router.get("/salesrobot/campaigns/{campaign_uuid}/leads")
+def get_salesrobot_campaign_leads(campaign_uuid: str, db: Session = Depends(get_db)):
+    """Level 2 -- real per-prospect status (lastActivity, status) for a campaign, per
+    docs.salesrobot.co/reference/getprospectsforcampaign. Trimmed to the fields the UI
+    actually shows; the full raw record is still available for the Activity drill-down."""
+    account_uuid = _get_salesrobot_linkedin_account_uuid(db)
+    try:
+        result = get_campaign_prospects(campaign_uuid, account_uuid, db, ELEPHANT_EDGE_TENANT_ID)
+    except SalesRobotError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    prospects = result.get("data", {}).get("data", [])
+    return [
+        {
+            "prospectUuid": p.get("prospectUuid"),
+            "fullName": p.get("fullName"),
+            "jobTitle": p.get("jobTitle"),
+            "companyName": p.get("companyName"),
+            "profileUrl": p.get("profileUrl"),
+            "lastActivity": p.get("lastActivity"),
+            "status": p.get("status"),
+            "raw": p,
+        }
+        for p in prospects
+    ]
+
+
+@router.get("/salesrobot/leads/activity")
+def get_lead_activity(profile_url: str, db: Session = Depends(get_db)):
+    """Level 3 -- historical events for one lead, matched by scanning received webhook
+    payloads for their LinkedIn profile URL (same best-effort approach as the webhook
+    receiver's own contact matching). The live status snapshot (lastActivity/status) comes
+    from the leads endpoint above; this is the timestamped history on top of that."""
+    profile_key = profile_url.rstrip("/").lower()
+    events = db.query(CampaignEvent).order_by(CampaignEvent.received_at.desc()).limit(500).all()
+    matching = [e for e in events if profile_key in json.dumps(e.raw_payload).lower()]
+    return [
+        {
+            "id": e.id,
+            "event_type": e.event_type,
+            "received_at": e.received_at,
+            "raw_payload": e.raw_payload,
+        }
+        for e in matching
+    ]
 
 
 @router.post("/salesrobot/test-push")
@@ -651,16 +692,7 @@ def test_salesrobot_push(campaign_uuid: str, linkedin_url: str, personalized_mes
     campaign's message template actually uses an API-supplied custom field value (vs.
     SalesRobot's own "AI Variable" generation) before trusting the real pipeline's push. Not
     tied to a real Contact row -- doesn't touch CampaignPush/scoring/any real pipeline state."""
-    linkedin_account_uuid = (
-        db.query(Parameter)
-        .filter(Parameter.tenant_id == ELEPHANT_EDGE_TENANT_ID)
-        .filter(Parameter.key == "salesrobot_linkedin_account_uuid")
-        .first()
-    )
-    if not linkedin_account_uuid or not linkedin_account_uuid.value:
-        raise HTTPException(status_code=400, detail="salesrobot_linkedin_account_uuid parameter is not set")
-    account_uuid = linkedin_account_uuid.value.get("value") if isinstance(linkedin_account_uuid.value, dict) else linkedin_account_uuid.value
-
+    account_uuid = _get_salesrobot_linkedin_account_uuid(db)
     prospect = {"profileUrl": linkedin_url, "customMap": {"personalizedMessage": personalized_message}}
     if first_name:
         prospect["firstName"] = first_name
