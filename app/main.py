@@ -1,10 +1,11 @@
 from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.db.session import SessionLocal, ensure_indexes
 from app.google_calendar_client import GoogleCalendarError
-from app.phases.autonomous_orchestrator import resume_pending_approvals, run_daily_autonomous_cycle
+from app.phases.autonomous_orchestrator import get_autonomous_schedule_utc, resume_pending_approvals, run_daily_autonomous_cycle
 from app.phases.calendar_sync import sync_calendar_bookings
 from app.routes import api
 from app.routes.api import ELEPHANT_EDGE_TENANT_ID, refresh_active_batch_caches
@@ -76,10 +77,23 @@ def _scheduled_calendar_sync():
         db.close()
 
 
+def reschedule_autonomous_job(hour: int, minute: int):
+    """Called from the Settings save endpoint so a new schedule time takes effect
+    immediately -- no redeploy/restart needed. CronTrigger fires at this exact wall-clock
+    time every day, unaffected by when the process itself started (unlike the old
+    interval-based job, whose "24h from now" countdown restarted on every deploy)."""
+    scheduler.reschedule_job("autonomous_daily_cycle", trigger=CronTrigger(hour=hour, minute=minute, timezone="UTC"))
+
+
 @app.on_event("startup")
 def on_startup():
     ensure_indexes()
-    scheduler.add_job(_scheduled_autonomous_tick, "interval", hours=24, id="autonomous_daily_cycle")
+    db = SessionLocal()
+    try:
+        hour, minute = get_autonomous_schedule_utc(db, ELEPHANT_EDGE_TENANT_ID)
+    finally:
+        db.close()
+    scheduler.add_job(_scheduled_autonomous_tick, CronTrigger(hour=hour, minute=minute, timezone="UTC"), id="autonomous_daily_cycle")
     scheduler.add_job(_scheduled_approval_sweep, "interval", minutes=5, id="approval_window_sweep")
     scheduler.add_job(_scheduled_cache_refresh, "interval", minutes=3, id="batch_cache_refresh")
     scheduler.add_job(_scheduled_calendar_sync, "interval", minutes=15, id="calendar_booking_sync")

@@ -11,7 +11,7 @@ from app.deepline_client import DeeplineError, get_credit_balance_usd
 from app.heyreach_client import HeyReachError
 from app.hubspot_client import HubSpotError
 from app.outreach.selector import get_outreach_channel
-from app.phases.autonomous_orchestrator import cancel_run, get_autonomous_discovery_source, get_daily_budget_usd, get_daily_company_cap, is_autonomous_enabled, recover_run_to_awaiting_approval, resend_approval_notification, resume_pending_approvals, run_daily_autonomous_cycle
+from app.phases.autonomous_orchestrator import cancel_run, get_autonomous_discovery_source, get_autonomous_schedule_utc, get_daily_budget_usd, get_daily_company_cap, is_autonomous_enabled, recover_run_to_awaiting_approval, resend_approval_notification, resume_pending_approvals, run_daily_autonomous_cycle
 from app.phases.buying_signal import run_buying_signal_check
 from app.phases.campaign_execution import run_campaign_execution
 from app.phases.decision_maker import run_decision_maker_id
@@ -777,6 +777,7 @@ def get_autonomous_status(db: Session = Depends(get_db)):
         "daily_budget_usd": get_daily_budget_usd(db, ELEPHANT_EDGE_TENANT_ID),
         "daily_company_cap": get_daily_company_cap(db, ELEPHANT_EDGE_TENANT_ID),
         "discovery_source": get_autonomous_discovery_source(db, ELEPHANT_EDGE_TENANT_ID),
+        "schedule_utc": dict(zip(("hour", "minute"), get_autonomous_schedule_utc(db, ELEPHANT_EDGE_TENANT_ID))),
         "last_run": {
             "id": last_run.id,
             "batch_id": last_run.batch_id,
@@ -805,6 +806,33 @@ def toggle_autonomous(enabled: bool, db: Session = Depends(get_db)):
         db.add(param)
     db.commit()
     return {"enabled": enabled}
+
+
+@router.post("/autonomous/schedule")
+def set_autonomous_schedule(hour: int, minute: int, db: Session = Depends(get_db)):
+    """Fixed daily UTC time the autonomous cycle fires at. Applies immediately (no redeploy
+    needed) -- reschedule_autonomous_job calls scheduler.reschedule_job on the live
+    APScheduler instance. Import is deferred to avoid a circular import (main.py imports
+    this router; this route needs something back from main.py)."""
+    if not (0 <= hour <= 23) or not (0 <= minute <= 59):
+        raise HTTPException(status_code=400, detail="hour must be 0-23, minute must be 0-59")
+    param = (
+        db.query(Parameter)
+        .filter(Parameter.tenant_id == ELEPHANT_EDGE_TENANT_ID)
+        .filter(Parameter.key == "autonomous_schedule_utc")
+        .first()
+    )
+    if param:
+        param.value = {"hour": hour, "minute": minute}
+    else:
+        param = Parameter(tenant_id=ELEPHANT_EDGE_TENANT_ID, key="autonomous_schedule_utc", value={"hour": hour, "minute": minute},
+                           description="Fixed daily UTC time the autonomous cycle fires at")
+        db.add(param)
+    db.commit()
+
+    from app.main import reschedule_autonomous_job
+    reschedule_autonomous_job(hour, minute)
+    return {"hour": hour, "minute": minute}
 
 
 @router.post("/autonomous/discovery-source")

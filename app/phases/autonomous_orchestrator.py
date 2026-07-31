@@ -37,6 +37,8 @@ from app.outreach.selector import get_outreach_channel
 DEFAULT_DAILY_COMPANY_CAP = 5
 DEFAULT_DAILY_BUDGET_USD = 1.0
 DEFAULT_DISCOVERY_SOURCE = "deepline"
+DEFAULT_SCHEDULE_HOUR_UTC = 9
+DEFAULT_SCHEDULE_MINUTE_UTC = 0
 DISCOVERY_PAGE_SIZE = 10
 DISCOVERY_MAX_CHECKED = 50
 STALE_RUN_TIMEOUT_MINUTES = 120
@@ -50,6 +52,18 @@ def _get_tenant_param(db: Session, tenant_id: int, key: str) -> Parameter | None
         .filter(Parameter.key == key)
         .first()
     )
+
+
+def get_autonomous_schedule_utc(db: Session, tenant_id: int) -> tuple[int, int]:
+    """Fixed wall-clock time (UTC) the daily autonomous cycle fires at -- deliberately a
+    CronTrigger at this hour/minute, not an interval timer. An interval timer's countdown
+    restarts from whenever the process last started, so every deploy silently pushed the
+    "24h from now" target later -- confirmed live as the reason a run's actual fire time kept
+    drifting. A fixed time is unaffected by deploys/restarts."""
+    param = _get_tenant_param(db, tenant_id, "autonomous_schedule_utc")
+    if param and param.value and "hour" in param.value and "minute" in param.value:
+        return int(param.value["hour"]), int(param.value["minute"])
+    return DEFAULT_SCHEDULE_HOUR_UTC, DEFAULT_SCHEDULE_MINUTE_UTC
 
 
 def is_autonomous_enabled(db: Session, tenant_id: int) -> bool:
