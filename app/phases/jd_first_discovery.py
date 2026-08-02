@@ -60,7 +60,15 @@ JD_FIRST_MAX_REVENUE_USD = 5_000_000  # tightened from discovery.py's shared $10
 # exclude any company whose revenue IS known and between $5-10M.
 
 
-def _search_jobs_page(offset: int, limit: int) -> list[dict]:
+def _search_jobs_page(offset: int, limit: int, exclude_domains: list[str]) -> list[dict]:
+    """exclude_domains: passed as company_domain_not, a real TheirStack filter -- this
+    endpoint bills per result returned (confirmed live: 2.76-5.52 credits per 25-result page,
+    regardless of how many of those results turn out to be already-known companies we just
+    throw away). Without this filter, a company we've already discovered in any prior run
+    keeps re-surfacing on every subsequent daily run (it's still actively hiring for the same
+    role) and we pay TheirStack for that result every single time before rejecting it locally.
+    Excluding at the query level means TheirStack itself skips those postings, so we only ever
+    pay for postings that have at least a chance of being new."""
     response = execute_tool(
         "theirstack_job_search",
         {
@@ -72,6 +80,7 @@ def _search_jobs_page(offset: int, limit: int) -> list[dict]:
             "max_revenue_usd": JD_FIRST_MAX_REVENUE_USD,
             "max_funding_usd": JD_FIRST_MAX_FUNDING_USD,
             "job_country_code_or": ["US"],
+            "company_domain_not": exclude_domains,
             "order_by": [{"field": "date_posted", "desc": True}],
             "offset": offset,
             "limit": limit,
@@ -123,7 +132,7 @@ def run_jd_first_discovery(batch_id: int, db: Session, tenant_id: int, target: i
             except BudgetExceededError:
                 budget_stopped_early = True
                 break
-        jobs = _search_jobs_page(offset, jobs_per_page)
+        jobs = _search_jobs_page(offset, jobs_per_page, list(seen_domains))
         if not jobs:
             break
         offset += len(jobs)
