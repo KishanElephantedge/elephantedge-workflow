@@ -77,12 +77,27 @@ def _scheduled_calendar_sync():
         db.close()
 
 
+AUTONOMOUS_MISFIRE_GRACE_SECONDS = 7200
+
+
 def reschedule_autonomous_job(hour: int, minute: int):
     """Called from the Settings save endpoint so a new schedule time takes effect
     immediately -- no redeploy/restart needed. CronTrigger fires at this exact wall-clock
     time every day, unaffected by when the process itself started (unlike the old
-    interval-based job, whose "24h from now" countdown restarted on every deploy)."""
-    scheduler.reschedule_job("autonomous_daily_cycle", trigger=CronTrigger(hour=hour, minute=minute, timezone="UTC"))
+    interval-based job, whose "24h from now" countdown restarted on every deploy).
+
+    misfire_grace_time matters here: found live that 2 daily runs (2026-07-31, 2026-08-01)
+    were silently skipped entirely, with no error anywhere, because APScheduler's default
+    misfire handling only fires a job if the process is alive within ~1 second of its exact
+    trigger time -- if the container happened to be mid-restart/outage at that exact moment,
+    the job is just dropped, not deferred. A 2-hour grace window means a restart overlapping
+    09:00 UTC still fires the job (late) as soon as the process comes back, instead of
+    silently waiting a full 24h for the next tick."""
+    scheduler.reschedule_job(
+        "autonomous_daily_cycle",
+        trigger=CronTrigger(hour=hour, minute=minute, timezone="UTC"),
+        misfire_grace_time=AUTONOMOUS_MISFIRE_GRACE_SECONDS,
+    )
 
 
 @app.on_event("startup")
@@ -93,7 +108,12 @@ def on_startup():
         hour, minute = get_autonomous_schedule_utc(db, ELEPHANT_EDGE_TENANT_ID)
     finally:
         db.close()
-    scheduler.add_job(_scheduled_autonomous_tick, CronTrigger(hour=hour, minute=minute, timezone="UTC"), id="autonomous_daily_cycle")
+    scheduler.add_job(
+        _scheduled_autonomous_tick,
+        CronTrigger(hour=hour, minute=minute, timezone="UTC"),
+        id="autonomous_daily_cycle",
+        misfire_grace_time=AUTONOMOUS_MISFIRE_GRACE_SECONDS,
+    )
     scheduler.add_job(_scheduled_approval_sweep, "interval", minutes=5, id="approval_window_sweep")
     scheduler.add_job(_scheduled_cache_refresh, "interval", minutes=3, id="batch_cache_refresh")
     scheduler.add_job(_scheduled_calendar_sync, "interval", minutes=15, id="calendar_booking_sync")

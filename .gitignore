@@ -5,3 +5,4 @@ __pycache__/
 venv/
 node_modules/
 data/*.csv
+company-research-drive/
