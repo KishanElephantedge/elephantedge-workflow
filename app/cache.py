@@ -8,7 +8,17 @@ import redis
 # surface. It's a pure cache: if it's ever unreachable, every function here degrades to a
 # silent no-op (cache miss / skipped write) rather than raising, so a cache outage can never
 # turn into a request failure -- the caller just falls through to querying the DB directly.
-_client = redis.Redis(host="localhost", port=6379, decode_responses=True, socket_connect_timeout=1)
+_client = redis.Redis(
+    host="localhost", port=6379, decode_responses=True,
+    socket_connect_timeout=1,
+    # socket_connect_timeout only bounds opening the connection -- once connected, a
+    # GET/SET/ZADD with no socket_timeout blocks forever if Redis ever stalls on a command,
+    # hanging the request thread indefinitely with no exception ever raised for the
+    # except-and-fall-through-to-DB pattern below to catch. Not confirmed as the cause of
+    # the real 502 pattern seen this session (that predates Redis being added at all), but
+    # a genuine latent gap worth closing regardless.
+    socket_timeout=1,
+)
 
 # Sorted set of cache keys that have been read recently, scored by last-read unix time --
 # lets the background refresher find "what's actually being viewed" without scanning all of
