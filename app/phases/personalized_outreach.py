@@ -14,7 +14,7 @@ pipeline -- degraded input, not a hard stop, since a message with less context i
 better than no message.
 """
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from sqlalchemy.orm import Session
 
@@ -143,6 +143,27 @@ def run_company_research(company: Company, db: Session, tenant_id: int) -> dict:
     return generate_json(prompt, db, tenant_id, max_tokens=1000)
 
 
+RECENT_POST_MAX_AGE_DAYS = 90
+
+
+def _is_recent_post(post: dict) -> bool:
+    """Found live: a real message called a 9-month-old post 'recent' and congratulated the
+    contact on it as if it just happened -- the LLM was only ever given the post's text, with
+    no age information at all, so it had no way to know otherwise. Aviato's response does
+    include a real timestamp (postRange.latest) that was simply never being read. Filtering
+    here, before anything reaches the prompt, means a stale post can never again be mistaken
+    for current news -- more reliable than hoping the model correctly weighs an age hint in
+    the text."""
+    latest = (post.get("postRange") or {}).get("latest")
+    if not latest:
+        return False
+    try:
+        post_date = datetime.fromisoformat(latest.replace("Z", "+00:00")).replace(tzinfo=None)
+    except ValueError:
+        return False
+    return post_date >= datetime.utcnow() - timedelta(days=RECENT_POST_MAX_AGE_DAYS)
+
+
 def run_contact_research(contact: Contact, db: Session, tenant_id: int) -> dict:
     if not contact.linkedin_url:
         raise DeeplineError("Contact has no LinkedIn URL to research")
@@ -150,7 +171,8 @@ def run_contact_research(contact: Contact, db: Session, tenant_id: int) -> dict:
     response = execute_tool("aviato_get_person_posts", {"linkedinID": linkedin_id})
     raw = response.get("toolResponse", {}).get("raw", {})
     posts = raw.get("results", []) if isinstance(raw, dict) else []
-    posts_text = "\n\n".join(p.get("commentary", "") for p in posts if p.get("commentary"))
+    recent_posts = [p for p in posts if _is_recent_post(p)]
+    posts_text = "\n\n".join(p.get("commentary", "") for p in recent_posts if p.get("commentary"))
     if not posts_text:
         posts_text = "(no recent posts found)"
     contact_name = f"{contact.first_name or ''} {contact.last_name or ''}".strip()
