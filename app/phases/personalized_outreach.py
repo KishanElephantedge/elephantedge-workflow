@@ -170,11 +170,14 @@ A key part of what I'm working on is an autonomous, AI-led sales motion. Rather 
 Slip Robotics is scaling rapidly, and I imagine you've encountered some interesting challenges around pipeline generation, sales execution, and GTM as you've grown.
 Would you be open to a 20-minute conversation? My goal is simply to understand your current GTM and sales process, the bottlenecks you're seeing, and where you think AI could genuinely help. This isn't a sales call, I'm looking to learn from operators building great companies."""
 
+SENDER_REAL_CONTEXT = "A serial founder currently building a Fractional GTM business, genuinely interested in autonomous/AI-led sales -- this is the one real, true thing about the sender."
+
 CURIOSITY_MESSAGE_SYNTHESIS_PROMPT = """Write a short LinkedIn outreach message in the TONE and SPIRIT of the two real examples below -- genuinely curious, not selling anything, asking to learn from this specific person's real experience. These examples are style/intent reference ONLY, not templates: do not copy their structure, opening line, or wording, and do not force a line like "you're leading Sales at X" onto someone whose real role is different. Vary structure and phrasing naturally based on THIS contact's real research -- do not mechanically repeat the same skeleton you'd use for anyone else.
 
 {examples}
 
 Sender's name (sign off with this): {sender_name}
+The one true fact about who the sender is: {sender_context}
 Contact first name: {first_name}
 Contact's real title: {contact_title}
 Company name: {company_name}
@@ -187,7 +190,9 @@ Contact research:
 
 Rules:
 - No product/service pitch of any kind. Nothing about what we offer, sell, or could help with.
+- Always include the one true fact about the sender given above, in your own plain words, in every message -- do not drop it, and do not adapt or reword it to sound like it matches the recipient's own specific domain (e.g. never claim to be building loan-servicing AI, security infrastructure, farming tech, etc. just because that happens to be the recipient's business -- that would be fabricating what the sender does).
 - Reference something real and specific about THIS company/contact from the research above -- naturally, in a way that fits their actual role (don't invent a role or initiative that isn't supported by the research).
+- Keep the language plain and casual, the way the two real examples are written -- short, simple sentences, like a real person typing a message, not a formal business tone. Avoid corporate-sounding phrases (e.g. "operator experience," "architectural challenges," "hands-on experience").
 - Ask for a short (15-20 minute), no-pressure conversation to learn from their real experience -- frame it as genuine curiosity, not a disguised sales call.
 - Never name a specific day, date, or time frame.
 - Sign off with the sender's name given above.
@@ -198,6 +203,7 @@ def run_curiosity_message_synthesis(contact: Contact, company_research: dict, co
     prompt = CURIOSITY_MESSAGE_SYNTHESIS_PROMPT.format(
         examples=CURIOSITY_MESSAGE_EXAMPLES,
         sender_name=_get_sender_name(db, tenant_id),
+        sender_context=SENDER_REAL_CONTEXT,
         first_name=contact.first_name or "there",
         contact_title=contact.title or "unknown",
         company_name=contact.company.name if contact.company else "unknown",
