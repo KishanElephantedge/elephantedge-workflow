@@ -50,12 +50,25 @@ class SalesRobotChannel(OutreachChannel):
         # Only an APPROVED Phase 13 message is ever sent -- draft/rejected/no-message
         # contacts still get pushed (this gate is deliberately separate from message
         # approval, see autonomous_orchestrator.py), just without a personalized note.
-        # SalesRobot's connection-request/first-message template has to reference this exact
-        # key (e.g. a {{personalizedMessage}} placeholder) for it to actually appear in what
-        # gets sent -- that's configured in SalesRobot's own campaign editor, not here.
+        # SalesRobot's connection-request/message step templates have to reference these
+        # exact keys ({{connectionNote}} / {{personalizedMessage}}) for them to actually
+        # appear in what gets sent -- configured in SalesRobot's own campaign editor, not
+        # here. Two separate fields, not one shared one: found live that a single shared
+        # field meant the connection note and the post-acceptance follow-up message were
+        # literally the same text, since both steps' templates referenced the same
+        # placeholder -- there was nothing else for the second step to display. connectionNote
+        # is a short, free, template-based line (no extra LLM cost) specifically sized for a
+        # connection request; personalizedMessage remains the real, full Phase 13 message,
+        # meant only for the follow-up step sent after acceptance.
         pm = contact.personalized_message
         if pm and pm.status == "approved" and pm.generated_message:
-            prospect["customMap"] = {"personalizedMessage": pm.generated_message}
+            company_name = contact.company.name if contact.company and contact.company.name else None
+            note = f"Hi {contact.first_name}, I'd love to connect"
+            note += f" -- following what {company_name} is building." if company_name else "."
+            prospect["customMap"] = {
+                "connectionNote": note,
+                "personalizedMessage": pm.generated_message,
+            }
 
         try:
             add_single_prospect(campaign_uuid, linkedin_account_uuid, prospect, self.db, self.tenant_id)

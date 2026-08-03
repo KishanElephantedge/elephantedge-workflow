@@ -686,14 +686,23 @@ def get_lead_activity(profile_url: str, db: Session = Depends(get_db)):
 
 
 @router.post("/salesrobot/test-push")
-def test_salesrobot_push(campaign_uuid: str, linkedin_url: str, personalized_message: str, first_name: str | None = None, db: Session = Depends(get_db)):
-    """One-off test utility -- pushes a single synthetic prospect to any campaign UUID with a
-    known customMap.personalizedMessage value, so we can confirm live whether a SalesRobot
-    campaign's message template actually uses an API-supplied custom field value (vs.
-    SalesRobot's own "AI Variable" generation) before trusting the real pipeline's push. Not
-    tied to a real Contact row -- doesn't touch CampaignPush/scoring/any real pipeline state."""
+def test_salesrobot_push(campaign_uuid: str, linkedin_url: str, personalized_message: str, first_name: str | None = None, connection_note: str | None = None, db: Session = Depends(get_db)):
+    """One-off test utility -- pushes a single synthetic prospect to any campaign UUID with
+    known customMap values, so we can confirm live whether a SalesRobot campaign's message
+    templates actually use API-supplied custom field values (vs. SalesRobot's own "AI
+    Variable" generation) before trusting the real pipeline's push. Not tied to a real
+    Contact row -- doesn't touch CampaignPush/scoring/any real pipeline state.
+
+    connection_note mirrors the real push path (app/outreach/salesrobot.py): a separate
+    short field for the connection-request step, distinct from personalizedMessage (the
+    full follow-up message) -- defaults to a generic line if not given, same shape as
+    production, so this test reflects what the real system will actually do."""
     account_uuid = _get_salesrobot_linkedin_account_uuid(db)
-    prospect = {"profileUrl": linkedin_url, "customMap": {"personalizedMessage": personalized_message}}
+    note = connection_note or f"Hi {first_name or 'there'}, I'd love to connect."
+    prospect = {
+        "profileUrl": linkedin_url,
+        "customMap": {"connectionNote": note, "personalizedMessage": personalized_message},
+    }
     if first_name:
         prospect["firstName"] = first_name
 
