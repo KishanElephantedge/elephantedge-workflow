@@ -142,7 +142,7 @@ Fit analysis:
 {fit_analysis_json}
 
 Structure:
-1. A short opening that proves you understand their company and the contact's current priorities (reference a real anchor phrase or recent initiative).
+1. A short opening that proves you understand their company and the contact's current priorities (reference a real anchor phrase or recent initiative). Avoid anchor phrases that are specific, sensitive comparison claims (e.g. "our AI outperforms human agents") -- referencing those too literally reads as an odd, oddly-specific thing for a stranger to bring up. Pick a neutral, substantive detail instead.
 2. One paragraph positioning our value proposition specifically in relation to what they're dealing with right now -- not a generic pitch.
 3. One line proposing a small, low-commitment next step (e.g. a short call, or piloting on a narrow slice of their pipeline first) -- not a hard sell. Frame it as confident and easy to say yes to, never as tentative or unproven -- avoid words like "experiment" or "test" that could imply we're not sure this works yet. The smallness is about THEIR commitment, not our confidence. Never name a specific day, date, or time frame (e.g. "next Tuesday," "this week") -- the message may not even be read until well after any day named in it, which reads as stale or presumptuous. Keep the ask open-ended (e.g. "open to a quick call?").
 4. If there are non-fit areas, acknowledge what we are NOT trying to be -- but only if it adds real clarity, and only as a natural, conversational aside (the kind a person would actually say), never as a formal disclaimer or a "just to be clear, we don't do X" clause. If it can't be phrased that way, leave it out rather than force it in.
