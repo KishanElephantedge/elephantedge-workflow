@@ -490,7 +490,9 @@ def backfill_hubspot_sync(batch_id: int, db: Session = Depends(get_db)):
 # so a human can review/edit any stage, not just the final message.
 
 @router.post("/contacts/{contact_id}/generate-message")
-def generate_message(contact_id: int, db: Session = Depends(get_db)):
+def generate_message(contact_id: int, style: str = "pitch", db: Session = Depends(get_db)):
+    """style: "pitch" (default, pitches our value proposition) or "curiosity" (the lead's
+    real, tested no-pitch alternative -- see personalized_outreach.py)."""
     contact = (
         db.query(Contact)
         .join(Company)
@@ -500,7 +502,7 @@ def generate_message(contact_id: int, db: Session = Depends(get_db)):
     )
     if not contact:
         raise HTTPException(status_code=404, detail="Contact not found")
-    pm = generate_personalized_message(contact_id, db, ELEPHANT_EDGE_TENANT_ID)
+    pm = generate_personalized_message(contact_id, db, ELEPHANT_EDGE_TENANT_ID, style=style)
     bump_batch_version(contact.company.batch_id)
     return {
         "contact_id": contact_id,

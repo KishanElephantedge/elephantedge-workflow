@@ -47,6 +47,21 @@ def _get_value_proposition(db: Session, tenant_id: int) -> dict:
     return param.value if param and param.value else DEFAULT_VALUE_PROPOSITION
 
 
+DEFAULT_SENDER_NAME = "the founder"
+
+
+def _get_sender_name(db: Session, tenant_id: int) -> str:
+    param = (
+        db.query(Parameter)
+        .filter(Parameter.tenant_id == tenant_id)
+        .filter(Parameter.key == "outreach_sender_name")
+        .first()
+    )
+    if param and param.value and isinstance(param.value, dict) and param.value.get("name"):
+        return param.value["name"]
+    return DEFAULT_SENDER_NAME
+
+
 COMPANY_RESEARCH_PROMPT = """You are analyzing a company's website content to build a structured research summary for a B2B sales outreach tool.
 
 Website content (scraped from their homepage and product/about pages):
@@ -134,6 +149,63 @@ Structure:
 
 Keep it under 150 words. Return ONLY the message text, no subject line, no preamble, no explanation."""
 
+# Real examples the lead has actually sent and gotten replies on -- given here as TONE/INTENT
+# reference only, not templates. Both happen to open with "you're leading Sales at X" because
+# both real recipients were Sales leaders; that line does not generalize to every contact
+# (several of ours are CEOs/Co-Founders/Product roles) and must not be copied verbatim. The
+# prompt below explicitly instructs the model to vary wording and structure per contact based
+# on their real research, not to mechanically reuse either example's skeleton.
+CURIOSITY_MESSAGE_EXAMPLES = """Example A:
+Bryn, would you allow me to access your knowledge?
+I'm a serial founder. Today I'm building a Fractional GTM business, and one thing I'm obsessed with is autonomous sales.
+Instead of sitting in a room guessing what sales teams need, I'm talking to people who live it every day.
+You're leading Sales at Slip Robotics. I'm sure you've seen things that don't show up in LinkedIn posts or playbooks.
+Would you spare 20 minutes and let me borrow some of that knowledge? I'd love to understand how you run Sales team today, where the friction is, and what you'd automate if you could.
+Just trying to build something that's actually useful.
+
+Example B:
+15-Minute Conversation on B2B Sales Challenges
+I'm a serial founder currently building a Fractional Sales consulting business.
+A key part of what I'm working on is an autonomous, AI-led sales motion. Rather than building it in isolation, I want to solve real GTM challenges that companies are facing today.
+Slip Robotics is scaling rapidly, and I imagine you've encountered some interesting challenges around pipeline generation, sales execution, and GTM as you've grown.
+Would you be open to a 20-minute conversation? My goal is simply to understand your current GTM and sales process, the bottlenecks you're seeing, and where you think AI could genuinely help. This isn't a sales call, I'm looking to learn from operators building great companies."""
+
+CURIOSITY_MESSAGE_SYNTHESIS_PROMPT = """Write a short LinkedIn outreach message in the TONE and SPIRIT of the two real examples below -- genuinely curious, not selling anything, asking to learn from this specific person's real experience. These examples are style/intent reference ONLY, not templates: do not copy their structure, opening line, or wording, and do not force a line like "you're leading Sales at X" onto someone whose real role is different. Vary structure and phrasing naturally based on THIS contact's real research -- do not mechanically repeat the same skeleton you'd use for anyone else.
+
+{examples}
+
+Sender's name (sign off with this): {sender_name}
+Contact first name: {first_name}
+Contact's real title: {contact_title}
+Company name: {company_name}
+
+Company research:
+{company_research_json}
+
+Contact research:
+{contact_research_json}
+
+Rules:
+- No product/service pitch of any kind. Nothing about what we offer, sell, or could help with.
+- Reference something real and specific about THIS company/contact from the research above -- naturally, in a way that fits their actual role (don't invent a role or initiative that isn't supported by the research).
+- Ask for a short (15-20 minute), no-pressure conversation to learn from their real experience -- frame it as genuine curiosity, not a disguised sales call.
+- Never name a specific day, date, or time frame.
+- Sign off with the sender's name given above.
+- Keep it under 130 words. Return ONLY the message text, no subject line unless it reads naturally as one, no preamble, no explanation."""
+
+
+def run_curiosity_message_synthesis(contact: Contact, company_research: dict, contact_research: dict, db: Session, tenant_id: int) -> str:
+    prompt = CURIOSITY_MESSAGE_SYNTHESIS_PROMPT.format(
+        examples=CURIOSITY_MESSAGE_EXAMPLES,
+        sender_name=_get_sender_name(db, tenant_id),
+        first_name=contact.first_name or "there",
+        contact_title=contact.title or "unknown",
+        company_name=contact.company.name if contact.company else "unknown",
+        company_research_json=json.dumps(company_research, indent=2),
+        contact_research_json=json.dumps(contact_research, indent=2),
+    )
+    return generate_text(prompt, db, tenant_id, max_tokens=400)
+
 
 def run_company_research(company: Company, db: Session, tenant_id: int) -> dict:
     if not company.domain:
@@ -200,10 +272,14 @@ def run_message_synthesis(contact: Contact, company_research: dict, contact_rese
     return generate_text(prompt, db, tenant_id, max_tokens=500)
 
 
-def generate_personalized_message(contact_id: int, db: Session, tenant_id: int) -> PersonalizedMessage:
-    """Entrypoint. Runs all 4 modules in sequence, persisting whatever succeeds even if a
-    later module fails -- a partial result (e.g. company research only) is still visible and
-    useful, not silently discarded."""
+def generate_personalized_message(contact_id: int, db: Session, tenant_id: int, style: str = "pitch") -> PersonalizedMessage:
+    """Entrypoint. Runs company/contact research either way, then branches on style:
+    "pitch" (default, the original 4-module spec) runs fit_analysis and pitches our value
+    proposition; "curiosity" (the lead's real, tested alternative -- genuine no-pitch outreach
+    asking to learn from the contact's real experience) skips fit_analysis entirely since
+    there's no value-prop positioning to compare against, and no reason to spend the extra
+    tokens on it. Persists whatever succeeds even if a later step fails -- a partial result is
+    still visible and useful, not silently discarded."""
     contact = db.query(Contact).filter(Contact.id == contact_id).first()
     if not contact:
         raise ValueError(f"Contact {contact_id} not found")
@@ -228,11 +304,14 @@ def generate_personalized_message(contact_id: int, db: Session, tenant_id: int) 
         pm.contact_research = contact_research
         db.commit()
 
-        fit_analysis = run_fit_analysis(company_research, contact_research, db, tenant_id)
-        pm.fit_analysis = fit_analysis
-        db.commit()
+        if style == "curiosity":
+            message = run_curiosity_message_synthesis(contact, company_research, contact_research, db, tenant_id)
+        else:
+            fit_analysis = run_fit_analysis(company_research, contact_research, db, tenant_id)
+            pm.fit_analysis = fit_analysis
+            db.commit()
+            message = run_message_synthesis(contact, company_research, contact_research, fit_analysis, db, tenant_id)
 
-        message = run_message_synthesis(contact, company_research, contact_research, fit_analysis, db, tenant_id)
         pm.generated_message = message
         pm.generated_at = datetime.utcnow()
         pm.error_message = None
