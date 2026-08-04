@@ -214,6 +214,25 @@ def _generate_messages_for_batch(batch_id: int, db: Session, tenant_id: int, gua
     return results
 
 
+def _send_failure_alert(batch: Batch, run: AutonomousRun, error: str, db: Session, tenant_id: int) -> None:
+    """Found live: an autonomous run failing outright (e.g. an unhandled rate-limit error)
+    previously sent NO notification at all -- the only sign anything went wrong was the run
+    row silently sitting as "failed" in the database, discovered by chance days later, not an
+    alert. Same Slack channels as the success-path approval notification. Best-effort: a
+    failure to send this alert must never raise past the caller, which is already inside its
+    own failure-handling block."""
+    text = (
+        f":rotating_light: Autonomous run failed\n"
+        f"Batch: {batch.name} (id {batch.id})\n"
+        f"Run id: {run.id}\n"
+        f"Error: {error}"
+    )
+    try:
+        send_slack_message(text, db, tenant_id)
+    except SlackError:
+        pass
+
+
 def _send_approval_notification(batch: Batch, run: AutonomousRun, decision_maker_result: dict, db: Session, tenant_id: int, messages: list[dict] | None = None) -> str | None:
     """Sent right after Decision Maker (and Phase 13 message drafting) completes, before
     anything reaches the outreach channel. Slack-only -- email over raw SMTP is blocked at
@@ -325,6 +344,7 @@ def run_daily_autonomous_cycle(db: Session, tenant_id: int) -> dict:
             db.add(run)
             db.add(batch)
             db.commit()
+            _send_failure_alert(batch, run, str(e), db, tenant_id)
             return {"status": "failed", "batch_id": batch.id, "source": source, "error": str(e)}
 
     try:
@@ -417,6 +437,7 @@ def run_daily_autonomous_cycle(db: Session, tenant_id: int) -> dict:
         db.add(run)
         db.add(batch)
         db.commit()
+        _send_failure_alert(batch, run, str(e), db, tenant_id)
         return {"status": "failed", "batch_id": batch.id, "error": str(e)}
 
 
