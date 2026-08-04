@@ -100,6 +100,24 @@ def get_autonomous_discovery_source(db: Session, tenant_id: int) -> str:
     return DEFAULT_DISCOVERY_SOURCE
 
 
+DEFAULT_MESSAGE_STYLE = "curiosity"
+
+
+def get_autonomous_message_style(db: Session, tenant_id: int) -> str:
+    """Which Phase 13 prompt the daily autonomous cycle uses for message generation -- "pitch"
+    (the original value-prop-pitch prompt) or "curiosity" (the lead's real, tested no-pitch
+    alternative -- see personalized_outreach.py). Found live: this was never actually wired up
+    here at all -- _generate_messages_for_batch called generate_personalized_message with no
+    style argument, so every real autonomous run silently used "pitch" regardless of what was
+    being tested manually. Defaults to "curiosity" per the lead's explicit direction ("use
+    curiosity style until I say otherwise"), toggleable without a deploy via the same
+    Parameter pattern as discovery_source."""
+    param = _get_tenant_param(db, tenant_id, "autonomous_message_style")
+    if param and param.value and param.value.get("style") in ("pitch", "curiosity"):
+        return param.value["style"]
+    return DEFAULT_MESSAGE_STYLE
+
+
 def _clear_stale_running_flags(db: Session, tenant_id: int) -> None:
     cutoff = datetime.utcnow() - timedelta(minutes=STALE_RUN_TIMEOUT_MINUTES)
     stale_runs = (
@@ -187,6 +205,7 @@ def _generate_messages_for_batch(batch_id: int, db: Session, tenant_id: int, gua
         .filter(Company.batch_id == batch_id)
         .all()
     )
+    message_style = get_autonomous_message_style(db, tenant_id)
     results = []
     for contact in contacts:
         entry = {
@@ -205,7 +224,7 @@ def _generate_messages_for_batch(batch_id: int, db: Session, tenant_id: int, gua
                 results.append(entry)
                 continue
         try:
-            pm = generate_personalized_message(contact.id, db, tenant_id)
+            pm = generate_personalized_message(contact.id, db, tenant_id, style=message_style)
             entry["message"] = pm.generated_message
             entry["error"] = pm.error_message
         except Exception as e:  # noqa: BLE001 -- one contact's failure must never block the rest

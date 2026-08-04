@@ -14,7 +14,7 @@ from app.deepline_client import DeeplineError, get_credit_balance_usd
 from app.heyreach_client import HeyReachError
 from app.hubspot_client import HubSpotError
 from app.outreach.selector import get_outreach_channel
-from app.phases.autonomous_orchestrator import cancel_run, get_autonomous_discovery_source, get_autonomous_schedule_utc, get_daily_budget_usd, get_daily_company_cap, is_autonomous_enabled, recover_run_to_awaiting_approval, resend_approval_notification, resume_pending_approvals, run_daily_autonomous_cycle
+from app.phases.autonomous_orchestrator import cancel_run, get_autonomous_discovery_source, get_autonomous_message_style, get_autonomous_schedule_utc, get_daily_budget_usd, get_daily_company_cap, is_autonomous_enabled, recover_run_to_awaiting_approval, resend_approval_notification, resume_pending_approvals, run_daily_autonomous_cycle
 from app.phases.buying_signal import run_buying_signal_check
 from app.phases.campaign_execution import run_campaign_execution
 from app.phases.decision_maker import run_decision_maker_id
@@ -1144,6 +1144,7 @@ def get_autonomous_status(db: Session = Depends(get_db)):
         "daily_budget_usd": get_daily_budget_usd(db, ELEPHANT_EDGE_TENANT_ID),
         "daily_company_cap": get_daily_company_cap(db, ELEPHANT_EDGE_TENANT_ID),
         "discovery_source": get_autonomous_discovery_source(db, ELEPHANT_EDGE_TENANT_ID),
+        "message_style": get_autonomous_message_style(db, ELEPHANT_EDGE_TENANT_ID),
         "schedule_utc": dict(zip(("hour", "minute"), get_autonomous_schedule_utc(db, ELEPHANT_EDGE_TENANT_ID))),
         "last_run": {
             "id": last_run.id,
@@ -1223,6 +1224,30 @@ def set_autonomous_discovery_source(source: str, db: Session = Depends(get_db)):
         db.add(param)
     db.commit()
     return {"discovery_source": source}
+
+
+@router.post("/autonomous/message-style")
+def set_autonomous_message_style(style: str, db: Session = Depends(get_db)):
+    """Which Phase 13 prompt the daily autonomous trigger uses -- "pitch" or "curiosity" (see
+    autonomous_orchestrator.py's get_autonomous_message_style docstring for why this exists:
+    the real autonomous cycle was silently always using "pitch", never actually wired to the
+    curiosity-style prompt built and tested separately)."""
+    if style not in ("pitch", "curiosity"):
+        raise HTTPException(status_code=400, detail="style must be 'pitch' or 'curiosity'")
+    param = (
+        db.query(Parameter)
+        .filter(Parameter.tenant_id == ELEPHANT_EDGE_TENANT_ID)
+        .filter(Parameter.key == "autonomous_message_style")
+        .first()
+    )
+    if param:
+        param.value = {"style": style}
+    else:
+        param = Parameter(tenant_id=ELEPHANT_EDGE_TENANT_ID, key="autonomous_message_style", value={"style": style},
+                           description="Which Phase 13 prompt (pitch or curiosity) the daily autonomous trigger uses")
+        db.add(param)
+    db.commit()
+    return {"message_style": style}
 
 
 @router.get("/autonomous/runs")
