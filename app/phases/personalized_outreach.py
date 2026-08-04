@@ -172,7 +172,7 @@ Would you be open to a 20-minute conversation? My goal is simply to understand y
 
 SENDER_REAL_CONTEXT = "serial founder; currently building a Fractional GTM business; genuinely interested in autonomous/AI-led sales"
 
-CURIOSITY_MESSAGE_SYNTHESIS_PROMPT = """Write a short LinkedIn outreach message in the TONE and SPIRIT of the two real examples below -- genuinely curious, not selling anything, asking to learn from this specific person's real experience. These examples are style/intent reference ONLY, not templates: do not copy their structure, opening line, or wording, and do not force a line like "you're leading Sales at X" onto someone whose real role is different. Vary structure and phrasing naturally based on THIS contact's real research -- do not mechanically repeat the same skeleton you'd use for anyone else.
+CURIOSITY_MESSAGE_SYNTHESIS_PROMPT = """Write a short LinkedIn outreach message in the TONE and SPIRIT of the two real examples below -- genuinely curious, not selling anything, asking to learn from this specific person's real experience. These examples are style/intent reference ONLY, not templates: do not copy their structure, opening line, or wording, and do not force a line like "you're leading Sales at X" onto someone whose real role is different. Notice how LIGHT the company references are in both examples -- one general observation, not a detailed rundown. Match that same simplicity and brevity, not the depth of the research data below.
 
 {examples}
 
@@ -182,17 +182,19 @@ Contact first name: {first_name}
 Contact's real title: {contact_title}
 Company name: {company_name}
 
-Company research:
+Company research (background only -- do not dump multiple details from this into the message):
 {company_research_json}
 
-Contact research:
+Contact research (background only -- do not dump multiple details from this into the message):
 {contact_research_json}
 
+{avoid_openers_block}
+
 Rules:
-- No product/service pitch of any kind. Nothing about what we offer, sell, or could help with.
+- No product/service pitch of any kind. Nothing about what we offer, sell, or could help with. Do not describe anything the sender would do, offer, handle, or provide for them -- not even hedged or conditional ("we could help with...", "I could run..."). This is purely an ask to learn, nothing else.
+- Keep the company/contact reference to ONE light, general observation -- like the examples do ("I imagine you've seen things that don't show up in playbooks," "you've probably hit some interesting challenges as you've grown"). Do not list out multiple specific initiatives, features, or details from the research -- that reads as a deep-dive, not a casual message.
 - Always work in the real facts about the sender given above, somewhere in the message -- do not drop them, and do not adapt or reword them to sound like they match the recipient's own specific domain (e.g. never claim to be building loan-servicing AI, security infrastructure, farming tech, etc. just because that happens to be the recipient's business -- that would be fabricating what the sender does).
-- Genuinely vary your wording message to message -- do not default to the exact phrases in the two reference examples ("I'm a serial founder," "would you be open to sharing a bit of your experience?," etc.) or reuse the same opening line/ask line every time. Say the same underlying things in fresh, different words each time, the way a real person writing many separate messages naturally would never phrase the intro or the ask identically twice.
-- Reference something real and specific about THIS company/contact from the research above -- naturally, in a way that fits their actual role (don't invent a role or initiative that isn't supported by the research).
+- Genuinely vary your wording message to message -- do not default to the exact phrases in the two reference examples ("I'm a serial founder," "would you be open to sharing a bit of your experience?," etc.). Say the same underlying things in fresh, different words each time, the way a real person writing many separate messages naturally would never phrase the intro or the ask identically twice. If an "avoid" list is given above, do not open with anything similar to those lines.
 - Keep the language plain and casual, the way the two real examples are written -- short, simple sentences, like a real person typing a message, not a formal business tone. Avoid corporate-sounding phrases (e.g. "operator experience," "architectural challenges," "hands-on experience").
 - Ask for a short (15-20 minute), no-pressure conversation to learn from their real experience -- frame it as genuine curiosity, not a disguised sales call.
 - Never name a specific day, date, or time frame.
@@ -200,7 +202,52 @@ Rules:
 - Keep it under 130 words. Return ONLY the message text, no subject line unless it reads naturally as one, no preamble, no explanation."""
 
 
+CURIOSITY_RECENT_OPENERS_MAX = 8
+
+
+def _get_recent_curiosity_openers(db: Session, tenant_id: int) -> list[str]:
+    param = (
+        db.query(Parameter)
+        .filter(Parameter.tenant_id == tenant_id)
+        .filter(Parameter.key == "curiosity_recent_openers")
+        .first()
+    )
+    if param and param.value and isinstance(param.value, dict):
+        return param.value.get("openers", [])
+    return []
+
+
+def _record_curiosity_opener(db: Session, tenant_id: int, opener: str) -> None:
+    """Keeps a short rolling history of recent opening lines so the next generation can be
+    told explicitly what to avoid -- found live that a single "vary your wording" instruction
+    isn't enough on its own, since each contact's message is generated independently with no
+    memory of what was written for anyone else. A concrete "don't open like these" list is
+    far more reliable than an abstract instruction."""
+    openers = _get_recent_curiosity_openers(db, tenant_id)
+    openers.append(opener)
+    openers = openers[-CURIOSITY_RECENT_OPENERS_MAX:]
+    param = (
+        db.query(Parameter)
+        .filter(Parameter.tenant_id == tenant_id)
+        .filter(Parameter.key == "curiosity_recent_openers")
+        .first()
+    )
+    if param:
+        param.value = {"openers": openers}
+    else:
+        param = Parameter(tenant_id=tenant_id, key="curiosity_recent_openers", value={"openers": openers},
+                           description="Rolling history of recent curiosity-style message openers, used to keep new messages from repeating the same opening line")
+        db.add(param)
+    db.commit()
+
+
 def run_curiosity_message_synthesis(contact: Contact, company_research: dict, contact_research: dict, db: Session, tenant_id: int) -> str:
+    recent_openers = _get_recent_curiosity_openers(db, tenant_id)
+    if recent_openers:
+        avoid_block = "Lines already used as openers in other recent messages -- do NOT open with anything similar to these:\n" + "\n".join(f"- {o}" for o in recent_openers)
+    else:
+        avoid_block = ""
+
     prompt = CURIOSITY_MESSAGE_SYNTHESIS_PROMPT.format(
         examples=CURIOSITY_MESSAGE_EXAMPLES,
         sender_name=_get_sender_name(db, tenant_id),
@@ -210,8 +257,14 @@ def run_curiosity_message_synthesis(contact: Contact, company_research: dict, co
         company_name=contact.company.name if contact.company else "unknown",
         company_research_json=json.dumps(company_research, indent=2),
         contact_research_json=json.dumps(contact_research, indent=2),
+        avoid_openers_block=avoid_block,
     )
-    return generate_text(prompt, db, tenant_id, max_tokens=400)
+    message = generate_text(prompt, db, tenant_id, max_tokens=400)
+
+    opener = message.strip().split("\n")[0][:80]
+    _record_curiosity_opener(db, tenant_id, opener)
+
+    return message
 
 
 def run_company_research(company: Company, db: Session, tenant_id: int) -> dict:
