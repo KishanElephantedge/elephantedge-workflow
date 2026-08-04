@@ -118,6 +118,39 @@ def get_autonomous_message_style(db: Session, tenant_id: int) -> str:
     return DEFAULT_MESSAGE_STYLE
 
 
+def _get_jobo_start_page(db: Session, tenant_id: int) -> int:
+    """Jobo's job-search results are relevance-ranked, and unlike TheirStack (jd_first),
+    Jobo's search API has no server-side domain-exclusion filter -- there's no way to tell
+    it "skip companies I already have." Found live: a real production run always started
+    from page 1, meaning every single day re-scanned and re-paid for the exact same
+    oversaturated top-of-relevance-ranking pages (dominated by large companies, since
+    generic terms like "account executive" get posted far more by big companies than real
+    11-50 startups) -- burning real budget while making zero forward progress. A one-off
+    manual test script found real results by hardcoding a start page far into the ranking
+    (page 53), which is what led to finding this. Persisting the real page reached so each
+    day continues past where the last one stopped, instead of resetting to page 1 forever."""
+    param = _get_tenant_param(db, tenant_id, "jobo_next_start_page")
+    if param and param.value and isinstance(param.value.get("page"), int):
+        return param.value["page"]
+    return 1
+
+
+def _set_jobo_start_page(db: Session, tenant_id: int, page: int) -> None:
+    param = (
+        db.query(Parameter)
+        .filter(Parameter.tenant_id == tenant_id)
+        .filter(Parameter.key == "jobo_next_start_page")
+        .first()
+    )
+    if param:
+        param.value = {"page": page}
+    else:
+        param = Parameter(tenant_id=tenant_id, key="jobo_next_start_page", value={"page": page},
+                           description="Next Jobo job-search page to resume from -- advances daily so we don't re-pay for the same oversaturated top-of-relevance pages")
+        db.add(param)
+    db.commit()
+
+
 def _clear_stale_running_flags(db: Session, tenant_id: int) -> None:
     cutoff = datetime.utcnow() - timedelta(minutes=STALE_RUN_TIMEOUT_MINUTES)
     stale_runs = (
@@ -467,8 +500,10 @@ def _run_jobo_autonomous_cycle(batch: Batch, run: AutonomousRun, db: Session, te
     approval-window/notification contract as the Deepline branch so the dashboard and email
     behavior are consistent regardless of which source a given day's run used."""
     cap = get_daily_company_cap(db, tenant_id)
+    start_page = _get_jobo_start_page(db, tenant_id)
     try:
-        result = run_jobo_discovery(batch.id, db, tenant_id, target=cap, budget_usd=budget_usd)
+        result = run_jobo_discovery(batch.id, db, tenant_id, target=cap, budget_usd=budget_usd, start_page=start_page)
+        _set_jobo_start_page(db, tenant_id, result["last_page"])
     except JoboError as e:
         db.rollback()
         run.status = "failed"
