@@ -629,16 +629,62 @@ def _get_salesrobot_linkedin_account_uuid(db: Session) -> str:
     return param.value.get("value") if isinstance(param.value, dict) else param.value
 
 
+def _get_our_campaign_uuids(db: Session) -> list[str]:
+    """The connected LinkedIn account is shared -- found live that GET /campaigns returns
+    EVERY campaign on that account, including ones that belong to other work entirely (same
+    reason the SalesRobot webhook is deliberately scoped to named campaigns only, not "All
+    Campaigns"). This is an explicit allowlist of campaign UUIDs that are actually ours, so we
+    never display someone else's campaign data. Falls back to just the configured production
+    campaign_uuid if the allowlist itself was never set."""
+    param = (
+        db.query(Parameter)
+        .filter(Parameter.tenant_id == ELEPHANT_EDGE_TENANT_ID)
+        .filter(Parameter.key == "salesrobot_our_campaign_uuids")
+        .first()
+    )
+    if param and param.value and isinstance(param.value, dict) and param.value.get("uuids"):
+        return param.value["uuids"]
+    prod_param = (
+        db.query(Parameter)
+        .filter(Parameter.tenant_id == ELEPHANT_EDGE_TENANT_ID)
+        .filter(Parameter.key == "salesrobot_campaign_uuid")
+        .first()
+    )
+    if prod_param and prod_param.value:
+        val = prod_param.value.get("value") if isinstance(prod_param.value, dict) else prod_param.value
+        return [val] if val else []
+    return []
+
+
+def _normalize_linkedin_url(url: str | None) -> str | None:
+    """LinkedIn URLs come in inconsistently from every source we deal with (our own decision-
+    maker search, SalesRobot's prospect records) -- with/without https://, with/without www.,
+    with/without a trailing slash, mixed case. Matching on raw strings silently drops real
+    matches. Normalizes to the bare "linkedin.com/in/handle" form for reliable comparison."""
+    if not url:
+        return None
+    normalized = url.strip().lower()
+    for prefix in ("https://", "http://"):
+        if normalized.startswith(prefix):
+            normalized = normalized[len(prefix):]
+    if normalized.startswith("www."):
+        normalized = normalized[4:]
+    return normalized.rstrip("/")
+
+
 @router.get("/salesrobot/campaigns")
 def get_salesrobot_campaigns(db: Session = Depends(get_db)):
     """Level 1 of the Campaigns -> Leads -> Activity view -- real campaign list per
-    SalesRobot's own docs.salesrobot.co/reference/getcampaigns."""
+    SalesRobot's own docs.salesrobot.co/reference/getcampaigns, filtered to only OUR
+    campaigns (see _get_our_campaign_uuids)."""
     account_uuid = _get_salesrobot_linkedin_account_uuid(db)
+    our_uuids = set(_get_our_campaign_uuids(db))
     try:
         result = list_campaigns(account_uuid, db, ELEPHANT_EDGE_TENANT_ID)
     except SalesRobotError as e:
         raise HTTPException(status_code=502, detail=str(e))
-    return result.get("data", {}).get("data", [])
+    campaigns = result.get("data", {}).get("data", [])
+    return [c for c in campaigns if c.get("uuid") in our_uuids]
 
 
 @router.get("/salesrobot/campaigns/{campaign_uuid}/leads")
@@ -685,6 +731,166 @@ def get_lead_activity(profile_url: str, db: Session = Depends(get_db)):
         }
         for e in matching
     ]
+
+
+def _fetch_our_salesrobot_prospects(db: Session) -> dict[str, dict]:
+    """Pulls real prospect status from every one of OUR campaigns (not the whole account --
+    see _get_our_campaign_uuids) and returns a dict keyed by normalized LinkedIn URL. Used to
+    enrich our own DB-driven lead list with live SalesRobot status, rather than the other way
+    around -- that way the lead list still works (just without live status) if SalesRobot is
+    briefly unreachable, and includes leads not yet pushed to any campaign at all."""
+    try:
+        account_uuid = _get_salesrobot_linkedin_account_uuid(db)
+    except HTTPException:
+        return {}
+    by_url: dict[str, dict] = {}
+    for campaign_uuid in _get_our_campaign_uuids(db):
+        try:
+            result = get_campaign_prospects(campaign_uuid, account_uuid, db, ELEPHANT_EDGE_TENANT_ID)
+        except SalesRobotError:
+            continue
+        for p in result.get("data", {}).get("data", []):
+            key = _normalize_linkedin_url(p.get("profileUrl"))
+            if key:
+                by_url[key] = p
+    return by_url
+
+
+@router.get("/leads")
+def list_leads(db: Session = Depends(get_db)):
+    """Unified lead list -- our own DB (the source of truth for who we've researched/messaged)
+    enriched with live SalesRobot status where a match exists. Deliberately DB-first, not
+    SalesRobot-first: a lead we've generated a message for but haven't pushed yet still shows
+    up, and the whole endpoint degrades gracefully (just missing live status) if SalesRobot is
+    down, rather than failing outright."""
+    contacts = (
+        db.query(Contact)
+        .join(Company)
+        .filter(Company.batch_id.in_(db.query(Batch.id).filter(Batch.tenant_id == ELEPHANT_EDGE_TENANT_ID)))
+        .options(selectinload(Contact.personalized_message), selectinload(Contact.campaign_pushes), selectinload(Contact.company))
+        .all()
+    )
+    # Only leads that have actually entered the outreach pipeline -- a raw decision-maker
+    # match with no message and no push isn't a "lead" for this view yet.
+    contacts = [c for c in contacts if c.personalized_message or c.campaign_pushes]
+
+    live_by_url = _fetch_our_salesrobot_prospects(db)
+
+    leads = []
+    for c in contacts:
+        pm = c.personalized_message
+        push = c.campaign_pushes[-1] if c.campaign_pushes else None
+        live = live_by_url.get(_normalize_linkedin_url(c.linkedin_url))
+        leads.append({
+            "contact_id": c.id,
+            "first_name": c.first_name,
+            "last_name": c.last_name,
+            "title": c.title,
+            "linkedin_url": c.linkedin_url,
+            "company_name": c.company.name if c.company else None,
+            "company_linkedin_url": c.company.linkedin_url if c.company else None,
+            "message_status": pm.status if pm else None,
+            "push_status": push.status if push else None,
+            "pushed_at": push.pushed_at if push else None,
+            "salesrobot_last_activity": live.get("lastActivity") if live else None,
+            "salesrobot_status": live.get("status") if live else None,
+        })
+    return leads
+
+
+@router.get("/leads/stats")
+def get_leads_stats(db: Session = Depends(get_db)):
+    """KPI cards for the lead dashboard. Connection/acceptance/reply counts come straight from
+    SalesRobot's own per-campaign aggregates (already accurate, no need to recompute from
+    per-prospect records) summed across only OUR campaigns; research/message counts come from
+    our own DB."""
+    account_uuid = None
+    try:
+        account_uuid = _get_salesrobot_linkedin_account_uuid(db)
+    except HTTPException:
+        pass
+
+    sent = accepted = replied = 0
+    if account_uuid:
+        our_uuids = set(_get_our_campaign_uuids(db))
+        try:
+            result = list_campaigns(account_uuid, db, ELEPHANT_EDGE_TENANT_ID)
+            for c in result.get("data", {}).get("data", []):
+                if c.get("uuid") in our_uuids:
+                    sent += c.get("connectionRequestSentCount") or 0
+                    accepted += c.get("connectionRequestAcceptedCount") or 0
+                    replied += c.get("repliedCount") or 0
+        except SalesRobotError:
+            pass
+
+    contacts = (
+        db.query(Contact)
+        .join(Company)
+        .filter(Company.batch_id.in_(db.query(Batch.id).filter(Batch.tenant_id == ELEPHANT_EDGE_TENANT_ID)))
+        .options(selectinload(Contact.personalized_message))
+        .all()
+    )
+    researched = sum(1 for c in contacts if c.personalized_message)
+    approved = sum(1 for c in contacts if c.personalized_message and c.personalized_message.status == "approved")
+
+    return {
+        "researched": researched,
+        "approved": approved,
+        "connections_sent": sent,
+        "connections_accepted": accepted,
+        "replied": replied,
+        "acceptance_rate": round(accepted / sent, 3) if sent else None,
+        "reply_rate": round(replied / sent, 3) if sent else None,
+    }
+
+
+@router.get("/leads/{contact_id}")
+def get_lead_detail(contact_id: int, db: Session = Depends(get_db)):
+    """Full detail for one lead -- our own research/message data, live SalesRobot status if
+    matched, and historical webhook event timeline. Merges what previously required three
+    separate calls (message, campaign leads, activity) into one."""
+    contact = (
+        db.query(Contact)
+        .join(Company)
+        .filter(Contact.id == contact_id)
+        .filter(Company.batch_id.in_(db.query(Batch.id).filter(Batch.tenant_id == ELEPHANT_EDGE_TENANT_ID)))
+        .first()
+    )
+    if not contact:
+        raise HTTPException(status_code=404, detail="Contact not found")
+
+    pm = contact.personalized_message
+    push = contact.campaign_pushes[-1] if contact.campaign_pushes else None
+    live_by_url = _fetch_our_salesrobot_prospects(db)
+    live = live_by_url.get(_normalize_linkedin_url(contact.linkedin_url))
+
+    profile_key = _normalize_linkedin_url(contact.linkedin_url) or ""
+    events = db.query(CampaignEvent).order_by(CampaignEvent.received_at.desc()).limit(500).all()
+    matching_events = [e for e in events if profile_key and profile_key in json.dumps(e.raw_payload).lower()]
+
+    return {
+        "contact_id": contact.id,
+        "first_name": contact.first_name,
+        "last_name": contact.last_name,
+        "title": contact.title,
+        "linkedin_url": contact.linkedin_url,
+        "company_name": contact.company.name if contact.company else None,
+        "company_linkedin_url": contact.company.linkedin_url if contact.company else None,
+        "message_status": pm.status if pm else None,
+        "generated_message": pm.generated_message if pm else None,
+        "company_research": pm.company_research if pm else None,
+        "contact_research": pm.contact_research if pm else None,
+        "fit_analysis": pm.fit_analysis if pm else None,
+        "push_status": push.status if push else None,
+        "pushed_at": push.pushed_at if push else None,
+        "salesrobot_last_activity": live.get("lastActivity") if live else None,
+        "salesrobot_status": live.get("status") if live else None,
+        "salesrobot_raw": live,
+        "activity_history": [
+            {"id": e.id, "event_type": e.event_type, "received_at": e.received_at}
+            for e in matching_events
+        ],
+    }
 
 
 @router.post("/salesrobot/test-push")
