@@ -4,10 +4,10 @@ from datetime import datetime
 from fastapi import APIRouter, Body, Depends, HTTPException, Request
 from pydantic import BaseModel
 from sqlalchemy.orm import Session, selectinload
-from sqlalchemy import func
+from sqlalchemy import func, or_
 
 from app.cache import active_keys, bump_batch_version, cache_get, cache_set, get_batch_version, mark_active
-from app.db.models import AutonomousRun, Batch, CalendarBooking, CampaignEvent, Company, Contact, Credential, Parameter, Score
+from app.db.models import AutonomousRun, Batch, CalendarBooking, CampaignEvent, Company, Contact, Credential, Parameter, PersonalizedMessage, Score
 from app.google_calendar_client import GoogleCalendarError
 from app.db.session import get_db
 from app.deepline_client import DeeplineError, get_credit_balance_usd
@@ -757,22 +757,47 @@ def _fetch_our_salesrobot_prospects(db: Session) -> dict[str, dict]:
 
 
 @router.get("/leads")
-def list_leads(db: Session = Depends(get_db)):
+def list_leads(page: int = 1, page_size: int = 25, search: str = "", message_status: str = "", db: Session = Depends(get_db)):
     """Unified lead list -- our own DB (the source of truth for who we've researched/messaged)
     enriched with live SalesRobot status where a match exists. Deliberately DB-first, not
     SalesRobot-first: a lead we've generated a message for but haven't pushed yet still shows
     up, and the whole endpoint degrades gracefully (just missing live status) if SalesRobot is
-    down, rather than failing outright."""
-    contacts = (
+    down, rather than failing outright.
+
+    Paginated, and search/status filtering happen at the query level (not "fetch everything,
+    filter in Python") -- so SalesRobot enrichment (a handful of real API calls) only ever
+    runs for the leads actually being shown on this page, not the whole table, regardless of
+    how large it grows."""
+    query = (
         db.query(Contact)
         .join(Company)
         .filter(Company.batch_id.in_(db.query(Batch.id).filter(Batch.tenant_id == ELEPHANT_EDGE_TENANT_ID)))
+        # Only leads that have actually entered the outreach pipeline -- a raw decision-maker
+        # match with no message and no push isn't a "lead" for this view yet.
+        .filter(or_(Contact.personalized_message.has(), Contact.campaign_pushes.any()))
+    )
+    if search.strip():
+        like = f"%{search.strip()}%"
+        query = query.filter(or_(
+            Contact.first_name.ilike(like),
+            Contact.last_name.ilike(like),
+            Contact.title.ilike(like),
+            Company.name.ilike(like),
+        ))
+    if message_status:
+        query = query.filter(Contact.personalized_message.has(PersonalizedMessage.status == message_status))
+
+    total = query.count()
+    page = max(page, 1)
+    page_size = max(1, min(page_size, 100))
+    contacts = (
+        query
         .options(selectinload(Contact.personalized_message), selectinload(Contact.campaign_pushes), selectinload(Contact.company))
+        .order_by(Contact.id.desc())
+        .offset((page - 1) * page_size)
+        .limit(page_size)
         .all()
     )
-    # Only leads that have actually entered the outreach pipeline -- a raw decision-maker
-    # match with no message and no push isn't a "lead" for this view yet.
-    contacts = [c for c in contacts if c.personalized_message or c.campaign_pushes]
 
     live_by_url = _fetch_our_salesrobot_prospects(db)
 
@@ -795,7 +820,13 @@ def list_leads(db: Session = Depends(get_db)):
             "salesrobot_last_activity": live.get("lastActivity") if live else None,
             "salesrobot_status": live.get("status") if live else None,
         })
-    return leads
+    return {
+        "page": page,
+        "page_size": page_size,
+        "total": total,
+        "total_pages": (total + page_size - 1) // page_size if total else 0,
+        "leads": leads,
+    }
 
 
 @router.get("/leads/stats")

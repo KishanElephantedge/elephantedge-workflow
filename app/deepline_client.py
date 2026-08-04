@@ -1,7 +1,9 @@
 import json
 import os
+import re
 import signal
 import subprocess
+import time
 
 from app.config import settings
 
@@ -50,16 +52,42 @@ def _masked_env_debug() -> str:
     return f"DEEPLINE_API_KEY[{key_view}] DEEPLINE_HOST_URL={host!r}"
 
 
+RATE_LIMIT_MAX_RETRIES = 3
+RATE_LIMIT_DEFAULT_DELAY_SECONDS = 5
+
+
+def _rate_limit_retry_delay(stdout: str) -> float | None:
+    """Returns the delay to wait before retrying, if stdout is a rate-limit error response --
+    found live: both autonomous days in a row failed the entire run outright on a single
+    transient 429 from crustdata_v3_person_search, whose own error body literally said "Retry
+    after 5000ms" -- there was no retry at all, just an instant hard failure. Real spend from
+    each failure was tiny (the rate-limited call itself isn't even billed), but the functional
+    cost was two full wasted days. Parses the provider's own suggested delay when present."""
+    if '"code": "RATE_LIMIT"' not in stdout and '"code":"RATE_LIMIT"' not in stdout:
+        return None
+    match = re.search(r"[Rr]etry after (\d+)ms", stdout)
+    return int(match.group(1)) / 1000 if match else RATE_LIMIT_DEFAULT_DELAY_SECONDS
+
+
 def execute_tool(tool_id: str, payload: dict) -> dict:
-    """Run `deepline tools execute <tool_id> --input '<json>' --json` and return the parsed response."""
-    try:
-        result = _run_deepline_cli(
-            [settings.deepline_cli_path, "tools", "execute", tool_id, "--input", json.dumps(payload), "--json"],
-            timeout_seconds=120,
-        )
-    except subprocess.TimeoutExpired as e:
-        raise DeeplineError(f"{tool_id} timed out after 120s") from e
-    if result.returncode != 0:
+    """Run `deepline tools execute <tool_id> --input '<json>' --json` and return the parsed
+    response. Retries on a rate-limit response (see _rate_limit_retry_delay) before giving up
+    -- any other failure still raises immediately, no change there."""
+    result = None
+    for attempt in range(RATE_LIMIT_MAX_RETRIES + 1):
+        try:
+            result = _run_deepline_cli(
+                [settings.deepline_cli_path, "tools", "execute", tool_id, "--input", json.dumps(payload), "--json"],
+                timeout_seconds=120,
+            )
+        except subprocess.TimeoutExpired as e:
+            raise DeeplineError(f"{tool_id} timed out after 120s") from e
+        if result.returncode == 0:
+            break
+        delay = _rate_limit_retry_delay(result.stdout)
+        if delay is not None and attempt < RATE_LIMIT_MAX_RETRIES:
+            time.sleep(delay)
+            continue
         raise DeeplineError(
             f"{tool_id} failed (exit {result.returncode}): stdout={result.stdout!r} stderr={result.stderr!r} "
             f"env={_masked_env_debug()}"
