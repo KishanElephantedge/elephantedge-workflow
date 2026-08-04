@@ -166,6 +166,7 @@ def run_jobo_discovery(batch_id: int, db: Session, tenant_id: int, target: int =
     raw_checked = 0
     page = start_page
     budget_stopped_early = False
+    api_error: str | None = None
 
     with httpx.Client() as client:
         while qualifying_count < target and page < start_page + max_pages:
@@ -176,7 +177,17 @@ def run_jobo_discovery(batch_id: int, db: Session, tenant_id: int, target: int =
             except JoboError:
                 budget_stopped_early = True
                 break
-            except httpx.HTTPError:
+            except httpx.HTTPStatusError as e:
+                # Found live: this used to be a silent `except httpx.HTTPError: break`, so a
+                # real API failure (invalid/expired key, server error, etc.) was
+                # indistinguishable from "genuinely zero postings this page" -- both reported
+                # as a clean "completed, 0 companies found" with no error visible anywhere.
+                # Capturing the real response body/status here so a broken credential doesn't
+                # silently masquerade as an empty result.
+                api_error = f"Jobo search failed ({e.response.status_code}): {e.response.text[:500]}"
+                break
+            except httpx.HTTPError as e:
+                api_error = f"Jobo search failed: {e}"
                 break
 
             jobs = data.get("jobs", [])
@@ -303,4 +314,5 @@ def run_jobo_discovery(batch_id: int, db: Session, tenant_id: int, target: int =
         "budget_stopped_early": budget_stopped_early,
         "credits_spent_usd": guard.spent_usd(),
         "last_page": page,
+        "api_error": api_error,
     }

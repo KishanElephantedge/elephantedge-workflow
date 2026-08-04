@@ -496,6 +496,23 @@ def _run_jobo_autonomous_cycle(batch: Batch, run: AutonomousRun, db: Session, te
     run.credits_spent_usd = result["credits_spent_usd"]
     run.budget_stopped_early = result["budget_stopped_early"]
 
+    if result.get("api_error"):
+        # Found live: a real Jobo API failure (e.g. an expired key) used to come back
+        # indistinguishable from "genuinely zero postings" -- reported as a clean
+        # "completed, 0 companies" with the actual error thrown away. Now treated as a real
+        # failure, same alerting as every other failure path, instead of masquerading as an
+        # empty-but-successful run.
+        db.rollback()
+        run.status = "failed"
+        run.error_message = result["api_error"]
+        run.completed_at = datetime.utcnow()
+        batch.status = "failed"
+        db.add(run)
+        db.add(batch)
+        db.commit()
+        _send_failure_alert(batch, run, result["api_error"], db, tenant_id)
+        return {"status": "failed", "batch_id": batch.id, "source": "jobo", "error": result["api_error"]}
+
     if result["budget_stopped_early"] or result["companies_qualified"] == 0:
         batch.current_phase = "autonomous_cycle_done"
         batch.status = "complete"
