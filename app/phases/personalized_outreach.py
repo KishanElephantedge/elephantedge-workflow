@@ -197,14 +197,16 @@ Rules:
 - Genuinely vary your wording message to message -- do not default to the exact phrases in the two reference examples ("I'm a serial founder," "would you be open to sharing a bit of your experience?," etc.). Say the same underlying things in fresh, different words each time, the way a real person writing many separate messages naturally would never phrase the intro or the ask identically twice. If an "avoid" list is given above, do not open with anything similar to those lines.
 - Do not use the phrase "don't show up in/find in [playbooks/textbooks/LinkedIn posts]" or any close variant of it, even though one of the reference examples uses it -- it's become a repeated crutch across separate messages and needs to stop appearing. Find a different, message-specific way to say the same thing, or leave the thought out.
 - Avoid the phrase "a big focus for me right now" or similar filler -- say what the sender is actually doing or interested in plainly and specifically instead of using a vague intensifier like "big focus."
-- Keep the language plain and casual, the way the two real examples are written -- short, simple sentences, like a real person typing a message, not a formal business tone. Avoid corporate-sounding phrases (e.g. "operator experience," "architectural challenges," "hands-on experience").
+- Keep the language plain and casual, the way the two real examples are written -- short, simple sentences, like a real person typing a message, not a formal business tone. Avoid corporate-sounding phrases (e.g. "operator experience," "architectural challenges," "hands-on experience," "sales motions" -- say "sales" or "outreach" instead).
+- Never open a sentence with a distancing, third-person description of the recipient like "As someone who..." or "As a person who..." -- it reads like the message is describing them from the outside rather than actually talking to them. Address them directly instead.
+- Never use an em dash (the "—" character, distinct from a normal hyphen "-"). It's a well-known tell that text was AI-generated. Use a period, comma, or a plain word like "and"/"but" instead.
 - Ask for a short (15-20 minute), no-pressure conversation to learn from their real experience -- frame it as genuine curiosity, not a disguised sales call.
 - Never name a specific day, date, or time frame.
 - Sign off with the sender's name given above.
 - Keep it under 130 words. Return ONLY the message text, no subject line unless it reads naturally as one, no preamble, no explanation."""
 
 
-CURIOSITY_RECENT_OPENERS_MAX = 8
+CURIOSITY_RECENT_OPENERS_MAX = 5
 
 
 def _get_recent_curiosity_openers(db: Session, tenant_id: int) -> list[str]:
@@ -246,7 +248,19 @@ def _record_curiosity_opener(db: Session, tenant_id: int, opener: str) -> None:
 def run_curiosity_message_synthesis(contact: Contact, company_research: dict, contact_research: dict, db: Session, tenant_id: int) -> str:
     recent_openers = _get_recent_curiosity_openers(db, tenant_id)
     if recent_openers:
-        avoid_block = "Lines already used as openers in other recent messages -- do NOT open with anything similar to these:\n" + "\n".join(f"- {o}" for o in recent_openers)
+        avoid_block = (
+            "Full text of recent messages already sent to OTHER contacts -- found live that "
+            "tracking only the opening line wasn't enough, since messages kept reusing the "
+            "same sentence structure to introduce the sender ('I'm a serial founder currently "
+            "[X]-ing a Fractional GTM business') with just a synonym swapped in place of [X], "
+            "which reads as obvious copy-paste, not real variation. Do not reuse a similar "
+            "SENTENCE STRUCTURE to any of these anywhere in your message, not just the opening "
+            "line -- restructure entirely (different sentence order, different framing, "
+            "sometimes mention the sender's background later in the message instead of up "
+            "front, sometimes phrase it as running/leading rather than building, etc.), not "
+            "just different word choices for the same sentence shape:\n\n"
+            + "\n\n---\n\n".join(recent_openers)
+        )
     else:
         avoid_block = ""
 
@@ -262,9 +276,12 @@ def run_curiosity_message_synthesis(contact: Contact, company_research: dict, co
         avoid_openers_block=avoid_block,
     )
     message = generate_text(prompt, db, tenant_id, max_tokens=400)
+    # Guaranteed, not just instructed -- found live the model doesn't reliably follow a
+    # "never use an em dash" instruction on its own. Replacing it here means it truly never
+    # reaches a real message, regardless of what the model does.
+    message = message.replace("—", ", ").replace("--", ", ")
 
-    opener = message.strip().split("\n")[0][:80]
-    _record_curiosity_opener(db, tenant_id, opener)
+    _record_curiosity_opener(db, tenant_id, message.strip())
 
     return message
 
