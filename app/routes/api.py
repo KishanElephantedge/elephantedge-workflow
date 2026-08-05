@@ -259,33 +259,6 @@ def import_companies(batch_id: int, companies: list[CompanyImport], db: Session 
     return {"imported": len(created), "companies": [{"id": c.id, "name": c.name, "domain": c.domain} for c in created]}
 
 
-class HiringSignalOverride(BaseModel):
-    role: str
-    strength: str = "medium"
-    reasoning: str = "Manually verified"
-
-
-@router.post("/_scratch/companies/{company_id}/hiring-signal")
-def _scratch_set_company_hiring_signal(company_id: int, override: HiringSignalOverride, db: Session = Depends(get_db)):
-    """TEMPORARY -- one-off backfill for 5 manually-imported companies (batch 38) whose real
-    hiring signal was independently verified via a live diagnostic query but never written to
-    the DB, since /companies/import doesn't take these fields. Delete this route once used."""
-    company = (
-        db.query(Company)
-        .join(Batch)
-        .filter(Company.id == company_id)
-        .filter(Batch.tenant_id == ELEPHANT_EDGE_TENANT_ID)
-        .first()
-    )
-    if not company:
-        raise HTTPException(status_code=404, detail="Company not found")
-    company.hiring_signal_role = override.role
-    company.hiring_signal_strength = override.strength
-    company.hiring_signal_reasoning = override.reasoning
-    db.commit()
-    return {"company_id": company_id, "hiring_signal_role": override.role}
-
-
 class ContactImport(BaseModel):
     first_name: str
     last_name: str | None = None
