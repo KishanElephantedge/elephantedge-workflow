@@ -266,6 +266,27 @@ def _generate_messages_for_batch(batch_id: int, db: Session, tenant_id: int, gua
     return results
 
 
+def _humanize_failure(error: str) -> str:
+    """Slack for this alert is a shared channel with non-technical teammates -- found live
+    that raw error text (stack-trace-shaped JSON, "[Errno 2] No such file or directory",
+    Deepline env var dumps) was going straight into it, confusing to read for anyone not
+    debugging it directly. Maps a few known real patterns to a plain sentence; the full raw
+    error is always still in AutonomousRun.error_message for whoever needs to actually fix
+    it -- this function only decides what gets said out loud in Slack."""
+    low = error.lower()
+    if "no such file or directory" in low and "deepline" in low:
+        return "The discovery tool wasn't available on the server (a missing system component) -- this is an infrastructure issue, not a data problem."
+    if "rate limit" in low or "429" in low:
+        return "A data provider temporarily rate-limited us. This usually resolves on its own by the next run."
+    if "timed out" in low or "timeout" in low:
+        return "A data provider took too long to respond and the request timed out."
+    if "billing balance" in low or "credit" in low and "balance" in low:
+        return "Couldn't verify the remaining credit balance with a data provider before starting."
+    if "401" in low or "unauthorized" in low or "invalid api key" in low or "authentication" in low:
+        return "A data provider rejected our API key -- it may have expired or been rotated."
+    return "Something unexpected went wrong partway through today's run."
+
+
 def _send_failure_alert(batch: Batch, run: AutonomousRun, error: str, db: Session, tenant_id: int) -> None:
     """Found live: an autonomous run failing outright (e.g. an unhandled rate-limit error)
     previously sent NO notification at all -- the only sign anything went wrong was the run
@@ -277,7 +298,8 @@ def _send_failure_alert(batch: Batch, run: AutonomousRun, error: str, db: Sessio
         f":rotating_light: Autonomous run failed\n"
         f"Batch: {batch.name} (id {batch.id})\n"
         f"Run id: {run.id}\n"
-        f"Error: {error}"
+        f"What happened: {_humanize_failure(error)}\n"
+        f"(Full technical details are saved on this run in the dashboard for debugging.)"
     )
     try:
         send_slack_message(text, db, tenant_id)
