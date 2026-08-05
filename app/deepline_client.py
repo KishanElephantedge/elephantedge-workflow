@@ -82,6 +82,19 @@ def execute_tool(tool_id: str, payload: dict) -> dict:
             )
         except subprocess.TimeoutExpired as e:
             raise DeeplineError(f"{tool_id} timed out after 120s") from e
+        except FileNotFoundError as e:
+            # Found live: a real production run failed outright with "[Errno 2] No such
+            # file or directory: 'deepline'" -- correlated against deploy timing, this
+            # happened seconds after a git push, almost certainly a container mid-deploy-
+            # rollover where the CLI binary (baked into the image at build time, see
+            # Dockerfile) briefly wasn't in place yet. The very next run, a minute later,
+            # worked normally -- confirming it was transient, not a persistent break.
+            # Retrying with a short delay lets this kind of deploy race self-heal instead
+            # of failing the whole day's run outright.
+            if attempt < RATE_LIMIT_MAX_RETRIES:
+                time.sleep(RATE_LIMIT_DEFAULT_DELAY_SECONDS)
+                continue
+            raise DeeplineError(f"{tool_id}: deepline CLI not found after {RATE_LIMIT_MAX_RETRIES} retries: {e}") from e
         if result.returncode == 0:
             break
         delay = _rate_limit_retry_delay(result.stdout)
