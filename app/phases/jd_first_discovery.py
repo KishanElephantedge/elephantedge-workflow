@@ -52,7 +52,7 @@ JOB_TITLE_PATTERN_OR = [
 # capital-efficient/well-funded companies specifically). Kept separate from discovery.py's
 # EMPLOYEE_COUNT_MAX (200) -- this is a jd_first-specific experiment, not a change to the
 # main company-first pipeline.
-JD_FIRST_EMPLOYEE_COUNT_MAX = 100
+JD_FIRST_EMPLOYEE_COUNT_MAX = 50
 JD_FIRST_MAX_FUNDING_USD = 20_000_000
 JD_FIRST_MAX_REVENUE_USD = 5_000_000  # tightened from discovery.py's shared $10M -- Inspectify
 # and Skopenow both showed real revenue $10-20M despite the $10M cap, same null-passthrough
@@ -88,6 +88,26 @@ def _search_jobs_page(offset: int, limit: int, exclude_domains: list[str]) -> li
     )
     raw = response.get("toolResponse", {}).get("raw", {})
     return raw.get("data", []) if isinstance(raw, dict) else []
+
+
+def _employee_range_in_target(range_str: str, min_size: int, max_size: int) -> bool:
+    """Crustdata's employee_count_range is a bucket string like "11-50" or "5001-10000", not
+    a raw number -- checks whether that bucket overlaps [min_size, max_size] at all, rather
+    than requiring an exact string match, since bucket boundaries aren't guaranteed to align
+    perfectly with our target range. A free, local safety net: TheirStack's own
+    max_employee_count query filter is the first line of defense, but this catches anything
+    that leaks through it (e.g. a null-employee-count company TheirStack let pass) at zero
+    extra cost, since firmographics is already fetched for every candidate regardless."""
+    if not range_str:
+        return False
+    parts = range_str.replace("+", "-999999999").split("-")
+    if len(parts) != 2:
+        return False
+    try:
+        low, high = int(parts[0]), int(parts[1])
+    except ValueError:
+        return False
+    return low <= max_size and high >= min_size
 
 
 def _real_firmographics(domain: str) -> dict | None:
@@ -169,6 +189,10 @@ def run_jd_first_discovery(batch_id: int, db: Session, tenant_id: int, target: i
                 continue
 
             employee_range = firmographics.get("employee_count_range") or ""
+            if not _employee_range_in_target(employee_range, EMPLOYEE_COUNT_MIN, JD_FIRST_EMPLOYEE_COUNT_MAX):
+                rejection_counts["employee_range_out_of_target"] = rejection_counts.get("employee_range_out_of_target", 0) + 1
+                continue
+
             company = Company(
                 batch_id=batch_id,
                 name=firmographics.get("name") or job.get("company") or "Unknown",
