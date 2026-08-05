@@ -74,6 +74,32 @@ def list_linkedin_accounts(db: Session, tenant_id: int, page: int = 0, size: int
     return response.json()
 
 
+def send_message_to_prospect(thread_id: str, prospect_uuid: str, linkedin_account_uuid: str, message: str, db: Session, tenant_id: int) -> dict:
+    """Real, documented endpoint (docs.salesrobot.co/reference/sendamessage) -- POST
+    /sendAMessage. Sends directly into an EXISTING conversation thread, independent of
+    campaign-sequence timing/status entirely. Needed live: found a real prospect stuck at
+    status "STOPPED" (cause still unconfirmed -- NOT correlated with replying, confirmed
+    against real data showing several never-replied prospects also STOPPED, most likely a
+    side effect of repeated campaign-sequence edits catching prospects mid-flight) whose
+    Step 2 message would otherwise never fire. This bypasses that stuck state entirely by
+    sending straight into the thread that already exists from the connection note."""
+    api_key = _get_api_key(db, tenant_id)
+    response = httpx.post(
+        f"{BASE_URL}/sendAMessage",
+        json={
+            "threadId": thread_id,
+            "prospectUuid": prospect_uuid,
+            "linkedinAccountUuid": linkedin_account_uuid,
+            "messageToSend": message,
+        },
+        headers={"X-API-KEY": api_key, "content-type": "application/json;charset=UTF-8"},
+        timeout=30,
+    )
+    if response.status_code != 200:
+        raise SalesRobotError(f"sendAMessage failed ({response.status_code}): {response.text}")
+    return response.json()
+
+
 def add_single_prospect(campaign_uuid: str, linkedin_account_uuid: str, prospect: dict, db: Session, tenant_id: int) -> dict:
     """prospect: {"profileUrl": str, "firstName": str, "lastName": str, "jobTitle": str,
     "companyName": str, "customMap": {...}}"""
