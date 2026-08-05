@@ -27,7 +27,7 @@ from app.phases.calendar_sync import sync_calendar_bookings
 from app.phases.personalized_outreach import generate_personalized_message
 from app.phases.scoring import run_scoring
 from app.phases.tech_stack import run_tech_stack_check
-from app.salesrobot_client import SalesRobotError, add_single_prospect, get_campaign_prospects, list_campaigns
+from app.salesrobot_client import SalesRobotError, add_single_prospect, get_campaign_prospects, list_campaigns, send_message_to_prospect
 
 router = APIRouter()
 
@@ -257,6 +257,33 @@ def import_companies(batch_id: int, companies: list[CompanyImport], db: Session 
     for c in created:
         db.refresh(c)
     return {"imported": len(created), "companies": [{"id": c.id, "name": c.name, "domain": c.domain} for c in created]}
+
+
+class HiringSignalOverride(BaseModel):
+    role: str
+    strength: str = "medium"
+    reasoning: str = "Manually verified"
+
+
+@router.post("/_scratch/companies/{company_id}/hiring-signal")
+def _scratch_set_company_hiring_signal(company_id: int, override: HiringSignalOverride, db: Session = Depends(get_db)):
+    """TEMPORARY -- one-off backfill for 5 manually-imported companies (batch 38) whose real
+    hiring signal was independently verified via a live diagnostic query but never written to
+    the DB, since /companies/import doesn't take these fields. Delete this route once used."""
+    company = (
+        db.query(Company)
+        .join(Batch)
+        .filter(Company.id == company_id)
+        .filter(Batch.tenant_id == ELEPHANT_EDGE_TENANT_ID)
+        .first()
+    )
+    if not company:
+        raise HTTPException(status_code=404, detail="Company not found")
+    company.hiring_signal_role = override.role
+    company.hiring_signal_strength = override.strength
+    company.hiring_signal_reasoning = override.reasoning
+    db.commit()
+    return {"company_id": company_id, "hiring_signal_role": override.role}
 
 
 class ContactImport(BaseModel):
@@ -922,6 +949,20 @@ def get_lead_detail(contact_id: int, db: Session = Depends(get_db)):
             for e in matching_events
         ],
     }
+
+
+@router.post("/salesrobot/send-message")
+def send_salesrobot_message(thread_id: str, prospect_uuid: str, message: str, db: Session = Depends(get_db)):
+    """Sends directly into an existing conversation thread via the real, documented
+    POST /sendAMessage endpoint -- independent of campaign-sequence timing/status. For
+    delivering a message to a prospect stuck in a state (e.g. status "STOPPED") where the
+    campaign's own Step 2 won't fire on its own."""
+    account_uuid = _get_salesrobot_linkedin_account_uuid(db)
+    try:
+        result = send_message_to_prospect(thread_id, prospect_uuid, account_uuid, message, db, ELEPHANT_EDGE_TENANT_ID)
+    except SalesRobotError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    return result
 
 
 @router.post("/salesrobot/test-push")
