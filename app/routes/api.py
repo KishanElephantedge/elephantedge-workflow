@@ -1049,18 +1049,32 @@ def get_overview_stats(start_date: str | None = None, end_date: str | None = Non
     bookings_query = _apply_date_filter(bookings_query, CalendarBooking.start_time)
     meetings_booked = bookings_query.filter(CalendarBooking.status != "cancelled").count()
 
-    lead_stats = get_leads_stats(db)  # reuse the exact same outreach-stage numbers, one source of truth
+    # Our own DB's pushed count, not SalesRobot's campaign-level connectionRequestSentCount
+    # (used by /leads/stats) -- that SalesRobot number is broader, since it also counts
+    # prospects added directly in SalesRobot outside this app (ad-hoc manual test pushes).
+    # Every number on the Overview funnel should trace back to something this app actually
+    # tracked, so this one deliberately does NOT reuse lead_stats.
+    connections_sent = (
+        db.query(CampaignPush)
+        .join(Contact)
+        .join(Company)
+        .filter(Company.batch_id.in_(batch_ids))
+        .filter(CampaignPush.status == "pushed")
+        .count()
+    )
+
+    lead_stats = get_leads_stats(db)  # accepted/replied still come from SalesRobot -- no DB equivalent exists
 
     return {
         "companies_researched": companies_researched,
         "companies_qualified": companies_qualified,
         "decision_makers_found": decision_makers_found,
         "messages_approved": lead_stats["approved"],
-        "connections_sent": lead_stats["connections_sent"],
+        "connections_sent": connections_sent,
         "connections_accepted": lead_stats["connections_accepted"],
         "replied": lead_stats["replied"],
         "meetings_booked": meetings_booked,
-        "date_filtered_stages": ["companies_researched", "companies_qualified", "decision_makers_found", "meetings_booked"],
+        "date_filtered_stages": ["companies_researched", "companies_qualified", "decision_makers_found", "meetings_booked", "connections_sent"],
     }
 
 
