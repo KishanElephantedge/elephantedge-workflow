@@ -1,4 +1,5 @@
 import json
+from collections import Counter
 from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Request
@@ -69,33 +70,78 @@ def create_batch(name: str, source: str = "deepline", db: Session = Depends(get_
     return {"id": batch.id, "name": batch.name, "source": batch.source, "status": batch.status}
 
 
-@router.get("/batches")
-def list_batches(source: str | None = None, db: Session = Depends(get_db)):
-    query = db.query(Batch).filter(Batch.tenant_id == ELEPHANT_EDGE_TENANT_ID)
-    if source is not None:
-        if source not in ("deepline", "jobo"):
-            raise HTTPException(status_code=400, detail="source must be 'deepline' or 'jobo'")
-        query = query.filter(Batch.source == source)
-    batches = query.order_by(Batch.created_at.desc()).all()
+def _normalize_company_source(raw: str | None) -> str:
+    """Company.source is a free-text provenance string (e.g. "jd_first:theirstack_job_search+
+    crustdata_v3_company_identify", "apify:fantastic-jobs_advanced-linkedin-job-search-api",
+    "jobo", "deepline", "crustdata_companydb_search", or null for a manual import). Batch.source
+    itself is only ever "deepline" or "jobo" (a dashboard-tab grouping, not a real pipeline
+    label -- jd_first and apify are both tagged "deepline" at the batch level, see
+    autonomous_orchestrator.py). The real "where did this come from" answer lives per-company,
+    not per-batch -- this collapses that into a short display label."""
+    if not raw:
+        return "manual"
+    if raw.startswith("jd_first"):
+        return "jd_first"
+    if raw.startswith("apify"):
+        return "apify"
+    if raw.startswith("jobo") or raw == "jobo":
+        return "jobo"
+    if raw.startswith("manual_entry"):
+        return "manual"
+    return "deepline"  # crustdata_companydb_search, "deepline", or any other legacy value
 
-    counts = dict(
-        db.query(Company.batch_id, func.count(Company.id))
-        .filter(Company.batch_id.in_([b.id for b in batches]))
-        .group_by(Company.batch_id)
+
+@router.get("/batches")
+def list_batches(page: int = 1, page_size: int = 10, source: str | None = None, db: Session = Depends(get_db)):
+    """`source` here filters on the real, per-company-derived label (jd_first/jobo/apify/
+    deepline/manual) -- NOT Batch.source, which is too coarse to answer "where did this batch's
+    companies actually come from" (see _normalize_company_source)."""
+    batches = (
+        db.query(Batch)
+        .filter(Batch.tenant_id == ELEPHANT_EDGE_TENANT_ID)
+        .order_by(Batch.created_at.desc())
         .all()
     )
-    return [
-        {
+
+    companies = (
+        db.query(Company.batch_id, Company.source)
+        .filter(Company.batch_id.in_([b.id for b in batches]))
+        .all()
+    )
+    sources_by_batch: dict[int, Counter] = {}
+    for batch_id, comp_source in companies:
+        bucket = sources_by_batch.setdefault(batch_id, Counter())
+        bucket[_normalize_company_source(comp_source)] += 1
+
+    rows = []
+    for b in batches:
+        bucket = sources_by_batch.get(b.id)
+        dominant_source = bucket.most_common(1)[0][0] if bucket else "manual"
+        rows.append({
             "id": b.id,
             "name": b.name,
-            "source": b.source,
+            "source": dominant_source,
             "created_at": b.created_at,
             "current_phase": b.current_phase,
             "status": b.status,
-            "company_count": counts.get(b.id, 0),
-        }
-        for b in batches
-    ]
+            "company_count": sum(bucket.values()) if bucket else 0,
+        })
+
+    if source:
+        rows = [r for r in rows if r["source"] == source]
+
+    total = len(rows)
+    page = max(page, 1)
+    page_size = max(1, min(page_size, 100))
+    page_rows = rows[(page - 1) * page_size: page * page_size]
+
+    return {
+        "page": page,
+        "page_size": page_size,
+        "total": total,
+        "total_pages": (total + page_size - 1) // page_size if total else 0,
+        "batches": page_rows,
+    }
 
 
 CACHE_TTL_SECONDS = 600  # generous -- the background refresher (main.py) keeps active
