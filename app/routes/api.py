@@ -7,7 +7,7 @@ from sqlalchemy.orm import Session, selectinload
 from sqlalchemy import func, or_
 
 from app.cache import active_keys, bump_batch_version, cache_get, cache_set, get_batch_version, mark_active
-from app.db.models import AutonomousRun, Batch, CalendarBooking, CampaignEvent, Company, Contact, Credential, Parameter, PersonalizedMessage, Score
+from app.db.models import AutonomousRun, Batch, CalendarBooking, CampaignEvent, CampaignPush, Company, Contact, Credential, Parameter, PersonalizedMessage, Score
 from app.google_calendar_client import GoogleCalendarError
 from app.phases.hiring_signal import has_qualifying_hiring_signal
 from app.db.session import get_db
