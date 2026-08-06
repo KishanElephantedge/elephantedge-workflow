@@ -41,6 +41,18 @@ router = APIRouter()
 ELEPHANT_EDGE_TENANT_ID = 2
 
 
+def _is_company_qualified(company: Company) -> bool:
+    """"Qualified" has to mean more than has_qualifying_hiring_signal alone -- found live
+    (2026-08-06) that companies discovered through the older company-first flow or manual/
+    Jobo research (e.g. Rogo: score 75, tier "jobo_manual") pass their OWN real qualification
+    gate and get a real decision-maker searched for them, but never touch hiring_signal_role
+    at all, so the newer flows' gate alone undercounted real qualified companies. A company
+    counts as qualified if EITHER gate says so."""
+    if has_qualifying_hiring_signal(company):
+        return True
+    return bool(company.score and company.score.tier and company.score.tier != "excluded")
+
+
 # ---- Batches ----
 # ICP (Phase 2) is confirmed -- see phase2-icp.md. Discovery/Qualification/Signal/Scoring
 # endpoints below implement that confirmed spec; Phase 4 (Qualification) has no endpoint of its
@@ -807,9 +819,9 @@ def list_companies(page: int = 1, page_size: int = 25, search: str = "", qualifi
     companies = query.order_by(Company.created_at.desc()).all()
 
     if qualified == "true":
-        companies = [c for c in companies if has_qualifying_hiring_signal(c)]
+        companies = [c for c in companies if _is_company_qualified(c)]
     elif qualified == "false":
-        companies = [c for c in companies if not has_qualifying_hiring_signal(c)]
+        companies = [c for c in companies if not _is_company_qualified(c)]
 
     total = len(companies)
     page = max(page, 1)
@@ -829,7 +841,7 @@ def list_companies(page: int = 1, page_size: int = 25, search: str = "", qualifi
                 "industry": c.industry,
                 "source": c.source,
                 "batch_id": c.batch_id,
-                "qualified": has_qualifying_hiring_signal(c),
+                "qualified": _is_company_qualified(c),
                 "hiring_signal_role": c.hiring_signal_role,
                 "hiring_signal_strength": c.hiring_signal_strength,
                 "team_fit_tier": c.team_fit_tier,
@@ -960,33 +972,49 @@ def list_leads(page: int = 1, page_size: int = 25, search: str = "", message_sta
 
 @router.get("/leads/stats")
 def get_leads_stats(db: Session = Depends(get_db)):
-    """KPI cards for the lead dashboard. Connection/acceptance/reply counts come straight from
-    SalesRobot's own per-campaign aggregates (already accurate, no need to recompute from
-    per-prospect records) summed across only OUR campaigns; research/message counts come from
-    our own DB."""
+    """KPI cards for the lead dashboard. `connections_sent` is our own DB's pushed count --
+    NOT SalesRobot's campaign-level connectionRequestSentCount, which also counts prospects
+    added directly in SalesRobot outside this app and was showing a different, confusing
+    number here than on the Overview tab for the same real thing. accepted/replied still come
+    from SalesRobot (no DB equivalent -- those events only exist in SalesRobot's own system).
+
+    `researched` here means "contacts with a message drafted" (any status), NOT "companies
+    researched" -- a real naming collision with the Overview tab's much larger "Companies
+    Researched" figure, which counts every company discovered regardless of whether a
+    decision-maker or message exists yet. Kept as its own field since the frontend already
+    reads it; UI label should say "Messages Drafted", not "Researched"."""
     account_uuid = None
     try:
         account_uuid = _get_salesrobot_linkedin_account_uuid(db)
     except HTTPException:
         pass
 
-    sent = accepted = replied = 0
+    accepted = replied = 0
     if account_uuid:
         our_uuids = set(_get_our_campaign_uuids(db))
         try:
             result = list_campaigns(account_uuid, db, ELEPHANT_EDGE_TENANT_ID)
             for c in result.get("data", {}).get("data", []):
                 if c.get("uuid") in our_uuids:
-                    sent += c.get("connectionRequestSentCount") or 0
                     accepted += c.get("connectionRequestAcceptedCount") or 0
                     replied += c.get("repliedCount") or 0
         except SalesRobotError:
             pass
 
+    batch_ids = db.query(Batch.id).filter(Batch.tenant_id == ELEPHANT_EDGE_TENANT_ID)
+    sent = (
+        db.query(CampaignPush)
+        .join(Contact)
+        .join(Company)
+        .filter(Company.batch_id.in_(batch_ids))
+        .filter(CampaignPush.status == "pushed")
+        .count()
+    )
+
     contacts = (
         db.query(Contact)
         .join(Company)
-        .filter(Company.batch_id.in_(db.query(Batch.id).filter(Batch.tenant_id == ELEPHANT_EDGE_TENANT_ID)))
+        .filter(Company.batch_id.in_(batch_ids))
         .options(selectinload(Contact.personalized_message))
         .all()
     )
@@ -1039,7 +1067,7 @@ def get_overview_stats(start_date: str | None = None, end_date: str | None = Non
     companies_query = _apply_date_filter(companies_query, Company.created_at)
     companies = companies_query.all()
     companies_researched = len(companies)
-    companies_qualified = sum(1 for c in companies if has_qualifying_hiring_signal(c))
+    companies_qualified = sum(1 for c in companies if _is_company_qualified(c))
 
     contacts_query = db.query(Contact).join(Company).filter(Company.batch_id.in_(batch_ids))
     contacts_query = _apply_date_filter(contacts_query, Contact.created_at)
@@ -1049,28 +1077,17 @@ def get_overview_stats(start_date: str | None = None, end_date: str | None = Non
     bookings_query = _apply_date_filter(bookings_query, CalendarBooking.start_time)
     meetings_booked = bookings_query.filter(CalendarBooking.status != "cancelled").count()
 
-    # Our own DB's pushed count, not SalesRobot's campaign-level connectionRequestSentCount
-    # (used by /leads/stats) -- that SalesRobot number is broader, since it also counts
-    # prospects added directly in SalesRobot outside this app (ad-hoc manual test pushes).
-    # Every number on the Overview funnel should trace back to something this app actually
-    # tracked, so this one deliberately does NOT reuse lead_stats.
-    connections_sent = (
-        db.query(CampaignPush)
-        .join(Contact)
-        .join(Company)
-        .filter(Company.batch_id.in_(batch_ids))
-        .filter(CampaignPush.status == "pushed")
-        .count()
-    )
-
-    lead_stats = get_leads_stats(db)  # accepted/replied still come from SalesRobot -- no DB equivalent exists
+    # get_leads_stats now computes connections_sent from our own DB too (see its docstring) --
+    # reused here, not recomputed, so this and the Campaign tab can never show two different
+    # numbers for the same real thing again.
+    lead_stats = get_leads_stats(db)
 
     return {
         "companies_researched": companies_researched,
         "companies_qualified": companies_qualified,
         "decision_makers_found": decision_makers_found,
         "messages_approved": lead_stats["approved"],
-        "connections_sent": connections_sent,
+        "connections_sent": lead_stats["connections_sent"],
         "connections_accepted": lead_stats["connections_accepted"],
         "replied": lead_stats["replied"],
         "meetings_booked": meetings_booked,
