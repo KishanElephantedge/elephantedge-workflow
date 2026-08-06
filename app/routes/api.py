@@ -972,44 +972,36 @@ def list_leads(page: int = 1, page_size: int = 25, search: str = "", message_sta
 
 @router.get("/leads/stats")
 def get_leads_stats(db: Session = Depends(get_db)):
-    """KPI cards for the lead dashboard. `connections_sent` is our own DB's pushed count --
-    NOT SalesRobot's campaign-level connectionRequestSentCount, which also counts prospects
-    added directly in SalesRobot outside this app and was showing a different, confusing
-    number here than on the Overview tab for the same real thing. accepted/replied still come
-    from SalesRobot (no DB equivalent -- those events only exist in SalesRobot's own system).
+    """KPI cards for the lead dashboard. `connections_sent`/accepted/replied come from
+    SalesRobot's own per-campaign aggregates -- the real, authoritative confirmation of what
+    was actually sent (per explicit direction: our own DB's pushed count undercounts, since it
+    misses prospects added directly in SalesRobot outside this app).
 
     `researched` here means "contacts with a message drafted" (any status), NOT "companies
     researched" -- a real naming collision with the Overview tab's much larger "Companies
     Researched" figure, which counts every company discovered regardless of whether a
     decision-maker or message exists yet. Kept as its own field since the frontend already
-    reads it; UI label should say "Messages Drafted", not "Researched"."""
+    reads it; UI label says "Messages Drafted", not "Researched"."""
     account_uuid = None
     try:
         account_uuid = _get_salesrobot_linkedin_account_uuid(db)
     except HTTPException:
         pass
 
-    accepted = replied = 0
+    sent = accepted = replied = 0
     if account_uuid:
         our_uuids = set(_get_our_campaign_uuids(db))
         try:
             result = list_campaigns(account_uuid, db, ELEPHANT_EDGE_TENANT_ID)
             for c in result.get("data", {}).get("data", []):
                 if c.get("uuid") in our_uuids:
+                    sent += c.get("connectionRequestSentCount") or 0
                     accepted += c.get("connectionRequestAcceptedCount") or 0
                     replied += c.get("repliedCount") or 0
         except SalesRobotError:
             pass
 
     batch_ids = db.query(Batch.id).filter(Batch.tenant_id == ELEPHANT_EDGE_TENANT_ID)
-    sent = (
-        db.query(CampaignPush)
-        .join(Contact)
-        .join(Company)
-        .filter(Company.batch_id.in_(batch_ids))
-        .filter(CampaignPush.status == "pushed")
-        .count()
-    )
 
     contacts = (
         db.query(Contact)
@@ -1077,9 +1069,8 @@ def get_overview_stats(start_date: str | None = None, end_date: str | None = Non
     bookings_query = _apply_date_filter(bookings_query, CalendarBooking.start_time)
     meetings_booked = bookings_query.filter(CalendarBooking.status != "cancelled").count()
 
-    # get_leads_stats now computes connections_sent from our own DB too (see its docstring) --
-    # reused here, not recomputed, so this and the Campaign tab can never show two different
-    # numbers for the same real thing again.
+    # Reused, not recomputed, so this and the Campaign tab always show the exact same numbers
+    # for connections sent/accepted/replied (SalesRobot's own campaign-level aggregates).
     lead_stats = get_leads_stats(db)
 
     return {
