@@ -1428,18 +1428,6 @@ def trigger_calendar_sync(db: Session = Depends(get_db)):
 
 # ---- In-app notifications -- see app/notifications.py for where these get created ----
 
-@router.post("/_scratch/seed-test-notifications")
-def _scratch_seed_test_notifications(db: Session = Depends(get_db)):
-    """TEMPORARY -- for visually verifying the new notification bell/dropdown/page against
-    real production data before real events start creating rows. Delete after use."""
-    from app.notifications import create_notification
-    create_notification(db, ELEPHANT_EDGE_TENANT_ID, "run_failed", "Run failed — test-batch", "A data provider rejected our API key.", severity="error")
-    create_notification(db, ELEPHANT_EDGE_TENANT_ID, "decision_makers_found", "3 decision-maker(s) found — test-batch", "Across 5 companies checked. Review and approve in the dashboard.", severity="info")
-    create_notification(db, ELEPHANT_EDGE_TENANT_ID, "meeting_booked", "Meeting booked — Jane Doe", "Scheduled for Aug 10, 2026 03:00 PM UTC.", severity="success")
-    create_notification(db, ELEPHANT_EDGE_TENANT_ID, "outreach_pushed", "5 contact(s) pushed — test-batch", "0 failed, 1 skipped as already pushed.", severity="success")
-    return {"seeded": 4}
-
-
 @router.get("/notifications")
 def list_notifications(page: int = 1, page_size: int = 20, unread_only: bool = False, db: Session = Depends(get_db)):
     """Auto-deletes anything past the 30-day retention window on every read (see
