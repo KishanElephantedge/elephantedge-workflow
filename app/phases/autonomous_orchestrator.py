@@ -20,6 +20,7 @@ from sqlalchemy.orm import Session
 
 from app.budget_guard import BudgetExceededError, BudgetGuard
 from app.db.models import AutonomousRun, Batch, Company, Contact, Parameter, Score
+from app.notifications import create_notification
 from app.slack_client import SlackError, send_slack_message
 from app.phases.buying_signal import run_buying_signal_check
 from app.phases.campaign_execution import run_campaign_execution
@@ -295,17 +296,22 @@ def _send_failure_alert(batch: Batch, run: AutonomousRun, error: str, db: Sessio
     alert. Same Slack channels as the success-path approval notification. Best-effort: a
     failure to send this alert must never raise past the caller, which is already inside its
     own failure-handling block."""
+    humanized = _humanize_failure(error)
     text = (
         f":rotating_light: Autonomous run failed\n"
         f"Batch: {batch.name} (id {batch.id})\n"
         f"Run id: {run.id}\n"
-        f"What happened: {_humanize_failure(error)}\n"
+        f"What happened: {humanized}\n"
         f"(Full technical details are saved on this run in the dashboard for debugging.)"
     )
     try:
         send_slack_message(text, db, tenant_id)
     except SlackError:
         pass
+    create_notification(
+        db, tenant_id, "run_failed", f"Run failed — {batch.name}", humanized,
+        severity="error", batch_id=batch.id, run_id=run.id,
+    )
 
 
 def _send_approval_notification(batch: Batch, run: AutonomousRun, decision_maker_result: dict, db: Session, tenant_id: int, messages: list[dict] | None = None) -> str | None:
@@ -342,6 +348,14 @@ def _send_approval_notification(batch: Batch, run: AutonomousRun, decision_maker
         f"*Decision-makers found:*\n{decision_maker_block}\n\n"
         f"*Drafted outreach messages:*\n\n{message_block}"
     )
+    create_notification(
+        db, tenant_id, "decision_makers_found",
+        f"{decision_maker_result['decision_makers_found']} decision-maker(s) found — {batch.name}",
+        f"Across {decision_maker_result['companies_checked']} companies checked. Pushes to the "
+        f"outreach channel in {APPROVAL_WINDOW_MINUTES} minutes unless cancelled -- review and "
+        f"approve in the dashboard.",
+        severity="info", batch_id=batch.id, run_id=run.id,
+    )
     try:
         send_slack_message(slack_text, db, tenant_id)
         return None
@@ -351,6 +365,11 @@ def _send_approval_notification(batch: Batch, run: AutonomousRun, decision_maker
 
 def _send_success_notification(batch: Batch, outreach_result: dict, db: Session, tenant_id: int) -> str | None:
     """Slack-only -- see _send_approval_notification's docstring for why email is dropped."""
+    create_notification(
+        db, tenant_id, "outreach_pushed", f"{outreach_result['pushed']} contact(s) pushed — {batch.name}",
+        f"{outreach_result['failed']} failed, {outreach_result['skipped']} skipped as already pushed.",
+        severity="success", batch_id=batch.id,
+    )
     try:
         send_slack_message(
             f":white_check_mark: *Elephant Edge* -- batch #{batch.id}: {outreach_result['pushed']} contact(s) "
@@ -453,13 +472,21 @@ def run_daily_autonomous_cycle(db: Session, tenant_id: int) -> dict:
         run.budget_stopped_early = budget_stopped_early
 
         if budget_stopped_early or decision_maker_result["decision_makers_found"] == 0:
-            # Nothing to push -- no approval window needed, nothing to notify about.
+            # Nothing to push -- no approval window needed, no Slack alert (that channel was
+            # deliberately kept to failures/approvals only), but this genuinely is a real
+            # outcome worth surfacing in-app (see the real "why only 2 of 5" investigation --
+            # a thin/empty result is information, not silence).
             batch.current_phase = "autonomous_cycle_done"
             batch.status = "complete"
             run.status = "completed"
             run.contacts_pushed = 0
             run.completed_at = datetime.utcnow()
             db.commit()
+            create_notification(
+                db, tenant_id, "run_completed_empty", f"Run completed — 0 decision-makers found ({batch.name})",
+                f"{discovery_result['companies_discovered']} companies discovered." + (" Budget cap stopped the run early." if budget_stopped_early else ""),
+                severity="warning" if budget_stopped_early else "info", batch_id=batch.id, run_id=run.id,
+            )
             return {
                 "status": "completed",
                 "batch_id": batch.id,
@@ -582,6 +609,11 @@ def _run_jobo_autonomous_cycle(batch: Batch, run: AutonomousRun, db: Session, te
         run.contacts_pushed = 0
         run.completed_at = datetime.utcnow()
         db.commit()
+        create_notification(
+            db, tenant_id, "run_completed_empty", f"Run completed — 0 decision-makers found ({batch.name})",
+            f"{result['companies_qualified']} companies discovered (Jobo)." + (" Budget cap stopped the run early." if result["budget_stopped_early"] else ""),
+            severity="warning" if result["budget_stopped_early"] else "info", batch_id=batch.id, run_id=run.id,
+        )
         return {
             "status": "completed",
             "batch_id": batch.id,
@@ -671,6 +703,11 @@ def _run_jd_first_autonomous_cycle(batch: Batch, run: AutonomousRun, db: Session
         run.contacts_pushed = 0
         run.completed_at = datetime.utcnow()
         db.commit()
+        create_notification(
+            db, tenant_id, "run_completed_empty", f"Run completed — 0 decision-makers found ({batch.name})",
+            f"{result['companies_discovered']} companies discovered (JD-First)." + (" Budget cap stopped the run early." if result["budget_stopped_early"] else ""),
+            severity="warning" if result["budget_stopped_early"] else "info", batch_id=batch.id, run_id=run.id,
+        )
         return {
             "status": "completed",
             "batch_id": batch.id,
@@ -772,6 +809,11 @@ def _run_apify_autonomous_cycle(batch: Batch, run: AutonomousRun, db: Session, t
         run.contacts_pushed = 0
         run.completed_at = datetime.utcnow()
         db.commit()
+        create_notification(
+            db, tenant_id, "run_completed_empty", f"Run completed — 0 decision-makers found ({batch.name})",
+            f"{result['companies_discovered']} companies discovered (Apify)." + (" Budget cap stopped the run early." if result["budget_stopped_early"] else ""),
+            severity="warning" if result["budget_stopped_early"] else "info", batch_id=batch.id, run_id=run.id,
+        )
         return {
             "status": "completed",
             "batch_id": batch.id,

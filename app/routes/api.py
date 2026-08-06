@@ -8,7 +8,8 @@ from sqlalchemy.orm import Session, selectinload
 from sqlalchemy import func, or_
 
 from app.cache import active_keys, bump_batch_version, cache_get, cache_set, get_batch_version, mark_active
-from app.db.models import AutonomousRun, Batch, CalendarBooking, CampaignEvent, CampaignPush, Company, Contact, Credential, Parameter, PersonalizedMessage, Score
+from app.db.models import AutonomousRun, Batch, CalendarBooking, CampaignEvent, CampaignPush, Company, Contact, Credential, Notification, Parameter, PersonalizedMessage, Score
+from app.notifications import delete_expired_notifications
 from app.google_calendar_client import GoogleCalendarError
 from app.phases.hiring_signal import has_qualifying_hiring_signal
 from app.db.session import get_db
@@ -1423,6 +1424,116 @@ def trigger_calendar_sync(db: Session = Depends(get_db)):
         return sync_calendar_bookings(db, ELEPHANT_EDGE_TENANT_ID)
     except GoogleCalendarError as e:
         raise HTTPException(status_code=502, detail=str(e))
+
+
+# ---- In-app notifications -- see app/notifications.py for where these get created ----
+
+@router.get("/notifications")
+def list_notifications(page: int = 1, page_size: int = 20, unread_only: bool = False, db: Session = Depends(get_db)):
+    """Auto-deletes anything past the 30-day retention window on every read (see
+    delete_expired_notifications) -- no separate scheduled job needed at this volume."""
+    delete_expired_notifications(db, ELEPHANT_EDGE_TENANT_ID)
+
+    query = db.query(Notification).filter(Notification.tenant_id == ELEPHANT_EDGE_TENANT_ID)
+    if unread_only:
+        query = query.filter(Notification.read_at.is_(None))
+
+    total = query.count()
+    unread_count = (
+        db.query(Notification)
+        .filter(Notification.tenant_id == ELEPHANT_EDGE_TENANT_ID)
+        .filter(Notification.read_at.is_(None))
+        .count()
+    )
+    page = max(page, 1)
+    page_size = max(1, min(page_size, 100))
+    items = (
+        query
+        .order_by(Notification.created_at.desc())
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+        .all()
+    )
+    return {
+        "page": page,
+        "page_size": page_size,
+        "total": total,
+        "total_pages": (total + page_size - 1) // page_size if total else 0,
+        "unread_count": unread_count,
+        "notifications": [
+            {
+                "id": n.id,
+                "type": n.type,
+                "severity": n.severity,
+                "title": n.title,
+                "message": n.message,
+                "batch_id": n.batch_id,
+                "run_id": n.run_id,
+                "read": n.read_at is not None,
+                "created_at": n.created_at,
+            }
+            for n in items
+        ],
+    }
+
+
+class NotificationIds(BaseModel):
+    ids: list[int]
+
+
+@router.post("/notifications/{notification_id}/read")
+def mark_notification_read(notification_id: int, db: Session = Depends(get_db)):
+    notif = (
+        db.query(Notification)
+        .filter(Notification.id == notification_id)
+        .filter(Notification.tenant_id == ELEPHANT_EDGE_TENANT_ID)
+        .first()
+    )
+    if not notif:
+        raise HTTPException(status_code=404, detail="Notification not found")
+    if notif.read_at is None:
+        notif.read_at = datetime.utcnow()
+        db.commit()
+    return {"id": notification_id, "read": True}
+
+
+@router.post("/notifications/read-all")
+def mark_all_notifications_read(db: Session = Depends(get_db)):
+    updated = (
+        db.query(Notification)
+        .filter(Notification.tenant_id == ELEPHANT_EDGE_TENANT_ID)
+        .filter(Notification.read_at.is_(None))
+        .update({"read_at": datetime.utcnow()})
+    )
+    db.commit()
+    return {"marked_read": updated}
+
+
+@router.post("/notifications/bulk-delete")
+def bulk_delete_notifications(body: NotificationIds, db: Session = Depends(get_db)):
+    deleted = (
+        db.query(Notification)
+        .filter(Notification.tenant_id == ELEPHANT_EDGE_TENANT_ID)
+        .filter(Notification.id.in_(body.ids))
+        .delete(synchronize_session=False)
+    )
+    db.commit()
+    return {"deleted": deleted}
+
+
+@router.delete("/notifications/{notification_id}")
+def delete_notification(notification_id: int, db: Session = Depends(get_db)):
+    notif = (
+        db.query(Notification)
+        .filter(Notification.id == notification_id)
+        .filter(Notification.tenant_id == ELEPHANT_EDGE_TENANT_ID)
+        .first()
+    )
+    if not notif:
+        raise HTTPException(status_code=404, detail="Notification not found")
+    db.delete(notif)
+    db.commit()
+    return {"deleted": True}
 
 
 # ---- Phase 12: Campaign Execution ----

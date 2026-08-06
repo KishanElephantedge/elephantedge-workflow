@@ -247,6 +247,26 @@ class CalendarBooking(Base):
     synced_at = Column(DateTime, default=datetime.utcnow)
 
 
+class Notification(Base):
+    """In-app notification feed -- separate from (not a replacement for) the existing Slack
+    alerts, which some teammates without dashboard access still rely on. Created at the same
+    real event points Slack already fires on (see app/notifications.py), plus new meeting-
+    booked events Slack never covered. Rows older than NOTIFICATION_RETENTION_DAYS are swept
+    on every list read (see app/notifications.py) -- no separate scheduled job needed."""
+    __tablename__ = "notifications"
+
+    id = Column(Integer, primary_key=True)
+    tenant_id = Column(Integer, nullable=False)
+    type = Column(String, nullable=False)  # run_failed | decision_makers_found | run_completed_empty | outreach_pushed | meeting_booked
+    severity = Column(String, default="info")  # info | success | warning | error
+    title = Column(String, nullable=False)
+    message = Column(Text, nullable=True)
+    batch_id = Column(Integer, nullable=True)
+    run_id = Column(Integer, nullable=True)
+    read_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
 class AutonomousRun(Base):
     __tablename__ = "autonomous_runs"
 

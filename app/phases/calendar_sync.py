@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 
 from app.db.models import CalendarBooking
 from app.google_calendar_client import fetch_events
+from app.notifications import create_notification
 
 
 def _parse_event_time(time_obj: dict | None) -> datetime | None:
@@ -75,5 +76,12 @@ def sync_calendar_bookings(db: Session, tenant_id: int, days_ahead: int = 30, da
                 synced_at=datetime.utcnow(),
             ))
             created += 1
+            start = _parse_event_time(event.get("start"))
+            create_notification(
+                db, tenant_id, "meeting_booked",
+                f"Meeting booked — {booker_name or booker_email or 'unknown'}",
+                f"Scheduled for {start.strftime('%b %d, %Y %I:%M %p UTC') if start else 'an unspecified time'}.",
+                severity="success",
+            )
     db.commit()
     return {"fetched": len(events), "created": created, "updated": updated}

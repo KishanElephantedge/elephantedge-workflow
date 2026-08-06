@@ -64,3 +64,18 @@ def ensure_indexes():
                 synced_at TIMESTAMP
             )
         """))
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS notifications (
+                id SERIAL PRIMARY KEY,
+                tenant_id INTEGER NOT NULL,
+                type VARCHAR NOT NULL,
+                severity VARCHAR DEFAULT 'info',
+                title VARCHAR NOT NULL,
+                message TEXT,
+                batch_id INTEGER,
+                run_id INTEGER,
+                read_at TIMESTAMP,
+                created_at TIMESTAMP
+            )
+        """))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_notifications_tenant_created ON notifications (tenant_id, created_at DESC)"))
