@@ -1,5 +1,5 @@
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Request
 from pydantic import BaseModel
@@ -9,6 +9,7 @@ from sqlalchemy import func, or_
 from app.cache import active_keys, bump_batch_version, cache_get, cache_set, get_batch_version, mark_active
 from app.db.models import AutonomousRun, Batch, CalendarBooking, CampaignEvent, Company, Contact, Credential, Parameter, PersonalizedMessage, Score
 from app.google_calendar_client import GoogleCalendarError
+from app.phases.hiring_signal import has_qualifying_hiring_signal
 from app.db.session import get_db
 from app.deepline_client import DeeplineError, get_credit_balance_usd
 from app.heyreach_client import HeyReachError
@@ -784,8 +785,83 @@ def _fetch_our_salesrobot_prospects(db: Session) -> dict[str, dict]:
     return by_url
 
 
+@router.get("/companies")
+def list_companies(page: int = 1, page_size: int = 25, search: str = "", qualified: str = "", db: Session = Depends(get_db)):
+    """Cross-batch company list -- previously the only way to see companies at all was per-
+    batch (BatchDetail), with no single "everything we've researched" view. `qualified`
+    ("true"/"false") filters by the exact same has_qualifying_hiring_signal check that's the
+    real production gate before Decision Maker ever runs (see hiring_signal.py), so this
+    matches production behavior rather than an approximated definition. That check has no SQL
+    column of its own (it's role-is-set OR product-fit-categories-is-set), so it's applied
+    Python-side after a bounded DB fetch -- acceptable at today's real company volume (low
+    thousands), would need a computed/indexed column if that grows an order of magnitude."""
+    query = (
+        db.query(Company)
+        .join(Batch)
+        .filter(Batch.tenant_id == ELEPHANT_EDGE_TENANT_ID)
+    )
+    if search.strip():
+        like = f"%{search.strip()}%"
+        query = query.filter(or_(Company.name.ilike(like), Company.domain.ilike(like), Company.industry.ilike(like)))
+
+    companies = query.order_by(Company.created_at.desc()).all()
+
+    if qualified == "true":
+        companies = [c for c in companies if has_qualifying_hiring_signal(c)]
+    elif qualified == "false":
+        companies = [c for c in companies if not has_qualifying_hiring_signal(c)]
+
+    total = len(companies)
+    page = max(page, 1)
+    page_size = max(1, min(page_size, 100))
+    page_items = companies[(page - 1) * page_size: page * page_size]
+
+    return {
+        "page": page,
+        "page_size": page_size,
+        "total": total,
+        "total_pages": (total + page_size - 1) // page_size if total else 0,
+        "companies": [
+            {
+                "id": c.id,
+                "name": c.name,
+                "domain": c.domain,
+                "industry": c.industry,
+                "source": c.source,
+                "batch_id": c.batch_id,
+                "qualified": has_qualifying_hiring_signal(c),
+                "hiring_signal_role": c.hiring_signal_role,
+                "hiring_signal_strength": c.hiring_signal_strength,
+                "team_fit_tier": c.team_fit_tier,
+                "linkedin_url": c.linkedin_url,
+                "created_at": c.created_at,
+            }
+            for c in page_items
+        ],
+    }
+
+
+def _lead_dict(c: Contact, live: dict | None) -> dict:
+    pm = c.personalized_message
+    push = c.campaign_pushes[-1] if c.campaign_pushes else None
+    return {
+        "contact_id": c.id,
+        "first_name": c.first_name,
+        "last_name": c.last_name,
+        "title": c.title,
+        "linkedin_url": c.linkedin_url,
+        "company_name": c.company.name if c.company else None,
+        "company_linkedin_url": c.company.linkedin_url if c.company else None,
+        "message_status": pm.status if pm else None,
+        "push_status": push.status if push else None,
+        "pushed_at": push.pushed_at if push else None,
+        "salesrobot_last_activity": live.get("lastActivity") if live else None,
+        "salesrobot_status": live.get("status") if live else None,
+    }
+
+
 @router.get("/leads")
-def list_leads(page: int = 1, page_size: int = 25, search: str = "", message_status: str = "", db: Session = Depends(get_db)):
+def list_leads(page: int = 1, page_size: int = 25, search: str = "", message_status: str = "", activity: str = "", db: Session = Depends(get_db)):
     """Unified lead list -- our own DB (the source of truth for who we've researched/messaged)
     enriched with live SalesRobot status where a match exists. Deliberately DB-first, not
     SalesRobot-first: a lead we've generated a message for but haven't pushed yet still shows
@@ -795,7 +871,13 @@ def list_leads(page: int = 1, page_size: int = 25, search: str = "", message_sta
     Paginated, and search/status filtering happen at the query level (not "fetch everything,
     filter in Python") -- so SalesRobot enrichment (a handful of real API calls) only ever
     runs for the leads actually being shown on this page, not the whole table, regardless of
-    how large it grows."""
+    how large it grows.
+
+    `activity` (e.g. "CONNECTED", "REPLIED", "NO_REPLY_YET", or "NOT_SENT") is the one
+    exception -- live SalesRobot status has no DB column to filter/paginate on at the SQL
+    level, so that path fetches the full matching set once and paginates in Python. Fine at
+    today's real lead volume (dozens-low hundreds); would need a synced status column if this
+    grows an order of magnitude."""
     query = (
         db.query(Contact)
         .join(Company)
@@ -815,9 +897,37 @@ def list_leads(page: int = 1, page_size: int = 25, search: str = "", message_sta
     if message_status:
         query = query.filter(Contact.personalized_message.has(PersonalizedMessage.status == message_status))
 
-    total = query.count()
     page = max(page, 1)
     page_size = max(1, min(page_size, 100))
+
+    if activity:
+        contacts = (
+            query
+            .options(selectinload(Contact.personalized_message), selectinload(Contact.campaign_pushes), selectinload(Contact.company))
+            .order_by(Contact.id.desc())
+            .all()
+        )
+        live_by_url = _fetch_our_salesrobot_prospects(db)
+        matched = []
+        for c in contacts:
+            live = live_by_url.get(_normalize_linkedin_url(c.linkedin_url))
+            last_activity = (live.get("lastActivity") if live else None) or ""
+            if activity.upper() == "NOT_SENT":
+                if not live and not c.campaign_pushes:
+                    matched.append((c, live))
+            elif last_activity.upper() == activity.upper():
+                matched.append((c, live))
+        total = len(matched)
+        page_slice = matched[(page - 1) * page_size: page * page_size]
+        return {
+            "page": page,
+            "page_size": page_size,
+            "total": total,
+            "total_pages": (total + page_size - 1) // page_size if total else 0,
+            "leads": [_lead_dict(c, live) for c, live in page_slice],
+        }
+
+    total = query.count()
     contacts = (
         query
         .options(selectinload(Contact.personalized_message), selectinload(Contact.campaign_pushes), selectinload(Contact.company))
@@ -828,26 +938,7 @@ def list_leads(page: int = 1, page_size: int = 25, search: str = "", message_sta
     )
 
     live_by_url = _fetch_our_salesrobot_prospects(db)
-
-    leads = []
-    for c in contacts:
-        pm = c.personalized_message
-        push = c.campaign_pushes[-1] if c.campaign_pushes else None
-        live = live_by_url.get(_normalize_linkedin_url(c.linkedin_url))
-        leads.append({
-            "contact_id": c.id,
-            "first_name": c.first_name,
-            "last_name": c.last_name,
-            "title": c.title,
-            "linkedin_url": c.linkedin_url,
-            "company_name": c.company.name if c.company else None,
-            "company_linkedin_url": c.company.linkedin_url if c.company else None,
-            "message_status": pm.status if pm else None,
-            "push_status": push.status if push else None,
-            "pushed_at": push.pushed_at if push else None,
-            "salesrobot_last_activity": live.get("lastActivity") if live else None,
-            "salesrobot_status": live.get("status") if live else None,
-        })
+    leads = [_lead_dict(c, live_by_url.get(_normalize_linkedin_url(c.linkedin_url))) for c in contacts]
     return {
         "page": page,
         "page_size": page_size,
@@ -900,6 +991,66 @@ def get_leads_stats(db: Session = Depends(get_db)):
         "replied": replied,
         "acceptance_rate": round(accepted / sent, 3) if sent else None,
         "reply_rate": round(replied / sent, 3) if sent else None,
+    }
+
+
+@router.get("/overview/stats")
+def get_overview_stats(start_date: str | None = None, end_date: str | None = None, db: Session = Depends(get_db)):
+    """The full funnel, not just the outreach half of it -- /leads/stats (above) only covers
+    from "message approved" onward. This adds the two stages before it (companies researched,
+    companies qualified) and the one stage after replies that nothing else surfaces
+    (meetings booked), so the Overview tab can show one real funnel end to end.
+
+    start_date/end_date (YYYY-MM-DD) filter every DB-sourced count by created_at -- the
+    SalesRobot-sourced counts (sent/accepted/replied) are that provider's own campaign-level
+    aggregates, which have no per-event timestamp to filter by (see /leads/stats's own
+    docstring), so a date range only narrows the DB-native stages. Documented in the response
+    itself via `date_filtered_stages` so the frontend doesn't have to guess which numbers moved."""
+    batch_ids = db.query(Batch.id).filter(Batch.tenant_id == ELEPHANT_EDGE_TENANT_ID)
+
+    def _parse_date(value: str | None):
+        if not value:
+            return None
+        return datetime.strptime(value, "%Y-%m-%d")
+
+    start_dt = _parse_date(start_date)
+    end_dt = _parse_date(end_date)
+    if end_dt:
+        end_dt = end_dt + timedelta(days=1)  # inclusive of the whole end date
+
+    def _apply_date_filter(query, column):
+        if start_dt:
+            query = query.filter(column >= start_dt)
+        if end_dt:
+            query = query.filter(column < end_dt)
+        return query
+
+    companies_query = db.query(Company).filter(Company.batch_id.in_(batch_ids))
+    companies_query = _apply_date_filter(companies_query, Company.created_at)
+    companies = companies_query.all()
+    companies_researched = len(companies)
+    companies_qualified = sum(1 for c in companies if has_qualifying_hiring_signal(c))
+
+    contacts_query = db.query(Contact).join(Company).filter(Company.batch_id.in_(batch_ids))
+    contacts_query = _apply_date_filter(contacts_query, Contact.created_at)
+    decision_makers_found = contacts_query.count()
+
+    bookings_query = db.query(CalendarBooking)
+    bookings_query = _apply_date_filter(bookings_query, CalendarBooking.start_time)
+    meetings_booked = bookings_query.filter(CalendarBooking.status != "cancelled").count()
+
+    lead_stats = get_leads_stats(db)  # reuse the exact same outreach-stage numbers, one source of truth
+
+    return {
+        "companies_researched": companies_researched,
+        "companies_qualified": companies_qualified,
+        "decision_makers_found": decision_makers_found,
+        "messages_approved": lead_stats["approved"],
+        "connections_sent": lead_stats["connections_sent"],
+        "connections_accepted": lead_stats["connections_accepted"],
+        "replied": lead_stats["replied"],
+        "meetings_booked": meetings_booked,
+        "date_filtered_stages": ["companies_researched", "companies_qualified", "decision_makers_found", "meetings_booked"],
     }
 
 
@@ -1053,21 +1204,41 @@ def list_campaign_events(db: Session = Depends(get_db)):
 # so this is a periodic pull (see main.py's scheduler) plus a manual trigger for testing.
 
 @router.get("/calendar-bookings")
-def list_calendar_bookings(db: Session = Depends(get_db)):
-    bookings = db.query(CalendarBooking).order_by(CalendarBooking.start_time.desc()).limit(200).all()
-    return [
-        {
-            "id": b.id,
-            "booker_name": b.booker_name,
-            "booker_email": b.booker_email,
-            "start_time": b.start_time,
-            "end_time": b.end_time,
-            "status": b.status,
-            "raw_payload": b.raw_payload,
-            "synced_at": b.synced_at,
-        }
-        for b in bookings
-    ]
+def list_calendar_bookings(page: int = 1, page_size: int = 25, search: str = "", db: Session = Depends(get_db)):
+    query = db.query(CalendarBooking)
+    if search.strip():
+        like = f"%{search.strip()}%"
+        query = query.filter(or_(CalendarBooking.booker_name.ilike(like), CalendarBooking.booker_email.ilike(like)))
+
+    total = query.count()
+    page = max(page, 1)
+    page_size = max(1, min(page_size, 100))
+    bookings = (
+        query
+        .order_by(CalendarBooking.start_time.desc())
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+        .all()
+    )
+    return {
+        "page": page,
+        "page_size": page_size,
+        "total": total,
+        "total_pages": (total + page_size - 1) // page_size if total else 0,
+        "bookings": [
+            {
+                "id": b.id,
+                "booker_name": b.booker_name,
+                "booker_email": b.booker_email,
+                "start_time": b.start_time,
+                "end_time": b.end_time,
+                "status": b.status,
+                "raw_payload": b.raw_payload,
+                "synced_at": b.synced_at,
+            }
+            for b in bookings
+        ],
+    }
 
 
 @router.post("/calendar-bookings/sync")
