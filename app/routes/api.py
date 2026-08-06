@@ -861,7 +861,7 @@ def _lead_dict(c: Contact, live: dict | None) -> dict:
 
 
 @router.get("/leads")
-def list_leads(page: int = 1, page_size: int = 25, search: str = "", message_status: str = "", activity: str = "", db: Session = Depends(get_db)):
+def list_leads(page: int = 1, page_size: int = 25, search: str = "", message_status: str = "", activity: str = "", pipeline_only: bool = True, db: Session = Depends(get_db)):
     """Unified lead list -- our own DB (the source of truth for who we've researched/messaged)
     enriched with live SalesRobot status where a match exists. Deliberately DB-first, not
     SalesRobot-first: a lead we've generated a message for but haven't pushed yet still shows
@@ -877,15 +877,19 @@ def list_leads(page: int = 1, page_size: int = 25, search: str = "", message_sta
     exception -- live SalesRobot status has no DB column to filter/paginate on at the SQL
     level, so that path fetches the full matching set once and paginates in Python. Fine at
     today's real lead volume (dozens-low hundreds); would need a synced status column if this
-    grows an order of magnitude."""
+    grows an order of magnitude.
+
+    `pipeline_only` (default True, matches original/Campaign-tab behavior): a raw decision-
+    maker match with no message and no push isn't a "lead" for that view. Set False for the
+    Overview tab's "Decision-Makers Found" drill-down, which means every Contact regardless
+    of pipeline stage."""
     query = (
         db.query(Contact)
         .join(Company)
         .filter(Company.batch_id.in_(db.query(Batch.id).filter(Batch.tenant_id == ELEPHANT_EDGE_TENANT_ID)))
-        # Only leads that have actually entered the outreach pipeline -- a raw decision-maker
-        # match with no message and no push isn't a "lead" for this view yet.
-        .filter(or_(Contact.personalized_message.has(), Contact.campaign_pushes.any()))
     )
+    if pipeline_only:
+        query = query.filter(or_(Contact.personalized_message.has(), Contact.campaign_pushes.any()))
     if search.strip():
         like = f"%{search.strip()}%"
         query = query.filter(or_(
