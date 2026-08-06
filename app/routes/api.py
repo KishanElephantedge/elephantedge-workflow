@@ -919,6 +919,12 @@ def list_leads(page: int = 1, page_size: int = 25, search: str = "", message_sta
             if activity.upper() == "NOT_SENT":
                 if not live and not c.campaign_pushes:
                     matched.append((c, live))
+            elif activity.upper() == "SENT":
+                # Any live SalesRobot status at all means a connection request actually went
+                # out -- CONNECTED/REPLIED/NO_REPLY_YET are all "sent", just at different
+                # outcomes past that point.
+                if live:
+                    matched.append((c, live))
             elif last_activity.upper() == activity.upper():
                 matched.append((c, live))
         total = len(matched)
