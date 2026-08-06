@@ -1064,6 +1064,104 @@ def get_overview_stats(start_date: str | None = None, end_date: str | None = Non
     }
 
 
+@router.get("/overview/recent-activity")
+def get_overview_recent_activity(limit: int = 8, db: Session = Depends(get_db)):
+    """A real activity feed for the Overview tab -- three genuine event types merged and
+    sorted by real timestamp, not a synthetic log. No new table: batches (discovery
+    completing), approved messages, and pushed connections are all already timestamped."""
+    batch_ids = db.query(Batch.id).filter(Batch.tenant_id == ELEPHANT_EDGE_TENANT_ID)
+    items = []
+
+    recent_batches = (
+        db.query(Batch)
+        .filter(Batch.tenant_id == ELEPHANT_EDGE_TENANT_ID)
+        .order_by(Batch.created_at.desc())
+        .limit(limit)
+        .all()
+    )
+    for b in recent_batches:
+        company_count = db.query(Company).filter(Company.batch_id == b.id).count()
+        if company_count == 0:
+            continue
+        items.append({
+            "type": "discovery",
+            "text": f"Discovered {company_count} compan{'y' if company_count == 1 else 'ies'} in \"{b.name}\"",
+            "timestamp": b.created_at,
+        })
+
+    recent_messages = (
+        db.query(PersonalizedMessage)
+        .join(Contact)
+        .join(Company)
+        .filter(Company.batch_id.in_(batch_ids))
+        .filter(PersonalizedMessage.status == "approved")
+        .order_by(PersonalizedMessage.generated_at.desc())
+        .limit(limit)
+        .all()
+    )
+    for m in recent_messages:
+        contact = m.contact
+        name = f"{contact.first_name or ''} {contact.last_name or ''}".strip() or "a contact"
+        company_name = contact.company.name if contact.company else ""
+        items.append({
+            "type": "message",
+            "text": f"Message approved for {name}" + (f" @ {company_name}" if company_name else ""),
+            "timestamp": m.generated_at,
+        })
+
+    recent_pushes = (
+        db.query(CampaignPush)
+        .join(Contact)
+        .join(Company)
+        .filter(Company.batch_id.in_(batch_ids))
+        .filter(CampaignPush.status == "pushed")
+        .order_by(CampaignPush.pushed_at.desc())
+        .limit(limit)
+        .all()
+    )
+    for p in recent_pushes:
+        contact = p.contact
+        name = f"{contact.first_name or ''} {contact.last_name or ''}".strip() or "a contact"
+        company_name = contact.company.name if contact.company else ""
+        items.append({
+            "type": "outreach",
+            "text": f"Connection request sent to {name}" + (f" @ {company_name}" if company_name else ""),
+            "timestamp": p.pushed_at,
+        })
+
+    items = [i for i in items if i["timestamp"] is not None]
+    items.sort(key=lambda i: i["timestamp"], reverse=True)
+    return items[:limit]
+
+
+@router.get("/overview/trend")
+def get_overview_trend(days: int = 14, db: Session = Depends(get_db)):
+    """Daily companies-discovered count for the last N days -- the one trend that matters
+    without touching cost/spend (kept backend-only/out of the UI per explicit direction)."""
+    days = max(1, min(days, 90))
+    since = datetime.utcnow() - timedelta(days=days - 1)
+    since = since.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    companies = (
+        db.query(Company)
+        .join(Batch)
+        .filter(Batch.tenant_id == ELEPHANT_EDGE_TENANT_ID)
+        .filter(Company.created_at >= since)
+        .all()
+    )
+    counts: dict[str, int] = {}
+    for c in companies:
+        day_key = c.created_at.strftime("%Y-%m-%d")
+        counts[day_key] = counts.get(day_key, 0) + 1
+
+    series = []
+    for i in range(days):
+        day = since + timedelta(days=i)
+        day_key = day.strftime("%Y-%m-%d")
+        series.append({"date": day_key, "companies_found": counts.get(day_key, 0)})
+    return series
+
+
 @router.get("/leads/{contact_id}")
 def get_lead_detail(contact_id: int, db: Session = Depends(get_db)):
     """Full detail for one lead -- our own research/message data, live SalesRobot status if
