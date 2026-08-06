@@ -21,6 +21,8 @@ from app.phases.decision_maker import run_decision_maker_id
 from app.phases.discovery import run_discovery
 from app.phases.jd_first_discovery import run_jd_first_discovery
 from app.phases.jobo_discovery import run_jobo_discovery
+from app.phases.apify_discovery import run_apify_discovery
+from app.apify_client import ApifyError
 from app.jobo_client import JoboError
 from app.phases.hubspot_sync import sync_to_hubspot
 from app.phases.calendar_sync import sync_calendar_bookings
@@ -342,6 +344,32 @@ def execute_jd_first_discovery(batch_id: int, target: int = 10, db: Session = De
         raise HTTPException(status_code=404, detail="Batch not found")
     _require_batch_source(batch, "deepline")
     result = run_jd_first_discovery(batch_id, db, ELEPHANT_EDGE_TENANT_ID, target=target)
+    batch.current_phase = "discovery_done"
+    db.commit()
+    bump_batch_version(batch_id)
+    return result
+
+
+# ---- Apify Discovery -- LinkedIn Jobs Scraper, real second discovery source validated live
+# 2026-08-05/06 (8/8 and 5/5 real qualifying companies vs. jd_first's 2/5 the same week) ----
+
+@router.post("/batches/{batch_id}/phases/discovery-apify")
+def execute_apify_discovery(batch_id: int, target: int = 5, db: Session = Depends(get_db)):
+    batch = (
+        db.query(Batch)
+        .filter(Batch.id == batch_id)
+        .filter(Batch.tenant_id == ELEPHANT_EDGE_TENANT_ID)
+        .first()
+    )
+    if not batch:
+        raise HTTPException(status_code=404, detail="Batch not found")
+    _require_batch_source(batch, "deepline")
+    try:
+        result = run_apify_discovery(batch_id, db, ELEPHANT_EDGE_TENANT_ID, target=target)
+    except ApifyError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    if result.get("api_error"):
+        raise HTTPException(status_code=502, detail=result["api_error"])
     batch.current_phase = "discovery_done"
     db.commit()
     bump_batch_version(batch_id)
@@ -1222,8 +1250,8 @@ def set_autonomous_discovery_source(source: str, db: Session = Depends(get_db)):
     """Which pipeline the daily autonomous trigger uses -- validated here (not just in the
     generic /parameters endpoint) so a typo can't silently disable the source check in
     run_daily_autonomous_cycle and fall through to the deepline default unexpectedly."""
-    if source not in ("deepline", "jobo"):
-        raise HTTPException(status_code=400, detail="source must be 'deepline' or 'jobo'")
+    if source not in ("deepline", "jobo", "jd_first", "apify"):
+        raise HTTPException(status_code=400, detail="source must be 'deepline', 'jobo', 'jd_first', or 'apify'")
     param = (
         db.query(Parameter)
         .filter(Parameter.tenant_id == ELEPHANT_EDGE_TENANT_ID)

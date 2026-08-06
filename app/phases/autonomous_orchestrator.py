@@ -30,6 +30,7 @@ from app.phases.scoring import run_scoring
 from app.phases.tech_stack import run_tech_stack_check
 from app.phases.jobo_discovery import run_jobo_discovery
 from app.phases.jd_first_discovery import run_jd_first_discovery
+from app.phases.apify_discovery import run_apify_discovery
 from app.phases.decision_maker import find_decision_maker
 from app.jobo_client import JoboError
 from app.outreach.selector import get_outreach_channel
@@ -95,7 +96,7 @@ def get_autonomous_discovery_source(db: Session, tenant_id: int) -> str:
     read once at the start of run_daily_autonomous_cycle, never re-read mid-run so a settings
     change can't switch source partway through a cycle."""
     param = _get_tenant_param(db, tenant_id, "autonomous_discovery_source")
-    if param and param.value and param.value.get("source") in ("deepline", "jobo", "jd_first"):
+    if param and param.value and param.value.get("source") in ("deepline", "jobo", "jd_first", "apify"):
         return param.value["source"]
     return DEFAULT_DISCOVERY_SOURCE
 
@@ -382,9 +383,10 @@ def run_daily_autonomous_cycle(db: Session, tenant_id: int) -> dict:
         }
 
     source = get_autonomous_discovery_source(db, tenant_id)  # read once, never re-checked mid-run
-    # jd_first is still a Deepline-based method (TheirStack, not Jobo) -- tagged "deepline" at
-    # the batch level so it shows in the same dashboard tab as the old flow; the per-company
-    # source field (set inside jd_first_discovery.py) is what actually distinguishes it.
+    # jd_first and apify are both still tagged "deepline" at the batch level (neither is a
+    # jobo-style separate credit system) so they show in the same dashboard tab as the old
+    # flow -- the per-company source field (set inside jd_first_discovery.py/apify_discovery.py)
+    # is what actually distinguishes which pipeline found a given company.
     batch_source = "jobo" if source == "jobo" else "deepline"
     batch = Batch(tenant_id=tenant_id, name=f"autonomous-{datetime.utcnow().date().isoformat()}", source=batch_source)
     db.add(batch)
@@ -398,16 +400,19 @@ def run_daily_autonomous_cycle(db: Session, tenant_id: int) -> dict:
 
     budget_usd = get_daily_budget_usd(db, tenant_id)
 
-    if source in ("jobo", "jd_first"):
-        # Both branches can raise before they ever reach their own internal error handling
-        # (jd_first has none at all; jobo only catches JoboError specifically) -- confirmed
-        # live: BudgetGuard's Deepline balance check timed out on both its own retry attempts
-        # right at cycle start, the exception propagated uncaught, and the run row stayed
-        # "running" forever since nothing ever marked it failed. This is the safety net that
-        # was missing -- any exception here now always finalizes the run/batch as failed.
+    if source in ("jobo", "jd_first", "apify"):
+        # All three branches can raise before they ever reach their own internal error
+        # handling (jd_first/apify have none at all; jobo only catches JoboError
+        # specifically) -- confirmed live: BudgetGuard's Deepline balance check timed out on
+        # both its own retry attempts right at cycle start, the exception propagated
+        # uncaught, and the run row stayed "running" forever since nothing ever marked it
+        # failed. This is the safety net that was missing -- any exception here now always
+        # finalizes the run/batch as failed.
         try:
             if source == "jobo":
                 return _run_jobo_autonomous_cycle(batch, run, db, tenant_id, budget_usd)
+            if source == "apify":
+                return _run_apify_autonomous_cycle(batch, run, db, tenant_id, budget_usd)
             return _run_jd_first_autonomous_cycle(batch, run, db, tenant_id, budget_usd)
         except Exception as e:
             db.rollback()
@@ -699,6 +704,106 @@ def _run_jd_first_autonomous_cycle(batch: Batch, run: AutonomousRun, db: Session
         "status": "awaiting_approval",
         "batch_id": batch.id,
         "source": "jd_first",
+        "companies_discovered": result["companies_discovered"],
+        "companies_checked_by_discovery": result["postings_checked"],
+        "discovery_rejection_breakdown": result["rejection_breakdown"],
+        "decision_maker_result": decision_maker_result,
+        "awaiting_approval_until": run.awaiting_approval_until,
+        "notification_error": notification_error,
+        "credits_spent_usd": final_spend,
+        "budget_usd": budget_usd,
+    }
+
+
+def _run_apify_autonomous_cycle(batch: Batch, run: AutonomousRun, db: Session, tenant_id: int, budget_usd: float) -> dict:
+    """Apify's autonomous branch -- validated live 2026-08-05/06 as a real second discovery
+    source (8/8 and 5/5 real qualifying companies across two real test days, vs. jd_first's
+    2/5 on the intervening real production day). Single synchronous Apify call per run (see
+    apify_discovery.py) -- no paging/BudgetGuard loop needed since cost is deterministic from
+    the actor's own `limit` parameter, unlike jd_first's per-page TheirStack billing."""
+    cap = get_daily_company_cap(db, tenant_id)
+    result = run_apify_discovery(batch.id, db, tenant_id, target=cap)
+
+    if result.get("api_error"):
+        # Same treatment as jobo's api_error path -- a real Apify failure (e.g. a missing/
+        # expired apify_api_key credential) must never come back indistinguishable from
+        # "genuinely zero postings today".
+        db.rollback()
+        run.status = "failed"
+        run.error_message = result["api_error"]
+        run.completed_at = datetime.utcnow()
+        batch.status = "failed"
+        db.add(run)
+        db.add(batch)
+        db.commit()
+        _send_failure_alert(batch, run, result["api_error"], db, tenant_id)
+        return {"status": "failed", "batch_id": batch.id, "source": "apify", "error": result["api_error"]}
+
+    found = 0
+    companies = db.query(Company).filter(Company.batch_id == batch.id).all()
+    for company in companies:
+        contact = find_decision_maker(company, db)
+        company.decision_maker_searched_at = datetime.utcnow()
+        db.commit()
+        if contact:
+            found += 1
+
+    final_spend = result.get("estimated_cost_usd")
+    decision_maker_result = {
+        "companies_checked": result["companies_discovered"],
+        "decision_makers_found": found,
+        "companies_with_no_contact": result["companies_discovered"] - found,
+        "companies_skipped_already_resolved": 0,
+        "hubspot_synced": 0,
+        "hubspot_errors": [],
+        "budget_stopped_early": result["budget_stopped_early"],
+    }
+
+    run.companies_discovered = result["companies_discovered"]
+    run.companies_selected = result["companies_discovered"]
+    run.contacts_found = found
+    run.credits_spent_usd = final_spend
+    run.budget_stopped_early = result["budget_stopped_early"]
+
+    if result["budget_stopped_early"] or found == 0:
+        batch.current_phase = "autonomous_cycle_done"
+        batch.status = "complete"
+        run.status = "completed"
+        run.contacts_pushed = 0
+        run.completed_at = datetime.utcnow()
+        db.commit()
+        return {
+            "status": "completed",
+            "batch_id": batch.id,
+            "source": "apify",
+            "companies_discovered": result["companies_discovered"],
+            "companies_checked_by_discovery": result["postings_checked"],
+            "discovery_rejection_breakdown": result["rejection_breakdown"],
+            "decision_maker_result": decision_maker_result,
+            "outreach_result": {"contacts_checked": 0, "pushed": 0, "failed": 0, "skipped": 0},
+            "credits_spent_usd": final_spend,
+            "budget_stopped_early": result["budget_stopped_early"],
+            "budget_usd": budget_usd,
+        }
+
+    batch.current_phase = "awaiting_approval"
+    run.status = "awaiting_approval"
+    run.awaiting_approval_until = datetime.utcnow() + timedelta(minutes=APPROVAL_WINDOW_MINUTES)
+    db.commit()
+
+    # Isolated so a notification-layer failure is reported but never overwrites the already-
+    # successful run status -- see the jd_first branch's docstring comment for the full
+    # explanation.
+    try:
+        messages = _generate_messages_for_batch(batch.id, db, tenant_id)
+        notification_error = _send_approval_notification(batch, run, decision_maker_result, db, tenant_id, messages=messages)
+    except Exception as e:
+        notification_error = f"message generation/notification step failed: {e}"
+
+    return {
+        "status": "awaiting_approval",
+        "batch_id": batch.id,
+        "source": "apify",
         "companies_discovered": result["companies_discovered"],
         "companies_checked_by_discovery": result["postings_checked"],
         "discovery_rejection_breakdown": result["rejection_breakdown"],
