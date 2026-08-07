@@ -23,7 +23,7 @@ ANTHROPIC_VERSION = "2023-06-01"
 # budget-capped autonomous cycle), so a clear log line is the cost visibility mechanism here.
 MODEL_PRICING_PER_MTOK_USD = {
     "claude-haiku-4-5-20251001": (1.0, 5.0),
-    "claude-sonnet-4-5-20250929": (3.0, 15.0),
+    "claude-sonnet-5": (3.0, 15.0),
 }
 
 logger = logging.getLogger("claude_client")
@@ -89,7 +89,7 @@ def call_claude(prompt: str, db: Session, tenant_id: int, system: str | None = N
     return content[0]["text"]
 
 
-def call_claude_messages(messages: list[dict], db: Session, tenant_id: int, system: str | None = None, tools: list[dict] | None = None, max_tokens: int = 1500, model: str = "claude-sonnet-4-5-20250929") -> dict:
+def call_claude_messages(messages: list[dict], db: Session, tenant_id: int, system: str | None = None, tools: list[dict] | None = None, max_tokens: int = 1500, model: str = "claude-sonnet-5") -> dict:
     """Multi-turn / tool-use call -- returns the FULL parsed response (content blocks incl.
     any tool_use, stop_reason, usage), unlike call_claude which only returns the first text
     block. Built for the chat widget's tool-calling loop (see app/routes/api.py's
