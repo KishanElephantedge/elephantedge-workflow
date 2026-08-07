@@ -70,7 +70,10 @@ def search_linkedin_jobs(
         json=payload,
         timeout=90,
     )
-    if response.status_code != 200:
+    if response.status_code >= 300:
+        # Confirmed live (2026-08-07): run-sync-get-dataset-items can legitimately return 201,
+        # not just 200, for a real successful run with real dataset items in the body -- the
+        # old `!= 200` check rejected a genuine successful result as an error.
         raise ApifyError(f"LinkedIn jobs search failed ({response.status_code}): {response.text[:500]}")
     return response.json()
 
