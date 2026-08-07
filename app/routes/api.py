@@ -1434,17 +1434,30 @@ def trigger_calendar_sync(db: Session = Depends(get_db)):
 def _scratch_chat_diagnostic(db: Session = Depends(get_db)):
     """TEMPORARY -- isolating a 401 that only occurs via call_claude_messages, never via the
     already-working call_claude, both using Haiku and the same credential. Delete after use."""
+    import httpx as _httpx
+    from app.claude_client import BASE_URL, ANTHROPIC_VERSION, DEFAULT_MODEL, _get_api_key
+
     results = {}
-    for label, use_tools in [("haiku_messages_no_tools", False), ("haiku_messages_with_tools", True)]:
-        try:
-            resp = call_claude_messages(
-                [{"role": "user", "content": "Say OK"}], db, ELEPHANT_EDGE_TENANT_ID,
-                tools=[{"name": "ping", "description": "test", "input_schema": {"type": "object", "properties": {}}}] if use_tools else None,
-                max_tokens=20,
-            )
-            results[label] = {"ok": True, "stop_reason": resp.get("stop_reason")}
-        except ClaudeError as e:
-            results[label] = {"ok": False, "error": str(e)}
+    api_key = _get_api_key(db, ELEPHANT_EDGE_TENANT_ID)
+    results["key_len"] = len(api_key)
+    results["key_prefix"] = api_key[:12]
+    results["key_suffix"] = api_key[-6:]
+    results["key_has_whitespace"] = api_key != api_key.strip()
+
+    payload = {"model": DEFAULT_MODEL, "max_tokens": 20, "messages": [{"role": "user", "content": "Say OK"}]}
+    resp = _httpx.post(
+        BASE_URL,
+        headers={"x-api-key": api_key, "anthropic-version": ANTHROPIC_VERSION, "content-type": "application/json"},
+        json=payload, timeout=60,
+    )
+    results["raw_direct_call"] = {"status": resp.status_code, "body": resp.text[:300]}
+
+    try:
+        resp2 = call_claude_messages([{"role": "user", "content": "Say OK"}], db, ELEPHANT_EDGE_TENANT_ID, max_tokens=20)
+        results["via_call_claude_messages"] = {"ok": True, "stop_reason": resp2.get("stop_reason")}
+    except ClaudeError as e:
+        results["via_call_claude_messages"] = {"ok": False, "error": str(e)}
+
     return results
 
 
