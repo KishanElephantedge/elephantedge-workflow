@@ -32,11 +32,24 @@ PAGE_SIZE = 20
 ALL_ROLE_TITLE_KEYWORDS = sorted({kw for kws in ROLE_KEYWORDS.values() for kw in kws})
 ALL_ROLE_TITLE_KEYWORDS.extend(["representative", "specialist", "employee", "associate", "inside sales", "growth", "lead generation"])
 
+# Widened 2026-08-07 to test whether the near-zero 11-50-employee hit rate is a query-breadth
+# problem or a real data-density gap in Jobo's ATS-sourced index (see run_jobo_discovery
+# investigation) -- added generic sales-leadership titles small companies are more likely to
+# post for than dedicated "SDR"/"BDR" reqs, which tend to be a later, bigger-company hire.
 SEARCH_QUERIES = [
     '"sales development representative"',
     '"account executive"',
     '"business development representative"',
     '"inside sales representative"',
+    '"head of sales"',
+    '"vp of sales"',
+    '"vp sales"',
+    '"sales director"',
+    '"director of sales"',
+    '"sales manager"',
+    '"sales lead"',
+    '"business development manager"',
+    '"chief revenue officer"',
 ]
 
 # Leadership-list-scoped GTM check -- Jobo's company profile only exposes an explicit
