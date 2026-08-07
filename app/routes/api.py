@@ -1438,6 +1438,18 @@ def _scratch_chat_diagnostic(db: Session = Depends(get_db)):
     from app.claude_client import BASE_URL, ANTHROPIC_VERSION, DEFAULT_MODEL, _get_api_key
 
     results = {}
+    all_rows = (
+        db.query(Credential)
+        .filter(Credential.tenant_id == ELEPHANT_EDGE_TENANT_ID)
+        .filter(Credential.name == "anthropic_api_key")
+        .all()
+    )
+    results["credential_row_count"] = len(all_rows)
+    results["credential_rows"] = [
+        {"id": c.id, "len": len(c.value), "prefix": c.value[:12], "suffix": c.value[-6:], "updated_at": str(c.updated_at)}
+        for c in all_rows
+    ]
+
     api_key = _get_api_key(db, ELEPHANT_EDGE_TENANT_ID)
     results["key_len"] = len(api_key)
     results["key_prefix"] = api_key[:12]
