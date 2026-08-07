@@ -1430,52 +1430,6 @@ def trigger_calendar_sync(db: Session = Depends(get_db)):
         raise HTTPException(status_code=502, detail=str(e))
 
 
-@router.get("/_scratch/jobo-leadership-check")
-def _scratch_jobo_leadership_check(db: Session = Depends(get_db)):
-    """TEMPORARY -- checking whether Jobo's free company-profile leadership data exists for
-    real companies discovered via Apify (batch 41), to see if Jobo's free decision-maker
-    lookup can serve as a cheap layer in front of Deepline for non-Jobo-sourced companies.
-    Small, bounded cost: page_size=3 per company name search. Delete after use."""
-    import httpx as _httpx
-    from app.jobo_client import _get_api_key as _get_jobo_api_key, get_company_profile
-
-    companies = ["First Resonance", "Trusted Concepts", "QuadSci", "Corridor", "MAJC",
-                 "Vectro Consulting", "DIAMO", "Erias Ventures", "Kwant"]
-    api_key = _get_jobo_api_key(db, ELEPHANT_EDGE_TENANT_ID)
-    results = {}
-    total_spent_credits_start = None
-    with _httpx.Client() as client:
-        for name in companies:
-            try:
-                resp = client.post(
-                    "https://connect.jobo.world/api/jobs/search",
-                    headers={"X-Api-Key": api_key, "Content-Type": "application/json"},
-                    json={"queries": [name], "page": 1, "page_size": 3, "include_fields": []},
-                    timeout=60,
-                )
-                resp.raise_for_status()
-                balance = int(resp.headers.get("x-credits-balance", 0))
-                data = resp.json()
-                jobs = data.get("jobs", [])
-                matched = [j.get("company", {}) for j in jobs if name.lower() in (j.get("company", {}).get("name") or "").lower()]
-                if not matched:
-                    results[name] = {"found_in_jobo": False, "credits_balance": balance}
-                    continue
-                company_id = matched[0].get("id")
-                profile = get_company_profile(client, company_id)
-                leadership = (profile or {}).get("leadership") or []
-                results[name] = {
-                    "found_in_jobo": True,
-                    "jobo_company_name": matched[0].get("name"),
-                    "credits_balance": balance,
-                    "leadership_count": len(leadership),
-                    "leadership": [{"name": p.get("name"), "title": p.get("title")} for p in leadership],
-                }
-            except Exception as e:
-                results[name] = {"error": str(e)}
-    return results
-
-
 # ---- AI Chat Widget ----
 # Internal-only (Elephant Edge's own team, not customer-facing) -- so tool actions execute
 # directly with no per-action confirmation step, EXCEPT pushing to a SalesRobot campaign,
