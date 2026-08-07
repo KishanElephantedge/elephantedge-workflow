@@ -171,7 +171,15 @@ def run_jobo_discovery(batch_id: int, db: Session, tenant_id: int, target: int =
     with httpx.Client() as client:
         while qualifying_count < target and page < start_page + max_pages:
             try:
-                data, balance = search_jobs(client, api_key, SEARCH_QUERIES, page, PAGE_SIZE)
+                # locations=["United States"] -- real server-side filter, found live
+                # (2026-08-07) to have never been passed at all, so every prior run paid to
+                # fetch and then locally reject non-US postings (86 of 349 in one real test)
+                # instead of excluding them for free at the query level. include_facets
+                # requests industries composition at no extra cost, to check real canonical
+                # industry values before ever filtering by them (a wrong/typo'd industry name
+                # silently matches nothing per Jobo's own docs, no error).
+                data, balance = search_jobs(client, api_key, SEARCH_QUERIES, page, PAGE_SIZE,
+                                             locations=["United States"], include_facets=["industries"])
                 guard.record(balance)
                 guard.check()
             except JoboError:

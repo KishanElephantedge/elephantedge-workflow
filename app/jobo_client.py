@@ -51,8 +51,21 @@ class JoboCreditGuard:
             raise JoboError(f"JoboCreditGuard cap reached: spent ${self.spent_usd():.3f} of ${self.cap_usd:.2f}")
 
 
-def search_jobs(client: httpx.Client, api_key: str, queries: list[str], page: int, page_size: int) -> tuple[dict, int]:
+def search_jobs(client: httpx.Client, api_key: str, queries: list[str], page: int, page_size: int,
+                 locations: list[str] | None = None, include_facets: list[str] | None = None) -> tuple[dict, int]:
+    """locations: real, documented server-side filter (POST body field `locations`, a plain
+    string array) -- found live (2026-08-07) that the original integration never passed this
+    at all, so every search paid to fetch and then locally reject non-US postings (86 of 349
+    in one real test run) instead of excluding them for free at the query level.
+
+    include_facets: bundled into the same metered call at no extra cost per Jobo's docs --
+    used here to see the real industries composition of results without a separate paid
+    call or guessing at canonical industry name strings before filtering by them."""
     body = {"queries": queries, "page": page, "page_size": page_size, "include_fields": ["description"]}
+    if locations:
+        body["locations"] = locations
+    if include_facets:
+        body["include_facets"] = include_facets
     response = client.post(
         f"{BASE_URL}/api/jobs/search",
         headers={"X-Api-Key": api_key, "Content-Type": "application/json"},
