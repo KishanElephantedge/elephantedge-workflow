@@ -89,15 +89,14 @@ def call_claude(prompt: str, db: Session, tenant_id: int, system: str | None = N
     return content[0]["text"]
 
 
-def call_claude_messages(messages: list[dict], db: Session, tenant_id: int, system: str | None = None, tools: list[dict] | None = None, max_tokens: int = 1500, model: str = "claude-sonnet-5") -> dict:
+def call_claude_messages(messages: list[dict], db: Session, tenant_id: int, system: str | None = None, tools: list[dict] | None = None, max_tokens: int = 1500, model: str = DEFAULT_MODEL) -> dict:
     """Multi-turn / tool-use call -- returns the FULL parsed response (content blocks incl.
     any tool_use, stop_reason, usage), unlike call_claude which only returns the first text
     block. Built for the chat widget's tool-calling loop (see app/routes/api.py's
     _run_chat_turn), where the caller has to inspect stop_reason and any tool_use blocks
     across multiple round-trips, not just get text back once.
 
-    Sonnet, not Haiku, is the default here (opposite of the rest of this file) -- picking the
-    right tool and reasoning over the results needs more than straightforward extraction."""
+    Haiku, same as the rest of this file -- keeps chat cost in line with everything else here."""
     api_key = _get_api_key(db, tenant_id)
     payload = {
         "model": model,
