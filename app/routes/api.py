@@ -1,3 +1,6 @@
+import base64
+import csv
+import io
 import json
 from collections import Counter
 from datetime import datetime, timedelta
@@ -8,7 +11,8 @@ from sqlalchemy.orm import Session, selectinload
 from sqlalchemy import func, or_
 
 from app.cache import active_keys, bump_batch_version, cache_get, cache_set, get_batch_version, mark_active
-from app.db.models import AutonomousRun, Batch, CalendarBooking, CampaignEvent, CampaignPush, Company, Contact, Credential, Notification, Parameter, PersonalizedMessage, Score
+from app.claude_client import ClaudeError, call_claude_messages
+from app.db.models import AutonomousRun, Batch, CalendarBooking, CampaignEvent, CampaignPush, ChatConversation, ChatMessage, Company, Contact, Credential, Notification, Parameter, PersonalizedMessage, Score
 from app.notifications import delete_expired_notifications
 from app.google_calendar_client import GoogleCalendarError
 from app.phases.hiring_signal import has_qualifying_hiring_signal
@@ -1424,6 +1428,569 @@ def trigger_calendar_sync(db: Session = Depends(get_db)):
         return sync_calendar_bookings(db, ELEPHANT_EDGE_TENANT_ID)
     except GoogleCalendarError as e:
         raise HTTPException(status_code=502, detail=str(e))
+
+
+# ---- AI Chat Widget ----
+# Internal-only (Elephant Edge's own team, not customer-facing) -- so tool actions execute
+# directly with no per-action confirmation step, EXCEPT pushing to a SalesRobot campaign,
+# which is deliberately not exposed as a tool at all: the autonomous cycle already owns real
+# sends end to end, and every manual push this session has been a one-off testing/tuning
+# action, not something that should be one chat message away from happening by accident.
+#
+# Conversations are tenant-scoped, not per-user -- this backend has no user identity concept
+# anywhere (auth lives entirely in the gateway), matching every other table here.
+
+CHAT_SYSTEM_PROMPT_TEMPLATE = """You are the AI assistant embedded in Elephant Edge's Sales \
+Operating System dashboard -- an internal tool used only by Elephant Edge's own team to run \
+outbound company discovery, decision-maker research, personalized message drafting, and \
+LinkedIn outreach via SalesRobot.
+
+Today's date is {today}.
+
+Answer questions about the platform's data (companies found, decision-makers, messages, \
+connections, replies, meetings, notifications, batches, etc.) using the tools available -- \
+always call a tool to get real numbers rather than guessing or estimating. When asked "how \
+many X yesterday/this week/last month", compute the actual date range yourself from today's \
+date and pass it to the relevant tool.
+
+You can also take actions on the user's behalf: approve/reject a drafted message, exclude a \
+contact from being pushed, mark notifications read, and generate a downloadable CSV of any \
+company or lead list. Since this is an internal team tool, take these actions directly when \
+asked -- no need to ask for confirmation first.
+
+You CANNOT push contacts to a SalesRobot campaign (send connection requests or LinkedIn \
+messages) -- that capability is deliberately not available here. If asked, explain that \
+real sends happen through the autonomous pipeline or a manual push in the dashboard, not \
+through chat.
+
+The platform's pipeline, stage by stage: company discovery (via TheirStack/Crustdata job \
+postings, Jobo, or Apify's LinkedIn Jobs Scraper) -> qualification (hiring-signal + team-fit \
+scoring) -> decision-maker search -> personalized message drafting (curiosity-style, no \
+pitch) -> human approval -> push to a SalesRobot LinkedIn campaign (connection request + \
+follow-up message, or direct InMail for Open Profile members) -> reply/meeting tracking. \
+There's also an autonomous mode that runs discovery through decision-maker search on a \
+daily schedule, with a human approval window before anything gets pushed.
+
+Be concise and direct -- this is a working tool for a small team, not a customer support \
+chat. Use real numbers from tool calls, never invent or estimate them."""
+
+
+CHAT_TOOLS = [
+    {
+        "name": "get_funnel_stats",
+        "description": "Full outbound funnel counts: companies researched, companies qualified, decision-makers found, messages approved, connections sent/accepted, replied, meetings booked. Optionally date-filtered.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "start_date": {"type": "string", "description": "YYYY-MM-DD, inclusive"},
+                "end_date": {"type": "string", "description": "YYYY-MM-DD, inclusive"},
+            },
+        },
+    },
+    {
+        "name": "get_leads_stats",
+        "description": "Messages drafted/approved counts, and SalesRobot's own aggregate connections sent/accepted/replied counts with acceptance and reply rates.",
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "get_recent_activity",
+        "description": "Recent real events feed: discoveries, message approvals, connection pushes, most recent first.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"limit": {"type": "integer", "description": "default 8, max 50"}},
+        },
+    },
+    {
+        "name": "get_companies_found_trend",
+        "description": "Daily count of companies discovered for the last N days -- use this for \"how many companies were found on/since <date>\" style questions.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"days": {"type": "integer", "description": "default 14, max 90"}},
+        },
+    },
+    {
+        "name": "search_companies",
+        "description": "Search/filter companies across all batches. Returns up to `limit` matching rows plus the real total match count (which may be larger than what's returned).",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "search": {"type": "string", "description": "matches name, domain, or industry"},
+                "qualified": {"type": "string", "enum": ["true", "false"]},
+                "source": {"type": "string", "enum": ["jd_first", "jobo", "apify", "deepline", "manual"]},
+                "created_after": {"type": "string", "description": "YYYY-MM-DD, inclusive"},
+                "created_before": {"type": "string", "description": "YYYY-MM-DD, inclusive"},
+                "limit": {"type": "integer", "description": "default 20, max 100"},
+            },
+        },
+    },
+    {
+        "name": "get_company_detail",
+        "description": "Full detail for one company by name or domain, including its contacts and their message/push status.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"name_or_domain": {"type": "string"}},
+            "required": ["name_or_domain"],
+        },
+    },
+    {
+        "name": "search_leads",
+        "description": "Search/filter decision-maker contacts (leads) across all batches, including message and push status and live SalesRobot activity.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "search": {"type": "string", "description": "matches contact name, title, or company name"},
+                "message_status": {"type": "string", "enum": ["draft", "approved", "rejected"]},
+                "activity": {"type": "string", "enum": ["CONNECTED", "REPLIED", "NO_REPLY_YET", "NOT_SENT"]},
+                "pipeline_only": {"type": "boolean", "description": "default true -- only contacts with a drafted message or a push attempt; set false to include every decision-maker found regardless of stage"},
+                "limit": {"type": "integer", "description": "default 20, max 100"},
+            },
+        },
+    },
+    {
+        "name": "list_batches",
+        "description": "List discovery batches (a batch = one discovery run) with phase/status/company count.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "source": {"type": "string", "enum": ["jd_first", "jobo", "apify", "deepline", "manual"]},
+                "limit": {"type": "integer", "description": "default 20, max 100"},
+            },
+        },
+    },
+    {
+        "name": "get_batch_detail",
+        "description": "Full detail for one batch: every company in it, their qualification/scoring, and their contacts.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"batch_id": {"type": "integer"}},
+            "required": ["batch_id"],
+        },
+    },
+    {
+        "name": "list_notifications",
+        "description": "Recent in-app notifications (run failed, decision-makers found, meeting booked, etc.).",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "unread_only": {"type": "boolean"},
+                "limit": {"type": "integer", "description": "default 10, max 50"},
+            },
+        },
+    },
+    {
+        "name": "approve_message",
+        "description": "Approve a contact's drafted outreach message so it's eligible to be pushed.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"contact_id": {"type": "integer"}},
+            "required": ["contact_id"],
+        },
+    },
+    {
+        "name": "reject_message",
+        "description": "Reject a contact's drafted outreach message.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"contact_id": {"type": "integer"}},
+            "required": ["contact_id"],
+        },
+    },
+    {
+        "name": "set_contact_excluded_from_push",
+        "description": "Include or exclude a contact from being pushed to an outreach campaign.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "contact_id": {"type": "integer"},
+                "excluded": {"type": "boolean"},
+            },
+            "required": ["contact_id", "excluded"],
+        },
+    },
+    {
+        "name": "mark_notification_read",
+        "description": "Mark one notification as read.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"notification_id": {"type": "integer"}},
+            "required": ["notification_id"],
+        },
+    },
+    {
+        "name": "mark_all_notifications_read",
+        "description": "Mark every unread notification as read.",
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "export_csv",
+        "description": "Generate a downloadable CSV of a filtered company or lead list. Use this whenever the user asks for a CSV, spreadsheet, export, or list to download.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "entity": {"type": "string", "enum": ["companies", "leads"]},
+                "search": {"type": "string"},
+                "qualified": {"type": "string", "enum": ["true", "false"], "description": "companies only"},
+                "source": {"type": "string", "enum": ["jd_first", "jobo", "apify", "deepline", "manual"], "description": "companies only"},
+                "message_status": {"type": "string", "enum": ["draft", "approved", "rejected"], "description": "leads only"},
+                "created_after": {"type": "string", "description": "YYYY-MM-DD"},
+                "created_before": {"type": "string", "description": "YYYY-MM-DD"},
+            },
+            "required": ["entity"],
+        },
+    },
+]
+
+
+def _chat_parse_date(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    return datetime.strptime(value, "%Y-%m-%d")
+
+
+def _chat_query_companies(db: Session, search: str = "", qualified: str = "", source: str = "",
+                           created_after: str = "", created_before: str = "") -> list[Company]:
+    query = db.query(Company).join(Batch).filter(Batch.tenant_id == ELEPHANT_EDGE_TENANT_ID)
+    if search.strip():
+        like = f"%{search.strip()}%"
+        query = query.filter(or_(Company.name.ilike(like), Company.domain.ilike(like), Company.industry.ilike(like)))
+    after_dt = _chat_parse_date(created_after)
+    before_dt = _chat_parse_date(created_before)
+    if after_dt:
+        query = query.filter(Company.created_at >= after_dt)
+    if before_dt:
+        query = query.filter(Company.created_at < before_dt + timedelta(days=1))
+    companies = query.order_by(Company.created_at.desc()).all()
+    if source:
+        companies = [c for c in companies if _normalize_company_source(c.source) == source]
+    if qualified == "true":
+        companies = [c for c in companies if _is_company_qualified(c)]
+    elif qualified == "false":
+        companies = [c for c in companies if not _is_company_qualified(c)]
+    return companies
+
+
+def _execute_chat_tool(name: str, tool_input: dict, db: Session) -> dict:
+    """Dispatches one Claude tool_use call to real DB queries/mutations. Every branch is
+    wrapped by the caller in a try/except -- a failed tool call becomes an error string fed
+    back to Claude, not a crashed chat turn."""
+    if name == "get_funnel_stats":
+        return get_overview_stats(start_date=tool_input.get("start_date"), end_date=tool_input.get("end_date"), db=db)
+
+    if name == "get_leads_stats":
+        return get_leads_stats(db=db)
+
+    if name == "get_recent_activity":
+        limit = min(tool_input.get("limit", 8), 50)
+        return {"activity": get_overview_recent_activity(limit=limit, db=db)}
+
+    if name == "get_companies_found_trend":
+        days = min(tool_input.get("days", 14), 90)
+        return {"trend": get_overview_trend(days=days, db=db)}
+
+    if name == "search_companies":
+        limit = min(tool_input.get("limit", 20), 100)
+        companies = _chat_query_companies(
+            db, search=tool_input.get("search", ""), qualified=tool_input.get("qualified", ""),
+            source=tool_input.get("source", ""), created_after=tool_input.get("created_after", ""),
+            created_before=tool_input.get("created_before", ""),
+        )
+        return {
+            "total_matches": len(companies),
+            "companies": [
+                {
+                    "id": c.id, "name": c.name, "domain": c.domain, "source": _normalize_company_source(c.source),
+                    "qualified": _is_company_qualified(c), "hiring_signal_role": c.hiring_signal_role,
+                    "created_at": c.created_at.isoformat() if c.created_at else None,
+                }
+                for c in companies[:limit]
+            ],
+        }
+
+    if name == "get_company_detail":
+        needle = tool_input["name_or_domain"].strip()
+        like = f"%{needle}%"
+        company = (
+            db.query(Company).join(Batch).filter(Batch.tenant_id == ELEPHANT_EDGE_TENANT_ID)
+            .filter(or_(Company.name.ilike(like), Company.domain.ilike(like)))
+            .order_by(Company.created_at.desc()).first()
+        )
+        if not company:
+            return {"error": f"No company matching '{needle}' found"}
+        return {
+            "id": company.id, "name": company.name, "domain": company.domain, "industry": company.industry,
+            "source": _normalize_company_source(company.source), "qualified": _is_company_qualified(company),
+            "hiring_signal_role": company.hiring_signal_role, "hiring_signal_reasoning": company.hiring_signal_reasoning,
+            "batch_id": company.batch_id, "created_at": company.created_at.isoformat() if company.created_at else None,
+            "contacts": [
+                {
+                    "id": ct.id, "name": f"{ct.first_name or ''} {ct.last_name or ''}".strip(), "title": ct.title,
+                    "message_status": ct.personalized_message.status if ct.personalized_message else None,
+                    "excluded_from_push": ct.excluded_from_push,
+                }
+                for ct in company.contacts
+            ],
+        }
+
+    if name == "search_leads":
+        limit = min(tool_input.get("limit", 20), 100)
+        result = list_leads(
+            page=1, page_size=limit, search=tool_input.get("search", ""),
+            message_status=tool_input.get("message_status", ""), activity=tool_input.get("activity", ""),
+            pipeline_only=tool_input.get("pipeline_only", True), db=db,
+        )
+        return result
+
+    if name == "list_batches":
+        limit = min(tool_input.get("limit", 20), 100)
+        return list_batches(page=1, page_size=limit, source=tool_input.get("source"), db=db)
+
+    if name == "get_batch_detail":
+        payload = _build_batch_payload(tool_input["batch_id"], page=1, page_size=200, db=db)
+        if payload is None:
+            return {"error": f"No batch with id {tool_input['batch_id']}"}
+        return payload
+
+    if name == "list_notifications":
+        limit = min(tool_input.get("limit", 10), 50)
+        return list_notifications(page=1, page_size=limit, unread_only=tool_input.get("unread_only", False), db=db)
+
+    if name == "approve_message":
+        contact = db.query(Contact).join(Company).filter(Contact.id == tool_input["contact_id"]).filter(
+            Company.batch_id.in_(db.query(Batch.id).filter(Batch.tenant_id == ELEPHANT_EDGE_TENANT_ID))).first()
+        if not contact or not contact.personalized_message:
+            return {"error": "No generated message for this contact"}
+        contact.personalized_message.status = "approved"
+        db.commit()
+        bump_batch_version(contact.company.batch_id)
+        return {"contact_id": contact.id, "status": "approved"}
+
+    if name == "reject_message":
+        contact = db.query(Contact).join(Company).filter(Contact.id == tool_input["contact_id"]).filter(
+            Company.batch_id.in_(db.query(Batch.id).filter(Batch.tenant_id == ELEPHANT_EDGE_TENANT_ID))).first()
+        if not contact or not contact.personalized_message:
+            return {"error": "No generated message for this contact"}
+        contact.personalized_message.status = "rejected"
+        db.commit()
+        bump_batch_version(contact.company.batch_id)
+        return {"contact_id": contact.id, "status": "rejected"}
+
+    if name == "set_contact_excluded_from_push":
+        contact = db.query(Contact).join(Company).filter(Contact.id == tool_input["contact_id"]).filter(
+            Company.batch_id.in_(db.query(Batch.id).filter(Batch.tenant_id == ELEPHANT_EDGE_TENANT_ID))).first()
+        if not contact:
+            return {"error": "Contact not found"}
+        contact.excluded_from_push = tool_input["excluded"]
+        db.commit()
+        bump_batch_version(contact.company.batch_id)
+        return {"contact_id": contact.id, "excluded_from_push": contact.excluded_from_push}
+
+    if name == "mark_notification_read":
+        return mark_notification_read(tool_input["notification_id"], db=db)
+
+    if name == "mark_all_notifications_read":
+        return mark_all_notifications_read(db=db)
+
+    if name == "export_csv":
+        entity = tool_input["entity"]
+        if entity == "companies":
+            companies = _chat_query_companies(
+                db, search=tool_input.get("search", ""), qualified=tool_input.get("qualified", ""),
+                source=tool_input.get("source", ""), created_after=tool_input.get("created_after", ""),
+                created_before=tool_input.get("created_before", ""),
+            )
+            buf = io.StringIO()
+            writer = csv.writer(buf)
+            writer.writerow(["name", "domain", "industry", "source", "qualified", "hiring_signal_role", "created_at"])
+            for c in companies:
+                writer.writerow([c.name, c.domain, c.industry, _normalize_company_source(c.source),
+                                  _is_company_qualified(c), c.hiring_signal_role,
+                                  c.created_at.isoformat() if c.created_at else ""])
+            row_count = len(companies)
+        elif entity == "leads":
+            # Direct query, not list_leads() -- that route caps page_size at 100 internally,
+            # which would silently truncate an export past today's real ~80 total contacts as
+            # the dataset grows. No live SalesRobot enrichment needed for a CSV, so this skips
+            # the extra API calls list_leads makes for the `activity` filter entirely.
+            query = (
+                db.query(Contact).join(Company)
+                .filter(Company.batch_id.in_(db.query(Batch.id).filter(Batch.tenant_id == ELEPHANT_EDGE_TENANT_ID)))
+                .options(selectinload(Contact.personalized_message), selectinload(Contact.campaign_pushes), selectinload(Contact.company))
+            )
+            search = tool_input.get("search", "")
+            if search.strip():
+                like = f"%{search.strip()}%"
+                query = query.filter(or_(Contact.first_name.ilike(like), Contact.last_name.ilike(like),
+                                          Contact.title.ilike(like), Company.name.ilike(like)))
+            message_status = tool_input.get("message_status", "")
+            if message_status:
+                query = query.filter(Contact.personalized_message.has(PersonalizedMessage.status == message_status))
+            after_dt = _chat_parse_date(tool_input.get("created_after"))
+            before_dt = _chat_parse_date(tool_input.get("created_before"))
+            if after_dt:
+                query = query.filter(Contact.created_at >= after_dt)
+            if before_dt:
+                query = query.filter(Contact.created_at < before_dt + timedelta(days=1))
+            contacts = query.order_by(Contact.created_at.desc()).all()
+
+            buf = io.StringIO()
+            writer = csv.writer(buf)
+            writer.writerow(["first_name", "last_name", "title", "company_name", "linkedin_url", "message_status", "push_status"])
+            for ct in contacts:
+                push = ct.campaign_pushes[-1] if ct.campaign_pushes else None
+                writer.writerow([ct.first_name, ct.last_name, ct.title, ct.company.name if ct.company else "",
+                                  ct.linkedin_url, ct.personalized_message.status if ct.personalized_message else "",
+                                  push.status if push else ""])
+            row_count = len(contacts)
+        else:
+            return {"error": "entity must be 'companies' or 'leads'"}
+
+        filename = f"{entity}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.csv"
+        return {"_csv_filename": filename, "_csv_content": buf.getvalue(), "row_count": row_count}
+
+    return {"error": f"Unknown tool '{name}'"}
+
+
+CHAT_HISTORY_WINDOW = 20  # prior turns fed back to Claude as context -- not unbounded, so
+# cost per message stays flat as a conversation ages, matching the real per-call cost
+# already logged in claude_client.py.
+CHAT_MAX_TOOL_ITERATIONS = 6
+
+
+def _run_chat_turn(conversation_id: int, user_text: str, db: Session) -> dict:
+    prior = (
+        db.query(ChatMessage)
+        .filter(ChatMessage.conversation_id == conversation_id)
+        .order_by(ChatMessage.created_at.desc())
+        .limit(CHAT_HISTORY_WINDOW)
+        .all()
+    )
+    prior.reverse()
+
+    db.add(ChatMessage(conversation_id=conversation_id, role="user", content=user_text))
+    db.commit()
+
+    messages = [{"role": m.role, "content": m.content} for m in prior]
+    messages.append({"role": "user", "content": user_text})
+
+    system = CHAT_SYSTEM_PROMPT_TEMPLATE.format(today=datetime.utcnow().strftime("%Y-%m-%d"))
+    tools_used: list[str] = []
+    csv_attachment = None
+
+    for _ in range(CHAT_MAX_TOOL_ITERATIONS):
+        try:
+            response = call_claude_messages(messages, db, ELEPHANT_EDGE_TENANT_ID, system=system, tools=CHAT_TOOLS)
+        except ClaudeError as e:
+            reply = f"I hit an error talking to Claude: {e}"
+            db.add(ChatMessage(conversation_id=conversation_id, role="assistant", content=reply, tools_used=tools_used))
+            db.commit()
+            return {"reply": reply, "tools_used": tools_used, "csv": None}
+
+        content_blocks = response.get("content", [])
+        if response.get("stop_reason") != "tool_use":
+            reply = "".join(b.get("text", "") for b in content_blocks if b.get("type") == "text").strip()
+            if not reply:
+                reply = "I wasn't able to generate a response for that."
+            db.add(ChatMessage(conversation_id=conversation_id, role="assistant", content=reply, tools_used=tools_used))
+            conv = db.query(ChatConversation).filter(ChatConversation.id == conversation_id).first()
+            if conv:
+                conv.updated_at = datetime.utcnow()
+            db.commit()
+            return {"reply": reply, "tools_used": tools_used, "csv": csv_attachment}
+
+        messages.append({"role": "assistant", "content": content_blocks})
+        tool_results = []
+        for block in content_blocks:
+            if block.get("type") != "tool_use":
+                continue
+            tool_name = block["name"]
+            tools_used.append(tool_name)
+            try:
+                result = _execute_chat_tool(tool_name, block.get("input", {}), db)
+            except Exception as e:
+                result = {"error": str(e)}
+
+            if isinstance(result, dict) and "_csv_content" in result:
+                csv_attachment = {"filename": result["_csv_filename"], "content": result["_csv_content"]}
+                result = {"status": "csv_generated", "filename": result["_csv_filename"], "row_count": result["row_count"]}
+
+            tool_results.append({
+                "type": "tool_result",
+                "tool_use_id": block["id"],
+                "content": json.dumps(result, default=str)[:8000],
+            })
+        messages.append({"role": "user", "content": tool_results})
+
+    reply = "That took more steps than I could complete in one go -- try narrowing the question."
+    db.add(ChatMessage(conversation_id=conversation_id, role="assistant", content=reply, tools_used=tools_used))
+    db.commit()
+    return {"reply": reply, "tools_used": tools_used, "csv": csv_attachment}
+
+
+def _get_or_create_latest_conversation(db: Session) -> ChatConversation:
+    conv = (
+        db.query(ChatConversation)
+        .filter(ChatConversation.tenant_id == ELEPHANT_EDGE_TENANT_ID)
+        .order_by(ChatConversation.updated_at.desc())
+        .first()
+    )
+    if conv:
+        return conv
+    conv = ChatConversation(tenant_id=ELEPHANT_EDGE_TENANT_ID)
+    db.add(conv)
+    db.commit()
+    db.refresh(conv)
+    return conv
+
+
+@router.get("/chat/latest")
+def get_latest_chat_conversation(db: Session = Depends(get_db)):
+    conv = _get_or_create_latest_conversation(db)
+    messages = (
+        db.query(ChatMessage)
+        .filter(ChatMessage.conversation_id == conv.id)
+        .order_by(ChatMessage.created_at.asc())
+        .all()
+    )
+    return {
+        "conversation_id": conv.id,
+        "messages": [{"role": m.role, "content": m.content, "tools_used": m.tools_used, "created_at": m.created_at} for m in messages],
+    }
+
+
+@router.post("/chat/new")
+def start_new_chat_conversation(db: Session = Depends(get_db)):
+    conv = ChatConversation(tenant_id=ELEPHANT_EDGE_TENANT_ID)
+    db.add(conv)
+    db.commit()
+    db.refresh(conv)
+    return {"conversation_id": conv.id, "messages": []}
+
+
+class ChatMessageIn(BaseModel):
+    message: str
+
+
+@router.post("/chat/conversations/{conversation_id}/messages")
+def send_chat_message(conversation_id: int, body: ChatMessageIn, db: Session = Depends(get_db)):
+    conv = (
+        db.query(ChatConversation)
+        .filter(ChatConversation.id == conversation_id)
+        .filter(ChatConversation.tenant_id == ELEPHANT_EDGE_TENANT_ID)
+        .first()
+    )
+    if not conv:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    if not body.message.strip():
+        raise HTTPException(status_code=400, detail="message cannot be empty")
+
+    result = _run_chat_turn(conversation_id, body.message.strip(), db)
+    csv_payload = None
+    if result["csv"]:
+        csv_payload = {
+            "filename": result["csv"]["filename"],
+            "content_base64": base64.b64encode(result["csv"]["content"].encode("utf-8")).decode("ascii"),
+        }
+    return {"reply": result["reply"], "tools_used": result["tools_used"], "csv": csv_payload}
 
 
 # ---- In-app notifications -- see app/notifications.py for where these get created ----

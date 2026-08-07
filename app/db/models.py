@@ -302,6 +302,38 @@ class Credential(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
+class ChatConversation(Base):
+    """AI chat widget thread. One resumable, tenant-scoped conversation history (this backend
+    has no per-user identity concept at all -- auth lives entirely in the gateway -- so this
+    matches every other table here: scoped by tenant, not by individual user)."""
+    __tablename__ = "chat_conversations"
+
+    id = Column(Integer, primary_key=True)
+    tenant_id = Column(Integer, nullable=False)
+    title = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class ChatMessage(Base):
+    """Only user/assistant TEXT turns are persisted -- not the raw Anthropic tool_use/
+    tool_result blocks. Tool-calling only needs to see prior turns as plain conversation
+    context (same as any chat product), not literally replay past tool calls; the multi-step
+    tool loop itself is entirely in-memory within a single turn (see app/routes/api.py's
+    _run_chat_turn). tools_used is kept for UI transparency (a small "used: X, Y" chip),
+    not for replaying-into-Claude."""
+    __tablename__ = "chat_messages"
+
+    id = Column(Integer, primary_key=True)
+    conversation_id = Column(Integer, ForeignKey("chat_conversations.id"), nullable=False)
+    role = Column(String, nullable=False)  # user | assistant
+    content = Column(Text, nullable=False)
+    tools_used = Column(JSON, nullable=True)  # list of tool names called while producing this message
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    conversation = relationship("ChatConversation")
+
+
 class Parameter(Base):
     __tablename__ = "parameters"
 

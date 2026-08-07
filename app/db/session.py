@@ -79,3 +79,24 @@ def ensure_indexes():
             )
         """))
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_notifications_tenant_created ON notifications (tenant_id, created_at DESC)"))
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS chat_conversations (
+                id SERIAL PRIMARY KEY,
+                tenant_id INTEGER NOT NULL,
+                title VARCHAR,
+                created_at TIMESTAMP,
+                updated_at TIMESTAMP
+            )
+        """))
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS chat_messages (
+                id SERIAL PRIMARY KEY,
+                conversation_id INTEGER NOT NULL REFERENCES chat_conversations(id),
+                role VARCHAR NOT NULL,
+                content TEXT NOT NULL,
+                tools_used JSON,
+                created_at TIMESTAMP
+            )
+        """))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_chat_conversations_tenant_updated ON chat_conversations (tenant_id, updated_at DESC)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_chat_messages_conversation_created ON chat_messages (conversation_id, created_at)"))

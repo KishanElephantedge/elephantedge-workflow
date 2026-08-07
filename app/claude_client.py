@@ -89,6 +89,52 @@ def call_claude(prompt: str, db: Session, tenant_id: int, system: str | None = N
     return content[0]["text"]
 
 
+def call_claude_messages(messages: list[dict], db: Session, tenant_id: int, system: str | None = None, tools: list[dict] | None = None, max_tokens: int = 1500, model: str = "claude-sonnet-4-5-20250929") -> dict:
+    """Multi-turn / tool-use call -- returns the FULL parsed response (content blocks incl.
+    any tool_use, stop_reason, usage), unlike call_claude which only returns the first text
+    block. Built for the chat widget's tool-calling loop (see app/routes/api.py's
+    _run_chat_turn), where the caller has to inspect stop_reason and any tool_use blocks
+    across multiple round-trips, not just get text back once.
+
+    Sonnet, not Haiku, is the default here (opposite of the rest of this file) -- picking the
+    right tool and reasoning over the results needs more than straightforward extraction."""
+    api_key = _get_api_key(db, tenant_id)
+    payload = {
+        "model": model,
+        "max_tokens": max_tokens,
+        "messages": messages,
+    }
+    if system:
+        payload["system"] = system
+    if tools:
+        payload["tools"] = tools
+
+    response = httpx.post(
+        BASE_URL,
+        headers={
+            "x-api-key": api_key,
+            "anthropic-version": ANTHROPIC_VERSION,
+            "content-type": "application/json",
+        },
+        json=payload,
+        timeout=60,
+    )
+    if response.status_code != 200:
+        raise ClaudeError(f"Claude API call failed ({response.status_code}): {response.text}")
+    data = response.json()
+
+    usage = data.get("usage", {})
+    input_tokens = usage.get("input_tokens", 0)
+    output_tokens = usage.get("output_tokens", 0)
+    input_price, output_price = MODEL_PRICING_PER_MTOK_USD.get(model, MODEL_PRICING_PER_MTOK_USD[DEFAULT_MODEL])
+    cost_usd = (input_tokens / 1_000_000 * input_price) + (output_tokens / 1_000_000 * output_price)
+    logger.warning(
+        "claude_client call_messages: model=%s input_tokens=%d output_tokens=%d cost_usd=%.5f stop_reason=%s",
+        model, input_tokens, output_tokens, cost_usd, data.get("stop_reason"),
+    )
+    return data
+
+
 def call_claude_json(prompt: str, db: Session, tenant_id: int, system: str | None = None, max_tokens: int = 2000, model: str = DEFAULT_MODEL) -> dict:
     """Same as call_claude, but parses the response as JSON -- the prompt must instruct
     Claude to return ONLY JSON, no prose. Strips markdown code fences if present, since
