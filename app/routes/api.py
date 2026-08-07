@@ -1430,6 +1430,24 @@ def trigger_calendar_sync(db: Session = Depends(get_db)):
         raise HTTPException(status_code=502, detail=str(e))
 
 
+@router.get("/_scratch/chat-diagnostic")
+def _scratch_chat_diagnostic(db: Session = Depends(get_db)):
+    """TEMPORARY -- isolating a 401 that only occurs via call_claude_messages, never via the
+    already-working call_claude, both using Haiku and the same credential. Delete after use."""
+    results = {}
+    for label, use_tools in [("haiku_messages_no_tools", False), ("haiku_messages_with_tools", True)]:
+        try:
+            resp = call_claude_messages(
+                [{"role": "user", "content": "Say OK"}], db, ELEPHANT_EDGE_TENANT_ID,
+                tools=[{"name": "ping", "description": "test", "input_schema": {"type": "object", "properties": {}}}] if use_tools else None,
+                max_tokens=20,
+            )
+            results[label] = {"ok": True, "stop_reason": resp.get("stop_reason")}
+        except ClaudeError as e:
+            results[label] = {"ok": False, "error": str(e)}
+    return results
+
+
 # ---- AI Chat Widget ----
 # Internal-only (Elephant Edge's own team, not customer-facing) -- so tool actions execute
 # directly with no per-action confirmation step, EXCEPT pushing to a SalesRobot campaign,
