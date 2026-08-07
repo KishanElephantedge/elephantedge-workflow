@@ -36,6 +36,9 @@ ALL_ROLE_TITLE_KEYWORDS.extend(["representative", "specialist", "employee", "ass
 # problem or a real data-density gap in Jobo's ATS-sourced index (see run_jobo_discovery
 # investigation) -- added generic sales-leadership titles small companies are more likely to
 # post for than dedicated "SDR"/"BDR" reqs, which tend to be a later, bigger-company hire.
+# Capped at 10 -- confirmed live that Jobo's search rejects more than 10 terms (400, "Too many
+# search terms") -- trimmed the most redundant entries ("vp sales" vs "vp of sales", "director
+# of sales" vs "sales director", the vaguest generic "sales lead").
 SEARCH_QUERIES = [
     '"sales development representative"',
     '"account executive"',
@@ -43,11 +46,8 @@ SEARCH_QUERIES = [
     '"inside sales representative"',
     '"head of sales"',
     '"vp of sales"',
-    '"vp sales"',
     '"sales director"',
-    '"director of sales"',
     '"sales manager"',
-    '"sales lead"',
     '"business development manager"',
     '"chief revenue officer"',
 ]
