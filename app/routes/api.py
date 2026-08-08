@@ -1430,6 +1430,34 @@ def trigger_calendar_sync(db: Session = Depends(get_db)):
         raise HTTPException(status_code=502, detail=str(e))
 
 
+@router.get("/_scratch/jobo-leadership-raw-check")
+def _scratch_jobo_leadership_raw_check(db: Session = Depends(get_db)):
+    """TEMPORARY -- checking whether Jobo's leadership entries include a linkedin_url (or any
+    other field beyond name/title), which decides whether a Jobo-sourced "decision maker" is
+    actually usable for outreach (SalesRobot push requires Contact.linkedin_url). Reuses the
+    already-confirmed First Resonance match -- free profile lookup, effectively $0. Delete
+    after use."""
+    import httpx as _httpx
+    from app.jobo_client import _get_api_key as _get_jobo_api_key, get_company_profile
+
+    api_key = _get_jobo_api_key(db, ELEPHANT_EDGE_TENANT_ID)
+    with _httpx.Client() as client:
+        resp = client.post(
+            "https://connect.jobo.world/api/jobs/search",
+            headers={"X-Api-Key": api_key, "Content-Type": "application/json"},
+            json={"queries": ["First Resonance"], "page": 1, "page_size": 3, "include_fields": []},
+            timeout=60,
+        )
+        resp.raise_for_status()
+        jobs = resp.json().get("jobs", [])
+        matched = [j.get("company", {}) for j in jobs if "first resonance" in (j.get("company", {}).get("name") or "").lower()]
+        if not matched:
+            return {"found": False}
+        company_id = matched[0].get("id")
+        profile = get_company_profile(client, company_id)
+        return {"found": True, "raw_leadership": (profile or {}).get("leadership")}
+
+
 # ---- AI Chat Widget ----
 # Internal-only (Elephant Edge's own team, not customer-facing) -- so tool actions execute
 # directly with no per-action confirmation step, EXCEPT pushing to a SalesRobot campaign,
