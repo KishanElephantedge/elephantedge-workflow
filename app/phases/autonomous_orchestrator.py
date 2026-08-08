@@ -673,7 +673,7 @@ def _run_jd_first_autonomous_cycle(batch: Batch, run: AutonomousRun, db: Session
     found = 0
     companies = db.query(Company).filter(Company.batch_id == batch.id).all()
     for company in companies:
-        contact = find_decision_maker(company, db)
+        contact = find_decision_maker(company, db, tenant_id)
         company.decision_maker_searched_at = datetime.utcnow()
         db.commit()
         if contact:
@@ -779,7 +779,7 @@ def _run_apify_autonomous_cycle(batch: Batch, run: AutonomousRun, db: Session, t
     found = 0
     companies = db.query(Company).filter(Company.batch_id == batch.id).all()
     for company in companies:
-        contact = find_decision_maker(company, db)
+        contact = find_decision_maker(company, db, tenant_id)
         company.decision_maker_searched_at = datetime.utcnow()
         db.commit()
         if contact:

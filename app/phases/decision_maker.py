@@ -112,7 +112,16 @@ def _make_contact(company: Company, db: Session, person: dict, reasoning: str, t
     return contact
 
 
-def find_decision_maker(company: Company, db: Session) -> Contact | None:
+def find_decision_maker(company: Company, db: Session, tenant_id: int) -> Contact | None:
+    # Free/cheap resolution first (Jobo leadership + verified Apify LinkedIn lookup) -- a miss
+    # here costs nothing and falls straight through to the existing paid Deepline flow below,
+    # unchanged. Deferred import: free_decision_maker.py imports the title-keyword constants
+    # from this module, so a top-level import here would be circular.
+    from app.phases.free_decision_maker import find_free_decision_maker
+    free_person = find_free_decision_maker(db, tenant_id, company)
+    if free_person:
+        return _make_contact(company, db, free_person, free_person["reasoning"], free_person["thread_role"])
+
     persons = _run_search_contact(company, {"title_filters": [{"name": "ceo_filter", "filter": CEO_FILTER}]})
     person = _best_matching_person(persons, CEO_TITLE_KEYWORDS, require_bare_president=True)
     if person:
@@ -194,7 +203,7 @@ def run_decision_maker_id(batch_id: int, db: Session, tenant_id: int, retry_comp
         if team_fit["tier"] == "excluded":
             excluded_full_team += 1
             continue
-        contact = find_decision_maker(company, db)
+        contact = find_decision_maker(company, db, tenant_id)
         company.decision_maker_searched_at = datetime.utcnow()
         db.commit()
         if contact:

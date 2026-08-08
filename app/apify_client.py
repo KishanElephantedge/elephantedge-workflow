@@ -80,3 +80,34 @@ def search_linkedin_jobs(
 
 def estimate_cost_usd(job_count: int) -> float:
     return job_count * COST_PER_JOB_USD + COST_PER_RUN_USD
+
+
+# memo23/linkedin-people-search -- searches LinkedIn's own data directly (not Google's index of
+# it), unlike a generic web search. Validated live (2026-08-08): a name+company search returned
+# the exact, cross-confirmed correct profile for one real person (Karan Talati, First
+# Resonance) -- but also a real miss on a second person (Neal Sarraf, same company): the
+# `company` filter appears to return "people who work here" ranked by prominence rather than
+# strictly matching firstName/lastName, so a candidate's returned `name` must be verified
+# against the requested name before ever trusting it (see find_person_free.py).
+PEOPLE_SEARCH_ACTOR_ID = "xfz4tG0OB6ClIGVGv"
+PEOPLE_SEARCH_COST_PER_START_USD = 0.005
+PEOPLE_SEARCH_COST_PER_PROFILE_USD = 0.004
+
+
+def search_linkedin_people(api_key: str, first_name: str, last_name: str, company: str, max_results: int = 3) -> list[dict]:
+    payload = {
+        "mode": "public",
+        "firstName": first_name,
+        "lastName": last_name,
+        "company": company,
+        "maxResults": max_results,
+    }
+    response = httpx.post(
+        f"{BASE_URL}/acts/{PEOPLE_SEARCH_ACTOR_ID}/run-sync-get-dataset-items",
+        params={"token": api_key},
+        json=payload,
+        timeout=60,
+    )
+    if response.status_code >= 300:
+        raise ApifyError(f"LinkedIn people search failed ({response.status_code}): {response.text[:500]}")
+    return response.json()

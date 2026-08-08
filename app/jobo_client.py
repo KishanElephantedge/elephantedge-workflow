@@ -84,3 +84,24 @@ def get_company_profile(client: httpx.Client, company_id: str) -> dict | None:
         return None
     response.raise_for_status()
     return response.json()
+
+
+def find_company_id_by_name(client: httpx.Client, api_key: str, company_name: str) -> str | None:
+    """Jobo has no company search/filter endpoint at all (confirmed against their own docs
+    2026-08-08) -- the only way to resolve a company's internal ID is via a job-search hit
+    whose embedded company summary happens to match. Small, cheap, bounded (page_size=3);
+    costs $0 if there's no matching posting (metering is per delivered job, not per request).
+    Returns None on no match -- caller falls through to whatever's next in the chain."""
+    response = client.post(
+        f"{BASE_URL}/api/jobs/search",
+        headers={"X-Api-Key": api_key, "Content-Type": "application/json"},
+        json={"queries": [company_name], "page": 1, "page_size": 3, "include_fields": []},
+        timeout=60,
+    )
+    response.raise_for_status()
+    jobs = response.json().get("jobs", [])
+    for job in jobs:
+        company = job.get("company") or {}
+        if company_name.strip().lower() in (company.get("name") or "").lower():
+            return company.get("id")
+    return None
