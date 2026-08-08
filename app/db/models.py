@@ -334,6 +334,39 @@ class ChatMessage(Base):
     conversation = relationship("ChatConversation")
 
 
+class DailyReview(Base):
+    """Async, cross-timezone review layer -- lets two people in different places look at the
+    same day's automated activity (companies/decision-makers/messages found that day) and
+    leave a verdict + comment for each other, without needing to be online at the same time.
+    Deliberately NOT wired to any real pipeline action (message approve/reject, push) -- this
+    is a human tracking/communication layer on top of what already happened, not a control
+    surface. One row per calendar date; review_date is a "YYYY-MM-DD" string (matches the
+    date-string convention already used elsewhere in this codebase, e.g. get_overview_stats'
+    start_date/end_date), not a real Date column, to avoid timezone-conversion edge cases at
+    the JSON API boundary."""
+    __tablename__ = "daily_reviews"
+
+    id = Column(Integer, primary_key=True)
+    tenant_id = Column(Integer, nullable=False)
+    review_date = Column(String, nullable=False)  # "YYYY-MM-DD"
+    status = Column(String, default="pending")  # pending | approved | rejected
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class ReviewComment(Base):
+    """Free-text comments on a given day's review -- no author column by design (this backend
+    has no user-identity concept at all); the comment textarea's placeholder prompts
+    "@name ..." so whoever's commenting types their own name inline, same convention as a
+    Slack thread with no real accounts."""
+    __tablename__ = "review_comments"
+
+    id = Column(Integer, primary_key=True)
+    tenant_id = Column(Integer, nullable=False)
+    review_date = Column(String, nullable=False, index=True)  # "YYYY-MM-DD"
+    comment = Column(Text, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
 class Parameter(Base):
     __tablename__ = "parameters"
 

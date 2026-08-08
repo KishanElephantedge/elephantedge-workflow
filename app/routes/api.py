@@ -12,7 +12,7 @@ from sqlalchemy import func, or_
 
 from app.cache import active_keys, bump_batch_version, cache_get, cache_set, get_batch_version, mark_active
 from app.claude_client import ClaudeError, call_claude_messages
-from app.db.models import AutonomousRun, Batch, CalendarBooking, CampaignEvent, CampaignPush, ChatConversation, ChatMessage, Company, Contact, Credential, Notification, Parameter, PersonalizedMessage, Score
+from app.db.models import AutonomousRun, Batch, CalendarBooking, CampaignEvent, CampaignPush, ChatConversation, ChatMessage, Company, Contact, Credential, DailyReview, Notification, Parameter, PersonalizedMessage, ReviewComment, Score
 from app.notifications import delete_expired_notifications
 from app.google_calendar_client import GoogleCalendarError
 from app.phases.hiring_signal import has_qualifying_hiring_signal
@@ -1428,6 +1428,201 @@ def trigger_calendar_sync(db: Session = Depends(get_db)):
         return sync_calendar_bookings(db, ELEPHANT_EDGE_TENANT_ID)
     except GoogleCalendarError as e:
         raise HTTPException(status_code=502, detail=str(e))
+
+
+# ---- Daily Review (calendar) ----
+# A human tracking/communication layer, not a control surface -- lets two people in different
+# places (or timezones) independently look at a given day's automated activity and leave a
+# verdict + comment for each other. Deliberately disconnected from the real pipeline: approving
+# or rejecting a day here never touches PersonalizedMessage.status, CampaignPush, or anything
+# that actually sends. review_date is always a "YYYY-MM-DD" string, matching the date-string
+# convention already used by /overview/stats' start_date/end_date.
+
+def _parse_review_date(date_str: str) -> datetime:
+    try:
+        return datetime.strptime(date_str, "%Y-%m-%d")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="date must be YYYY-MM-DD")
+
+
+def _day_batches_payload(date_str: str, db: Session) -> list[dict]:
+    day_start = _parse_review_date(date_str)
+    day_end = day_start + timedelta(days=1)
+    batches = (
+        db.query(Batch)
+        .filter(Batch.tenant_id == ELEPHANT_EDGE_TENANT_ID)
+        .filter(Batch.created_at >= day_start)
+        .filter(Batch.created_at < day_end)
+        .order_by(Batch.created_at.asc())
+        .all()
+    )
+    payload = []
+    for batch in batches:
+        companies = (
+            db.query(Company)
+            .filter(Company.batch_id == batch.id)
+            .options(
+                selectinload(Company.score),
+                selectinload(Company.contacts).selectinload(Contact.personalized_message),
+            )
+            .order_by(Company.id)
+            .all()
+        )
+        payload.append({
+            "id": batch.id,
+            "name": batch.name,
+            "source": _normalize_company_source(companies[0].source) if companies else batch.source,
+            "current_phase": batch.current_phase,
+            "status": batch.status,
+            "companies": [
+                {
+                    "id": c.id,
+                    "name": c.name,
+                    "domain": c.domain,
+                    "qualified": _is_company_qualified(c),
+                    "hiring_signal_role": c.hiring_signal_role,
+                    "contacts": [
+                        {
+                            "id": ct.id,
+                            "name": f"{ct.first_name or ''} {ct.last_name or ''}".strip(),
+                            "title": ct.title,
+                            "linkedin_url": ct.linkedin_url,
+                            "message_status": ct.personalized_message.status if ct.personalized_message else None,
+                            "generated_message": ct.personalized_message.generated_message if ct.personalized_message else None,
+                        }
+                        for ct in c.contacts
+                    ],
+                }
+                for c in companies
+            ],
+        })
+    return payload
+
+
+@router.get("/calendar/month")
+def get_calendar_month(year: int, month: int, db: Session = Depends(get_db)):
+    if not (1 <= month <= 12):
+        raise HTTPException(status_code=400, detail="month must be 1-12")
+    month_start = datetime(year, month, 1)
+    month_end = datetime(year + 1, 1, 1) if month == 12 else datetime(year, month + 1, 1)
+
+    batches = (
+        db.query(Batch.created_at)
+        .filter(Batch.tenant_id == ELEPHANT_EDGE_TENANT_ID)
+        .filter(Batch.created_at >= month_start)
+        .filter(Batch.created_at < month_end)
+        .all()
+    )
+    activity_days = {row.created_at.strftime("%Y-%m-%d") for row in batches}
+
+    reviews = (
+        db.query(DailyReview)
+        .filter(DailyReview.tenant_id == ELEPHANT_EDGE_TENANT_ID)
+        .filter(DailyReview.review_date >= month_start.strftime("%Y-%m-%d"))
+        .filter(DailyReview.review_date < month_end.strftime("%Y-%m-%d"))
+        .all()
+    )
+    review_by_date = {r.review_date: r.status for r in reviews}
+
+    comments = (
+        db.query(ReviewComment.review_date, func.count(ReviewComment.id))
+        .filter(ReviewComment.tenant_id == ELEPHANT_EDGE_TENANT_ID)
+        .filter(ReviewComment.review_date >= month_start.strftime("%Y-%m-%d"))
+        .filter(ReviewComment.review_date < month_end.strftime("%Y-%m-%d"))
+        .group_by(ReviewComment.review_date)
+        .all()
+    )
+    comment_count_by_date = {date: count for date, count in comments}
+
+    days = []
+    for d in sorted(activity_days | set(review_by_date.keys()) | set(comment_count_by_date.keys())):
+        days.append({
+            "date": d,
+            "has_activity": d in activity_days,
+            "status": review_by_date.get(d, "pending"),
+            "comment_count": comment_count_by_date.get(d, 0),
+        })
+    return {"year": year, "month": month, "days": days}
+
+
+@router.get("/calendar/{date}")
+def get_calendar_day(date: str, db: Session = Depends(get_db)):
+    _parse_review_date(date)  # validates format, raises 400 if malformed
+    review = (
+        db.query(DailyReview)
+        .filter(DailyReview.tenant_id == ELEPHANT_EDGE_TENANT_ID)
+        .filter(DailyReview.review_date == date)
+        .first()
+    )
+    comments = (
+        db.query(ReviewComment)
+        .filter(ReviewComment.tenant_id == ELEPHANT_EDGE_TENANT_ID)
+        .filter(ReviewComment.review_date == date)
+        .order_by(ReviewComment.created_at.asc())
+        .all()
+    )
+    return {
+        "date": date,
+        "status": review.status if review else "pending",
+        "batches": _day_batches_payload(date, db),
+        "comments": [{"id": c.id, "comment": c.comment, "created_at": c.created_at} for c in comments],
+    }
+
+
+class DailyReviewStatus(BaseModel):
+    status: str
+
+
+@router.post("/calendar/{date}/review")
+def set_calendar_day_review(date: str, body: DailyReviewStatus, db: Session = Depends(get_db)):
+    _parse_review_date(date)
+    if body.status not in ("pending", "approved", "rejected"):
+        raise HTTPException(status_code=400, detail="status must be pending, approved, or rejected")
+    review = (
+        db.query(DailyReview)
+        .filter(DailyReview.tenant_id == ELEPHANT_EDGE_TENANT_ID)
+        .filter(DailyReview.review_date == date)
+        .first()
+    )
+    if review:
+        review.status = body.status
+    else:
+        review = DailyReview(tenant_id=ELEPHANT_EDGE_TENANT_ID, review_date=date, status=body.status)
+        db.add(review)
+    db.commit()
+    return {"date": date, "status": review.status}
+
+
+class ReviewCommentIn(BaseModel):
+    comment: str
+
+
+@router.post("/calendar/{date}/comments")
+def add_calendar_day_comment(date: str, body: ReviewCommentIn, db: Session = Depends(get_db)):
+    _parse_review_date(date)
+    if not body.comment.strip():
+        raise HTTPException(status_code=400, detail="comment cannot be empty")
+    comment = ReviewComment(tenant_id=ELEPHANT_EDGE_TENANT_ID, review_date=date, comment=body.comment.strip())
+    db.add(comment)
+    db.commit()
+    db.refresh(comment)
+    return {"id": comment.id, "comment": comment.comment, "created_at": comment.created_at}
+
+
+@router.delete("/calendar/{date}/comments/{comment_id}")
+def delete_calendar_day_comment(date: str, comment_id: int, db: Session = Depends(get_db)):
+    comment = (
+        db.query(ReviewComment)
+        .filter(ReviewComment.id == comment_id)
+        .filter(ReviewComment.tenant_id == ELEPHANT_EDGE_TENANT_ID)
+        .filter(ReviewComment.review_date == date)
+        .first()
+    )
+    if not comment:
+        raise HTTPException(status_code=404, detail="Comment not found")
+    db.delete(comment)
+    db.commit()
+    return {"deleted": True}
 
 
 # ---- AI Chat Widget ----

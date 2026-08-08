@@ -100,3 +100,23 @@ def ensure_indexes():
         """))
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_chat_conversations_tenant_updated ON chat_conversations (tenant_id, updated_at DESC)"))
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_chat_messages_conversation_created ON chat_messages (conversation_id, created_at)"))
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS daily_reviews (
+                id SERIAL PRIMARY KEY,
+                tenant_id INTEGER NOT NULL,
+                review_date VARCHAR NOT NULL,
+                status VARCHAR DEFAULT 'pending',
+                updated_at TIMESTAMP
+            )
+        """))
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS review_comments (
+                id SERIAL PRIMARY KEY,
+                tenant_id INTEGER NOT NULL,
+                review_date VARCHAR NOT NULL,
+                comment TEXT NOT NULL,
+                created_at TIMESTAMP
+            )
+        """))
+        conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ix_daily_reviews_tenant_date ON daily_reviews (tenant_id, review_date)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_review_comments_tenant_date ON review_comments (tenant_id, review_date)"))
