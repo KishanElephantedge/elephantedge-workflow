@@ -1501,6 +1501,20 @@ def _day_detail_payload(date_str: str, db: Session) -> dict:
     timeline = [t for t in timeline if t["timestamp"] is not None]
     timeline.sort(key=lambda t: t["timestamp"])
 
+    company_rows = [
+        {
+            "id": c.id,
+            "name": c.name,
+            "domain": c.domain,
+            "linkedin_url": c.linkedin_url,
+            "qualified": _is_company_qualified(c),
+            "hiring_signal_role": c.hiring_signal_role,
+            "contact_count": len(c.contacts),
+        }
+        for c in companies
+    ]
+    company_rows.sort(key=lambda c: (not c["qualified"], c["name"] or ""))  # qualified first, then alphabetical
+
     return {
         "summary": {
             "companies_discovered": len(companies),
@@ -1509,6 +1523,7 @@ def _day_detail_payload(date_str: str, db: Session) -> dict:
         },
         "batch_names": batch_names,
         "timeline": timeline,
+        "companies": company_rows,
         "decision_makers": decision_makers,
     }
 
@@ -1590,6 +1605,7 @@ def get_calendar_day(date: str, db: Session = Depends(get_db)):
         "summary": detail["summary"],
         "batch_names": detail["batch_names"],
         "timeline": detail["timeline"],
+        "companies": detail["companies"],
         "decision_makers": detail["decision_makers"],
         "comments": [{"id": c.id, "comment": c.comment, "created_at": c.created_at.isoformat() + "Z"} for c in comments],
     }
