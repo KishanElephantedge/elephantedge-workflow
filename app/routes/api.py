@@ -1445,7 +1445,10 @@ def _parse_review_date(date_str: str) -> datetime:
         raise HTTPException(status_code=400, detail="date must be YYYY-MM-DD")
 
 
-def _day_batches_payload(date_str: str, db: Session) -> list[dict]:
+def _day_detail_payload(date_str: str, db: Session) -> dict:
+    """Flat, purpose-built shape for the Daily Review page -- not batch-grouped, since a
+    reviewer cares about "what happened today" (a timeline + decision-makers found + their
+    messages), not which internal batch row a company happened to land in."""
     day_start = _parse_review_date(date_str)
     day_end = day_start + timedelta(days=1)
     batches = (
@@ -1456,47 +1459,58 @@ def _day_batches_payload(date_str: str, db: Session) -> list[dict]:
         .order_by(Batch.created_at.asc())
         .all()
     )
-    payload = []
-    for batch in batches:
-        companies = (
-            db.query(Company)
-            .filter(Company.batch_id == batch.id)
-            .options(
-                selectinload(Company.score),
-                selectinload(Company.contacts).selectinload(Contact.personalized_message),
-            )
-            .order_by(Company.id)
-            .all()
-        )
-        payload.append({
-            "id": batch.id,
-            "name": batch.name,
-            "source": _normalize_company_source(companies[0].source) if companies else batch.source,
-            "current_phase": batch.current_phase,
-            "status": batch.status,
-            "companies": [
-                {
-                    "id": c.id,
-                    "name": c.name,
-                    "domain": c.domain,
-                    "qualified": _is_company_qualified(c),
-                    "hiring_signal_role": c.hiring_signal_role,
-                    "contacts": [
-                        {
-                            "id": ct.id,
-                            "name": f"{ct.first_name or ''} {ct.last_name or ''}".strip(),
-                            "title": ct.title,
-                            "linkedin_url": ct.linkedin_url,
-                            "message_status": ct.personalized_message.status if ct.personalized_message else None,
-                            "generated_message": ct.personalized_message.generated_message if ct.personalized_message else None,
-                        }
-                        for ct in c.contacts
-                    ],
-                }
-                for c in companies
-            ],
-        })
-    return payload
+    batch_ids = [b.id for b in batches]
+    batch_names = [b.name for b in batches]
+
+    companies = (
+        db.query(Company)
+        .filter(Company.batch_id.in_(batch_ids))
+        .options(selectinload(Company.score), selectinload(Company.contacts).selectinload(Contact.personalized_message))
+        .order_by(Company.id)
+        .all()
+    ) if batch_ids else []
+
+    timeline = []
+    decision_makers = []
+    for c in companies:
+        timeline.append({"type": "discovery", "timestamp": c.created_at, "text": f"Discovered {c.name}"})
+        for ct in c.contacts:
+            ct_name = f"{ct.first_name or ''} {ct.last_name or ''}".strip() or "a decision-maker"
+            timeline.append({
+                "type": "decision_maker",
+                "timestamp": ct.created_at,
+                "text": f"Found {ct_name} at {c.name}",
+            })
+            pm = ct.personalized_message
+            decision_makers.append({
+                "contact_id": ct.id,
+                "name": f"{ct.first_name or ''} {ct.last_name or ''}".strip(),
+                "title": ct.title,
+                "company_name": c.name,
+                "linkedin_url": ct.linkedin_url,
+                "message_status": pm.status if pm else None,
+                "generated_message": pm.generated_message if pm else None,
+            })
+            if pm and pm.generated_at:
+                timeline.append({
+                    "type": "message",
+                    "timestamp": pm.generated_at,
+                    "text": f"Drafted a message for {ct.first_name or ''} {ct.last_name or ''} at {c.name}".strip(),
+                })
+
+    timeline = [t for t in timeline if t["timestamp"] is not None]
+    timeline.sort(key=lambda t: t["timestamp"])
+
+    return {
+        "summary": {
+            "companies_discovered": len(companies),
+            "companies_qualified": sum(1 for c in companies if _is_company_qualified(c)),
+            "decision_makers_found": len(decision_makers),
+        },
+        "batch_names": batch_names,
+        "timeline": timeline,
+        "decision_makers": decision_makers,
+    }
 
 
 @router.get("/calendar/month")
@@ -1561,11 +1575,23 @@ def get_calendar_day(date: str, db: Session = Depends(get_db)):
         .order_by(ReviewComment.created_at.asc())
         .all()
     )
+    detail = _day_detail_payload(date, db)
+    # created_at/timestamp are naive UTC (datetime.utcnow()) -- appending "Z" explicitly so the
+    # frontend's Date parsing treats them as UTC instead of local time. Found live: a comment
+    # posted seconds ago showed "6h ago" because a Z-less ISO string like
+    # "2026-08-08T13:06:00" gets parsed by JS as LOCAL time, not UTC, silently shifting it by
+    # the browser's own UTC offset.
+    for item in detail["timeline"]:
+        if item["timestamp"] is not None:
+            item["timestamp"] = item["timestamp"].isoformat() + "Z"
     return {
         "date": date,
         "status": review.status if review else "pending",
-        "batches": _day_batches_payload(date, db),
-        "comments": [{"id": c.id, "comment": c.comment, "created_at": c.created_at} for c in comments],
+        "summary": detail["summary"],
+        "batch_names": detail["batch_names"],
+        "timeline": detail["timeline"],
+        "decision_makers": detail["decision_makers"],
+        "comments": [{"id": c.id, "comment": c.comment, "created_at": c.created_at.isoformat() + "Z"} for c in comments],
     }
 
 
@@ -1606,7 +1632,7 @@ def add_calendar_day_comment(date: str, body: ReviewCommentIn, db: Session = Dep
     db.add(comment)
     db.commit()
     db.refresh(comment)
-    return {"id": comment.id, "comment": comment.comment, "created_at": comment.created_at}
+    return {"id": comment.id, "comment": comment.comment, "created_at": comment.created_at.isoformat() + "Z"}
 
 
 @router.delete("/calendar/{date}/comments/{comment_id}")
