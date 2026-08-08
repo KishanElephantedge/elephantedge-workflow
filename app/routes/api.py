@@ -1430,55 +1430,6 @@ def trigger_calendar_sync(db: Session = Depends(get_db)):
         raise HTTPException(status_code=502, detail=str(e))
 
 
-@router.post("/_scratch/hubspot-cleanup-batch41")
-def _scratch_hubspot_cleanup_batch41(db: Session = Depends(get_db)):
-    """TEMPORARY -- removes the 9 real HubSpot company+contact records accidentally created
-    by testing the decision-maker phase on batch 41 (a wiring-verification batch, never meant
-    to touch real production HubSpot data). Delete after use."""
-    import httpx as _httpx
-    from app.hubspot_client import _headers, find_company_by_domain
-
-    records = [
-        ("firstresonance.io", "Karan", "Talati"),
-        ("twosixtech.com", "Heath", "Johnson"),
-        ("quadsci.ai", "Dan", "Harmeson"),
-        ("corridor.dev", "Ashwin", "Ramaswami"),
-        ("majc.ai", "Andy", "Coughlin"),
-        ("vectroconsulting.com", "Suresh", "Subbu"),
-        ("diamo.ai", "Iv", "Beaton"),
-        ("eriasventures.com", "Jason", "Barbour"),
-        ("kwant.ai", "Niran", "S"),
-    ]
-    results = []
-    headers = _headers(db, ELEPHANT_EDGE_TENANT_ID)
-    for domain, first, last in records:
-        entry = {"domain": domain, "name": f"{first} {last}"}
-        company_id = find_company_by_domain(domain, db, ELEPHANT_EDGE_TENANT_ID)
-        if company_id:
-            resp = _httpx.delete(f"https://api.hubapi.com/crm/v3/objects/companies/{company_id}", headers=headers, timeout=30)
-            entry["company_deleted"] = resp.status_code == 204
-        else:
-            entry["company_deleted"] = None
-
-        search = _httpx.post(
-            "https://api.hubapi.com/crm/v3/objects/contacts/search",
-            headers=headers,
-            json={"filterGroups": [{"filters": [
-                {"propertyName": "firstname", "operator": "EQ", "value": first},
-                {"propertyName": "lastname", "operator": "EQ", "value": last},
-            ]}]},
-            timeout=30,
-        )
-        contact_ids = [r["id"] for r in search.json().get("results", [])] if search.status_code == 200 else []
-        deleted_contacts = []
-        for cid in contact_ids:
-            resp = _httpx.delete(f"https://api.hubapi.com/crm/v3/objects/contacts/{cid}", headers=headers, timeout=30)
-            deleted_contacts.append({"id": cid, "deleted": resp.status_code == 204})
-        entry["contacts_found_and_deleted"] = deleted_contacts
-        results.append(entry)
-    return results
-
-
 # ---- AI Chat Widget ----
 # Internal-only (Elephant Edge's own team, not customer-facing) -- so tool actions execute
 # directly with no per-action confirmation step, EXCEPT pushing to a SalesRobot campaign,
