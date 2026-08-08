@@ -1501,8 +1501,10 @@ def _day_detail_payload(date_str: str, db: Session) -> dict:
     timeline = [t for t in timeline if t["timestamp"] is not None]
     timeline.sort(key=lambda t: t["timestamp"])
 
-    company_rows = [
-        {
+    company_rows = []
+    for c in companies:
+        primary_contact = c.contacts[0] if c.contacts else None
+        company_rows.append({
             "id": c.id,
             "name": c.name,
             "domain": c.domain,
@@ -1510,9 +1512,9 @@ def _day_detail_payload(date_str: str, db: Session) -> dict:
             "qualified": _is_company_qualified(c),
             "hiring_signal_role": c.hiring_signal_role,
             "contact_count": len(c.contacts),
-        }
-        for c in companies
-    ]
+            "primary_contact_name": f"{primary_contact.first_name or ''} {primary_contact.last_name or ''}".strip() if primary_contact else None,
+            "primary_contact_title": primary_contact.title if primary_contact else None,
+        })
     company_rows.sort(key=lambda c: (not c["qualified"], c["name"] or ""))  # qualified first, then alphabetical
 
     return {
