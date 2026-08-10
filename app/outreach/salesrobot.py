@@ -2,6 +2,7 @@ from sqlalchemy.orm import Session
 
 from app.db.models import Contact, Parameter
 from app.outreach.base import OutreachChannel
+from app.outreach.smartlead import push_email
 from app.salesrobot_client import SalesRobotError, add_single_prospect
 
 
@@ -69,18 +70,19 @@ class SalesRobotChannel(OutreachChannel):
                 "connectionNote": note,
                 "personalizedMessage": pm.generated_message,
             }
-            # Email channel, added 2026-08-10 -- only when this contact has both a captured
-            # email (Contact.email, only ever populated via the paid Deepline decision-maker
-            # path) AND a generated email (personalized_outreach.py only generates one when
-            # contact.email is set). emailId goes on the prospect object itself, per
-            # SalesRobot's own docs -- distinct from customMap, which is template merge tags.
-            if contact.email and pm.email_subject and pm.email_body:
-                prospect["emailId"] = contact.email
-                prospect["customMap"]["emailSubject"] = pm.email_subject
-                prospect["customMap"]["emailBody"] = pm.email_body
 
         try:
             add_single_prospect(campaign_uuid, linkedin_account_uuid, prospect, self.db, self.tenant_id)
-            return {"status": "pushed", "error_message": None, "channel_ref": campaign_uuid}
+            result = {"status": "pushed", "error_message": None, "channel_ref": campaign_uuid}
         except SalesRobotError as e:
-            return {"status": "failed", "error_message": str(e), "channel_ref": campaign_uuid}
+            result = {"status": "failed", "error_message": str(e), "channel_ref": campaign_uuid}
+
+        # Email is a separate, additive channel via Smartlead (SalesRobot's own email step
+        # was found untested/unreliable -- see progress-log.md) -- best-effort, never lets an
+        # email failure override the LinkedIn push's own real result.
+        if pm and pm.status == "approved":
+            email_result = push_email(contact, pm, self.db, self.tenant_id)
+            if email_result["status"] == "failed":
+                result["error_message"] = (result.get("error_message") + " | " if result.get("error_message") else "") + f"email: {email_result['error_message']}"
+
+        return result

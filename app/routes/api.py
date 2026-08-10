@@ -37,6 +37,8 @@ from app.phases.personalized_outreach import generate_personalized_message
 from app.phases.scoring import run_scoring
 from app.phases.tech_stack import run_tech_stack_check
 from app.salesrobot_client import SalesRobotError, add_single_prospect, get_campaign_prospects, list_campaigns, send_message_to_prospect
+from app.smartlead_client import SmartleadError
+from app.smartlead_client import add_lead as smartlead_add_lead
 
 router = APIRouter()
 
@@ -642,6 +644,8 @@ def get_message(contact_id: int, db: Session = Depends(get_db)):
 
 class MessageEdit(BaseModel):
     generated_message: str | None = None
+    email_subject: str | None = None
+    email_body: str | None = None
     status: str | None = None
 
 
@@ -659,13 +663,24 @@ def edit_message(contact_id: int, body: MessageEdit, db: Session = Depends(get_d
     pm = contact.personalized_message
     if body.generated_message is not None:
         pm.generated_message = body.generated_message
+    if body.email_subject is not None:
+        pm.email_subject = body.email_subject
+    if body.email_body is not None:
+        pm.email_body = body.email_body
     if body.status is not None:
         if body.status not in ("draft", "approved", "rejected"):
             raise HTTPException(status_code=400, detail="status must be draft, approved, or rejected")
         pm.status = body.status
     db.commit()
     bump_batch_version(contact.company.batch_id)
-    return {"contact_id": contact_id, "status": pm.status, "generated_message": pm.generated_message}
+    return {
+        "contact_id": contact_id,
+        "status": pm.status,
+        "generated_message": pm.generated_message,
+        "contact_email": contact.email,
+        "email_subject": pm.email_subject,
+        "email_body": pm.email_body,
+    }
 
 
 @router.post("/contacts/{contact_id}/exclude-from-push")
@@ -713,6 +728,19 @@ def _find_linkedin_url_in_payload(obj) -> str | None:
             if found:
                 return found
     return None
+
+
+def _get_smartlead_campaign_id(db: Session) -> int:
+    param = (
+        db.query(Parameter)
+        .filter(Parameter.tenant_id == ELEPHANT_EDGE_TENANT_ID)
+        .filter(Parameter.key == "smartlead_campaign_id")
+        .first()
+    )
+    if not param or not param.value:
+        raise HTTPException(status_code=400, detail="smartlead_campaign_id parameter is not set")
+    value = param.value
+    return int(value.get("value") if isinstance(value, dict) else value)
 
 
 def _get_salesrobot_linkedin_account_uuid(db: Session) -> str:
@@ -1317,31 +1345,34 @@ def test_salesrobot_push(campaign_uuid: str, linkedin_url: str, personalized_mes
     full follow-up message) -- defaults to a generic line if not given, same shape as
     production, so this test reflects what the real system will actually do.
 
-    email/email_subject/email_body added 2026-08-10 to test the new email channel: emailId
-    goes on the prospect object itself (confirmed live via SalesRobot's own docs), while
-    emailSubject/emailBody go in customMap for the {{emailSubject}}/{{emailBody}} merge tags
-    in the campaign's email sequence step -- unverified until this test actually confirms it."""
+    email/email_subject/email_body added 2026-08-10: routed through Smartlead instead of
+    SalesRobot's own email step (SalesRobot's emailId/customMap email rendering was never
+    verified live and their email account has no active trial -- Smartlead is the confirmed,
+    working email channel as of 2026-08-10, see app/outreach/smartlead.py)."""
     account_uuid = _get_salesrobot_linkedin_account_uuid(db)
     note = connection_note or f"Hi {first_name or 'there'}, I'd love to connect."
-    custom_map = {"connectionNote": note, "personalizedMessage": personalized_message}
-    if email_subject:
-        custom_map["emailSubject"] = email_subject
-    if email_body:
-        custom_map["emailBody"] = email_body
     prospect = {
         "profileUrl": linkedin_url,
-        "customMap": custom_map,
+        "customMap": {"connectionNote": note, "personalizedMessage": personalized_message},
     }
     if first_name:
         prospect["firstName"] = first_name
-    if email:
-        prospect["emailId"] = email
 
     try:
         result = add_single_prospect(campaign_uuid, account_uuid, prospect, db, ELEPHANT_EDGE_TENANT_ID)
     except SalesRobotError as e:
         raise HTTPException(status_code=502, detail=str(e))
-    return {"sent_prospect": prospect, "salesrobot_response": result}
+
+    email_result = None
+    if email and email_subject and email_body:
+        try:
+            email_result = smartlead_add_lead(
+                _get_smartlead_campaign_id(db), email, first_name, email_subject, email_body, db, ELEPHANT_EDGE_TENANT_ID
+            )
+        except SmartleadError as e:
+            email_result = {"error": str(e)}
+
+    return {"sent_prospect": prospect, "salesrobot_response": result, "email_result": email_result}
 
 
 @router.post("/webhooks/salesrobot/{secret}")
