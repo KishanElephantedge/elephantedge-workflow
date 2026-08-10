@@ -704,16 +704,6 @@ def set_contact_excluded_from_push(contact_id: int, excluded: bool, db: Session 
     return {"contact_id": contact_id, "excluded_from_push": contact.excluded_from_push}
 
 
-@router.post("/_scratch/set-contact-email")
-def _scratch_set_contact_email(contact_id: int, email: str, db: Session = Depends(get_db)):
-    contact = db.query(Contact).filter(Contact.id == contact_id).first()
-    if not contact:
-        raise HTTPException(status_code=404, detail="Contact not found")
-    contact.email = email
-    db.commit()
-    return {"contact_id": contact_id, "email": contact.email}
-
-
 # ---- SalesRobot outcome webhook ----
 # SalesRobot pushes events to us (confirmed live -- no pull/status API exists); this receives
 # them. The secret path segment is the only protection available, since SalesRobot's webhook
