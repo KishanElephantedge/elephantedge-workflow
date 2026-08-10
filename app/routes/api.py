@@ -1500,61 +1500,91 @@ def _parse_review_date(date_str: str) -> datetime:
 def _day_detail_payload(date_str: str, db: Session) -> dict:
     """Flat, purpose-built shape for the Daily Review page -- not batch-grouped, since a
     reviewer cares about "what happened today" (a timeline + decision-makers found + their
-    messages), not which internal batch row a company happened to land in."""
+    messages), not which internal batch row a company happened to land in.
+
+    Filters by each entity's OWN timestamp (Company.created_at, Contact.created_at,
+    PersonalizedMessage.generated_at), not by Batch.created_at -- fixed 2026-08-10 after a
+    real bug: a batch created on day N commonly has decision-maker/message work happen on
+    day N+1 (batches get reused across days, not recreated daily), so filtering by the
+    parent batch's creation date silently attributed a whole day's real activity to the
+    wrong day, leaving the actual day looking empty. Each section below now queries
+    independently by its own real timestamp, joined back to Batch only to scope by tenant."""
     day_start = _parse_review_date(date_str)
     day_end = day_start + timedelta(days=1)
-    batches = (
-        db.query(Batch)
-        .filter(Batch.tenant_id == ELEPHANT_EDGE_TENANT_ID)
-        .filter(Batch.created_at >= day_start)
-        .filter(Batch.created_at < day_end)
-        .order_by(Batch.created_at.asc())
-        .all()
-    )
-    batch_ids = [b.id for b in batches]
-    batch_names = [b.name for b in batches]
 
-    companies = (
+    tenant_batch_ids = db.query(Batch.id).filter(Batch.tenant_id == ELEPHANT_EDGE_TENANT_ID)
+
+    companies_discovered_today = (
         db.query(Company)
-        .filter(Company.batch_id.in_(batch_ids))
-        .options(selectinload(Company.score), selectinload(Company.contacts).selectinload(Contact.personalized_message))
+        .filter(Company.batch_id.in_(tenant_batch_ids))
+        .filter(Company.created_at >= day_start)
+        .filter(Company.created_at < day_end)
+        .options(selectinload(Company.contacts).selectinload(Contact.personalized_message))
         .order_by(Company.id)
         .all()
-    ) if batch_ids else []
+    )
+
+    contacts_found_today = (
+        db.query(Contact)
+        .join(Company)
+        .filter(Company.batch_id.in_(tenant_batch_ids))
+        .filter(Contact.created_at >= day_start)
+        .filter(Contact.created_at < day_end)
+        .options(selectinload(Contact.personalized_message), selectinload(Contact.company))
+        .order_by(Contact.id)
+        .all()
+    )
+
+    messages_drafted_today = (
+        db.query(PersonalizedMessage)
+        .join(Contact)
+        .join(Company)
+        .filter(Company.batch_id.in_(tenant_batch_ids))
+        .filter(PersonalizedMessage.generated_at >= day_start)
+        .filter(PersonalizedMessage.generated_at < day_end)
+        .options(selectinload(PersonalizedMessage.contact).selectinload(Contact.company))
+        .all()
+    )
 
     timeline = []
-    decision_makers = []
-    for c in companies:
+    for c in companies_discovered_today:
         timeline.append({"type": "discovery", "timestamp": c.created_at, "text": f"Discovered {c.name}"})
-        for ct in c.contacts:
-            ct_name = f"{ct.first_name or ''} {ct.last_name or ''}".strip() or "a decision-maker"
-            timeline.append({
-                "type": "decision_maker",
-                "timestamp": ct.created_at,
-                "text": f"Found {ct_name} at {c.name}",
-            })
-            pm = ct.personalized_message
-            decision_makers.append({
-                "contact_id": ct.id,
-                "name": f"{ct.first_name or ''} {ct.last_name or ''}".strip(),
-                "title": ct.title,
-                "company_name": c.name,
-                "linkedin_url": ct.linkedin_url,
-                "message_status": pm.status if pm else None,
-                "generated_message": pm.generated_message if pm else None,
-            })
-            if pm and pm.generated_at:
-                timeline.append({
-                    "type": "message",
-                    "timestamp": pm.generated_at,
-                    "text": f"Drafted a message for {ct.first_name or ''} {ct.last_name or ''} at {c.name}".strip(),
-                })
-
+    for ct in contacts_found_today:
+        ct_name = f"{ct.first_name or ''} {ct.last_name or ''}".strip() or "a decision-maker"
+        timeline.append({
+            "type": "decision_maker",
+            "timestamp": ct.created_at,
+            "text": f"Found {ct_name} at {ct.company.name}",
+        })
+    for pm in messages_drafted_today:
+        ct = pm.contact
+        timeline.append({
+            "type": "message",
+            "timestamp": pm.generated_at,
+            "text": f"Drafted a message for {ct.first_name or ''} {ct.last_name or ''} at {ct.company.name}".strip(),
+        })
     timeline = [t for t in timeline if t["timestamp"] is not None]
     timeline.sort(key=lambda t: t["timestamp"])
 
+    decision_makers = []
+    for ct in contacts_found_today:
+        pm = ct.personalized_message
+        decision_makers.append({
+            "contact_id": ct.id,
+            "name": f"{ct.first_name or ''} {ct.last_name or ''}".strip(),
+            "title": ct.title,
+            "company_name": ct.company.name,
+            "linkedin_url": ct.linkedin_url,
+            "message_status": pm.status if pm else None,
+            "generated_message": pm.generated_message if pm else None,
+            "contact_email": ct.email,
+            "contact_email_source": ct.email_source,
+            "email_subject": pm.email_subject if pm else None,
+            "email_body": pm.email_body if pm else None,
+        })
+
     company_rows = []
-    for c in companies:
+    for c in companies_discovered_today:
         primary_contact = c.contacts[0] if c.contacts else None
         company_rows.append({
             "id": c.id,
@@ -1571,11 +1601,10 @@ def _day_detail_payload(date_str: str, db: Session) -> dict:
 
     return {
         "summary": {
-            "companies_discovered": len(companies),
-            "companies_qualified": sum(1 for c in companies if _is_company_qualified(c)),
+            "companies_discovered": len(companies_discovered_today),
+            "companies_qualified": sum(1 for c in companies_discovered_today if _is_company_qualified(c)),
             "decision_makers_found": len(decision_makers),
         },
-        "batch_names": batch_names,
         "timeline": timeline,
         "companies": company_rows,
         "decision_makers": decision_makers,
@@ -1589,14 +1618,38 @@ def get_calendar_month(year: int, month: int, db: Session = Depends(get_db)):
     month_start = datetime(year, month, 1)
     month_end = datetime(year + 1, 1, 1) if month == 12 else datetime(year, month + 1, 1)
 
-    batches = (
-        db.query(Batch.created_at)
-        .filter(Batch.tenant_id == ELEPHANT_EDGE_TENANT_ID)
-        .filter(Batch.created_at >= month_start)
-        .filter(Batch.created_at < month_end)
+    # Same fix as _day_detail_payload: real per-entity timestamps, not Batch.created_at (a
+    # batch created on day N routinely has real activity on day N+1+, since batches get
+    # reused across days rather than recreated daily).
+    tenant_batch_ids = db.query(Batch.id).filter(Batch.tenant_id == ELEPHANT_EDGE_TENANT_ID)
+    activity_days = set()
+    company_dates = (
+        db.query(Company.created_at)
+        .filter(Company.batch_id.in_(tenant_batch_ids))
+        .filter(Company.created_at >= month_start)
+        .filter(Company.created_at < month_end)
         .all()
     )
-    activity_days = {row.created_at.strftime("%Y-%m-%d") for row in batches}
+    activity_days |= {row.created_at.strftime("%Y-%m-%d") for row in company_dates if row.created_at}
+    contact_dates = (
+        db.query(Contact.created_at)
+        .join(Company)
+        .filter(Company.batch_id.in_(tenant_batch_ids))
+        .filter(Contact.created_at >= month_start)
+        .filter(Contact.created_at < month_end)
+        .all()
+    )
+    activity_days |= {row.created_at.strftime("%Y-%m-%d") for row in contact_dates if row.created_at}
+    message_dates = (
+        db.query(PersonalizedMessage.generated_at)
+        .join(Contact)
+        .join(Company)
+        .filter(Company.batch_id.in_(tenant_batch_ids))
+        .filter(PersonalizedMessage.generated_at >= month_start)
+        .filter(PersonalizedMessage.generated_at < month_end)
+        .all()
+    )
+    activity_days |= {row.generated_at.strftime("%Y-%m-%d") for row in message_dates if row.generated_at}
 
     reviews = (
         db.query(DailyReview)
@@ -1657,7 +1710,6 @@ def get_calendar_day(date: str, db: Session = Depends(get_db)):
         "date": date,
         "status": review.status if review else "pending",
         "summary": detail["summary"],
-        "batch_names": detail["batch_names"],
         "timeline": detail["timeline"],
         "companies": detail["companies"],
         "decision_makers": detail["decision_makers"],
