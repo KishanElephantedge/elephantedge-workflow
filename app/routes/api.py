@@ -2460,16 +2460,6 @@ def delete_credential(name: str, db: Session = Depends(get_db)):
 
 # ---- Parameters (autonomous_enabled, daily_credit_budget_usd, daily_company_cap) ----
 
-@router.post("/_scratch/merge-batch")
-def _scratch_merge_batch(from_batch_id: int, into_batch_id: int, db: Session = Depends(get_db)):
-    companies = db.query(Company).filter(Company.batch_id == from_batch_id).all()
-    for c in companies:
-        c.batch_id = into_batch_id
-    db.commit()
-    bump_batch_version(into_batch_id)
-    return {"moved_companies": len(companies), "into_batch_id": into_batch_id}
-
-
 @router.get("/parameters")
 def list_parameters(db: Session = Depends(get_db)):
     params = db.query(Parameter).filter(Parameter.tenant_id == ELEPHANT_EDGE_TENANT_ID).all()
