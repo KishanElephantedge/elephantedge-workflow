@@ -97,12 +97,17 @@ def _best_matching_person(persons: list[dict], title_keywords: list[str], requir
 
 
 def _make_contact(company: Company, db: Session, person: dict, reasoning: str, thread_role: str) -> Contact:
+    # Free -- already present in search_contact's own response, just never extracted before
+    # (confirmed live 2026-08-10). professional_email preferred over personal_email since it's
+    # the one actually tied to the company domain we're targeting. Only ever populated via this
+    # (paid Deepline) path -- free_decision_maker.py's Jobo+Apify contacts have no email source.
     contact = Contact(
         company_id=company.id,
         first_name=person.get("first_name"),
         last_name=person.get("last_name"),
         title=person.get("title"),
         linkedin_url=person.get("linkedin_url") or person.get("linkedin"),
+        email=person.get("professional_email") or person.get("personal_email"),
         thread_role=thread_role,
         matched_title_reasoning=reasoning,
     )

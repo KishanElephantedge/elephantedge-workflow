@@ -206,6 +206,40 @@ Rules:
 - Keep it under 130 words. Return ONLY the message text, no subject line unless it reads naturally as one, no preamble, no explanation."""
 
 
+CURIOSITY_EMAIL_SYNTHESIS_PROMPT = """Write a short, genuinely curious cold email in the TONE and SPIRIT of the two real examples below (those are LinkedIn messages, not emails -- use them for tone/intent only, not structure). Same rules as the LinkedIn version: not selling anything, asking to learn from this specific person's real experience, one light company/contact reference, never a product pitch.
+
+{examples}
+
+Sender's name (sign off with this): {sender_name}
+Real facts about the sender (rephrase in your own words): {sender_context}
+Contact first name: {first_name}
+Contact's real title: {contact_title}
+Company name: {company_name}
+
+Company research (background only -- do not dump multiple details into the email):
+{company_research_json}
+
+Contact research (background only -- do not dump multiple details into the email):
+{contact_research_json}
+
+{avoid_openers_block}
+
+Rules:
+- No product/service pitch of any kind, same as the LinkedIn version -- purely an ask to learn.
+- Subject line: short (under 8 words), plain, specific enough to not read as spam -- never generic like "Quick question" or "Following up," never clickbait, never in all caps or title case (write it the way a real person types a subject line).
+- Body: keep the company/contact reference to ONE light, general observation, not a detailed rundown.
+- Always work in the real facts about the sender given above, without adapting them to sound like they match the recipient's own domain.
+- Genuinely vary wording from the reference examples and from the avoid-list below.
+- Plain, casual language -- short sentences, no corporate phrasing, no em dash.
+- Never open with "As someone who..." or similar third-person distancing.
+- Ask for a short (15-20 minute), no-pressure conversation -- frame as genuine curiosity.
+- Never name a specific day, date, or time frame.
+- Sign off the body with the sender's name given above.
+- Keep the body under 130 words.
+
+Return ONLY a JSON object with exactly this shape (no markdown fences, no prose): {{"subject": "...", "body": "..."}}"""
+
+
 CURIOSITY_RECENT_OPENERS_MAX = 5
 
 
@@ -284,6 +318,40 @@ def run_curiosity_message_synthesis(contact: Contact, company_research: dict, co
     _record_curiosity_opener(db, tenant_id, message.strip())
 
     return message
+
+
+def run_curiosity_email_synthesis(contact: Contact, company_research: dict, contact_research: dict, db: Session, tenant_id: int) -> dict:
+    """Email counterpart to run_curiosity_message_synthesis -- same tone/rules, same rolling
+    avoid-openers list (one shared voice across both channels for the same sender), but
+    returns {"subject", "body"} since email needs a distinct subject line LinkedIn doesn't."""
+    recent_openers = _get_recent_curiosity_openers(db, tenant_id)
+    if recent_openers:
+        avoid_block = (
+            "Full text of recent messages already sent to OTHER contacts -- do not reuse a "
+            "similar sentence structure anywhere in this email, not just the opening line:\n\n"
+            + "\n\n---\n\n".join(recent_openers)
+        )
+    else:
+        avoid_block = ""
+
+    prompt = CURIOSITY_EMAIL_SYNTHESIS_PROMPT.format(
+        examples=CURIOSITY_MESSAGE_EXAMPLES,
+        sender_name=_get_sender_name(db, tenant_id),
+        sender_context=SENDER_REAL_CONTEXT,
+        first_name=contact.first_name or "there",
+        contact_title=contact.title or "unknown",
+        company_name=contact.company.name if contact.company else "unknown",
+        company_research_json=json.dumps(company_research, indent=2),
+        contact_research_json=json.dumps(contact_research, indent=2),
+        avoid_openers_block=avoid_block,
+    )
+    result = generate_json(prompt, db, tenant_id, max_tokens=500)
+    subject = (result.get("subject") or "").replace("—", ", ").replace("--", ", ").strip()
+    body = (result.get("body") or "").replace("—", ", ").replace("--", ", ").strip()
+
+    _record_curiosity_opener(db, tenant_id, body)
+
+    return {"subject": subject, "body": body}
 
 
 def run_company_research(company: Company, db: Session, tenant_id: int) -> dict:
@@ -395,6 +463,20 @@ def generate_personalized_message(contact_id: int, db: Session, tenant_id: int, 
         pm.generated_at = datetime.utcnow()
         pm.error_message = None
         db.commit()
+
+        # Email channel -- only if this contact actually has a captured email (see
+        # Contact.email, only ever populated via the paid Deepline decision-maker path).
+        # Best-effort: a failure here must never wipe out the LinkedIn message that already
+        # succeeded above.
+        if style == "curiosity" and contact.email:
+            try:
+                email = run_curiosity_email_synthesis(contact, company_research, contact_research, db, tenant_id)
+                pm.email_subject = email["subject"]
+                pm.email_body = email["body"]
+                db.commit()
+            except ClaudeError as e:
+                pm.error_message = (pm.error_message + " | " if pm.error_message else "") + f"email generation failed: {e}"
+                db.commit()
     except (ScrapeError, ClaudeError, DeeplineError) as e:
         pm.error_message = str(e)
         db.commit()

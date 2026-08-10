@@ -156,6 +156,15 @@ class Contact(Base):
     last_name = Column(String, nullable=True)
     title = Column(String, nullable=True)
     linkedin_url = Column(String, nullable=True)
+    # Free, already present in search_contact's own response (professional_email preferred,
+    # personal_email as fallback) -- confirmed live (2026-08-10) we were paying for this call
+    # and silently discarding the email fields on every single one. Only ever populated via
+    # the paid Deepline path; the free Jobo+Apify decision-maker layer has no email source at
+    # all. `contacts` is a shared table Synefi owns the schema for -- see that repo's
+    # db/models.py and session.py's ensure_indexes() ALTER TABLE pattern; this column is
+    # declared here for parity, but the actual ALTER TABLE lives in this backend's own
+    # ensure_indexes() since that's the deploy pipeline this change was made through.
+    email = Column(String, nullable=True)
     thread_role = Column(String, nullable=True)
     matched_title_reasoning = Column(Text, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
@@ -191,6 +200,13 @@ class PersonalizedMessage(Base):
     contact_research = Column(JSON, nullable=True)
     fit_analysis = Column(JSON, nullable=True)
     generated_message = Column(Text, nullable=True)
+    # Email channel, added 2026-08-10 -- same research/tone as generated_message, just a
+    # second rendering (subject + body) for contacts who have a real email captured (see
+    # Contact.email). Shares this row's single `status` -- one review decision covers both
+    # channels, not independent per-channel approval (not asked for; would be easy to split
+    # out later if it ever is).
+    email_subject = Column(String, nullable=True)
+    email_body = Column(Text, nullable=True)
     status = Column(String, default="draft")  # draft | approved | rejected
     error_message = Column(Text, nullable=True)
     generated_at = Column(DateTime, nullable=True)

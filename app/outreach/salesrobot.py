@@ -69,6 +69,15 @@ class SalesRobotChannel(OutreachChannel):
                 "connectionNote": note,
                 "personalizedMessage": pm.generated_message,
             }
+            # Email channel, added 2026-08-10 -- only when this contact has both a captured
+            # email (Contact.email, only ever populated via the paid Deepline decision-maker
+            # path) AND a generated email (personalized_outreach.py only generates one when
+            # contact.email is set). emailId goes on the prospect object itself, per
+            # SalesRobot's own docs -- distinct from customMap, which is template merge tags.
+            if contact.email and pm.email_subject and pm.email_body:
+                prospect["emailId"] = contact.email
+                prospect["customMap"]["emailSubject"] = pm.email_subject
+                prospect["customMap"]["emailBody"] = pm.email_body
 
         try:
             add_single_prospect(campaign_uuid, linkedin_account_uuid, prospect, self.db, self.tenant_id)

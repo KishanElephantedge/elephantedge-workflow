@@ -120,3 +120,10 @@ def ensure_indexes():
         """))
         conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ix_daily_reviews_tenant_date ON daily_reviews (tenant_id, review_date)"))
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_review_comments_tenant_date ON review_comments (tenant_id, review_date)"))
+        # contacts is a shared table Synefi owns the schema for (see that repo's session.py
+        # for the same ALTER TABLE IF NOT EXISTS pattern on excluded_from_push/linkedin_url).
+        # Adding it here too since this backend's deploy pipeline is what this change is
+        # actually going through -- the statement itself is idempotent either way.
+        conn.execute(text("ALTER TABLE contacts ADD COLUMN IF NOT EXISTS email VARCHAR"))
+        conn.execute(text("ALTER TABLE personalized_messages ADD COLUMN IF NOT EXISTS email_subject VARCHAR"))
+        conn.execute(text("ALTER TABLE personalized_messages ADD COLUMN IF NOT EXISTS email_body TEXT"))

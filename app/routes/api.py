@@ -603,6 +603,9 @@ def generate_message(contact_id: int, style: str = "pitch", db: Session = Depend
         "contact_research": pm.contact_research,
         "fit_analysis": pm.fit_analysis,
         "generated_message": pm.generated_message,
+        "contact_email": contact.email,
+        "email_subject": pm.email_subject,
+        "email_body": pm.email_body,
         "error_message": pm.error_message,
         "generated_at": pm.generated_at,
     }
@@ -629,6 +632,9 @@ def get_message(contact_id: int, db: Session = Depends(get_db)):
         "contact_research": pm.contact_research,
         "fit_analysis": pm.fit_analysis,
         "generated_message": pm.generated_message,
+        "contact_email": contact.email,
+        "email_subject": pm.email_subject,
+        "email_body": pm.email_body,
         "error_message": pm.error_message,
         "generated_at": pm.generated_at,
     }
@@ -1299,7 +1305,7 @@ def send_salesrobot_message(thread_id: str, prospect_uuid: str, message: str, db
 
 
 @router.post("/salesrobot/test-push")
-def test_salesrobot_push(campaign_uuid: str, linkedin_url: str, personalized_message: str, first_name: str | None = None, connection_note: str | None = None, db: Session = Depends(get_db)):
+def test_salesrobot_push(campaign_uuid: str, linkedin_url: str, personalized_message: str, first_name: str | None = None, connection_note: str | None = None, email: str | None = None, email_subject: str | None = None, email_body: str | None = None, db: Session = Depends(get_db)):
     """One-off test utility -- pushes a single synthetic prospect to any campaign UUID with
     known customMap values, so we can confirm live whether a SalesRobot campaign's message
     templates actually use API-supplied custom field values (vs. SalesRobot's own "AI
@@ -1309,21 +1315,33 @@ def test_salesrobot_push(campaign_uuid: str, linkedin_url: str, personalized_mes
     connection_note mirrors the real push path (app/outreach/salesrobot.py): a separate
     short field for the connection-request step, distinct from personalizedMessage (the
     full follow-up message) -- defaults to a generic line if not given, same shape as
-    production, so this test reflects what the real system will actually do."""
+    production, so this test reflects what the real system will actually do.
+
+    email/email_subject/email_body added 2026-08-10 to test the new email channel: emailId
+    goes on the prospect object itself (confirmed live via SalesRobot's own docs), while
+    emailSubject/emailBody go in customMap for the {{emailSubject}}/{{emailBody}} merge tags
+    in the campaign's email sequence step -- unverified until this test actually confirms it."""
     account_uuid = _get_salesrobot_linkedin_account_uuid(db)
     note = connection_note or f"Hi {first_name or 'there'}, I'd love to connect."
+    custom_map = {"connectionNote": note, "personalizedMessage": personalized_message}
+    if email_subject:
+        custom_map["emailSubject"] = email_subject
+    if email_body:
+        custom_map["emailBody"] = email_body
     prospect = {
         "profileUrl": linkedin_url,
-        "customMap": {"connectionNote": note, "personalizedMessage": personalized_message},
+        "customMap": custom_map,
     }
     if first_name:
         prospect["firstName"] = first_name
+    if email:
+        prospect["emailId"] = email
 
     try:
         result = add_single_prospect(campaign_uuid, account_uuid, prospect, db, ELEPHANT_EDGE_TENANT_ID)
     except SalesRobotError as e:
         raise HTTPException(status_code=502, detail=str(e))
-    return {"sent_customMap": prospect["customMap"], "salesrobot_response": result}
+    return {"sent_prospect": prospect, "salesrobot_response": result}
 
 
 @router.post("/webhooks/salesrobot/{secret}")
