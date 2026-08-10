@@ -1430,20 +1430,6 @@ def trigger_calendar_sync(db: Session = Depends(get_db)):
         raise HTTPException(status_code=502, detail=str(e))
 
 
-@router.get("/_scratch/search-contact-raw-check")
-def _scratch_search_contact_raw_check(db: Session = Depends(get_db)):
-    """TEMPORARY -- checking whether search_contact's raw response includes an email field
-    already (would be free, since we already pay for this call), before adding a separate
-    paid email-finder tool. Reuses a real company we already have (First Resonance) so this
-    doesn't discover anything new. Delete after use."""
-    from app.phases.decision_maker import _run_search_contact, CEO_FILTER
-    company = db.query(Company).filter(Company.id == 666).first()
-    if not company:
-        return {"error": "company 666 not found"}
-    persons = _run_search_contact(company, {"title_filters": [{"name": "ceo_filter", "filter": CEO_FILTER}]})
-    return {"persons": persons}
-
-
 # ---- Daily Review (calendar) ----
 # A human tracking/communication layer, not a control surface -- lets two people in different
 # places (or timezones) independently look at a given day's automated activity and leave a
