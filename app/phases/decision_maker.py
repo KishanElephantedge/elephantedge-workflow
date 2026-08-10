@@ -96,24 +96,36 @@ def _best_matching_person(persons: list[dict], title_keywords: list[str], requir
     return None
 
 
-def _make_contact(company: Company, db: Session, person: dict, reasoning: str, thread_role: str) -> Contact:
+def _make_contact(company: Company, db: Session, tenant_id: int, person: dict, reasoning: str, thread_role: str) -> Contact:
     # Free -- already present in search_contact's own response, just never extracted before
     # (confirmed live 2026-08-10). professional_email preferred over personal_email since it's
     # the one actually tied to the company domain we're targeting. Only ever populated via this
     # (paid Deepline) path -- free_decision_maker.py's Jobo+Apify contacts have no email source.
+    email = person.get("professional_email") or person.get("personal_email")
     contact = Contact(
         company_id=company.id,
         first_name=person.get("first_name"),
         last_name=person.get("last_name"),
         title=person.get("title"),
         linkedin_url=person.get("linkedin_url") or person.get("linkedin"),
-        email=person.get("professional_email") or person.get("personal_email"),
+        email=email,
+        email_source="deepline" if email else None,
         thread_role=thread_role,
         matched_title_reasoning=reasoning,
     )
     db.add(contact)
     db.commit()
     db.refresh(contact)
+
+    if not contact.email:
+        # Deferred import -- same circular-import reason as the free-path call in
+        # find_decision_maker below.
+        from app.phases.free_decision_maker import resolve_fallback_email
+        fallback = resolve_fallback_email(db, tenant_id, company, contact.first_name)
+        if fallback:
+            contact.email, contact.email_source = fallback
+            db.commit()
+
     return contact
 
 
@@ -125,19 +137,19 @@ def find_decision_maker(company: Company, db: Session, tenant_id: int) -> Contac
     from app.phases.free_decision_maker import find_free_decision_maker
     free_person = find_free_decision_maker(db, tenant_id, company)
     if free_person:
-        return _make_contact(company, db, free_person, free_person["reasoning"], free_person["thread_role"])
+        return _make_contact(company, db, tenant_id, free_person, free_person["reasoning"], free_person["thread_role"])
 
     persons = _run_search_contact(company, {"title_filters": [{"name": "ceo_filter", "filter": CEO_FILTER}]})
     person = _best_matching_person(persons, CEO_TITLE_KEYWORDS, require_bare_president=True)
     if person:
-        return _make_contact(company, db, person, f"title_filter={CEO_FILTER}, verified_title={person.get('title')!r}", "founder_ceo")
+        return _make_contact(company, db, tenant_id, person, f"title_filter={CEO_FILTER}, verified_title={person.get('title')!r}", "founder_ceo")
 
     # No primary (founder/CEO) contact exists at all for this domain -- try the secondary
     # sales-leader target rather than leaving the company with zero contact.
     persons = _run_search_contact(company, {"title_filters": [{"name": "sales_leader_filter", "filter": SALES_LEADER_FILTER}]})
     person = _best_matching_person(persons, SALES_LEADER_TITLE_KEYWORDS)
     if person:
-        return _make_contact(company, db, person, f"title_filter={SALES_LEADER_FILTER}, verified_title={person.get('title')!r}", "sales_leader")
+        return _make_contact(company, db, tenant_id, person, f"title_filter={SALES_LEADER_FILTER}, verified_title={person.get('title')!r}", "sales_leader")
 
     return None
 

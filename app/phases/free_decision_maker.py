@@ -92,6 +92,42 @@ def _resolve_linkedin_url(db: Session, tenant_id: int, first_name: str, last_nam
     return None
 
 
+def resolve_fallback_email(db: Session, tenant_id: int, company: Company, first_name: str) -> tuple[str, str] | None:
+    """Called for ANY contact (free-path or paid-Deepline-path) that still has no email after
+    the primary resolution. Two free, zero-verification layers, in order:
+
+    1. Jobo's company-level `email_address` (a generic info@/support@ address, not personal --
+       confirmed live 2026-08-10 this is the ONLY email field anywhere in Jobo's data model;
+       their leadership objects have no personal email at all, confirmed three independent
+       ways -- raw API docs, marketing site, and the CompanyLeaderDto field reference).
+    2. A single pattern guess, firstname@domain -- NOT verified. Self-built SMTP RCPT TO
+       verification was built and worked perfectly locally (see app/email_verify.py) but
+       Render blocks all outbound port 25 ("[Errno 101] Network is unreachable", confirmed
+       live 2026-08-10), so it cannot run in production. Deliberately guesses only the single
+       most common pattern, not a multi-pattern chain -- more guesses without catch-all
+       detection just means more chances of silently landing in a wrong-but-existing inbox.
+       Caller must treat this as a real guess (see Contact.email_source), not a confirmed fact.
+
+    Returns (email, source) or None if nothing found."""
+    try:
+        api_key = _get_jobo_api_key(db, tenant_id)
+        with httpx.Client() as client:
+            company_id = find_company_id_by_name(client, api_key, company.name)
+            if company_id:
+                profile = get_company_profile(client, company_id)
+                generic_email = (profile or {}).get("email_address")
+                if generic_email:
+                    return generic_email, "jobo_company"
+    except (httpx.HTTPError, JoboError):
+        pass
+
+    if first_name and company.domain:
+        guess = f"{first_name.strip().lower()}@{company.domain.strip().lower()}"
+        return guess, "pattern_guess"
+
+    return None
+
+
 def find_free_decision_maker(db: Session, tenant_id: int, company: Company) -> dict | None:
     """Tries Jobo (free name+title) -> Apify people-search (~$0.02, verified) in that order.
     Returns a person dict shaped like decision_maker.py's _make_contact expects

@@ -125,5 +125,6 @@ def ensure_indexes():
         # Adding it here too since this backend's deploy pipeline is what this change is
         # actually going through -- the statement itself is idempotent either way.
         conn.execute(text("ALTER TABLE contacts ADD COLUMN IF NOT EXISTS email VARCHAR"))
+        conn.execute(text("ALTER TABLE contacts ADD COLUMN IF NOT EXISTS email_source VARCHAR"))
         conn.execute(text("ALTER TABLE personalized_messages ADD COLUMN IF NOT EXISTS email_subject VARCHAR"))
         conn.execute(text("ALTER TABLE personalized_messages ADD COLUMN IF NOT EXISTS email_body TEXT"))

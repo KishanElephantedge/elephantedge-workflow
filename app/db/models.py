@@ -158,13 +158,19 @@ class Contact(Base):
     linkedin_url = Column(String, nullable=True)
     # Free, already present in search_contact's own response (professional_email preferred,
     # personal_email as fallback) -- confirmed live (2026-08-10) we were paying for this call
-    # and silently discarding the email fields on every single one. Only ever populated via
-    # the paid Deepline path; the free Jobo+Apify decision-maker layer has no email source at
-    # all. `contacts` is a shared table Synefi owns the schema for -- see that repo's
+    # and silently discarding the email fields on every single one. Also populated via free
+    # fallback layers (see email_source below and free_decision_maker.resolve_fallback_email)
+    # when the primary paid lookup finds no email. `contacts` is a shared table Synefi owns the schema for -- see that repo's
     # db/models.py and session.py's ensure_indexes() ALTER TABLE pattern; this column is
     # declared here for parity, but the actual ALTER TABLE lives in this backend's own
     # ensure_indexes() since that's the deploy pipeline this change was made through.
     email = Column(String, nullable=True)
+    # "deepline" (paid, verified-ish via provider) | "jobo_company" (free, company-level
+    # generic address, not personal) | "pattern_guess" (free, unverified firstname@domain --
+    # SMTP verification not possible in production, see app/email_verify.py's module
+    # docstring for why) -- lets the UI/review step show confidence honestly instead of
+    # presenting a guess as fact.
+    email_source = Column(String, nullable=True)
     thread_role = Column(String, nullable=True)
     matched_title_reasoning = Column(Text, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)

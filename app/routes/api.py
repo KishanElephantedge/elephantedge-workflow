@@ -606,6 +606,7 @@ def generate_message(contact_id: int, style: str = "pitch", db: Session = Depend
         "fit_analysis": pm.fit_analysis,
         "generated_message": pm.generated_message,
         "contact_email": contact.email,
+        "contact_email_source": contact.email_source,
         "email_subject": pm.email_subject,
         "email_body": pm.email_body,
         "error_message": pm.error_message,
@@ -635,6 +636,7 @@ def get_message(contact_id: int, db: Session = Depends(get_db)):
         "fit_analysis": pm.fit_analysis,
         "generated_message": pm.generated_message,
         "contact_email": contact.email,
+        "contact_email_source": contact.email_source,
         "email_subject": pm.email_subject,
         "email_body": pm.email_body,
         "error_message": pm.error_message,
@@ -678,6 +680,7 @@ def edit_message(contact_id: int, body: MessageEdit, db: Session = Depends(get_d
         "status": pm.status,
         "generated_message": pm.generated_message,
         "contact_email": contact.email,
+        "contact_email_source": contact.email_source,
         "email_subject": pm.email_subject,
         "email_body": pm.email_body,
     }
