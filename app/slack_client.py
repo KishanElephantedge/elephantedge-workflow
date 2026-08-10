@@ -6,7 +6,7 @@ with one webhook" option), so this sends to every configured webhook URL."""
 import httpx
 from sqlalchemy.orm import Session
 
-from app.db.models import Credential
+from app.db.models import Credential, Parameter
 
 WEBHOOK_CREDENTIAL_NAMES = ["slack_webhook_url", "slack_webhook_url_2"]
 
@@ -15,7 +15,26 @@ class SlackError(Exception):
     pass
 
 
+def is_slack_enabled(db: Session, tenant_id: int) -> bool:
+    """Defaults to True (existing behavior) -- set slack_enabled=false via the parameters
+    endpoint to silence notifications without touching/losing the webhook credential itself.
+    Callers already treat SlackError as best-effort (isolated try/except, never fails the
+    run), so this reuses that same path rather than needing its own guard at every call site."""
+    param = (
+        db.query(Parameter)
+        .filter(Parameter.tenant_id == tenant_id)
+        .filter(Parameter.key == "slack_enabled")
+        .first()
+    )
+    if not param or param.value is None:
+        return True
+    value = param.value
+    return bool(value.get("enabled") if isinstance(value, dict) else value)
+
+
 def _get_webhook_urls(db: Session, tenant_id: int) -> list[str]:
+    if not is_slack_enabled(db, tenant_id):
+        raise SlackError("Slack notifications are disabled (slack_enabled=false)")
     creds = (
         db.query(Credential)
         .filter(Credential.tenant_id == tenant_id)
