@@ -58,10 +58,17 @@ def _normalize_domain(website: str) -> str:
     return domain.replace("www.", "")
 
 
-def run_apify_discovery(batch_id: int, db: Session, tenant_id: int, target: int = 5, time_range: str = "24h") -> dict:
+def run_apify_discovery(batch_id: int, db: Session, tenant_id: int, target: int = 5, time_range: str = "7d") -> dict:
     """Entrypoint -- single synchronous Apify actor call (no budget_guard/paging loop like
     jd_first, since the actor's own `limit` already bounds spend deterministically: N results
-    costs exactly N*$0.005 + $0.01, no per-page uncertainty)."""
+    costs exactly N*$0.005 + $0.01, no per-page uncertainty).
+
+    time_range default changed from "24h" to "7d" (2026-08-10) -- confirmed live that "24h"
+    produced only 1 real posting on an otherwise-normal day, well short of the 5-10/day
+    target. "7d" is the actor's own recommended default. Safe for a daily-running cron: we
+    already dedup against every domain ever seen (seen_domains, above), not just today's
+    batch, so a wider window can only mean re-fetching (and paying to re-check, then
+    discarding) postings already seen on a prior day -- never a duplicate Company row."""
     seen_domains = _existing_domains(tenant_id, db)
 
     try:
