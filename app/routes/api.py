@@ -1448,6 +1448,44 @@ def trigger_calendar_sync(db: Session = Depends(get_db)):
         raise HTTPException(status_code=502, detail=str(e))
 
 
+@router.post("/_scratch/backfill-emails-batch48")
+def _scratch_backfill_emails_batch48(db: Session = Depends(get_db)):
+    """TEMPORARY -- re-runs search_contact for the 4 batch-48 companies (already paid for
+    once, on 2026-08-09, before Contact.email existed) to capture the email now, matching the
+    returned person's name against the already-known contact so we never overwrite with the
+    wrong person. Only for contacts that went through the PAID Deepline path -- never re-run
+    for the free Jobo+Apify contacts, that would spend real money the free layer exists to
+    avoid. Delete after use."""
+    from app.phases.decision_maker import _run_search_contact, CEO_FILTER
+
+    targets = [
+        (679, 100, "Eric", "Madden"),
+        (680, 101, "Robert", "Lewis"),
+        (682, 102, "Christopher", "Kuncaitis"),
+        (684, 103, "Duncan", "Hinkle"),
+    ]
+    results = []
+    for company_id, contact_id, first, last in targets:
+        company = db.query(Company).filter(Company.id == company_id).first()
+        contact = db.query(Contact).filter(Contact.id == contact_id).first()
+        if not company or not contact:
+            results.append({"contact_id": contact_id, "error": "company or contact not found"})
+            continue
+        persons = _run_search_contact(company, {"title_filters": [{"name": "ceo_filter", "filter": CEO_FILTER}]})
+        matched = next(
+            (p for p in persons if (p.get("first_name") or "").lower() == first.lower() and (p.get("last_name") or "").lower() == last.lower()),
+            None,
+        )
+        if not matched:
+            results.append({"contact_id": contact_id, "name": f"{first} {last}", "matched": False, "candidates": len(persons)})
+            continue
+        email = matched.get("professional_email") or matched.get("personal_email")
+        contact.email = email
+        db.commit()
+        results.append({"contact_id": contact_id, "name": f"{first} {last}", "matched": True, "email": email})
+    return results
+
+
 # ---- Daily Review (calendar) ----
 # A human tracking/communication layer, not a control surface -- lets two people in different
 # places (or timezones) independently look at a given day's automated activity and leave a
