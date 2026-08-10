@@ -3,7 +3,13 @@ domain's real mail server and asks whether it would accept mail to a given addre
 actually sending anything. Confirmed live (2026-08-10) against known-real and known-fake
 addresses across Outlook/Google Workspace/Mimecast-hosted domains: correctly distinguishes
 real recipients (250) from non-existent ones (550), and catch-all domains are detected by
-probing a random nonexistent address first."""
+probing a random nonexistent address first.
+
+NOT CURRENTLY WIRED IN -- confirmed live (2026-08-10) that Render blocks all outbound port
+25 at the network level ("[Errno 101] Network is unreachable"), so this cannot run from our
+production host as-is. Works perfectly from an unrestricted network (tested locally). Left
+in place for if/when we run this from a host that allows outbound SMTP (a small VM, a
+different PaaS, or a proxy service), rather than deleting proven-working code."""
 import smtplib
 import socket
 
