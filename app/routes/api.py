@@ -37,6 +37,7 @@ from app.phases.personalized_outreach import generate_personalized_message
 from app.phases.scoring import run_scoring
 from app.phases.tech_stack import run_tech_stack_check
 from app.salesrobot_client import SalesRobotError, add_single_prospect, get_campaign_prospects, list_campaigns, send_message_to_prospect
+from app.email_verify import guess_and_verify, verify_email
 from app.smartlead_client import SmartleadError
 from app.smartlead_client import add_lead as smartlead_add_lead
 
@@ -2456,6 +2457,18 @@ def delete_credential(name: str, db: Session = Depends(get_db)):
 
 
 # ---- Parameters (autonomous_enabled, daily_credit_budget_usd, daily_company_cap) ----
+
+@router.get("/_scratch/smtp-test")
+def _scratch_smtp_test():
+    results = {
+        "verify_known_real": verify_email("emadden@astutetm.com"),
+        "verify_known_fake": verify_email("definitely-not-a-real-person-xyz999@astutetm.com"),
+        "guess_andy_majc": guess_and_verify("Andy", "Coughlin", "majc.ai"),
+        "guess_iv_diamo": guess_and_verify("Iv", "Beaton", "diamo.ai"),
+        "guess_suresh_vectro": guess_and_verify("Suresh", "Subbu", "vectroconsulting.com"),
+    }
+    return results
+
 
 @router.get("/parameters")
 def list_parameters(db: Session = Depends(get_db)):
