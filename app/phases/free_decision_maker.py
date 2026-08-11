@@ -51,18 +51,25 @@ search for the founder/CEO of "{company_name}" ({domain}).
 AI Overview text:
 {text}
 
-Extract the current CEO or founder's name and title, ONLY if the text is clearly about the \
-company at domain "{domain}" -- not a different, similarly-named company. This is a real, \
-confirmed failure mode: a search for a small company called "Nebi" once returned the CEO of \
-"Nebius", a completely unrelated, much larger company, because the AI Overview assumed that's \
-what was meant. If the text hedges, guesses, or explicitly says it might be a different \
-company, treat that as NOT confident.
+Extract up to 2 people, ONLY if the text is clearly about the company at domain "{domain}" \
+-- not a different, similarly-named company. This is a real, confirmed failure mode: a search \
+for a small company called "Nebi" once returned the CEO of "Nebius", a completely unrelated, \
+much larger company, because the AI Overview assumed that's what was meant. If the text \
+hedges, guesses, or explicitly says it might be a different company, treat that as NOT \
+confident.
+
+List whoever is CURRENTLY, ACTIVELY running the company FIRST (current CEO/President/head \
+executive), even if their title is described loosely rather than with the exact word "CEO" --\
+ then the ORIGINAL FOUNDER second, only if they're a different person. This ordering matters: \
+a company's original founder from decades ago is often no longer active day-to-day (retired, \
+moved on) even though the text still credits them as founder, while whoever is described as \
+"currently leads/serves as President/head executive" is the real, present-day contact.
 
 Return JSON exactly in this shape:
-{{"first_name": "...", "last_name": "...", "title": "...", "confident_same_company": true}}
+{{"candidates": [{{"first_name": "...", "last_name": "...", "title": "..."}}, ...], "confident_same_company": true}}
 
-If the text doesn't clearly identify a leader for this exact company, return:
-{{"first_name": null, "last_name": null, "title": null, "confident_same_company": false}}"""
+If the text doesn't clearly identify anyone for this exact company, return:
+{{"candidates": [], "confident_same_company": false}}"""
 
 
 def _split_name(full_name: str) -> tuple[str, str]:
@@ -164,31 +171,39 @@ def _find_via_google_search(db: Session, tenant_id: int, company: Company) -> di
     try:
         extracted = generate_json(
             GOOGLE_LEADER_EXTRACTION_PROMPT.format(company_name=company.name, domain=company.domain, text=content),
-            db, tenant_id, max_tokens=300,
+            db, tenant_id, max_tokens=400,
         )
     except Exception:
         return None
 
     if not extracted.get("confident_same_company"):
         return None
-    first_name, last_name = extracted.get("first_name"), extracted.get("last_name")
-    if not first_name or not last_name:
-        return None
-    title = extracted.get("title") or ""
 
-    linkedin_url = _resolve_linkedin_url_strict(db, tenant_id, first_name, last_name, company.name)
-    if not linkedin_url:
-        return None
+    # Try each candidate in the LLM's priority order (current active leader first, historical
+    # founder second) -- confirmed live 2026-08-11 this matters: a real case (DAKCS) named
+    # both Kent Green (1980s founder, LinkedIn verification correctly failed -- long retired)
+    # and Andy Shumway (current President, actually verifiable) in the same AI Overview. Only
+    # trying the first candidate silently lost a real, findable contact.
+    for candidate in extracted.get("candidates") or []:
+        first_name, last_name = candidate.get("first_name"), candidate.get("last_name")
+        if not first_name or not last_name:
+            continue
+        title = candidate.get("title") or ""
 
-    thread_role = "sales_leader" if _matches_title(title, SALES_LEADER_TITLE_KEYWORDS) else "founder_ceo"
-    return {
-        "first_name": first_name,
-        "last_name": last_name,
-        "title": title,
-        "linkedin_url": linkedin_url,
-        "thread_role": thread_role,
-        "reasoning": f"Google AI Overview match (title={title!r}), LinkedIn resolved+verified (name+current-company match)",
-    }
+        linkedin_url = _resolve_linkedin_url_strict(db, tenant_id, first_name, last_name, company.name)
+        if not linkedin_url:
+            continue
+
+        thread_role = "sales_leader" if _matches_title(title, SALES_LEADER_TITLE_KEYWORDS) else "founder_ceo"
+        return {
+            "first_name": first_name,
+            "last_name": last_name,
+            "title": title,
+            "linkedin_url": linkedin_url,
+            "thread_role": thread_role,
+            "reasoning": f"Google AI Overview match (title={title!r}), LinkedIn resolved+verified (name+current-company match)",
+        }
+    return None
 
 
 def resolve_fallback_email(db: Session, tenant_id: int, company: Company, first_name: str) -> tuple[str, str] | None:
