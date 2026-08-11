@@ -2608,6 +2608,21 @@ def delete_credential(name: str, db: Session = Depends(get_db)):
 
 # ---- Parameters (autonomous_enabled, daily_credit_budget_usd, daily_company_cap) ----
 
+@router.post("/_scratch/retry-dm-one")
+def _scratch_retry_dm_one(company_id: int, db: Session = Depends(get_db)):
+    from app.phases.decision_maker import find_decision_maker
+
+    company = db.query(Company).filter(Company.id == company_id).first()
+    if not company:
+        raise HTTPException(status_code=404, detail="Company not found")
+    contact, used_paid = find_decision_maker(company, db, ELEPHANT_EDGE_TENANT_ID, allow_paid_fallback=False)
+    company.decision_maker_searched_at = datetime.utcnow()
+    db.commit()
+    if contact:
+        return {"company": company.name, "found": True, "contact_id": contact.id, "name": f"{contact.first_name} {contact.last_name}"}
+    return {"company": company.name, "found": False}
+
+
 @router.get("/_scratch/diagnose-google-dm")
 def _scratch_diagnose_google_dm(company_id: int, db: Session = Depends(get_db)):
     from app.apify_client import search_google_ai_overview, search_linkedin_people
