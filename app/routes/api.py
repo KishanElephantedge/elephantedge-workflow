@@ -2608,25 +2608,6 @@ def delete_credential(name: str, db: Session = Depends(get_db)):
 
 # ---- Parameters (autonomous_enabled, daily_credit_budget_usd, daily_company_cap) ----
 
-@router.post("/_scratch/fill-remaining-dm-one")
-def _scratch_fill_remaining_dm_one(company_id: int, allow_paid: bool = True, db: Session = Depends(get_db)):
-    """Single-company version -- the batch version timed out against Render's own platform
-    request limit running 12 companies sequentially in one HTTP call. Deliberately does NOT
-    call sync_to_hubspot (unlike run_decision_maker_id), matching the autonomous cycle's own
-    behavior, given the real accidental-HubSpot-sync incident earlier this session."""
-    from app.phases.decision_maker import find_decision_maker
-
-    company = db.query(Company).filter(Company.id == company_id).first()
-    if not company:
-        raise HTTPException(status_code=404, detail="Company not found")
-    contact, used_paid = find_decision_maker(company, db, ELEPHANT_EDGE_TENANT_ID, allow_paid_fallback=allow_paid)
-    company.decision_maker_searched_at = datetime.utcnow()
-    db.commit()
-    if contact:
-        return {"company": company.name, "found": True, "contact_id": contact.id, "name": f"{contact.first_name} {contact.last_name}", "used_paid": used_paid}
-    return {"company": company.name, "found": False, "used_paid": used_paid}
-
-
 @router.get("/parameters")
 def list_parameters(db: Session = Depends(get_db)):
     params = db.query(Parameter).filter(Parameter.tenant_id == ELEPHANT_EDGE_TENANT_ID).all()
