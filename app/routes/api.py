@@ -2610,13 +2610,49 @@ def delete_credential(name: str, db: Session = Depends(get_db)):
 
 @router.get("/_scratch/test-google-dm")
 def _scratch_test_google_dm(company_id: int, db: Session = Depends(get_db)):
-    from app.phases.free_decision_maker import find_free_decision_maker
+    from app.apify_client import search_google_ai_overview
+    from app.apify_client import _get_api_key as _get_apify_api_key
+    from app.llm_client import generate_json
+    from app.phases.free_decision_maker import (
+        GOOGLE_LEADER_EXTRACTION_PROMPT,
+        _resolve_linkedin_url_strict,
+    )
 
     company = db.query(Company).filter(Company.id == company_id).first()
     if not company:
         raise HTTPException(status_code=404, detail="Company not found")
-    result = find_free_decision_maker(db, ELEPHANT_EDGE_TENANT_ID, company)
-    return {"company": company.name, "domain": company.domain, "result": result}
+
+    out = {"company": company.name, "domain": company.domain}
+    try:
+        api_key = _get_apify_api_key(db, ELEPHANT_EDGE_TENANT_ID)
+        content = search_google_ai_overview(api_key, f"{company.name} {company.domain} founder CEO")
+        out["ai_overview_content"] = content
+    except Exception as e:
+        out["ai_overview_error"] = f"{type(e).__name__}: {e}"
+        return out
+    if not content:
+        return out
+
+    try:
+        extracted = generate_json(
+            GOOGLE_LEADER_EXTRACTION_PROMPT.format(company_name=company.name, domain=company.domain, text=content),
+            db, ELEPHANT_EDGE_TENANT_ID, max_tokens=300,
+        )
+        out["extracted"] = extracted
+    except Exception as e:
+        out["extraction_error"] = f"{type(e).__name__}: {e}"
+        return out
+
+    if not extracted.get("confident_same_company") or not extracted.get("first_name"):
+        return out
+
+    try:
+        linkedin_url = _resolve_linkedin_url_strict(db, ELEPHANT_EDGE_TENANT_ID, extracted["first_name"], extracted.get("last_name") or "", company.name)
+        out["linkedin_url"] = linkedin_url
+    except Exception as e:
+        out["linkedin_error"] = f"{type(e).__name__}: {e}"
+
+    return out
 
 
 @router.get("/parameters")
