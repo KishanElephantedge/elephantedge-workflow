@@ -96,6 +96,21 @@ def _names_match(requested_first: str, requested_last: str, candidate_name: str)
     return requested_first.strip().lower() in candidate_lower and requested_last.strip().lower() in candidate_lower
 
 
+def _slug_matches(requested_first: str, requested_last: str, profile_url: str) -> bool:
+    """Fallback for _names_match: confirmed live 2026-08-11 that this actor's `name` field is
+    sometimes a headline/tagline instead of the person's actual name on "partial": true
+    profiles (e.g. "Driving down cycle times and building more homes." instead of "Henry
+    Dziuba") -- which made _names_match wrongly reject two real, correct matches (Roy Raugh at
+    Valens Software, Henry Dziuba at TradeTrax) even though their real name was sitting right
+    there in the profile URL slug (linkedin.com/in/roy-raugh-54891b36a). Checked as an OR with
+    _names_match, never instead of it -- the URL slug is a real, LinkedIn-assigned identifier
+    tied to the actual person, not free text, so it's a reliable independent signal."""
+    if not profile_url:
+        return False
+    slug = profile_url.rstrip("/").split("/")[-1].lower().replace("-", " ")
+    return requested_first.strip().lower() in slug and requested_last.strip().lower() in slug
+
+
 def _jobo_leadership_candidates(db: Session, tenant_id: int, company: Company) -> list[dict]:
     """Returns [] on any failure (no credential, no match, Jobo error) -- this is a
     best-effort free pre-check, never allowed to block or fail the real decision-maker
@@ -122,7 +137,7 @@ def _resolve_linkedin_url(db: Session, tenant_id: int, first_name: str, last_nam
     except ApifyError:
         return None
     for candidate in candidates:
-        if _names_match(first_name, last_name, candidate.get("name") or ""):
+        if _names_match(first_name, last_name, candidate.get("name") or "") or _slug_matches(first_name, last_name, candidate.get("profileUrl") or ""):
             return candidate.get("profileUrl")
     return None
 
@@ -149,7 +164,7 @@ def _resolve_linkedin_url_strict(db: Session, tenant_id: int, first_name: str, l
         return None
     company_lower = company_name.strip().lower()
     for candidate in candidates:
-        if not _names_match(first_name, last_name, candidate.get("name") or ""):
+        if not (_names_match(first_name, last_name, candidate.get("name") or "") or _slug_matches(first_name, last_name, candidate.get("profileUrl") or "")):
             continue
         profile_text = f"{candidate.get('summary') or ''} {candidate.get('about') or ''}".lower()
         if not profile_text.strip():
