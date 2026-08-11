@@ -49,6 +49,7 @@ APIFY_INDUSTRY_FILTER = [
 
 APIFY_EMPLOYEE_MIN = 25
 APIFY_EMPLOYEE_MAX = 50
+APIFY_DISCOVERY_LIMIT_CAP = 150
 
 
 def _normalize_domain(website: str) -> str:
@@ -82,7 +83,15 @@ def run_apify_discovery(batch_id: int, db: Session, tenant_id: int, target: int 
             industry_filter=APIFY_INDUSTRY_FILTER,
             time_range=time_range,
             remove_agency=True,
-            limit=max(target * 20, 100),  # real hit rate ~15-30% after dedup/team-fit -- oversample
+            # Apify bills per actual result returned, not per limit requested -- so this cap
+            # is a REAL worst-case cost ceiling (150 * $0.005 + $0.01 ~= $0.76 for discovery
+            # alone), not just an oversample target. Uncapped target*20 would let a real
+            # higher-inventory day cost proportionally more as target grows (e.g. target=15 ->
+            # limit=300 -> up to ~$1.51) -- fixed 2026-08-11 before raising target past 5.
+            # It's fine (explicitly confirmed, not a bug) if this cap means fewer than
+            # `target` companies get kept on a low-inventory day -- the run still completes
+            # normally with however many it found, never crashes or stops the pipeline.
+            limit=min(max(target * 20, 100), APIFY_DISCOVERY_LIMIT_CAP),
         )
     except ApifyError as e:
         return {

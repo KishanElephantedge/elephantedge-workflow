@@ -19,7 +19,7 @@ from datetime import datetime, timedelta
 from sqlalchemy.orm import Session
 
 from app.budget_guard import BudgetExceededError, BudgetGuard
-from app.db.models import AutonomousRun, Batch, Company, Contact, Parameter, Score
+from app.db.models import AutonomousRun, Batch, Company, Contact, Parameter, PersonalizedMessage, Score
 from app.notifications import create_notification
 from app.slack_client import SlackError, send_slack_message
 from app.phases.buying_signal import run_buying_signal_check
@@ -972,6 +972,25 @@ def resume_pending_approvals(db: Session, tenant_id: int) -> dict:
     for run in due_runs:
         batch = run.batch
         try:
+            # Auto-approve is intentional (explicit product decision, 2026-08-11): no review
+            # within the window means "approve by default," not "send a bare, unpersonalized
+            # connection request forever." Without this, a message left in "draft" past the
+            # deadline would get pushed to LinkedIn with no personalization AND would never
+            # trigger the Smartlead email (push_email requires pm.status == "approved") --
+            # confirmed live as the real, silent cause of 5 of 6 contacts in a batch missing
+            # both their personalized note and their email the first time this ran for real.
+            draft_messages = (
+                db.query(PersonalizedMessage)
+                .join(Contact)
+                .join(Company)
+                .filter(Company.batch_id == batch.id)
+                .filter(PersonalizedMessage.status == "draft")
+                .all()
+            )
+            for pm in draft_messages:
+                pm.status = "approved"
+            db.commit()
+
             channel = get_outreach_channel(db, tenant_id)
             outreach_result = run_campaign_execution(batch.id, db, channel)
 
