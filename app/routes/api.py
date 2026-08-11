@@ -1583,8 +1583,18 @@ def _day_detail_payload(date_str: str, db: Session) -> dict:
             "email_body": pm.email_body if pm else None,
         })
 
+    # Companies tab shows every company "touched" today -- discovered today OR had a
+    # decision-maker found today -- not just companies discovered today. A company found on
+    # day N whose decision-maker search happens on day N+1 (routine, since batches/companies
+    # get worked on over multiple days) should still show up in day N+1's Companies tab, or a
+    # reviewer looking at "what happened today" sees decision-makers with no companies listed
+    # at all -- confirmed live as a real, confusing gap (2026-08-11).
+    companies_touched_today = {c.id: c for c in companies_discovered_today}
+    for ct in contacts_found_today:
+        companies_touched_today[ct.company.id] = ct.company
+
     company_rows = []
-    for c in companies_discovered_today:
+    for c in companies_touched_today.values():
         primary_contact = c.contacts[0] if c.contacts else None
         company_rows.append({
             "id": c.id,
@@ -1608,6 +1618,91 @@ def _day_detail_payload(date_str: str, db: Session) -> dict:
         "timeline": timeline,
         "companies": company_rows,
         "decision_makers": decision_makers,
+    }
+
+
+PIPELINE_STEP_NAMES = ["Discovery", "Decision-Maker Search", "Message Drafting", "Approval Window", "Push to Campaigns"]
+
+
+def _compute_autonomous_steps(run: AutonomousRun | None, decision_makers_today: list[dict]) -> list[dict]:
+    """Per the lead's spec: each of the 5 real pipeline stages shows completed / pending /
+    failed, with the real reason attached when failed. Message Drafting's success/failure
+    isn't tracked as a distinct AutonomousRun field (a drafting failure there gets caught and
+    folded into notification_error, not run.status='failed' -- see
+    autonomous_orchestrator.py's approval-notification try/except), so that step is judged
+    from the real decision_makers list (did any actually get a generated_message) rather
+    than from the run row directly."""
+    steps = [{"name": name, "status": "pending", "detail": None} for name in PIPELINE_STEP_NAMES]
+    if run is None:
+        return steps
+
+    if run.status == "failed" and not run.companies_discovered:
+        steps[0] = {"name": "Discovery", "status": "failed", "detail": run.error_message}
+        return steps
+    steps[0] = {"name": "Discovery", "status": "completed", "detail": f"{run.companies_discovered or 0} companies found"}
+
+    if run.status == "failed" and not run.contacts_found:
+        steps[1] = {"name": "Decision-Maker Search", "status": "failed", "detail": run.error_message}
+        return steps
+    steps[1] = {"name": "Decision-Maker Search", "status": "completed", "detail": f"{run.contacts_found or 0} decision-makers found"}
+
+    drafted = sum(1 for dm in decision_makers_today if dm.get("generated_message"))
+    if drafted > 0:
+        steps[2] = {"name": "Message Drafting", "status": "completed", "detail": f"{drafted} messages drafted"}
+    elif run.contacts_found:
+        steps[2] = {"name": "Message Drafting", "status": "failed", "detail": "No messages were drafted for the decision-makers found"}
+    else:
+        return steps  # nothing found to draft for -- rest stay pending
+
+    reviewed = sum(1 for dm in decision_makers_today if dm.get("message_status") in ("approved", "rejected"))
+    if run.status == "completed" or reviewed > 0:
+        steps[3] = {"name": "Approval Window", "status": "completed", "detail": f"{reviewed} reviewed" if reviewed else None}
+    elif run.status == "awaiting_approval":
+        until = run.awaiting_approval_until.isoformat() + "Z" if run.awaiting_approval_until else None
+        steps[3] = {"name": "Approval Window", "status": "pending", "detail": f"Awaiting review until {until}" if until else "Awaiting review"}
+    else:
+        return steps
+
+    if run.contacts_pushed:
+        steps[4] = {"name": "Push to Campaigns", "status": "completed", "detail": f"{run.contacts_pushed} pushed"}
+    # else stays pending -- not yet pushed
+
+    return steps
+
+
+def _autonomous_day_payload(date_str: str, decision_makers_today: list[dict], db: Session) -> dict:
+    """The lead's "what's the plan for the next 24h / what's the outcome" request -- one
+    section covering both: the tenant's current autonomous configuration (what it's set to
+    do), plus the real run(s) for this specific date and their step-by-step status."""
+    day_start = _parse_review_date(date_str)
+    day_end = day_start + timedelta(days=1)
+
+    runs = (
+        db.query(AutonomousRun)
+        .filter(AutonomousRun.run_date >= day_start)
+        .filter(AutonomousRun.run_date < day_end)
+        .order_by(AutonomousRun.run_date.asc())
+        .all()
+    )
+    latest_run = runs[-1] if runs else None
+    hour, minute = get_autonomous_schedule_utc(db, ELEPHANT_EDGE_TENANT_ID)
+
+    return {
+        "enabled": is_autonomous_enabled(db, ELEPHANT_EDGE_TENANT_ID),
+        "scheduled_time_utc": f"{hour:02d}:{minute:02d}",
+        "discovery_source": get_autonomous_discovery_source(db, ELEPHANT_EDGE_TENANT_ID),
+        "daily_company_cap": get_daily_company_cap(db, ELEPHANT_EDGE_TENANT_ID),
+        "daily_budget_usd": get_daily_budget_usd(db, ELEPHANT_EDGE_TENANT_ID),
+        "run_count": len(runs),
+        "latest_run": {
+            "status": latest_run.status,
+            "companies_discovered": latest_run.companies_discovered,
+            "contacts_found": latest_run.contacts_found,
+            "contacts_pushed": latest_run.contacts_pushed,
+            "credits_spent_usd": latest_run.credits_spent_usd,
+            "error_message": latest_run.error_message,
+        } if latest_run else None,
+        "steps": _compute_autonomous_steps(latest_run, decision_makers_today),
     }
 
 
@@ -1714,6 +1809,7 @@ def get_calendar_day(date: str, db: Session = Depends(get_db)):
         "companies": detail["companies"],
         "decision_makers": detail["decision_makers"],
         "comments": [{"id": c.id, "comment": c.comment, "created_at": c.created_at.isoformat() + "Z"} for c in comments],
+        "autonomous": _autonomous_day_payload(date, detail["decision_makers"], db),
     }
 
 
