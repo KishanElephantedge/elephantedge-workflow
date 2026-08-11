@@ -128,12 +128,20 @@ def _resolve_linkedin_url(db: Session, tenant_id: int, first_name: str, last_nam
 
 
 def _resolve_linkedin_url_strict(db: Session, tenant_id: int, first_name: str, last_name: str, company_name: str) -> str | None:
-    """Same as _resolve_linkedin_url but ALSO requires the candidate's own currentCompany
-    field to match -- used only for Google-AI-Overview-derived candidates, where the name
-    itself has already passed through an LLM extraction step and could plausibly be a real
-    person at the WRONG company (the Nebi/Nebius failure mode), not just an unrelated
-    same-named person. Name-match alone (as the Jobo layer uses) isn't enough protection here
-    since the AI Overview's own confusion already produced a real, correctly-spelled name."""
+    """Same as _resolve_linkedin_url but ALSO requires the company to be verifiable from the
+    candidate's own profile text -- used only for Google-AI-Overview-derived candidates,
+    where the name itself has already passed through an LLM extraction step and could
+    plausibly be a real person at the WRONG company (the Nebi/Nebius failure mode), not just
+    an unrelated same-named person. Name-match alone (as the Jobo layer uses) isn't enough
+    protection here since the AI Overview's own confusion already produced a real,
+    correctly-spelled name.
+
+    Checks `summary`/`about`, NOT `currentCompany` -- confirmed live 2026-08-11 that this
+    actor's `currentCompany` field is null on essentially every real result (checked 6 real
+    candidates, all null), which made the original currentCompany-based check reject every
+    match unconditionally, including genuinely correct ones. `summary`/`about` reliably
+    contains real company text instead (e.g. "Senior Account Executive at DAKCS Software
+    Systems"), confirmed present on the same real results."""
     try:
         api_key = _get_apify_api_key(db, tenant_id)
         candidates = search_linkedin_people(api_key, first_name, last_name, company_name, max_results=3)
@@ -143,10 +151,10 @@ def _resolve_linkedin_url_strict(db: Session, tenant_id: int, first_name: str, l
     for candidate in candidates:
         if not _names_match(first_name, last_name, candidate.get("name") or ""):
             continue
-        current_company = (candidate.get("currentCompany") or "").strip().lower()
-        if not current_company:
+        profile_text = f"{candidate.get('summary') or ''} {candidate.get('about') or ''}".lower()
+        if not profile_text.strip():
             continue  # unverifiable -- reject rather than risk a wrong-company match
-        if company_lower in current_company or current_company in company_lower:
+        if company_lower in profile_text:
             return candidate.get("profileUrl")
     return None
 
