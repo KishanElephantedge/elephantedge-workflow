@@ -45,6 +45,16 @@ DISCOVERY_PAGE_SIZE = 10
 DISCOVERY_MAX_CHECKED = 50
 STALE_RUN_TIMEOUT_MINUTES = 120
 APPROVAL_WINDOW_MINUTES = 60
+# Real, deterministic spend ceiling for decision-maker search per autonomous run -- free
+# resolution (Jobo + Apify, ~$0) stays uncapped since it costs nothing regardless of hit
+# rate; only the PAID Deepline fallback (~$0.17/company) is capped, at a fixed count, not a
+# live balance check -- deliberately NOT a BudgetGuard-style external check, since that
+# class of guard was already found live to hang on Deepline's balance-check subprocess and
+# had to be removed from the jd_first branch (see below). Once this many companies in one
+# run have used the paid fallback, any further free-miss just gets no contact instead of
+# costing more -- confirmed acceptable (2026-08-11): a lower-yield day is fine, a hung or
+# runaway-cost run is not.
+PAID_DECISION_MAKER_FALLBACK_CAP = 5
 
 
 def _get_tenant_param(db: Session, tenant_id: int, key: str) -> Parameter | None:
@@ -671,9 +681,13 @@ def _run_jd_first_autonomous_cycle(batch: Batch, run: AutonomousRun, db: Session
     result = run_jd_first_discovery(batch.id, db, tenant_id, target=cap, jobs_per_page=min(cap, 10))
 
     found = 0
+    paid_fallback_used = 0
     companies = db.query(Company).filter(Company.batch_id == batch.id).all()
     for company in companies:
-        contact = find_decision_maker(company, db, tenant_id)
+        allow_paid = paid_fallback_used < PAID_DECISION_MAKER_FALLBACK_CAP
+        contact, used_paid = find_decision_maker(company, db, tenant_id, allow_paid_fallback=allow_paid)
+        if used_paid:
+            paid_fallback_used += 1
         company.decision_maker_searched_at = datetime.utcnow()
         db.commit()
         if contact:
@@ -777,9 +791,13 @@ def _run_apify_autonomous_cycle(batch: Batch, run: AutonomousRun, db: Session, t
         return {"status": "failed", "batch_id": batch.id, "source": "apify", "error": result["api_error"]}
 
     found = 0
+    paid_fallback_used = 0
     companies = db.query(Company).filter(Company.batch_id == batch.id).all()
     for company in companies:
-        contact = find_decision_maker(company, db, tenant_id)
+        allow_paid = paid_fallback_used < PAID_DECISION_MAKER_FALLBACK_CAP
+        contact, used_paid = find_decision_maker(company, db, tenant_id, allow_paid_fallback=allow_paid)
+        if used_paid:
+            paid_fallback_used += 1
         company.decision_maker_searched_at = datetime.utcnow()
         db.commit()
         if contact:

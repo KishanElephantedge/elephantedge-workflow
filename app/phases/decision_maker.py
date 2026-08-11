@@ -129,7 +129,17 @@ def _make_contact(company: Company, db: Session, tenant_id: int, person: dict, r
     return contact
 
 
-def find_decision_maker(company: Company, db: Session, tenant_id: int) -> Contact | None:
+def find_decision_maker(company: Company, db: Session, tenant_id: int, allow_paid_fallback: bool = True) -> tuple[Contact | None, bool]:
+    """Returns (contact, used_paid_fallback). used_paid_fallback is True whenever the paid
+    Deepline search_contact path was actually called -- regardless of whether it found
+    anyone -- since search_contact bills per call, not per hit. Callers that need to bound
+    real spend across a batch (see autonomous_orchestrator.py's per-run paid-fallback cap,
+    added 2026-08-11) count on this to know when money was actually spent, not just when a
+    contact was found.
+
+    allow_paid_fallback=False skips the paid path entirely on a free miss -- used once a
+    caller's own per-run cap on paid attempts has been reached, so remaining companies that
+    miss the free layer simply get no contact instead of costing more."""
     # Free/cheap resolution first (Jobo leadership + verified Apify LinkedIn lookup) -- a miss
     # here costs nothing and falls straight through to the existing paid Deepline flow below,
     # unchanged. Deferred import: free_decision_maker.py imports the title-keyword constants
@@ -137,21 +147,24 @@ def find_decision_maker(company: Company, db: Session, tenant_id: int) -> Contac
     from app.phases.free_decision_maker import find_free_decision_maker
     free_person = find_free_decision_maker(db, tenant_id, company)
     if free_person:
-        return _make_contact(company, db, tenant_id, free_person, free_person["reasoning"], free_person["thread_role"])
+        return _make_contact(company, db, tenant_id, free_person, free_person["reasoning"], free_person["thread_role"]), False
+
+    if not allow_paid_fallback:
+        return None, False
 
     persons = _run_search_contact(company, {"title_filters": [{"name": "ceo_filter", "filter": CEO_FILTER}]})
     person = _best_matching_person(persons, CEO_TITLE_KEYWORDS, require_bare_president=True)
     if person:
-        return _make_contact(company, db, tenant_id, person, f"title_filter={CEO_FILTER}, verified_title={person.get('title')!r}", "founder_ceo")
+        return _make_contact(company, db, tenant_id, person, f"title_filter={CEO_FILTER}, verified_title={person.get('title')!r}", "founder_ceo"), True
 
     # No primary (founder/CEO) contact exists at all for this domain -- try the secondary
     # sales-leader target rather than leaving the company with zero contact.
     persons = _run_search_contact(company, {"title_filters": [{"name": "sales_leader_filter", "filter": SALES_LEADER_FILTER}]})
     person = _best_matching_person(persons, SALES_LEADER_TITLE_KEYWORDS)
     if person:
-        return _make_contact(company, db, tenant_id, person, f"title_filter={SALES_LEADER_FILTER}, verified_title={person.get('title')!r}", "sales_leader")
+        return _make_contact(company, db, tenant_id, person, f"title_filter={SALES_LEADER_FILTER}, verified_title={person.get('title')!r}", "sales_leader"), True
 
-    return None
+    return None, True
 
 
 def run_decision_maker_id(batch_id: int, db: Session, tenant_id: int, retry_company_ids: list[int] | None = None, budget_guard: BudgetGuard | None = None) -> dict:
@@ -220,7 +233,7 @@ def run_decision_maker_id(batch_id: int, db: Session, tenant_id: int, retry_comp
         if team_fit["tier"] == "excluded":
             excluded_full_team += 1
             continue
-        contact = find_decision_maker(company, db, tenant_id)
+        contact, _ = find_decision_maker(company, db, tenant_id)
         company.decision_maker_searched_at = datetime.utcnow()
         db.commit()
         if contact:
