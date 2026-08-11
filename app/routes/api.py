@@ -2608,26 +2608,6 @@ def delete_credential(name: str, db: Session = Depends(get_db)):
 
 # ---- Parameters (autonomous_enabled, daily_credit_budget_usd, daily_company_cap) ----
 
-@router.get("/_scratch/diagnose-dm")
-def _scratch_diagnose_dm(company_id: int, db: Session = Depends(get_db)):
-    import traceback
-    from app.phases.decision_maker import _run_search_contact
-
-    company = db.query(Company).filter(Company.id == company_id).first()
-    if not company:
-        raise HTTPException(status_code=404, detail="Company not found")
-
-    result = {"company": company.name, "domain": company.domain}
-    try:
-        persons = _run_search_contact(company, {"title_filters": [{"name": "ceo_filter", "filter": "CEO OR Chief Executive Officer OR Founder OR Co-Founder OR Owner OR Managing Director OR President"}]})
-        result["raw_search_contact_persons"] = persons
-    except Exception as e:
-        result["raw_search_contact_error"] = f"{type(e).__name__}: {e}"
-        result["raw_search_contact_traceback"] = traceback.format_exc()
-
-    return result
-
-
 @router.get("/parameters")
 def list_parameters(db: Session = Depends(get_db)):
     params = db.query(Parameter).filter(Parameter.tenant_id == ELEPHANT_EDGE_TENANT_ID).all()
