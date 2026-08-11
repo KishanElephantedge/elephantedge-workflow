@@ -2611,7 +2611,7 @@ def delete_credential(name: str, db: Session = Depends(get_db)):
 @router.get("/_scratch/diagnose-dm")
 def _scratch_diagnose_dm(company_id: int, db: Session = Depends(get_db)):
     import traceback
-    from app.phases.decision_maker import find_decision_maker, _run_search_contact
+    from app.phases.decision_maker import _run_search_contact
 
     company = db.query(Company).filter(Company.id == company_id).first()
     if not company:
@@ -2619,24 +2619,11 @@ def _scratch_diagnose_dm(company_id: int, db: Session = Depends(get_db)):
 
     result = {"company": company.name, "domain": company.domain}
     try:
-        result["deepline_balance_usd"] = get_credit_balance_usd(db, ELEPHANT_EDGE_TENANT_ID)
-    except DeeplineError as e:
-        result["deepline_balance_error"] = str(e)
-
-    try:
         persons = _run_search_contact(company, {"title_filters": [{"name": "ceo_filter", "filter": "CEO OR Chief Executive Officer OR Founder OR Co-Founder OR Owner OR Managing Director OR President"}]})
         result["raw_search_contact_persons"] = persons
     except Exception as e:
         result["raw_search_contact_error"] = f"{type(e).__name__}: {e}"
         result["raw_search_contact_traceback"] = traceback.format_exc()
-
-    try:
-        contact, used_paid = find_decision_maker(company, db, ELEPHANT_EDGE_TENANT_ID, allow_paid_fallback=True)
-        result["find_decision_maker_contact"] = contact.first_name if contact else None
-        result["find_decision_maker_used_paid"] = used_paid
-    except Exception as e:
-        result["find_decision_maker_error"] = f"{type(e).__name__}: {e}"
-        result["find_decision_maker_traceback"] = traceback.format_exc()
 
     return result
 
