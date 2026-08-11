@@ -82,6 +82,35 @@ def estimate_cost_usd(job_count: int) -> float:
     return job_count * COST_PER_JOB_USD + COST_PER_RUN_USD
 
 
+# apify/google-search-scraper -- used here specifically for its AI Overview add-on, which
+# synthesizes an answer from Google's own knowledge graph + top results rather than us having
+# to parse organic snippets ourselves. Confirmed live (2026-08-10/11): real, correct answers
+# for real companies (DAKCS, GovEase) our other decision-maker sources missed entirely -- but
+# also a real, dangerous false-positive for a short/generic company name ("Nebi" confused with
+# the much larger "Nebius"), so callers MUST domain-qualify the query and verify the result
+# against LinkedIn before trusting it (see free_decision_maker.py).
+GOOGLE_SEARCH_ACTOR_ID = "nFJndFXA5zjCTuudP"
+GOOGLE_SEARCH_COST_PER_QUERY_USD = 0.0085  # $0.0045 page + $0.003 AI Overview + $0.001 start
+
+
+def search_google_ai_overview(api_key: str, query: str) -> str | None:
+    """Returns the AI Overview's text content for one query, or None if Google didn't
+    generate one (happens for some queries -- not an error)."""
+    response = httpx.post(
+        f"{BASE_URL}/acts/{GOOGLE_SEARCH_ACTOR_ID}/run-sync-get-dataset-items",
+        params={"token": api_key},
+        json={"queries": query, "maxPagesPerQuery": 1, "aiOverview": {"enabled": True}},
+        timeout=60,
+    )
+    if response.status_code >= 300:
+        raise ApifyError(f"Google search failed ({response.status_code}): {response.text[:500]}")
+    items = response.json()
+    if not items:
+        return None
+    overview = items[0].get("aiOverview") or {}
+    return overview.get("content") or None
+
+
 # memo23/linkedin-people-search -- searches LinkedIn's own data directly (not Google's index of
 # it), unlike a generic web search. Validated live (2026-08-08): a name+company search returned
 # the exact, cross-confirmed correct profile for one real person (Karan Talati, First
