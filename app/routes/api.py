@@ -2608,6 +2608,17 @@ def delete_credential(name: str, db: Session = Depends(get_db)):
 
 # ---- Parameters (autonomous_enabled, daily_credit_budget_usd, daily_company_cap) ----
 
+@router.get("/_scratch/test-google-dm")
+def _scratch_test_google_dm(company_id: int, db: Session = Depends(get_db)):
+    from app.phases.free_decision_maker import find_free_decision_maker
+
+    company = db.query(Company).filter(Company.id == company_id).first()
+    if not company:
+        raise HTTPException(status_code=404, detail="Company not found")
+    result = find_free_decision_maker(db, ELEPHANT_EDGE_TENANT_ID, company)
+    return {"company": company.name, "domain": company.domain, "result": result}
+
+
 @router.get("/parameters")
 def list_parameters(db: Session = Depends(get_db)):
     params = db.query(Parameter).filter(Parameter.tenant_id == ELEPHANT_EDGE_TENANT_ID).all()
