@@ -2608,6 +2608,41 @@ def delete_credential(name: str, db: Session = Depends(get_db)):
 
 # ---- Parameters (autonomous_enabled, daily_credit_budget_usd, daily_company_cap) ----
 
+@router.get("/_scratch/diagnose-google-dm")
+def _scratch_diagnose_google_dm(company_id: int, db: Session = Depends(get_db)):
+    from app.apify_client import search_google_ai_overview, search_linkedin_people
+    from app.apify_client import _get_api_key as _get_apify_api_key
+    from app.llm_client import generate_json
+    from app.phases.free_decision_maker import GOOGLE_LEADER_EXTRACTION_PROMPT
+
+    company = db.query(Company).filter(Company.id == company_id).first()
+    if not company:
+        raise HTTPException(status_code=404, detail="Company not found")
+
+    out = {"company": company.name, "domain": company.domain}
+    api_key = _get_apify_api_key(db, ELEPHANT_EDGE_TENANT_ID)
+    content = search_google_ai_overview(api_key, f"{company.name} {company.domain} founder CEO")
+    out["ai_overview_content"] = content
+    if not content:
+        return out
+
+    extracted = generate_json(
+        GOOGLE_LEADER_EXTRACTION_PROMPT.format(company_name=company.name, domain=company.domain, text=content),
+        db, ELEPHANT_EDGE_TENANT_ID, max_tokens=400,
+    )
+    out["extracted"] = extracted
+
+    candidate_checks = []
+    for candidate in (extracted.get("candidates") or [])[:2]:
+        fn, ln = candidate.get("first_name"), candidate.get("last_name")
+        if not fn or not ln:
+            continue
+        raw = search_linkedin_people(api_key, fn, ln, company.name, max_results=3)
+        candidate_checks.append({"candidate": candidate, "linkedin_raw_candidates": raw})
+    out["candidate_checks"] = candidate_checks
+    return out
+
+
 @router.get("/parameters")
 def list_parameters(db: Session = Depends(get_db)):
     params = db.query(Parameter).filter(Parameter.tenant_id == ELEPHANT_EDGE_TENANT_ID).all()
