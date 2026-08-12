@@ -117,8 +117,31 @@ service warmed up; confirmed via a direct `curl` request returning a proper `401
 authenticated` (correct behavior for an unauthenticated request) instead of a raw
 connection failure.
 
-**Open question, not yet decided**: whether to eventually move off Render's free tier
-entirely (paid plan, or a different platform like AWS/Fly.io) to avoid this class of outage
-recurring. Explicitly deferred for now -- the free second-account approach was chosen instead.
-If this account also gets suspended for the same reason, that decision should be revisited
-rather than repeating the same workaround indefinitely.
+**Follow-up decision (2026-08-12)**: move to AWS next, funded by the free-tier credit --
+research findings and the plan are below.
+
+## Planned: move to AWS (not yet started)
+
+Researched real, current AWS free-tier terms before deciding (AWS changed this July 2025 --
+it is no longer a classic "12 months of free EC2 hours" offer):
+
+- A new AWS account gets **$100 in credit immediately**, up to **$200 total** after
+  completing a few onboarding tasks (launch/terminate an EC2 instance, set up RDS, deploy a
+  Lambda, etc.).
+- Credits **expire 12 months after account creation**, or sooner if fully spent.
+- After credits run out, the account auto-closes unless explicitly converted to a paid plan
+  -- no risk of a surprise bill, but also no ongoing free hosting past that.
+- Real ongoing cost estimate once credits run out, for both services (gateway + backend)
+  running continuously: roughly **$10-20/month total** (EC2 t3.micro/small or Lightsail,
+  Singapore region to match the Neon DB) -- comparable to just paying for Render's own small
+  paid tier (~$7/service/month), so AWS isn't meaningfully cheaper long-term, but the ~12
+  months of credit is real free runway and avoids the free-tier-suspension problem for that
+  period.
+
+**Decision**: use the AWS credit to run both services for the next several months at no cost,
+deferring the eventual pay-or-not decision until closer to when the credit runs out. Not
+started yet -- when this happens, it's the same migration shape as the 2026-08-12 Render
+migration above (recreate both services on AWS, update `tenants.backend_url`, update
+`VITE_GATEWAY_URL`, update both keep-alive mechanisms), just onto EC2/Lightsail instead of a
+second Render account, and no longer needing the keep-alive workaround at all since a real
+EC2/Lightsail instance doesn't cold-start the way Render's free tier does.
