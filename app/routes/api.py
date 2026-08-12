@@ -1131,6 +1131,23 @@ def get_leads_stats(db: Session = Depends(get_db)):
     }
 
 
+@router.get("/_scratch/smartlead-analytics-debug")
+def _scratch_smartlead_analytics_debug(db: Session = Depends(get_db)):
+    out = {}
+    try:
+        campaign_id = _get_smartlead_campaign_id(db)
+        out["campaign_id"] = campaign_id
+    except Exception as e:
+        out["campaign_id_error"] = f"{type(e).__name__}: {e}"
+        return out
+    try:
+        analytics = smartlead_get_campaign_analytics(campaign_id, db, ELEPHANT_EDGE_TENANT_ID)
+        out["analytics"] = analytics
+    except Exception as e:
+        out["analytics_error"] = f"{type(e).__name__}: {e}"
+    return out
+
+
 @router.get("/overview/stats")
 def get_overview_stats(start_date: str | None = None, end_date: str | None = None, db: Session = Depends(get_db)):
     """The full funnel, not just the outreach half of it -- /leads/stats (above) only covers
