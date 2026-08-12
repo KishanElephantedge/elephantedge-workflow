@@ -1138,7 +1138,7 @@ def _scratch_smartlead_leads_debug(db: Session = Depends(get_db)):
     campaign_id = _get_smartlead_campaign_id(db)
     api_key = _get_api_key(db, ELEPHANT_EDGE_TENANT_ID)
     out = {}
-    for path in [f"/campaigns/{campaign_id}/leads", f"/campaigns/{campaign_id}/leads?offset=0&limit=10"]:
+    for path in ["/campaigns", f"/campaigns/{campaign_id}"]:
         sep = "&" if "?" in path else "?"
         resp = httpx.get(f"{BASE_URL}{path}{sep}api_key={api_key}", timeout=30)
         out[path] = {"status": resp.status_code, "body": resp.text[:2000]}
