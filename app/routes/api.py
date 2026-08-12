@@ -1131,6 +1131,20 @@ def get_leads_stats(db: Session = Depends(get_db)):
     }
 
 
+@router.get("/_scratch/smartlead-leads-debug")
+def _scratch_smartlead_leads_debug(db: Session = Depends(get_db)):
+    import httpx
+    from app.smartlead_client import _get_api_key, BASE_URL
+    campaign_id = _get_smartlead_campaign_id(db)
+    api_key = _get_api_key(db, ELEPHANT_EDGE_TENANT_ID)
+    out = {}
+    for path in [f"/campaigns/{campaign_id}/leads", f"/campaigns/{campaign_id}/leads?offset=0&limit=10"]:
+        sep = "&" if "?" in path else "?"
+        resp = httpx.get(f"{BASE_URL}{path}{sep}api_key={api_key}", timeout=30)
+        out[path] = {"status": resp.status_code, "body": resp.text[:2000]}
+    return out
+
+
 @router.get("/overview/stats")
 def get_overview_stats(start_date: str | None = None, end_date: str | None = None, db: Session = Depends(get_db)):
     """The full funnel, not just the outreach half of it -- /leads/stats (above) only covers
