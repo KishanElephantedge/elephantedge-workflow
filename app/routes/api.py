@@ -1195,6 +1195,80 @@ def list_smartlead_campaign_leads_route(campaign_id: int, db: Session = Depends(
     return {"total": int(result.get("total_leads") or 0), "leads": leads}
 
 
+@router.get("/_scratch/diagnose-free-dm/{company_id}")
+def _scratch_diagnose_free_dm(company_id: int, db: Session = Depends(get_db)):
+    from app.apify_client import search_google_ai_overview, search_linkedin_people
+    from app.llm_client import generate_json
+    from app.phases.free_decision_maker import (
+        GOOGLE_LEADER_EXTRACTION_PROMPT, _jobo_leadership_candidates, _names_match, _slug_matches,
+    )
+
+    company = db.query(Company).filter(Company.id == company_id).first()
+    if not company:
+        raise HTTPException(status_code=404, detail="Company not found")
+
+    out = {"company": company.name, "domain": company.domain}
+
+    out["jobo_leadership"] = _jobo_leadership_candidates(db, ELEPHANT_EDGE_TENANT_ID, company)
+
+    query = f"{company.name} {company.domain} founder CEO"
+    out["google_query"] = query
+    try:
+        api_key = _get_apify_key_for_diag(db)
+        content = search_google_ai_overview(api_key, query)
+    except Exception as e:
+        out["google_search_error"] = str(e)
+        content = None
+    out["google_ai_overview_text"] = content
+
+    if content:
+        try:
+            extracted = generate_json(
+                GOOGLE_LEADER_EXTRACTION_PROMPT.format(company_name=company.name, domain=company.domain, text=content),
+                db, ELEPHANT_EDGE_TENANT_ID, max_tokens=400,
+            )
+        except Exception as e:
+            extracted = {"error": str(e)}
+        out["llm_extraction"] = extracted
+
+        candidate_diagnostics = []
+        for candidate in (extracted.get("candidates") or []):
+            first_name, last_name = candidate.get("first_name"), candidate.get("last_name")
+            entry = {"candidate": candidate}
+            if not first_name or not last_name:
+                entry["skipped"] = "no first/last name"
+                candidate_diagnostics.append(entry)
+                continue
+            try:
+                people = search_linkedin_people(api_key, first_name, last_name, company.name, max_results=3)
+            except Exception as e:
+                entry["people_search_error"] = str(e)
+                candidate_diagnostics.append(entry)
+                continue
+            entry["people_search_results"] = []
+            for p in people:
+                name_ok = _names_match(first_name, last_name, p.get("name") or "")
+                slug_ok = _slug_matches(first_name, last_name, p.get("profileUrl") or "")
+                profile_text = f"{p.get('summary') or ''} {p.get('about') or ''}".lower()
+                company_ok = company.name.strip().lower() in profile_text
+                entry["people_search_results"].append({
+                    "name": p.get("name"), "profileUrl": p.get("profileUrl"),
+                    "name_match": name_ok, "slug_match": slug_ok,
+                    "profile_text_present": bool(profile_text.strip()),
+                    "company_name_in_profile_text": company_ok,
+                    "profile_text_excerpt": profile_text[:300],
+                })
+            candidate_diagnostics.append(entry)
+        out["candidate_diagnostics"] = candidate_diagnostics
+
+    return out
+
+
+def _get_apify_key_for_diag(db: Session) -> str:
+    from app.apify_client import _get_api_key
+    return _get_api_key(db, ELEPHANT_EDGE_TENANT_ID)
+
+
 @router.get("/overview/stats")
 def get_overview_stats(start_date: str | None = None, end_date: str | None = None, db: Session = Depends(get_db)):
     """The full funnel, not just the outreach half of it -- /leads/stats (above) only covers
