@@ -62,3 +62,21 @@ def add_lead(campaign_id: int, email: str, first_name: str | None, subject: str,
     if not result.get("ok") or result.get("total_leads", 0) < 1:
         raise SmartleadError(f"lead not actually attached to campaign {campaign_id}: {result}")
     return result
+
+
+def get_campaign_analytics(campaign_id: int, db: Session, tenant_id: int) -> dict:
+    """Real, documented endpoint (confirmed live 2026-08-10/11 while building the email
+    channel): GET /campaigns/{id}/analytics returns sent_count/open_count/click_count/
+    reply_count/bounce_count as the campaign's own aggregate, same shape SalesRobot's
+    list_campaigns gives for LinkedIn -- this is the email side of the same "trust the
+    provider's own counts, not our local push-attempt count" pattern used in
+    /leads/stats."""
+    api_key = _get_api_key(db, tenant_id)
+    response = httpx.get(
+        f"{BASE_URL}/campaigns/{campaign_id}/analytics",
+        params={"api_key": api_key},
+        timeout=30,
+    )
+    if response.status_code != 200:
+        raise SmartleadError(f"campaigns/{campaign_id}/analytics failed ({response.status_code}): {response.text}")
+    return response.json()

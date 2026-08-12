@@ -39,6 +39,7 @@ from app.phases.tech_stack import run_tech_stack_check
 from app.salesrobot_client import SalesRobotError, add_single_prospect, get_campaign_prospects, list_campaigns, send_message_to_prospect
 from app.smartlead_client import SmartleadError
 from app.smartlead_client import add_lead as smartlead_add_lead
+from app.smartlead_client import get_campaign_analytics as smartlead_get_campaign_analytics
 
 router = APIRouter()
 
@@ -1063,7 +1064,10 @@ def get_leads_stats(db: Session = Depends(get_db)):
     """KPI cards for the lead dashboard. `connections_sent`/accepted/replied come from
     SalesRobot's own per-campaign aggregates -- the real, authoritative confirmation of what
     was actually sent (per explicit direction: our own DB's pushed count undercounts, since it
-    misses prospects added directly in SalesRobot outside this app).
+    misses prospects added directly in SalesRobot outside this app). `emails_sent`/opened/
+    replied are the same pattern for the email channel, added 2026-08-12 -- Smartlead's own
+    campaign analytics, not our local push-attempt count, so this was genuinely missing full-
+    funnel visibility until now (LinkedIn was tracked, email wasn't).
 
     `researched` here means "contacts with a message drafted" (any status), NOT "companies
     researched" -- a real naming collision with the Overview tab's much larger "Companies
@@ -1089,6 +1093,16 @@ def get_leads_stats(db: Session = Depends(get_db)):
         except SalesRobotError:
             pass
 
+    emails_sent = emails_opened = emails_replied = 0
+    try:
+        smartlead_campaign_id = _get_smartlead_campaign_id(db)
+        email_analytics = smartlead_get_campaign_analytics(smartlead_campaign_id, db, ELEPHANT_EDGE_TENANT_ID)
+        emails_sent = int(email_analytics.get("sent_count") or 0)
+        emails_opened = int(email_analytics.get("unique_open_count") or email_analytics.get("open_count") or 0)
+        emails_replied = int(email_analytics.get("reply_count") or 0)
+    except (HTTPException, SmartleadError):
+        pass
+
     batch_ids = db.query(Batch.id).filter(Batch.tenant_id == ELEPHANT_EDGE_TENANT_ID)
 
     contacts = (
@@ -1109,6 +1123,11 @@ def get_leads_stats(db: Session = Depends(get_db)):
         "replied": replied,
         "acceptance_rate": round(accepted / sent, 3) if sent else None,
         "reply_rate": round(replied / sent, 3) if sent else None,
+        "emails_sent": emails_sent,
+        "emails_opened": emails_opened,
+        "emails_replied": emails_replied,
+        "email_open_rate": round(emails_opened / emails_sent, 3) if emails_sent else None,
+        "email_reply_rate": round(emails_replied / emails_sent, 3) if emails_sent else None,
     }
 
 
@@ -1170,6 +1189,9 @@ def get_overview_stats(start_date: str | None = None, end_date: str | None = Non
         "connections_accepted": lead_stats["connections_accepted"],
         "replied": lead_stats["replied"],
         "meetings_booked": meetings_booked,
+        "emails_sent": lead_stats["emails_sent"],
+        "emails_opened": lead_stats["emails_opened"],
+        "emails_replied": lead_stats["emails_replied"],
         "date_filtered_stages": ["companies_researched", "companies_qualified", "decision_makers_found", "meetings_booked", "connections_sent"],
     }
 
