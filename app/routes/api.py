@@ -1195,6 +1195,14 @@ def list_smartlead_campaign_leads_route(campaign_id: int, db: Session = Depends(
     return {"total": int(result.get("total_leads") or 0), "leads": leads}
 
 
+@router.get("/_scratch/deepline-balance")
+def _scratch_deepline_balance():
+    try:
+        return {"balance_usd": get_credit_balance_usd()}
+    except DeeplineError as e:
+        return {"error": str(e)}
+
+
 @router.get("/overview/stats")
 def get_overview_stats(start_date: str | None = None, end_date: str | None = None, db: Session = Depends(get_db)):
     """The full funnel, not just the outreach half of it -- /leads/stats (above) only covers
