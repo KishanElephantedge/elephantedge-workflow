@@ -80,3 +80,32 @@ def get_campaign_analytics(campaign_id: int, db: Session, tenant_id: int) -> dic
     if response.status_code != 200:
         raise SmartleadError(f"campaigns/{campaign_id}/analytics failed ({response.status_code}): {response.text}")
     return response.json()
+
+
+def list_campaigns(db: Session, tenant_id: int) -> list[dict]:
+    """Real, confirmed-live endpoint: GET /campaigns returns every campaign on the account
+    (id/name/status), same role as SalesRobot's list_campaigns for the LinkedIn side -- lets
+    the Campaign tab show Smartlead campaigns instead of only the one hardcoded via the
+    smartlead_campaign_id parameter."""
+    api_key = _get_api_key(db, tenant_id)
+    response = httpx.get(f"{BASE_URL}/campaigns", params={"api_key": api_key}, timeout=30)
+    if response.status_code != 200:
+        raise SmartleadError(f"campaigns failed ({response.status_code}): {response.text}")
+    return response.json()
+
+
+def get_campaign_leads(campaign_id: int, db: Session, tenant_id: int, offset: int = 0, limit: int = 100) -> dict:
+    """Real, confirmed-live endpoint: GET /campaigns/{id}/leads returns total_leads plus each
+    lead's own send status (COMPLETED/etc.) and email -- this is the email-channel equivalent
+    of SalesRobot's get_campaign_prospects, and the only source of truth for "was this contact
+    actually sent an email", since the pipeline doesn't write its own push record for the email
+    channel today (email sends have so far only gone out via the manual test-push endpoint)."""
+    api_key = _get_api_key(db, tenant_id)
+    response = httpx.get(
+        f"{BASE_URL}/campaigns/{campaign_id}/leads",
+        params={"api_key": api_key, "offset": offset, "limit": limit},
+        timeout=30,
+    )
+    if response.status_code != 200:
+        raise SmartleadError(f"campaigns/{campaign_id}/leads failed ({response.status_code}): {response.text}")
+    return response.json()

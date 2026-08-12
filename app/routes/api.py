@@ -40,6 +40,8 @@ from app.salesrobot_client import SalesRobotError, add_single_prospect, get_camp
 from app.smartlead_client import SmartleadError
 from app.smartlead_client import add_lead as smartlead_add_lead
 from app.smartlead_client import get_campaign_analytics as smartlead_get_campaign_analytics
+from app.smartlead_client import list_campaigns as smartlead_list_campaigns
+from app.smartlead_client import get_campaign_leads as smartlead_get_campaign_leads
 
 router = APIRouter()
 
@@ -942,9 +944,28 @@ def list_companies(page: int = 1, page_size: int = 25, search: str = "", qualifi
     }
 
 
-def _lead_dict(c: Contact, live: dict | None) -> dict:
+def _get_smartlead_sent_emails(db: Session) -> set[str]:
+    """The provider's own send record, not a local push flag -- email sends have so far only
+    gone out via the manual test-push endpoint (no automated campaign_execution wiring yet),
+    so there is no DB row to check locally. Mirrors the SalesRobot live-status enrichment
+    pattern (_fetch_our_salesrobot_prospects) already used just below."""
+    try:
+        campaign_id = _get_smartlead_campaign_id(db)
+        result = smartlead_get_campaign_leads(campaign_id, db, ELEPHANT_EDGE_TENANT_ID, limit=300)
+    except (HTTPException, SmartleadError):
+        return set()
+    emails = set()
+    for row in result.get("data", []):
+        email = (row.get("lead") or {}).get("email")
+        if email:
+            emails.add(email.strip().lower())
+    return emails
+
+
+def _lead_dict(c: Contact, live: dict | None, sent_emails: set[str] | None = None) -> dict:
     pm = c.personalized_message
     push = c.campaign_pushes[-1] if c.campaign_pushes else None
+    email_sent = bool(c.email and sent_emails and c.email.strip().lower() in sent_emails)
     return {
         "contact_id": c.id,
         "first_name": c.first_name,
@@ -958,6 +979,8 @@ def _lead_dict(c: Contact, live: dict | None) -> dict:
         "pushed_at": push.pushed_at if push else None,
         "salesrobot_last_activity": live.get("lastActivity") if live else None,
         "salesrobot_status": live.get("status") if live else None,
+        "email": c.email,
+        "email_status": "sent" if email_sent else None,
     }
 
 
@@ -1013,6 +1036,7 @@ def list_leads(page: int = 1, page_size: int = 25, search: str = "", message_sta
             .all()
         )
         live_by_url = _fetch_our_salesrobot_prospects(db)
+        sent_emails = _get_smartlead_sent_emails(db)
         matched = []
         for c in contacts:
             live = live_by_url.get(_normalize_linkedin_url(c.linkedin_url))
@@ -1035,7 +1059,7 @@ def list_leads(page: int = 1, page_size: int = 25, search: str = "", message_sta
             "page_size": page_size,
             "total": total,
             "total_pages": (total + page_size - 1) // page_size if total else 0,
-            "leads": [_lead_dict(c, live) for c, live in page_slice],
+            "leads": [_lead_dict(c, live, sent_emails) for c, live in page_slice],
         }
 
     total = query.count()
@@ -1049,7 +1073,8 @@ def list_leads(page: int = 1, page_size: int = 25, search: str = "", message_sta
     )
 
     live_by_url = _fetch_our_salesrobot_prospects(db)
-    leads = [_lead_dict(c, live_by_url.get(_normalize_linkedin_url(c.linkedin_url))) for c in contacts]
+    sent_emails = _get_smartlead_sent_emails(db)
+    leads = [_lead_dict(c, live_by_url.get(_normalize_linkedin_url(c.linkedin_url)), sent_emails) for c in contacts]
     return {
         "page": page,
         "page_size": page_size,
@@ -1131,18 +1156,43 @@ def get_leads_stats(db: Session = Depends(get_db)):
     }
 
 
-@router.get("/_scratch/smartlead-leads-debug")
-def _scratch_smartlead_leads_debug(db: Session = Depends(get_db)):
-    import httpx
-    from app.smartlead_client import _get_api_key, BASE_URL
-    campaign_id = _get_smartlead_campaign_id(db)
-    api_key = _get_api_key(db, ELEPHANT_EDGE_TENANT_ID)
-    out = {}
-    for path in ["/campaigns", f"/campaigns/{campaign_id}"]:
-        sep = "&" if "?" in path else "?"
-        resp = httpx.get(f"{BASE_URL}{path}{sep}api_key={api_key}", timeout=30)
-        out[path] = {"status": resp.status_code, "body": resp.text[:2000]}
-    return out
+@router.get("/smartlead/campaigns")
+def list_smartlead_campaigns_route(db: Session = Depends(get_db)):
+    """Email-channel equivalent of GET /salesrobot/campaigns -- the Campaign tab was only
+    showing LinkedIn (SalesRobot) campaigns before this; this lets it show Smartlead's real
+    campaign list too."""
+    try:
+        campaigns = smartlead_list_campaigns(db, ELEPHANT_EDGE_TENANT_ID)
+    except SmartleadError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    return [
+        {"id": c.get("id"), "name": c.get("name"), "status": c.get("status"), "created_at": c.get("created_at")}
+        for c in campaigns
+    ]
+
+
+@router.get("/smartlead/campaigns/{campaign_id}/leads")
+def list_smartlead_campaign_leads_route(campaign_id: int, db: Session = Depends(get_db)):
+    """Email-channel equivalent of GET /salesrobot/campaigns/{uuid}/leads -- lets a Smartlead
+    campaign be drilled into from the Campaign tab the same way a SalesRobot one already can."""
+    try:
+        result = smartlead_get_campaign_leads(campaign_id, db, ELEPHANT_EDGE_TENANT_ID, limit=300)
+    except SmartleadError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    leads = []
+    for row in result.get("data", []):
+        lead = row.get("lead") or {}
+        leads.append({
+            "id": lead.get("id"),
+            "first_name": lead.get("first_name"),
+            "last_name": lead.get("last_name"),
+            "email": lead.get("email"),
+            "status": row.get("status"),
+            "created_at": row.get("created_at"),
+            "email_subject": (lead.get("custom_fields") or {}).get("email_subject"),
+            "email_body": (lead.get("custom_fields") or {}).get("email_body"),
+        })
+    return {"total": int(result.get("total_leads") or 0), "leads": leads}
 
 
 @router.get("/overview/stats")
@@ -1327,6 +1377,8 @@ def get_lead_detail(contact_id: int, db: Session = Depends(get_db)):
     push = contact.campaign_pushes[-1] if contact.campaign_pushes else None
     live_by_url = _fetch_our_salesrobot_prospects(db)
     live = live_by_url.get(_normalize_linkedin_url(contact.linkedin_url))
+    sent_emails = _get_smartlead_sent_emails(db)
+    email_sent = bool(contact.email and contact.email.strip().lower() in sent_emails)
 
     profile_key = _normalize_linkedin_url(contact.linkedin_url) or ""
     events = db.query(CampaignEvent).order_by(CampaignEvent.received_at.desc()).limit(500).all()
@@ -1350,6 +1402,8 @@ def get_lead_detail(contact_id: int, db: Session = Depends(get_db)):
         "salesrobot_last_activity": live.get("lastActivity") if live else None,
         "salesrobot_status": live.get("status") if live else None,
         "salesrobot_raw": live,
+        "email": contact.email,
+        "email_status": "sent" if email_sent else None,
         "activity_history": [
             {"id": e.id, "event_type": e.event_type, "received_at": e.received_at}
             for e in matching_events
