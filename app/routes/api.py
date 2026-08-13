@@ -2990,6 +2990,42 @@ def delete_linkedin_monitor_profile(profile_id: int, db: Session = Depends(get_d
     return {"deleted": True}
 
 
+@router.patch("/linkedin-monitor/profiles/{profile_id}")
+def update_linkedin_monitor_profile(profile_id: int, name: str | None = None, company: str | None = None, active: bool | None = None, db: Session = Depends(get_db)):
+    profile = (
+        db.query(LinkedinMonitorProfile)
+        .filter(LinkedinMonitorProfile.id == profile_id)
+        .filter(LinkedinMonitorProfile.tenant_id == ELEPHANT_EDGE_TENANT_ID)
+        .first()
+    )
+    if not profile:
+        raise HTTPException(status_code=404, detail="Profile not found")
+    if name is not None:
+        profile.name = name
+    if company is not None:
+        profile.company = company
+    if active is not None:
+        profile.active = active
+    db.commit()
+    return {"updated": True}
+
+
+@router.get("/linkedin-monitor/keywords")
+def get_linkedin_monitor_keywords(db: Session = Depends(get_db)):
+    from app.phases.linkedin_monitor import get_keyword_tiers
+    return get_keyword_tiers(db, ELEPHANT_EDGE_TENANT_ID)
+
+
+@router.put("/linkedin-monitor/keywords")
+def put_linkedin_monitor_keywords(tiers: dict[str, list[str]], db: Session = Depends(get_db)):
+    """Full replace -- the dashboard's Targets > Settings tab sends the complete taxonomy back
+    on every save, so adding/removing a tier or a single keyword is just editing the object
+    client-side and PUTting the whole thing, no separate add/remove endpoints needed."""
+    from app.phases.linkedin_monitor import set_keyword_tiers
+    set_keyword_tiers(db, ELEPHANT_EDGE_TENANT_ID, tiers)
+    return {"updated": True}
+
+
 @router.get("/linkedin-monitor/signals")
 def list_linkedin_monitor_signals(limit: int = 50, db: Session = Depends(get_db)):
     signals = (
@@ -3016,3 +3052,53 @@ def trigger_linkedin_monitor_sweep(db: Session = Depends(get_db)):
     this lets a test post be checked immediately instead of waiting for the next tick."""
     from app.phases.linkedin_monitor import run_linkedin_monitor_sweep
     return run_linkedin_monitor_sweep(db, ELEPHANT_EDGE_TENANT_ID)
+
+
+@router.post("/linkedin-monitor/backfill-names")
+def backfill_linkedin_monitor_names(db: Session = Depends(get_db)):
+    """One-time-ish utility: fills in name/company for profiles added with only a LinkedIn URL
+    (targetedcompanies.md had no name/company for ~80 of them), using the same post-scraper
+    actor's own author metadata -- no scrapeUntil filter, limitPerSource=1, so this pulls each
+    profile's single most recent post (if any) purely to read the author's name off it. Real
+    cost: ~$0.002 per profile that has at least one public post, ~$0 for one with none."""
+    from app.apify_client import search_linkedin_posts
+    from app.apify_client import _get_api_key as _get_apify_api_key
+    from app.phases.linkedin_monitor import PROFILES_PER_BATCH
+
+    profiles = (
+        db.query(LinkedinMonitorProfile)
+        .filter(LinkedinMonitorProfile.tenant_id == ELEPHANT_EDGE_TENANT_ID)
+        .filter(LinkedinMonitorProfile.name.is_(None))
+        .all()
+    )
+    if not profiles:
+        return {"checked": 0, "updated": 0}
+
+    api_key = _get_apify_api_key(db, ELEPHANT_EDGE_TENANT_ID)
+    updated = 0
+    for i in range(0, len(profiles), PROFILES_PER_BATCH):
+        batch = profiles[i:i + PROFILES_PER_BATCH]
+        urls = [p.linkedin_url for p in batch]
+        try:
+            posts = search_linkedin_posts(api_key, urls, limit_per_source=1)
+        except Exception:
+            continue
+        by_url = {p.linkedin_url.rstrip("/").lower(): p for p in batch}
+        for post in posts:
+            input_url = (post.get("inputUrl") or post.get("authorProfileUrl") or "").rstrip("/").lower()
+            profile = by_url.get(input_url)
+            if not profile:
+                continue
+            author = post.get("author") or {}
+            name = post.get("authorName") or " ".join(filter(None, [author.get("firstName"), author.get("lastName")])).strip()
+            occupation = author.get("occupation") or ""
+            if name:
+                profile.name = name
+            if occupation and " at " in occupation.lower():
+                profile.company = occupation.split(" at ")[-1].strip()
+            elif occupation and "@" in occupation:
+                profile.company = occupation.split("@")[-1].strip()
+            updated += 1
+        db.commit()
+
+    return {"checked": len(profiles), "updated": updated}

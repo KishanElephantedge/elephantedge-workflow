@@ -25,11 +25,16 @@ from sqlalchemy.orm import Session
 
 from app.apify_client import ApifyError, search_linkedin_posts
 from app.apify_client import _get_api_key as _get_apify_api_key
-from app.db.models import LinkedinMonitorProfile, LinkedinMonitorSignal
+from app.db.models import LinkedinMonitorProfile, LinkedinMonitorSignal, Parameter
 from app.notifications import create_notification
 from app.slack_client import SlackError, send_slack_message
 
-KEYWORD_TIERS: dict[str, list[str]] = {
+KEYWORDS_PARAMETER_KEY = "linkedin_monitor_keywords"
+
+# Seed default, used only the first time (no Parameter row yet) -- from then on, the DB row is
+# the source of truth and is fully editable from the dashboard's Targets > Settings tab, not
+# this constant. Kept here only as the original starting taxonomy, not a hardcoded ceiling.
+DEFAULT_KEYWORD_TIERS: dict[str, list[str]] = {
     "Tier 1: Direct signals": [
         "AI SDR", "AI Sales Development Representative", "Autonomous SDR", "Autonomous Sales",
         "AI outbound", "AI prospecting", "AI sales agent", "Sales Agent", "SDR Agent",
@@ -63,12 +68,39 @@ INITIAL_LOOKBACK_DAYS = 2
 PROFILES_PER_BATCH = 20
 
 
-def match_keywords(text: str) -> list[tuple[str, str]]:
+def get_keyword_tiers(db: Session, tenant_id: int) -> dict[str, list[str]]:
+    param = (
+        db.query(Parameter)
+        .filter(Parameter.tenant_id == tenant_id)
+        .filter(Parameter.key == KEYWORDS_PARAMETER_KEY)
+        .first()
+    )
+    if param and isinstance(param.value, dict) and param.value:
+        return param.value
+    return DEFAULT_KEYWORD_TIERS
+
+
+def set_keyword_tiers(db: Session, tenant_id: int, tiers: dict[str, list[str]]) -> None:
+    param = (
+        db.query(Parameter)
+        .filter(Parameter.tenant_id == tenant_id)
+        .filter(Parameter.key == KEYWORDS_PARAMETER_KEY)
+        .first()
+    )
+    if param:
+        param.value = tiers
+    else:
+        param = Parameter(tenant_id=tenant_id, key=KEYWORDS_PARAMETER_KEY, value=tiers, description="GTM signal monitor keyword taxonomy, editable from Targets > Settings")
+        db.add(param)
+    db.commit()
+
+
+def match_keywords(text: str, keyword_tiers: dict[str, list[str]]) -> list[tuple[str, str]]:
     """Case-insensitive substring match against every tier -- returns [(tier, keyword), ...]
     for every keyword found, not just the first."""
     text_lower = (text or "").lower()
     hits = []
-    for tier, keywords in KEYWORD_TIERS.items():
+    for tier, keywords in keyword_tiers.items():
         for keyword in keywords:
             if keyword.lower() in text_lower:
                 hits.append((tier, keyword))
@@ -107,6 +139,7 @@ def run_linkedin_monitor_sweep(db: Session, tenant_id: int) -> dict:
     if not profiles:
         return {"profiles_checked": 0, "signals_found": 0}
 
+    keyword_tiers = get_keyword_tiers(db, tenant_id)
     api_key = _get_apify_api_key(db, tenant_id)
     now = datetime.utcnow()
     signals_found = 0
@@ -144,7 +177,7 @@ def run_linkedin_monitor_sweep(db: Session, tenant_id: int) -> dict:
             )
             if already_seen:
                 continue
-            hits = match_keywords(post.get("text") or "")
+            hits = match_keywords(post.get("text") or "", keyword_tiers)
             if not hits:
                 continue
 
