@@ -12,7 +12,7 @@ from sqlalchemy import func, or_
 
 from app.cache import active_keys, bump_batch_version, cache_get, cache_set, get_batch_version, mark_active
 from app.claude_client import ClaudeError, call_claude_messages
-from app.db.models import AutonomousRun, Batch, CalendarBooking, CampaignEvent, CampaignPush, ChatConversation, ChatMessage, Company, Contact, Credential, DailyReview, Notification, Parameter, PersonalizedMessage, ReviewComment, Score
+from app.db.models import AutonomousRun, Batch, CalendarBooking, CampaignEvent, CampaignPush, ChatConversation, ChatMessage, Company, Contact, Credential, DailyReview, LinkedinMonitorProfile, LinkedinMonitorSignal, Notification, Parameter, PersonalizedMessage, ReviewComment, Score
 from app.notifications import delete_expired_notifications
 from app.google_calendar_client import GoogleCalendarError
 from app.phases.hiring_signal import has_qualifying_hiring_signal
@@ -1193,17 +1193,6 @@ def list_smartlead_campaign_leads_route(campaign_id: int, db: Session = Depends(
             "email_body": (lead.get("custom_fields") or {}).get("email_body"),
         })
     return {"total": int(result.get("total_leads") or 0), "leads": leads}
-
-
-@router.get("/_scratch/test-linkedin-post-scrape")
-def _scratch_test_linkedin_post_scrape(url: str, db: Session = Depends(get_db)):
-    from app.apify_client import _get_api_key, search_linkedin_posts
-    api_key = _get_api_key(db, ELEPHANT_EDGE_TENANT_ID)
-    try:
-        posts = search_linkedin_posts(api_key, [url], limit_per_source=5)
-    except Exception as e:
-        return {"error": str(e)}
-    return {"count": len(posts), "posts": posts}
 
 
 @router.get("/overview/stats")
@@ -2949,3 +2938,81 @@ def deepline_balance():
         return {"ok": True, "rough_usd_balance": get_credit_balance_usd()}
     except DeeplineError as e:
         return {"ok": False, "error": str(e)}
+
+
+@router.get("/linkedin-monitor/profiles")
+def list_linkedin_monitor_profiles(db: Session = Depends(get_db)):
+    profiles = (
+        db.query(LinkedinMonitorProfile)
+        .filter(LinkedinMonitorProfile.tenant_id == ELEPHANT_EDGE_TENANT_ID)
+        .order_by(LinkedinMonitorProfile.id)
+        .all()
+    )
+    return [
+        {
+            "id": p.id, "name": p.name, "linkedin_url": p.linkedin_url, "company": p.company,
+            "active": p.active, "last_checked_at": p.last_checked_at,
+        }
+        for p in profiles
+    ]
+
+
+@router.post("/linkedin-monitor/profiles")
+def add_linkedin_monitor_profile(name: str | None = None, linkedin_url: str = "", company: str | None = None, db: Session = Depends(get_db)):
+    if not linkedin_url:
+        raise HTTPException(status_code=400, detail="linkedin_url is required")
+    existing = (
+        db.query(LinkedinMonitorProfile)
+        .filter(LinkedinMonitorProfile.tenant_id == ELEPHANT_EDGE_TENANT_ID)
+        .filter(LinkedinMonitorProfile.linkedin_url == linkedin_url)
+        .first()
+    )
+    if existing:
+        return {"id": existing.id, "already_existed": True}
+    profile = LinkedinMonitorProfile(tenant_id=ELEPHANT_EDGE_TENANT_ID, name=name, linkedin_url=linkedin_url, company=company)
+    db.add(profile)
+    db.commit()
+    return {"id": profile.id, "already_existed": False}
+
+
+@router.delete("/linkedin-monitor/profiles/{profile_id}")
+def delete_linkedin_monitor_profile(profile_id: int, db: Session = Depends(get_db)):
+    profile = (
+        db.query(LinkedinMonitorProfile)
+        .filter(LinkedinMonitorProfile.id == profile_id)
+        .filter(LinkedinMonitorProfile.tenant_id == ELEPHANT_EDGE_TENANT_ID)
+        .first()
+    )
+    if not profile:
+        raise HTTPException(status_code=404, detail="Profile not found")
+    db.delete(profile)
+    db.commit()
+    return {"deleted": True}
+
+
+@router.get("/linkedin-monitor/signals")
+def list_linkedin_monitor_signals(limit: int = 50, db: Session = Depends(get_db)):
+    signals = (
+        db.query(LinkedinMonitorSignal)
+        .filter(LinkedinMonitorSignal.tenant_id == ELEPHANT_EDGE_TENANT_ID)
+        .order_by(LinkedinMonitorSignal.id.desc())
+        .limit(limit)
+        .all()
+    )
+    return [
+        {
+            "id": s.id, "profile_id": s.profile_id, "profile_name": s.profile.name if s.profile else None,
+            "post_url": s.post_url, "post_text": s.post_text, "author_name": s.author_name,
+            "posted_at": s.posted_at, "matched_keywords": s.matched_keywords, "tier": s.tier,
+            "alerted_at": s.alerted_at, "created_at": s.created_at,
+        }
+        for s in signals
+    ]
+
+
+@router.post("/linkedin-monitor/sweep")
+def trigger_linkedin_monitor_sweep(db: Session = Depends(get_db)):
+    """Manual trigger for testing -- the scheduled sweep runs automatically once enabled, but
+    this lets a test post be checked immediately instead of waiting for the next tick."""
+    from app.phases.linkedin_monitor import run_linkedin_monitor_sweep
+    return run_linkedin_monitor_sweep(db, ELEPHANT_EDGE_TENANT_ID)

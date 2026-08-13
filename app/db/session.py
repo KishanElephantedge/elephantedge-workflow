@@ -128,3 +128,33 @@ def ensure_indexes():
         conn.execute(text("ALTER TABLE contacts ADD COLUMN IF NOT EXISTS email_source VARCHAR"))
         conn.execute(text("ALTER TABLE personalized_messages ADD COLUMN IF NOT EXISTS email_subject VARCHAR"))
         conn.execute(text("ALTER TABLE personalized_messages ADD COLUMN IF NOT EXISTS email_body TEXT"))
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS linkedin_monitor_profiles (
+                id SERIAL PRIMARY KEY,
+                tenant_id INTEGER NOT NULL,
+                name VARCHAR,
+                linkedin_url VARCHAR NOT NULL,
+                company VARCHAR,
+                active BOOLEAN DEFAULT TRUE,
+                last_checked_at TIMESTAMP,
+                created_at TIMESTAMP
+            )
+        """))
+        conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ix_linkedin_monitor_profiles_tenant_url ON linkedin_monitor_profiles (tenant_id, linkedin_url)"))
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS linkedin_monitor_signals (
+                id SERIAL PRIMARY KEY,
+                tenant_id INTEGER NOT NULL,
+                profile_id INTEGER NOT NULL REFERENCES linkedin_monitor_profiles(id),
+                post_urn VARCHAR NOT NULL,
+                post_url VARCHAR,
+                post_text TEXT,
+                author_name VARCHAR,
+                posted_at TIMESTAMP,
+                matched_keywords JSON,
+                tier VARCHAR,
+                alerted_at TIMESTAMP,
+                created_at TIMESTAMP
+            )
+        """))
+        conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ix_linkedin_monitor_signals_profile_urn ON linkedin_monitor_signals (profile_id, post_urn)"))

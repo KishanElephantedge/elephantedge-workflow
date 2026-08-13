@@ -398,3 +398,41 @@ class Parameter(Base):
     value = Column(JSON, nullable=False)
     description = Column(Text, nullable=True)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class LinkedinMonitorProfile(Base):
+    """A LinkedIn profile being watched for new posts, matched against a keyword taxonomy
+    (see app/phases/linkedin_monitor.py) to surface GTM signals -- competitor/partner
+    activity relevant to Elephant Edge's own positioning, not general prospecting."""
+    __tablename__ = "linkedin_monitor_profiles"
+
+    id = Column(Integer, primary_key=True)
+    tenant_id = Column(Integer, nullable=False)
+    name = Column(String, nullable=True)
+    linkedin_url = Column(String, nullable=False)
+    company = Column(String, nullable=True)
+    active = Column(Boolean, default=True)
+    last_checked_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class LinkedinMonitorSignal(Base):
+    """A new post from a monitored profile that matched at least one keyword -- one row per
+    (profile, post), never re-alerted once created (see the unique index on profile_id+post_urn
+    in ensure_indexes)."""
+    __tablename__ = "linkedin_monitor_signals"
+
+    id = Column(Integer, primary_key=True)
+    tenant_id = Column(Integer, nullable=False)
+    profile_id = Column(Integer, ForeignKey("linkedin_monitor_profiles.id"), nullable=False)
+    post_urn = Column(String, nullable=False)
+    post_url = Column(String, nullable=True)
+    post_text = Column(Text, nullable=True)
+    author_name = Column(String, nullable=True)
+    posted_at = Column(DateTime, nullable=True)
+    matched_keywords = Column(JSON, nullable=True)
+    tier = Column(String, nullable=True)
+    alerted_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    profile = relationship("LinkedinMonitorProfile")
