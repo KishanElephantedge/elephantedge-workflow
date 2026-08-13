@@ -1200,7 +1200,7 @@ def _scratch_deepline_monitors_status():
     from app.deepline_client import _run_deepline_cli
     from app.config import settings
     try:
-        result = _run_deepline_cli([settings.deepline_cli_path, "monitors", "status", "--json"], timeout_seconds=30)
+        result = _run_deepline_cli([settings.deepline_cli_path, "monitors", "status", "--json"], timeout_seconds=90)
     except Exception as e:
         return {"error": str(e)}
     return {"returncode": result.returncode, "stdout": result.stdout[:3000], "stderr": result.stderr[:1000]}
