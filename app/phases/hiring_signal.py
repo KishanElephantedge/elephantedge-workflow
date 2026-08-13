@@ -190,6 +190,15 @@ def assess_team_composition(company: Company, db: Session) -> dict:
 
     company.team_fit_tier = tier
     company.team_fit_reasoning = reasoning
+    # Free byproduct of the two paid calls above (added 2026-08-14): this is the exact data
+    # _infer_hire_type() needs (sales_headcount_percent/marketing_headcount_percent), previously
+    # only ever populated on the jd_first/Deepline path via a separate paid Crustdata call.
+    # Persisting it here means the Apify path's first-hire-vs-scaling classification actually
+    # works instead of always falling back to "unknown" -- no new cost, since sales_count/
+    # marketing_count were already being fetched and discarded after the tier decision.
+    if company.employee_count:
+        company.sales_headcount_percent = round(100 * sales_count / company.employee_count, 2)
+        company.marketing_headcount_percent = round(100 * marketing_count / company.employee_count, 2)
     db.commit()
     return {"tier": tier, "reasoning": reasoning, "sales_count": sales_count, "marketing_count": marketing_count}
 

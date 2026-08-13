@@ -3,7 +3,7 @@ additive only, never a new qualification gate. A company that already made it th
 pipeline keeps its spot regardless; this only ever adds a "Hot Lead" marker on top when a real,
 zero/near-zero-cost signal is present. Nothing here changes who gets discovered or contacted.
 
-Four signals, all from data already flowing through the currently-active Apify autonomous path
+Five signals, all from data already flowing through the currently-active Apify autonomous path
 (no new paid calls):
 
 1. Hiring velocity -- 2+ qualifying postings open at once at the same company (Signal
@@ -12,16 +12,23 @@ Four signals, all from data already flowing through the currently-active Apify a
 2. The "top of the funnel pipeline generation" JD phrase (Signal Framework v2, section 3).
 3. Product-fit JD category breadth -- 2+ distinct `PRODUCT_FIT_KEYWORD_CATEGORIES` matched in
    the JD reads much more like "this role is literally our product" than a single category hit.
-4. Decision-maker pain-language -- Phase 13's `contact_research` (`recent_initiatives`/
+4. First hire (head_of_sales/sdr/ae) -- added 2026-08-14, free byproduct of the team-composition
+   check `apify_discovery.py` already runs on every company (see `assess_team_composition` in
+   `hiring_signal.py`, now persisting sales/marketing headcount percentages it previously
+   computed and discarded). Per Gokul's framework, a first sales hire is typically a "strong"
+   signal -- testing outbound for the first time, or transferring revenue ownership off the
+   founder.
+5. Decision-maker pain-language -- Phase 13's `contact_research` (`recent_initiatives`/
    `stated_needs`/`implied_gaps`, pulled from the decision-maker's own recent LinkedIn posts)
    already gets collected for message personalization today and was never used as a signal
    until now. Only available for companies where a contact was actually found.
 
-Deliberately NOT included in this pass (real gaps, not oversights): funding recency,
-headcount-growth, and first-hire-vs-scaling classification are all part of the hot-leads
-research catalogue, but none of the underlying data is actually populated on the currently-
-active Apify discovery path -- adding them would require new paid calls, which is out of scope
-for this additive-only pass."""
+Deliberately NOT included in this pass (a real gap, not an oversight): funding recency and
+headcount-growth are both part of the hot-leads research catalogue, but that data comes from a
+Crustdata company-identify call the Apify discovery path deliberately does NOT make (a real,
+intentional cost-saving choice documented in `apify_discovery.py`'s own module docstring).
+Adding it means adding that paid call back in, per company -- a real new cost, out of scope for
+this additive-only pass."""
 
 from sqlalchemy.orm import Session
 
@@ -29,6 +36,7 @@ from app.db.models import Company
 
 HIRING_VELOCITY_THRESHOLD = 2
 PRODUCT_FIT_CATEGORY_THRESHOLD = 2
+FIRST_HIRE_ROLES = {"head_of_sales", "sdr", "ae"}
 
 PAIN_LANGUAGE_FIELDS = ["stated_needs", "implied_gaps", "recent_initiatives"]
 
@@ -42,6 +50,8 @@ def _company_signal_reasons(company: Company) -> list[str]:
     category_count = len(company.product_fit_jd_categories or [])
     if category_count >= PRODUCT_FIT_CATEGORY_THRESHOLD:
         reasons.append(f"{category_count} product-fit JD categories matched")
+    if company.hiring_signal_hire_type == "first_hire" and company.hiring_signal_role in FIRST_HIRE_ROLES:
+        reasons.append(f"first {company.hiring_signal_role.replace('_', ' ')} hire")
     return reasons
 
 

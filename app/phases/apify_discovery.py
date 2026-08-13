@@ -146,6 +146,7 @@ def run_apify_discovery(batch_id: int, db: Session, tenant_id: int, target: int 
             name=job.get("organization") or "Unknown",
             domain=domain,
             industry=job.get("org_linkedin_industry") or None,
+            employee_count=headcount,
             source="apify:fantastic-jobs_advanced-linkedin-job-search-api",
             active_job_title=title or None,
             product_fit_jd_categories=product_fit_categories or None,
@@ -153,6 +154,20 @@ def run_apify_discovery(batch_id: int, db: Session, tenant_id: int, target: int 
             hiring_signal_posting_count=domain_posting_counts.get(domain),
             tofu_keyword_found=TOFU_KEYWORD in description.lower(),
         )
+        db.add(company)
+        db.commit()
+        db.refresh(company)
+
+        # Team composition runs BEFORE hire-type classification (reordered 2026-08-14) --
+        # assess_team_composition persists sales_headcount_percent/marketing_headcount_percent
+        # as a free byproduct of its own paid calls, and _infer_hire_type() below needs those
+        # percentages to be real, not None, or it always falls back to "unknown".
+        team_fit = assess_team_composition(company, db)
+        if team_fit["tier"] == "excluded":
+            rejection_counts["full_team"] = rejection_counts.get("full_team", 0) + 1
+            db.delete(company)
+            db.commit()
+            continue
 
         if role:
             hire_type = _infer_hire_type(company, role)
@@ -164,17 +179,7 @@ def run_apify_discovery(batch_id: int, db: Session, tenant_id: int, target: int 
             company.hiring_signal_hire_type = hire_type
             company.hiring_signal_strength = strength
             company.hiring_signal_reasoning = reasoning
-
-        db.add(company)
-        db.commit()
-        db.refresh(company)
-
-        team_fit = assess_team_composition(company, db)
-        if team_fit["tier"] == "excluded":
-            rejection_counts["full_team"] = rejection_counts.get("full_team", 0) + 1
-            db.delete(company)
             db.commit()
-            continue
 
         seen_domains.add(domain)
         kept.append(company)
