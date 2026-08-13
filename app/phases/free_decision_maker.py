@@ -45,6 +45,12 @@ from app.phases.decision_maker import (
     SALES_LEADER_TITLE_KEYWORDS,
 )
 
+# Raised from 3 -> 7 (2026-08-12): confirmed live that a real, correct decision-maker can sit
+# outside the top 3 results -- KORONA POS's actual CEO (Till Freier) never appeared in a
+# 3-result search, only random other employees ranked by the actor's own prominence heuristic,
+# not name relevance. Cheap to widen (~$0.004/extra profile via Apify).
+PEOPLE_SEARCH_MAX_RESULTS = 7
+
 GOOGLE_LEADER_EXTRACTION_PROMPT = """The following is a Google AI Overview answering a \
 search for the founder/CEO of "{company_name}" ({domain}).
 
@@ -133,7 +139,7 @@ def _jobo_leadership_candidates(db: Session, tenant_id: int, company: Company) -
 def _resolve_linkedin_url(db: Session, tenant_id: int, first_name: str, last_name: str, company_name: str) -> str | None:
     try:
         api_key = _get_apify_api_key(db, tenant_id)
-        candidates = search_linkedin_people(api_key, first_name, last_name, company_name, max_results=3)
+        candidates = search_linkedin_people(api_key, first_name, last_name, company_name, max_results=PEOPLE_SEARCH_MAX_RESULTS)
     except ApifyError:
         return None
     for candidate in candidates:
@@ -159,7 +165,7 @@ def _resolve_linkedin_url_strict(db: Session, tenant_id: int, first_name: str, l
     Systems"), confirmed present on the same real results."""
     try:
         api_key = _get_apify_api_key(db, tenant_id)
-        candidates = search_linkedin_people(api_key, first_name, last_name, company_name, max_results=3)
+        candidates = search_linkedin_people(api_key, first_name, last_name, company_name, max_results=PEOPLE_SEARCH_MAX_RESULTS)
     except ApifyError:
         return None
     company_lower = company_name.strip().lower()
@@ -183,11 +189,21 @@ def _find_via_google_search(db: Session, tenant_id: int, company: Company) -> di
     docstring for why name-match alone isn't enough for this particular source."""
     if not company.domain:
         return None
+    query = f"{company.name} {company.domain} founder CEO"
     try:
         api_key = _get_apify_api_key(db, tenant_id)
-        content = search_google_ai_overview(api_key, f"{company.name} {company.domain} founder CEO")
+        content = search_google_ai_overview(api_key, query)
     except ApifyError:
         return None
+    if not content:
+        # Confirmed live (2026-08-12): Google's AI Overview is non-deterministic -- the exact
+        # same domain-qualified query returned nothing once, then a real, verifiable answer
+        # (Pitstop's Emmett Kilduff) shortly after. One retry catches this transient-empty
+        # class of miss for the cost of one extra query (~$0.0085).
+        try:
+            content = search_google_ai_overview(api_key, query)
+        except ApifyError:
+            return None
     if not content:
         return None
 
