@@ -432,6 +432,14 @@ class LinkedinMonitorSignal(Base):
     posted_at = Column(DateTime, nullable=True)
     matched_keywords = Column(JSON, nullable=True)
     tier = Column(String, nullable=True)
+    # LLM relevance screen (added 2026-08-13) -- a keyword match alone is noisy (e.g. the bare
+    # word "partnership" matches unrelated partner-marketing content); this is a second pass
+    # judging whether the post is ACTUALLY about AI SDR/sales-automation, not just containing
+    # the matched word. Every keyword-matched post is still stored and visible either way
+    # (never silently dropped) -- only the alert (Slack/notification) is gated on this.
+    relevance_score = Column(Integer, nullable=True)
+    recommended_action = Column(String, nullable=True)  # "engage" | "monitor" | "ignore"
+    classifier_reason = Column(Text, nullable=True)
     alerted_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 

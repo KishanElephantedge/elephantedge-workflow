@@ -11,13 +11,14 @@ profile checked -- `scrape_until` is set to each profile's own last-checked time
 with no new posts since the last sweep costs close to nothing.
 
 Keyword taxonomy provided by the user (sourced from a colleague's ChatGPT research,
-2026-08-12) -- deliberately simple substring matching for v1, not an LLM relevance classifier.
-The colleague's research recommended an AI classifier (to catch paraphrases like "the SDR as
-we knew it is disappearing" without keyword "AI SDR") and to reject false positives like "We're
-hiring an SDR" -- worth adding as a second pass once the keyword version is proven live, not
-before, per the same lesson learned on decision-maker verification: an LLM layer with no
-evidence discipline can produce dangerous false positives, so it needs to be built and tested
-deliberately, not bolted on speculatively."""
+2026-08-12) -- simple substring matching finds candidates, then an LLM relevance screen
+(added 2026-08-13, after a real confirmed false positive live: a Tier 4 "partnership" keyword
+matched a post about evaluating business partnerships in general, nothing to do with AI SDR)
+judges whether the post is ACTUALLY about AI SDR/sales-automation before anything gets
+alerted. Every keyword match is still stored either way (never silently dropped, same
+never-delete-just-flag pattern as scoring/verification elsewhere in this codebase) -- only the
+Slack/notification alert is gated on the classifier's judgment, so a human can always audit
+what got filtered and why via the Targets tab."""
 
 from datetime import datetime, timedelta
 
@@ -26,6 +27,7 @@ from sqlalchemy.orm import Session
 from app.apify_client import ApifyError, search_linkedin_posts
 from app.apify_client import _get_api_key as _get_apify_api_key
 from app.db.models import LinkedinMonitorProfile, LinkedinMonitorSignal, Parameter
+from app.llm_client import generate_json
 from app.notifications import create_notification
 from app.slack_client import SlackError, send_slack_message
 
@@ -105,6 +107,46 @@ def match_keywords(text: str, keyword_tiers: dict[str, list[str]]) -> list[tuple
             if keyword.lower() in text_lower:
                 hits.append((tier, keyword))
     return hits
+
+
+RELEVANCE_PROMPT = """You are screening a LinkedIn post for Elephant Edge, a company that \
+builds AI SDR / autonomous outbound sales systems. This post was flagged because it contains \
+the keyword(s): {keywords} (taxonomy tier: {tier}). A keyword match alone is not enough --\
+common words like "partnership" or "product launch" show up constantly in posts that have \
+nothing to do with AI SDR or sales automation (confirmed real case: a post literally titled \
+"partnership advice" about evaluating business partners in general, unrelated to AI or sales \
+tooling, matched purely on the word "partnership").
+
+Post text:
+\"\"\"{post_text}\"\"\"
+
+Judge whether this post is GENUINELY about AI SDRs, autonomous/automated sales, sales \
+workflow or GTM automation, or a competing product/company in this exact space -- not just \
+using one of the matched words in an unrelated context.
+
+Return JSON exactly:
+{{"relevance_score": <0-100 integer>, "recommended_action": "engage" | "monitor" | "ignore", "reason": "<one sentence>"}}
+
+- "engage": directly relevant, worth a human response or engagement angle right now
+- "monitor": tangentially relevant, worth knowing about but not urgent
+- "ignore": not actually relevant -- matched on keyword text alone, wrong topic"""
+
+
+def classify_relevance(post_text: str, matched_keywords: list[str], tier: str, db: Session, tenant_id: int) -> dict:
+    """Second pass after a keyword match -- returns {relevance_score, recommended_action,
+    reason}. Falls back to "monitor" (never silently drops a real match) if the LLM call
+    itself fails, since a classifier outage must never be indistinguishable from "confirmed
+    irrelevant"."""
+    try:
+        result = generate_json(
+            RELEVANCE_PROMPT.format(keywords=", ".join(matched_keywords), tier=tier, post_text=(post_text or "")[:2000]),
+            db, tenant_id, max_tokens=200,
+        )
+        if "recommended_action" not in result:
+            raise ValueError("missing recommended_action")
+        return result
+    except Exception as e:
+        return {"relevance_score": None, "recommended_action": "monitor", "reason": f"classifier unavailable: {e}"}
 
 
 def _format_slack_alert(profile: LinkedinMonitorProfile, post: dict, hits: list[tuple[str, str]]) -> str:
@@ -188,29 +230,39 @@ def run_linkedin_monitor_sweep(db: Session, tenant_id: int) -> dict:
                 except ValueError:
                     pass
 
+            matched_kw = [kw for _, kw in hits]
+            tier = min({t for t, _ in hits})  # most senior (lowest tier number) wins
+            classification = classify_relevance(post.get("text") or "", matched_kw, tier, db, tenant_id)
+
             signal = LinkedinMonitorSignal(
                 tenant_id=tenant_id, profile_id=profile.id, post_urn=urn,
                 post_url=post.get("url"), post_text=post.get("text"),
                 author_name=post.get("authorName"), posted_at=posted_at,
-                matched_keywords=[kw for _, kw in hits],
-                tier=min({tier for tier, _ in hits}),  # most senior (lowest tier number) wins
+                matched_keywords=matched_kw, tier=tier,
+                relevance_score=classification.get("relevance_score"),
+                recommended_action=classification.get("recommended_action"),
+                classifier_reason=classification.get("reason"),
             )
             db.add(signal)
             db.commit()
             signals_found += 1
 
-            try:
-                send_slack_message(_format_slack_alert(profile, post, hits), db, tenant_id)
-                signal.alerted_at = datetime.utcnow()
-                db.commit()
-            except SlackError:
-                pass
-            create_notification(
-                db, tenant_id, "linkedin_signal",
-                f"GTM signal: {profile.name or profile.linkedin_url}",
-                f"Matched {', '.join(sorted({kw for _, kw in hits}))} -- {post.get('url') or ''}",
-                severity="info",
-            )
+            # Only "ignore" is confirmed-irrelevant -- both "engage" and "monitor" (plus the
+            # classifier-unavailable fallback, which defaults to "monitor") still alert, since
+            # missing a real signal is worse than one extra notification.
+            if classification.get("recommended_action") != "ignore":
+                try:
+                    send_slack_message(_format_slack_alert(profile, post, hits), db, tenant_id)
+                    signal.alerted_at = datetime.utcnow()
+                    db.commit()
+                except SlackError:
+                    pass
+                create_notification(
+                    db, tenant_id, "linkedin_signal",
+                    f"GTM signal: {profile.name or profile.linkedin_url}",
+                    f"Matched {', '.join(sorted(set(matched_kw)))} -- {post.get('url') or ''}",
+                    severity="info",
+                )
 
         for profile in batch:
             profile.last_checked_at = now

@@ -3040,6 +3040,8 @@ def list_linkedin_monitor_signals(limit: int = 50, db: Session = Depends(get_db)
             "id": s.id, "profile_id": s.profile_id, "profile_name": s.profile.name if s.profile else None,
             "post_url": s.post_url, "post_text": s.post_text, "author_name": s.author_name,
             "posted_at": s.posted_at, "matched_keywords": s.matched_keywords, "tier": s.tier,
+            "relevance_score": s.relevance_score, "recommended_action": s.recommended_action,
+            "classifier_reason": s.classifier_reason,
             "alerted_at": s.alerted_at, "created_at": s.created_at,
         }
         for s in signals

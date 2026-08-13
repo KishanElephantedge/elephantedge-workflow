@@ -158,3 +158,6 @@ def ensure_indexes():
             )
         """))
         conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ix_linkedin_monitor_signals_profile_urn ON linkedin_monitor_signals (profile_id, post_urn)"))
+        conn.execute(text("ALTER TABLE linkedin_monitor_signals ADD COLUMN IF NOT EXISTS relevance_score INTEGER"))
+        conn.execute(text("ALTER TABLE linkedin_monitor_signals ADD COLUMN IF NOT EXISTS recommended_action VARCHAR"))
+        conn.execute(text("ALTER TABLE linkedin_monitor_signals ADD COLUMN IF NOT EXISTS classifier_reason TEXT"))
