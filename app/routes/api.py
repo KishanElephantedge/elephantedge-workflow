@@ -1195,6 +1195,17 @@ def list_smartlead_campaign_leads_route(campaign_id: int, db: Session = Depends(
     return {"total": int(result.get("total_leads") or 0), "leads": leads}
 
 
+@router.get("/_scratch/deepline-monitors-status")
+def _scratch_deepline_monitors_status():
+    from app.deepline_client import _run_deepline_cli
+    from app.config import settings
+    try:
+        result = _run_deepline_cli([settings.deepline_cli_path, "monitors", "status", "--json"], timeout_seconds=30)
+    except Exception as e:
+        return {"error": str(e)}
+    return {"returncode": result.returncode, "stdout": result.stdout[:3000], "stderr": result.stderr[:1000]}
+
+
 @router.get("/overview/stats")
 def get_overview_stats(start_date: str | None = None, end_date: str | None = None, db: Session = Depends(get_db)):
     """The full funnel, not just the outreach half of it -- /leads/stats (above) only covers
