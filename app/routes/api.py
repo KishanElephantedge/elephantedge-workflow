@@ -908,6 +908,9 @@ def list_companies(page: int = 1, page_size: int = 25, search: str = "", qualifi
         query = query.filter(or_(Company.name.ilike(like), Company.domain.ilike(like), Company.industry.ilike(like)))
 
     companies = query.order_by(Company.created_at.desc()).all()
+    # Hot leads float to the top of this same list -- no separate tab/filter (per explicit
+    # instruction). Stable sort keeps created_at-desc ordering within each group.
+    companies.sort(key=lambda c: not c.hot_lead)
 
     if qualified == "true":
         companies = [c for c in companies if _is_company_qualified(c)]
@@ -938,6 +941,8 @@ def list_companies(page: int = 1, page_size: int = 25, search: str = "", qualifi
                 "team_fit_tier": c.team_fit_tier,
                 "linkedin_url": c.linkedin_url,
                 "created_at": c.created_at,
+                "hot_lead": c.hot_lead,
+                "hot_lead_reasoning": c.hot_lead_reasoning,
             }
             for c in page_items
         ],

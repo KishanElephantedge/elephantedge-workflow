@@ -104,6 +104,13 @@ class Company(Base):
     team_fit_tier = Column(String, nullable=True)
     team_fit_reasoning = Column(Text, nullable=True)
 
+    # Hot-lead tagging (added 2026-08-13) -- additive only, never a qualification gate; see
+    # app/phases/hot_leads.py for the full signal logic and reasoning behind each field.
+    hiring_signal_posting_count = Column(Integer, nullable=True)  # how many qualifying postings this company had open at once, not just the one kept
+    tofu_keyword_found = Column(Boolean, nullable=True)  # JD contains "top of the funnel pipeline generation" (Signal Framework v2)
+    hot_lead = Column(Boolean, nullable=True)
+    hot_lead_reasoning = Column(Text, nullable=True)
+
     batch = relationship("Batch", back_populates="companies")
     signals = relationship("Signal", back_populates="company", cascade="all, delete-orphan")
     score = relationship("Score", back_populates="company", uselist=False, cascade="all, delete-orphan")

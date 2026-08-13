@@ -161,3 +161,7 @@ def ensure_indexes():
         conn.execute(text("ALTER TABLE linkedin_monitor_signals ADD COLUMN IF NOT EXISTS relevance_score INTEGER"))
         conn.execute(text("ALTER TABLE linkedin_monitor_signals ADD COLUMN IF NOT EXISTS recommended_action VARCHAR"))
         conn.execute(text("ALTER TABLE linkedin_monitor_signals ADD COLUMN IF NOT EXISTS classifier_reason TEXT"))
+        conn.execute(text("ALTER TABLE companies ADD COLUMN IF NOT EXISTS hiring_signal_posting_count INTEGER"))
+        conn.execute(text("ALTER TABLE companies ADD COLUMN IF NOT EXISTS tofu_keyword_found BOOLEAN"))
+        conn.execute(text("ALTER TABLE companies ADD COLUMN IF NOT EXISTS hot_lead BOOLEAN"))
+        conn.execute(text("ALTER TABLE companies ADD COLUMN IF NOT EXISTS hot_lead_reasoning TEXT"))

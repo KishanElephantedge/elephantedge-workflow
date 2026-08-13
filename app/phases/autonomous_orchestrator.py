@@ -26,6 +26,7 @@ from app.phases.buying_signal import run_buying_signal_check
 from app.phases.campaign_execution import run_campaign_execution
 from app.phases.decision_maker import run_decision_maker_id
 from app.phases.discovery import run_discovery
+from app.phases.hot_leads import apply_hot_lead_tags
 from app.phases.personalized_outreach import generate_personalized_message
 from app.phases.scoring import run_scoring
 from app.phases.tech_stack import run_tech_stack_check
@@ -647,6 +648,7 @@ def _run_jobo_autonomous_cycle(batch: Batch, run: AutonomousRun, db: Session, te
     # successful run status -- see the deepline branch above for the full explanation.
     try:
         messages = _generate_messages_for_batch(batch.id, db, tenant_id)
+        apply_hot_lead_tags(batch.id, db)
         notification_error = _send_approval_notification(batch, run, decision_maker_result, db, tenant_id, messages=messages)
     except Exception as e:
         notification_error = f"message generation/notification step failed: {e}"
@@ -747,6 +749,7 @@ def _run_jd_first_autonomous_cycle(batch: Batch, run: AutonomousRun, db: Session
     # jd_first run to "failed" after the fact).
     try:
         messages = _generate_messages_for_batch(batch.id, db, tenant_id)
+        apply_hot_lead_tags(batch.id, db)
         notification_error = _send_approval_notification(batch, run, decision_maker_result, db, tenant_id, messages=messages)
     except Exception as e:
         notification_error = f"message generation/notification step failed: {e}"
@@ -856,6 +859,7 @@ def _run_apify_autonomous_cycle(batch: Batch, run: AutonomousRun, db: Session, t
     # explanation.
     try:
         messages = _generate_messages_for_batch(batch.id, db, tenant_id)
+        apply_hot_lead_tags(batch.id, db)
         notification_error = _send_approval_notification(batch, run, decision_maker_result, db, tenant_id, messages=messages)
     except Exception as e:
         notification_error = f"message generation/notification step failed: {e}"

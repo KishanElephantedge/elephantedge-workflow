@@ -99,6 +99,19 @@ def run_apify_discovery(batch_id: int, db: Session, tenant_id: int, target: int 
             "budget_stopped_early": False, "api_error": str(e), "estimated_cost_usd": 0.0,
         }
 
+    # Hiring velocity (added 2026-08-13, Signal Framework v2's advisor-recommended top signal):
+    # how many qualifying postings a company has open AT ONCE in this same pull, not just the
+    # one posting that gets kept per company below. Free -- `jobs` already holds every posting
+    # from this single Apify call in memory; this just counts before the per-domain dedup loop
+    # discards the rest.
+    domain_posting_counts: dict[str, int] = {}
+    for job in jobs:
+        domain = _normalize_domain(job.get("org_linkedin_website") or "")
+        if not domain:
+            continue
+        if _classify_role(job.get("title") or "") or _detect_product_fit_signals(job.get("description_text") or ""):
+            domain_posting_counts[domain] = domain_posting_counts.get(domain, 0) + 1
+
     seen_this_run: set[str] = set()
     kept: list[Company] = []
     rejection_counts: dict[str, int] = {}
@@ -137,6 +150,8 @@ def run_apify_discovery(batch_id: int, db: Session, tenant_id: int, target: int 
             active_job_title=title or None,
             product_fit_jd_categories=product_fit_categories or None,
             linkedin_url=job.get("organization_url") or None,
+            hiring_signal_posting_count=domain_posting_counts.get(domain),
+            tofu_keyword_found=TOFU_KEYWORD in description.lower(),
         )
 
         if role:
