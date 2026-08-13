@@ -112,11 +112,34 @@ def run_reverse_discovery_sweep(db: Session, tenant_id: int) -> dict:
                 # never dropped, only ones the classifier is confident are off-topic.
                 continue
 
+            author_profile_url = post.get("authorProfileUrl") or ""
+            if "/company/" in author_profile_url:
+                # Confirmed live (2026-08-14): roughly 40% of keyword-search hits are vendor/
+                # marketing brand pages (e.g. AI-SDR-tool companies promoting their own
+                # product), not individuals organically discussing the topic -- not the
+                # self-declared-interest signal this mode exists to find. Real noise, not a
+                # borderline case, so this one IS dropped rather than stored as "unknown".
+                continue
+
             author = post.get("author") or {}
             author_name = post.get("authorName") or " ".join(filter(None, [author.get("firstName"), author.get("lastName")])).strip()
             occupation = author.get("occupation") or ""
-            company_name = _guess_company_name(occupation)
 
+            # Confirmed live: `occupation` is empty on search-RESULT posts (this actor only
+            # populates it when scraping a profile's own activity, not a search-results page)
+            # -- so a second, targeted call directly against the author's profile URL is
+            # needed to get real occupation/company text. Small, bounded cost: only for
+            # candidates that already passed the relevance filter above, never the raw search
+            # volume.
+            if not occupation and author_profile_url:
+                try:
+                    own_posts = search_linkedin_posts(api_key, [author_profile_url], limit_per_source=1)
+                    if own_posts:
+                        occupation = ((own_posts[0].get("author") or {}).get("occupation")) or ""
+                except ApifyError:
+                    pass
+
+            company_name = _guess_company_name(occupation)
             if company_name:
                 icp_status, icp_reasoning = check_icp_floor(company_name, db, tenant_id)
             else:
