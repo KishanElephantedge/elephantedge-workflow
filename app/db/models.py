@@ -451,3 +451,30 @@ class LinkedinMonitorSignal(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
     profile = relationship("LinkedinMonitorProfile")
+
+
+class ReverseDiscoveryCandidate(Base):
+    """Mode B from the hot-leads research (app/phases/reverse_discovery.py) -- a person found
+    via a broad LinkedIn keyword search (not a known watch-list) publicly discussing/exploring
+    AI SDR / autonomous sales themselves, with no job posting involved. Kept as its own table
+    and its own dashboard tab, deliberately separate from linkedin_monitor_* (which watches
+    KNOWN competitor/partner profiles) -- different mechanism, different purpose."""
+    __tablename__ = "reverse_discovery_candidates"
+
+    id = Column(Integer, primary_key=True)
+    tenant_id = Column(Integer, nullable=False)
+    post_urn = Column(String, nullable=False)
+    post_url = Column(String, nullable=True)
+    post_text = Column(Text, nullable=True)
+    matched_keyword = Column(String, nullable=True)
+    author_name = Column(String, nullable=True)
+    author_profile_url = Column(String, nullable=True)
+    author_occupation = Column(String, nullable=True)
+    guessed_company_name = Column(String, nullable=True)
+    relevance_score = Column(Integer, nullable=True)
+    recommended_action = Column(String, nullable=True)
+    classifier_reason = Column(Text, nullable=True)
+    icp_status = Column(String, nullable=True)  # "qualified" | "rejected" | "unknown"
+    icp_reasoning = Column(Text, nullable=True)
+    posted_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)

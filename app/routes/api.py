@@ -12,7 +12,7 @@ from sqlalchemy import func, or_
 
 from app.cache import active_keys, bump_batch_version, cache_get, cache_set, get_batch_version, mark_active
 from app.claude_client import ClaudeError, call_claude_messages
-from app.db.models import AutonomousRun, Batch, CalendarBooking, CampaignEvent, CampaignPush, ChatConversation, ChatMessage, Company, Contact, Credential, DailyReview, LinkedinMonitorProfile, LinkedinMonitorSignal, Notification, Parameter, PersonalizedMessage, ReviewComment, Score
+from app.db.models import AutonomousRun, Batch, CalendarBooking, CampaignEvent, CampaignPush, ChatConversation, ChatMessage, Company, Contact, Credential, DailyReview, LinkedinMonitorProfile, LinkedinMonitorSignal, Notification, Parameter, PersonalizedMessage, ReverseDiscoveryCandidate, ReviewComment, Score
 from app.notifications import delete_expired_notifications
 from app.google_calendar_client import GoogleCalendarError
 from app.phases.hiring_signal import has_qualifying_hiring_signal
@@ -3059,6 +3059,32 @@ def trigger_linkedin_monitor_sweep(db: Session = Depends(get_db)):
     this lets a test post be checked immediately instead of waiting for the next tick."""
     from app.phases.linkedin_monitor import run_linkedin_monitor_sweep
     return run_linkedin_monitor_sweep(db, ELEPHANT_EDGE_TENANT_ID)
+
+
+@router.get("/reverse-discovery/candidates")
+def list_reverse_discovery_candidates(icp_status: str = "", limit: int = 100, db: Session = Depends(get_db)):
+    query = db.query(ReverseDiscoveryCandidate).filter(ReverseDiscoveryCandidate.tenant_id == ELEPHANT_EDGE_TENANT_ID)
+    if icp_status:
+        query = query.filter(ReverseDiscoveryCandidate.icp_status == icp_status)
+    candidates = query.order_by(ReverseDiscoveryCandidate.id.desc()).limit(limit).all()
+    return [
+        {
+            "id": c.id, "post_url": c.post_url, "post_text": c.post_text, "matched_keyword": c.matched_keyword,
+            "author_name": c.author_name, "author_profile_url": c.author_profile_url,
+            "author_occupation": c.author_occupation, "guessed_company_name": c.guessed_company_name,
+            "relevance_score": c.relevance_score, "recommended_action": c.recommended_action,
+            "classifier_reason": c.classifier_reason, "icp_status": c.icp_status, "icp_reasoning": c.icp_reasoning,
+            "posted_at": c.posted_at, "created_at": c.created_at,
+        }
+        for c in candidates
+    ]
+
+
+@router.post("/reverse-discovery/sweep")
+def trigger_reverse_discovery_sweep(db: Session = Depends(get_db)):
+    """Manual trigger for testing -- not yet on a schedule (see Mode B build notes)."""
+    from app.phases.reverse_discovery import run_reverse_discovery_sweep
+    return run_reverse_discovery_sweep(db, ELEPHANT_EDGE_TENANT_ID)
 
 
 @router.post("/linkedin-monitor/backfill-names")

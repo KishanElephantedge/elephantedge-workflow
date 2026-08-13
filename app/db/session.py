@@ -165,3 +165,25 @@ def ensure_indexes():
         conn.execute(text("ALTER TABLE companies ADD COLUMN IF NOT EXISTS tofu_keyword_found BOOLEAN"))
         conn.execute(text("ALTER TABLE companies ADD COLUMN IF NOT EXISTS hot_lead BOOLEAN"))
         conn.execute(text("ALTER TABLE companies ADD COLUMN IF NOT EXISTS hot_lead_reasoning TEXT"))
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS reverse_discovery_candidates (
+                id SERIAL PRIMARY KEY,
+                tenant_id INTEGER NOT NULL,
+                post_urn VARCHAR NOT NULL,
+                post_url VARCHAR,
+                post_text TEXT,
+                matched_keyword VARCHAR,
+                author_name VARCHAR,
+                author_profile_url VARCHAR,
+                author_occupation VARCHAR,
+                guessed_company_name VARCHAR,
+                relevance_score INTEGER,
+                recommended_action VARCHAR,
+                classifier_reason TEXT,
+                icp_status VARCHAR,
+                icp_reasoning TEXT,
+                posted_at TIMESTAMP,
+                created_at TIMESTAMP
+            )
+        """))
+        conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ix_reverse_discovery_candidates_tenant_urn ON reverse_discovery_candidates (tenant_id, post_urn)"))
