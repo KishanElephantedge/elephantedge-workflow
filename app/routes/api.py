@@ -1195,6 +1195,26 @@ def list_smartlead_campaign_leads_route(campaign_id: int, db: Session = Depends(
     return {"total": int(result.get("total_leads") or 0), "leads": leads}
 
 
+@router.post("/_scratch/classify-unclassified-signals")
+def _scratch_classify_unclassified_signals(db: Session = Depends(get_db)):
+    from app.phases.linkedin_monitor import classify_relevance
+    signals = (
+        db.query(LinkedinMonitorSignal)
+        .filter(LinkedinMonitorSignal.tenant_id == ELEPHANT_EDGE_TENANT_ID)
+        .filter(LinkedinMonitorSignal.recommended_action.is_(None))
+        .all()
+    )
+    updated = []
+    for s in signals:
+        c = classify_relevance(s.post_text or "", s.matched_keywords or [], s.tier or "", db, ELEPHANT_EDGE_TENANT_ID)
+        s.relevance_score = c.get("relevance_score")
+        s.recommended_action = c.get("recommended_action")
+        s.classifier_reason = c.get("reason")
+        updated.append({"id": s.id, **c})
+    db.commit()
+    return {"updated": updated}
+
+
 @router.get("/overview/stats")
 def get_overview_stats(start_date: str | None = None, end_date: str | None = None, db: Session = Depends(get_db)):
     """The full funnel, not just the outreach half of it -- /leads/stats (above) only covers
