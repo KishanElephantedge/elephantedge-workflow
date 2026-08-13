@@ -1195,6 +1195,17 @@ def list_smartlead_campaign_leads_route(campaign_id: int, db: Session = Depends(
     return {"total": int(result.get("total_leads") or 0), "leads": leads}
 
 
+@router.get("/_scratch/test-linkedin-post-scrape")
+def _scratch_test_linkedin_post_scrape(url: str, db: Session = Depends(get_db)):
+    from app.apify_client import _get_api_key, search_linkedin_posts
+    api_key = _get_api_key(db, ELEPHANT_EDGE_TENANT_ID)
+    try:
+        posts = search_linkedin_posts(api_key, [url], limit_per_source=5)
+    except Exception as e:
+        return {"error": str(e)}
+    return {"count": len(posts), "posts": posts}
+
+
 @router.get("/overview/stats")
 def get_overview_stats(start_date: str | None = None, end_date: str | None = None, db: Session = Depends(get_db)):
     """The full funnel, not just the outreach half of it -- /leads/stats (above) only covers

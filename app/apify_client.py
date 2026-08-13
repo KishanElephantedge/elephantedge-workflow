@@ -123,6 +123,34 @@ PEOPLE_SEARCH_COST_PER_START_USD = 0.005
 PEOPLE_SEARCH_COST_PER_PROFILE_USD = 0.004
 
 
+# supreme_coder/linkedin-post -- Deepline's own currently-recommended actor for generic
+# LinkedIn post scraping (per its provider playbook, 2026-08). Pay-per-event: ~$2/1000 posts
+# scraped ($0.002/post), NOT billed per API call/profile checked -- confirmed via the actor's
+# own Store listing. This matters for polling: a profile with no new posts since the last
+# check should cost close to nothing, not a flat per-check fee, since `scrapeUntil` filters
+# server-side before billing.
+LINKEDIN_POST_ACTOR_ID = "supreme_coder~linkedin-post"
+LINKEDIN_POST_COST_PER_POST_USD = 0.002
+
+
+def search_linkedin_posts(api_key: str, profile_urls: list[str], scrape_until: str | None = None, limit_per_source: int = 5) -> list[dict]:
+    """Returns recent posts for each given LinkedIn profile/company/post URL. scrape_until
+    (ISO date string) filters to posts newer than that date -- pass the last time this profile
+    was checked to avoid re-billing for posts already seen."""
+    payload = {"urls": profile_urls, "limitPerSource": limit_per_source, "deepScrape": False}
+    if scrape_until:
+        payload["scrapeUntil"] = scrape_until
+    response = httpx.post(
+        f"{BASE_URL}/acts/{LINKEDIN_POST_ACTOR_ID}/run-sync-get-dataset-items",
+        params={"token": api_key},
+        json=payload,
+        timeout=120,
+    )
+    if response.status_code >= 300:
+        raise ApifyError(f"LinkedIn post search failed ({response.status_code}): {response.text[:500]}")
+    return response.json()
+
+
 def search_linkedin_people(api_key: str, first_name: str, last_name: str, company: str, max_results: int = 3) -> list[dict]:
     payload = {
         "mode": "public",
