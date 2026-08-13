@@ -7,6 +7,7 @@ from app.db.session import SessionLocal, ensure_indexes
 from app.google_calendar_client import GoogleCalendarError
 from app.phases.autonomous_orchestrator import get_autonomous_schedule_utc, resume_pending_approvals, run_daily_autonomous_cycle
 from app.phases.calendar_sync import sync_calendar_bookings
+from app.phases.linkedin_monitor import run_linkedin_monitor_sweep
 from app.routes import api
 from app.routes.api import ELEPHANT_EDGE_TENANT_ID, refresh_active_batch_caches
 
@@ -77,6 +78,17 @@ def _scheduled_calendar_sync():
         db.close()
 
 
+def _scheduled_linkedin_monitor_sweep():
+    """Runs every 45 minutes -- checks every active monitored profile for new posts since its
+    own last check, keyword-matches, and alerts on a hit. See app/phases/linkedin_monitor.py
+    for the full design (batched Apify calls, cost model, why this isn't Deepline Monitors)."""
+    db = SessionLocal()
+    try:
+        run_linkedin_monitor_sweep(db, tenant_id=ELEPHANT_EDGE_TENANT_ID)
+    finally:
+        db.close()
+
+
 AUTONOMOUS_MISFIRE_GRACE_SECONDS = 7200
 
 
@@ -117,6 +129,7 @@ def on_startup():
     scheduler.add_job(_scheduled_approval_sweep, "interval", minutes=5, id="approval_window_sweep")
     scheduler.add_job(_scheduled_cache_refresh, "interval", minutes=3, id="batch_cache_refresh")
     scheduler.add_job(_scheduled_calendar_sync, "interval", minutes=15, id="calendar_booking_sync")
+    scheduler.add_job(_scheduled_linkedin_monitor_sweep, "interval", minutes=45, id="linkedin_monitor_sweep")
     scheduler.start()
 
 
