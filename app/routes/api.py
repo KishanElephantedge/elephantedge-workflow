@@ -1200,19 +1200,6 @@ def list_smartlead_campaign_leads_route(campaign_id: int, db: Session = Depends(
     return {"total": int(result.get("total_leads") or 0), "leads": leads}
 
 
-@router.get("/_scratch/reverse-discovery-raw")
-def _scratch_reverse_discovery_raw(keyword: str = "AI SDR", db: Session = Depends(get_db)):
-    from app.apify_client import _get_api_key, search_linkedin_posts
-    from app.phases.reverse_discovery import _build_search_url
-    api_key = _get_api_key(db, ELEPHANT_EDGE_TENANT_ID)
-    url = _build_search_url(keyword)
-    try:
-        posts = search_linkedin_posts(api_key, [url], limit_per_source=10)
-    except Exception as e:
-        return {"url": url, "error": str(e)}
-    return {"url": url, "count": len(posts), "sample": posts[:2]}
-
-
 @router.get("/overview/stats")
 def get_overview_stats(start_date: str | None = None, end_date: str | None = None, db: Session = Depends(get_db)):
     """The full funnel, not just the outreach half of it -- /leads/stats (above) only covers
