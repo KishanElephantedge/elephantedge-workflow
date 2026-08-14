@@ -28,11 +28,12 @@ from urllib.parse import quote
 import httpx
 from sqlalchemy.orm import Session
 
-from app.apify_client import ApifyError, search_linkedin_posts
+from app.apify_client import ApifyError, search_google_ai_overview, search_linkedin_posts
 from app.apify_client import _get_api_key as _get_apify_api_key
 from app.db.models import ReverseDiscoveryCandidate
 from app.jobo_client import JoboError, find_company_id_by_name, get_company_profile
 from app.jobo_client import _get_api_key as _get_jobo_api_key
+from app.llm_client import generate_json
 from app.phases.linkedin_monitor import classify_relevance, get_keyword_tiers
 
 # Only the sharpest tier -- a broad public search needs tight keywords, unlike the Targets
@@ -54,28 +55,78 @@ def _guess_company_name(occupation: str) -> str | None:
     return None
 
 
+GOOGLE_ICP_FLOOR_PROMPT = """The following is a Google AI Overview answering a search about \
+the company "{company_name}".
+
+AI Overview text:
+{text}
+
+Based ONLY on what this text actually states or clearly implies (never guess or use outside \
+knowledge), determine:
+1. Is this company headquartered in the United States?
+2. Approximately how many employees does it have?
+
+If the text is clearly about a different company that just shares a similar name, or doesn't \
+give enough information to answer confidently, say so rather than guessing.
+
+Return JSON exactly:
+{{"confident_same_company": true/false, "is_us_based": true/false/null, "employee_count_estimate": <integer or null>, "reasoning": "one sentence"}}"""
+
+
+def _check_icp_floor_via_google(company_name: str, db: Session, tenant_id: int) -> tuple[str, str]:
+    """Fallback for when Jobo has no data (the common case -- Jobo's index covers only a
+    fraction of real companies). Real added cost per call (~$0.0085 Google search + a tiny LLM
+    call), only ever run on candidates Jobo already couldn't answer, never on the raw search
+    volume."""
+    try:
+        api_key = _get_apify_api_key(db, tenant_id)
+        content = search_google_ai_overview(api_key, f"{company_name} company headquarters location number of employees")
+    except ApifyError:
+        return "unknown", "Google search failed"
+    if not content:
+        return "unknown", "no Google AI Overview for this company"
+    try:
+        extracted = generate_json(GOOGLE_ICP_FLOOR_PROMPT.format(company_name=company_name, text=content), db, tenant_id, max_tokens=200)
+    except Exception as e:
+        return "unknown", f"classifier failed: {e}"
+    if not extracted.get("confident_same_company"):
+        return "unknown", "Google result not confidently about this exact company"
+
+    is_us = extracted.get("is_us_based")
+    count = extracted.get("employee_count_estimate")
+    reasoning = extracted.get("reasoning") or ""
+    if is_us is False:
+        return "rejected", f"not US-based per Google ({reasoning})"
+    if count is not None and not (8 <= count <= 55):
+        return "rejected", f"~{count} employees per Google, outside 11-50 range ({reasoning})"
+    if is_us and count is not None:
+        return "qualified", f"US-based, ~{count} employees per Google ({reasoning})"
+    return "unknown", f"Google didn't confirm both floors ({reasoning})"
+
+
 def check_icp_floor(company_name: str, db: Session, tenant_id: int) -> tuple[str, str]:
     """Only the two floors the user confirmed -- US-based AND 11-50 employees, nothing
     stricter. Returns (status, reasoning); status is "qualified"/"rejected"/"unknown".
-    "unknown" (not rejected) when Jobo has no data for this company -- Jobo's own index is
-    known to cover only a fraction of real companies (~11% per prior findings), so most
-    candidates will land here, and that's surfaced for manual review, never silently dropped."""
+    Tries Jobo first (free); if Jobo has no data (the common case -- its index covers only a
+    fraction of real companies, ~11% per prior findings), falls back to a Google AI Overview
+    lookup before giving up. "unknown" only when neither source can answer -- never silently
+    dropped, always surfaced for manual review."""
     try:
         api_key = _get_jobo_api_key(db, tenant_id)
         with httpx.Client() as client:
             company_id = find_company_id_by_name(client, api_key, company_name)
-            if not company_id:
-                return "unknown", "no Jobo match for this company name"
-            profile = get_company_profile(client, company_id)
+            profile = get_company_profile(client, company_id) if company_id else None
     except (httpx.HTTPError, JoboError):
-        return "unknown", "Jobo lookup failed"
-    if not profile:
-        return "unknown", "no Jobo profile data"
-    if profile.get("country_code") != "US":
-        return "rejected", f"not US (country_code={profile.get('country_code')!r})"
-    if profile.get("company_size") != ICP_TARGET_EMPLOYEE_SIZE:
-        return "rejected", f"employee size {profile.get('company_size')!r}, not {ICP_TARGET_EMPLOYEE_SIZE}"
-    return "qualified", "US-based, 11-50 employees"
+        profile = None
+
+    if profile:
+        if profile.get("country_code") != "US":
+            return "rejected", f"not US (country_code={profile.get('country_code')!r})"
+        if profile.get("company_size") != ICP_TARGET_EMPLOYEE_SIZE:
+            return "rejected", f"employee size {profile.get('company_size')!r}, not {ICP_TARGET_EMPLOYEE_SIZE}"
+        return "qualified", "US-based, 11-50 employees (Jobo)"
+
+    return _check_icp_floor_via_google(company_name, db, tenant_id)
 
 
 def run_reverse_discovery_sweep(db: Session, tenant_id: int) -> dict:
