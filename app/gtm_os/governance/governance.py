@@ -1,0 +1,360 @@
+"""GTM Governance Readout -- Batch 14. Pure, read-only, tenant-scoped aggregation. Every number
+in evaluate_gtm_governance() comes from calling an already-existing sweep/eval function verbatim,
+or a single direct COUNT query over an already-existing column -- nothing here recomputes a
+decision another module owns, and nothing here is persisted.
+
+REUSED VERBATIM (no reimplementation, no second version of any metric):
+    run_account_agent_sweep()          (Batch 12) -- account_distribution + the pipeline funnel's
+                                                       cumulative company-state counts
+    run_offering_matching_sweep()      (Batch 9)  -- offering_matched pipeline stage
+    run_gtm_motion_sweep()             (Batch 10) -- motion_ready pipeline stage
+    run_execution_readiness_sweep()    (Batch 13) -- execution_readiness + message-lifecycle
+                                                       pipeline stages
+    evaluate_learning_readout()        (Batch 7)  -- learning section, verbatim
+    run_trend_intelligence_sweep()     (Batch 6)  -- market_intelligence trend-state distribution
+    run_market_account_context_sweep() (Batch 11) -- market_intelligence account-bridge coverage
+    get_offering_config() / get_gtm_motion_config() / get_business_context() -- read directly to
+        surface already-known configuration gaps (e.g. offering_config's own "no applicable_icps"
+        marker, gtm_motion_config's own "no applicable_icps/offerings" marker) -- never a second
+        config system, just reading what each already stores.
+
+PIPELINE FUNNEL (Part 3): built by taking run_account_agent_sweep()'s own mutually-exclusive
+"furthest state reached" bucket counts and summing them CUMULATIVELY from the strongest state
+downward -- e.g. "reached icp_matched or further" = icp_matched + opportunity_identified +
+strategy_ready + sales_ready bucket counts. This is arithmetic over Batch 12's own real numbers,
+not a new classification: no company is ever placed in a stage its own account_status doesn't
+already support. offering_matched/motion_ready/execution-lifecycle stages are appended using
+their own sweep's own denominator (companies for the first two, opportunities for the
+execution-lifecycle ones) -- each stage's `denominator`/`source` names exactly which population
+and function it came from, so a reader never mistakes one denominator for another.
+
+BOTTLENECK DETECTION (Part 4): the largest drop is computed ONLY across the single, consistent,
+company-denominator cumulative funnel (companies -> identified_or_further -> ... ->
+sales_ready_or_further) -- never mixed with the opportunity-denominator execution stages, which
+would make a "drop" meaningless (different populations). The reason attached to a detected drop
+is only ever a fact already surfaced elsewhere in this same readout (e.g. an unconfigured ICP/
+offering/motion, or a real missing_information string) -- never an invented causal explanation.
+
+CONFIGURATION vs DATA vs OPERATIONAL (Part 14) -- kept in three separate lists, never collapsed:
+    configuration_gaps -- a Parameter-backed rule is absent/incomplete (offering has no
+        applicable_icps, motion has no applicable_icps/offerings, business_context goal fields
+        are still None)
+    data_gaps          -- a real Company/Contact field is missing on real rows (revenue,
+        employee_count, no known contact) -- counted via direct COUNT queries, nothing inferred
+    operational_issues -- a real recorded operational failure (AutonomousRun.status == "failed"
+        with a real error_message) for this tenant. Empty when none exist -- never fabricated to
+        fill the category (Part 21's own explicit instruction).
+
+PERSISTENCE DECISION: NO new table. evaluate_gtm_governance() is pure and computed on demand --
+every input is a cheap, already-indexed query or an already-existing sweep call. Nothing here
+needs its own history; each underlying layer already owns whatever history it needs."""
+
+from sqlalchemy.orm import Session
+
+from app.db.models import AutonomousRun, Batch, Company, Contact
+from app.gtm_os.account_agent.account_agent import ACCOUNT_STATES_ORDER, run_account_agent_sweep
+from app.gtm_os.content.topic import ContentTopic, ContentTopicEvidence
+from app.gtm_os.content.trend_intelligence import run_trend_intelligence_sweep
+from app.gtm_os.context.business_context import get_business_context
+from app.gtm_os.execution.execution_readiness import run_execution_readiness_sweep
+from app.gtm_os.gtm_motion.gtm_motion import run_gtm_motion_sweep
+from app.gtm_os.gtm_motion.gtm_motion_config import get_gtm_motion_config
+from app.gtm_os.icp.icp_offering_matching import run_offering_matching_sweep
+from app.gtm_os.learning.evaluation import evaluate_learning_readout
+from app.gtm_os.market_account.market_account_context import run_market_account_context_sweep
+from app.gtm_os.opportunity.offering_config import get_offering_config
+
+# Strongest -> weakest, the reverse of account_agent.ACCOUNT_STATES_ORDER, used to compute
+# cumulative "reached this state or further" funnel counts (see module docstring's PIPELINE
+# FUNNEL section).
+_STATES_STRONGEST_FIRST = list(reversed(ACCOUNT_STATES_ORDER))
+
+
+def _company_universe_count(db: Session, tenant_id: int) -> int:
+    return db.query(Company.id).join(Batch, Company.batch_id == Batch.id).filter(Batch.tenant_id == tenant_id).count()
+
+
+def _pct(count: int, denominator: int | None) -> float | None:
+    if not denominator:
+        return None
+    return round(count / denominator * 100, 2)
+
+
+def _pipeline_stages(total_companies: int, account_sweep: dict, offering_sweep: dict, motion_sweep: dict, execution_sweep: dict) -> list[dict]:
+    account_state_stages = []
+    cumulative = 0
+    for state in _STATES_STRONGEST_FIRST:  # sales_ready ... insufficient_context
+        cumulative += account_sweep.get(state, 0)
+        if state == "insufficient_context":
+            continue  # "reached insufficient_context or further" always == total companies -- not a meaningful funnel step
+        stage_name = f"{state}_or_further"
+        account_state_stages.append({
+            "stage": stage_name,
+            "count": cumulative,
+            "denominator": total_companies,
+            "percentage": _pct(cumulative, total_companies),
+            "source": "run_account_agent_sweep (Batch 12), cumulative over account_status buckets",
+        })
+    account_state_stages.reverse()  # present weakest -> strongest, matching the funnel reading order
+
+    stages = [{"stage": "companies", "count": total_companies, "denominator": None, "percentage": None, "source": "Company"}]
+    stages.extend(account_state_stages)
+
+    offering_denominator = offering_sweep.get("companies_evaluated", 0)
+    stages.append({
+        "stage": "offering_matched",
+        "count": offering_sweep.get("has_candidate_offering", 0),
+        "denominator": offering_denominator,
+        "percentage": _pct(offering_sweep.get("has_candidate_offering", 0), offering_denominator),
+        "source": "run_offering_matching_sweep (Batch 9)",
+    })
+
+    motion_denominator = motion_sweep.get("companies_evaluated", 0)
+    stages.append({
+        "stage": "motion_ready",
+        "count": motion_sweep.get("recommended", 0),
+        "denominator": motion_denominator,
+        "percentage": _pct(motion_sweep.get("recommended", 0), motion_denominator),
+        "source": "run_gtm_motion_sweep (Batch 10)",
+    })
+
+    execution_denominator = execution_sweep.get("evaluated", 0)
+    message_ready_count = execution_sweep.get("message_generation_available", 0) + execution_sweep.get("ready_for_review", 0) + execution_sweep.get("approved", 0)
+    stages.append({
+        "stage": "execution_ready",
+        "count": total_companies and (account_sweep.get("opportunity_identified", 0) + account_sweep.get("strategy_ready", 0) + account_sweep.get("sales_ready", 0)),
+        "denominator": total_companies,
+        "percentage": None,  # deliberately not computed -- this stage's numerator (companies with an Opportunity) and the execution sweep's own denominator (Opportunities) are different populations; see module docstring's BOTTLENECK DETECTION note
+        "source": "run_account_agent_sweep (Batch 12) -- companies with >=1 Opportunity",
+    })
+    stages.append({
+        "stage": "message_ready",
+        "count": message_ready_count,
+        "denominator": execution_denominator,
+        "percentage": _pct(message_ready_count, execution_denominator),
+        "source": "run_execution_readiness_sweep (Batch 13), denominator = Opportunities evaluated",
+    })
+    stages.append({
+        "stage": "approved",
+        "count": execution_sweep.get("approved", 0),
+        "denominator": execution_denominator,
+        "percentage": _pct(execution_sweep.get("approved", 0), execution_denominator),
+        "source": "run_execution_readiness_sweep (Batch 13), denominator = Opportunities evaluated",
+    })
+    return stages
+
+
+def _detect_bottleneck(company_funnel_stages: list[dict], configuration_gaps: list[dict]) -> dict | None:
+    """Largest drop across the SINGLE consistent company-denominator funnel only (Part 4) --
+    never compares stages with different denominators. `reason` is only ever a fact already
+    present in configuration_gaps for this same readout, never invented."""
+    if len(company_funnel_stages) < 2:
+        return None
+
+    largest = None
+    for prev, curr in zip(company_funnel_stages, company_funnel_stages[1:]):
+        drop = prev["count"] - curr["count"]
+        if drop <= 0:
+            continue
+        if largest is None or drop > largest["drop_count"]:
+            reason = None
+            for gap in configuration_gaps:
+                if curr["stage"].startswith(gap.get("relates_to_stage") or "\0"):
+                    reason = gap["description"]
+                    break
+            largest = {
+                "from": prev["stage"],
+                "to": curr["stage"],
+                "drop_count": drop,
+                "reason": reason or "no specific configuration gap traced to this stage in this readout -- see data_gaps/configuration_gaps for other possibly-relevant facts",
+            }
+    return largest
+
+
+def _configuration_gaps(db: Session, tenant_id: int) -> list[dict]:
+    gaps: list[dict] = []
+
+    offerings = get_offering_config(db, tenant_id)
+    for offering in offerings:
+        if not offering.get("applicable_icps"):
+            gaps.append({
+                "category": "configuration",
+                "relates_to_stage": "offering_matched",
+                "description": f"offering {offering['name']!r} has no applicable_icps configured -- it can never produce a candidate_match",
+                "source": "offering_config.get_offering_config",
+            })
+
+    motions = get_gtm_motion_config(db, tenant_id)
+    for motion in motions:
+        if not motion.get("applicable_icps") and not motion.get("applicable_offerings"):
+            gaps.append({
+                "category": "configuration",
+                "relates_to_stage": "motion_ready",
+                "description": f"GTM motion {motion['motion']!r} has no applicable_icps or applicable_offerings configured -- it can never be recommended",
+                "source": "gtm_motion_config.get_gtm_motion_config",
+            })
+
+    business_context = get_business_context(db, tenant_id)
+    goals = business_context.get("goals", {})
+    missing_goals = [k for k, v in goals.items() if v is None]
+    if missing_goals:
+        gaps.append({
+            "category": "configuration",
+            "relates_to_stage": None,
+            "description": f"business_context goals not yet configured: {sorted(missing_goals)}",
+            "source": "business_context.get_business_context",
+        })
+
+    return gaps
+
+
+def _data_gaps(db: Session, tenant_id: int, total_companies: int) -> list[dict]:
+    if total_companies == 0:
+        return []
+
+    company_ids_q = db.query(Company.id).join(Batch, Company.batch_id == Batch.id).filter(Batch.tenant_id == tenant_id)
+
+    missing_revenue = company_ids_q.filter(Company.estimated_revenue_lower_usd.is_(None)).count()
+    missing_employee_count = company_ids_q.filter(Company.employee_count.is_(None)).count()
+    companies_with_contact = (
+        db.query(Company.id)
+        .join(Batch, Company.batch_id == Batch.id)
+        .join(Contact, Contact.company_id == Company.id)
+        .filter(Batch.tenant_id == tenant_id)
+        .distinct()
+        .count()
+    )
+    missing_contact = total_companies - companies_with_contact
+
+    gaps = []
+    if missing_revenue:
+        gaps.append({"category": "data", "field": "estimated_revenue_lower_usd", "missing_count": missing_revenue, "denominator": total_companies, "source": "Company"})
+    if missing_employee_count:
+        gaps.append({"category": "data", "field": "employee_count", "missing_count": missing_employee_count, "denominator": total_companies, "source": "Company"})
+    if missing_contact:
+        gaps.append({"category": "data", "field": "decision_maker_contact", "missing_count": missing_contact, "denominator": total_companies, "source": "Contact"})
+    return gaps
+
+
+def _operational_issues(db: Session, tenant_id: int, limit: int = 5) -> list[dict]:
+    """Only reports a REAL, already-recorded AutonomousRun failure for this tenant -- never
+    infers operational health from anything else. Empty when no failed run exists."""
+    failed_runs = (
+        db.query(AutonomousRun)
+        .join(Batch, AutonomousRun.batch_id == Batch.id)
+        .filter(Batch.tenant_id == tenant_id, AutonomousRun.status == "failed")
+        .order_by(AutonomousRun.started_at.desc())
+        .limit(limit)
+        .all()
+    )
+    return [
+        {
+            "category": "operational",
+            "run_id": run.id,
+            "started_at": run.started_at,
+            # truncated for readability only -- the full message remains on the real
+            # AutonomousRun row (Batch 3's own field), never lost, just not repeated here
+            "error_message": (run.error_message[:300] + "...") if len(run.error_message) > 300 else run.error_message,
+            "source": "AutonomousRun",
+        }
+        for run in failed_runs
+        if run.error_message
+    ]
+
+
+def _market_intelligence(db: Session, tenant_id: int) -> dict:
+    trend_counts = run_trend_intelligence_sweep(db, tenant_id, limit=500)
+    bridge_counts = run_market_account_context_sweep(db, tenant_id, limit=500)
+    total_evidence = db.query(ContentTopicEvidence.id).filter(ContentTopicEvidence.tenant_id == tenant_id).count()
+    total_topics = db.query(ContentTopic.id).filter(ContentTopic.tenant_id == tenant_id).count()
+
+    note = None
+    if total_evidence > 0 and bridge_counts.get("has_market_context", 0) == 0:
+        note = "Market intelligence is currently not reaching account-level context."
+
+    return {
+        "total_topics": total_topics,
+        "total_evidence_rows": total_evidence,
+        "trend_state_distribution": {k: v for k, v in trend_counts.items() if k not in ("dry_run",)},
+        "account_bridge": bridge_counts,
+        "note": note,
+    }
+
+
+def _human_attention(configuration_gaps: list[dict], data_gaps: list[dict], operational_issues: list[dict], account_sweep: dict, execution_sweep: dict, market_intelligence: dict) -> list[dict]:
+    """Deterministic list of already-computed observations (Part 11) -- never a new computation,
+    purely a curated pass over what this same readout already found. Never creates a task or
+    changes anything (Part 11's own boundary)."""
+    items: list[dict] = []
+
+    if account_sweep.get("identified", 0) > 0:
+        items.append({"category": "coverage", "description": f"{account_sweep['identified']} identified companies currently have no ICP match"})
+    if account_sweep.get("icp_matched", 0) > 0:
+        items.append({"category": "coverage", "description": f"{account_sweep['icp_matched']} ICP-matched companies have not yet produced an Opportunity"})
+
+    for gap in configuration_gaps:
+        items.append({"category": "configuration", "description": gap["description"]})
+    for gap in data_gaps:
+        items.append({"category": "data", "description": f"{gap['missing_count']}/{gap['denominator']} companies missing {gap['field']}"})
+    for issue in operational_issues:
+        items.append({"category": "operational", "description": f"AutonomousRun {issue['run_id']} failed: {issue['error_message']}"})
+
+    if execution_sweep.get("blocked", 0) > 0:
+        items.append({"category": "execution", "description": f"{execution_sweep['blocked']} opportunities are currently blocked on a sales-readiness prerequisite"})
+    if execution_sweep.get("ready_for_review", 0) > 0:
+        items.append({"category": "execution", "description": f"{execution_sweep['ready_for_review']} message drafts are awaiting human review/approval"})
+
+    if market_intelligence.get("note"):
+        items.append({"category": "market_intelligence", "description": market_intelligence["note"]})
+
+    return items
+
+
+def evaluate_gtm_governance(db: Session, tenant_id: int) -> dict:
+    """Pure, read-only. Makes zero writes, zero LLM calls, zero external API calls. Safe to call
+    repeatedly with no side effects (Part 19)."""
+    total_companies = _company_universe_count(db, tenant_id)
+
+    account_sweep = run_account_agent_sweep(db, tenant_id, limit=100_000)
+    offering_sweep = run_offering_matching_sweep(db, tenant_id, limit=100_000)
+    motion_sweep = run_gtm_motion_sweep(db, tenant_id, limit=100_000)
+    execution_sweep = run_execution_readiness_sweep(db, tenant_id, limit=100_000)
+    learning = evaluate_learning_readout(db, tenant_id)
+    market_intelligence = _market_intelligence(db, tenant_id)
+
+    configuration_gaps = _configuration_gaps(db, tenant_id)
+    data_gaps = _data_gaps(db, tenant_id, total_companies)
+    operational_issues = _operational_issues(db, tenant_id)
+
+    pipeline_stages = _pipeline_stages(total_companies, account_sweep, offering_sweep, motion_sweep, execution_sweep)
+    company_funnel_stages = [s for s in pipeline_stages if s["stage"] == "companies" or s["stage"].endswith("_or_further")]
+    bottleneck = _detect_bottleneck(company_funnel_stages, configuration_gaps)
+
+    account_distribution = {"account_states": {state: account_sweep.get(state, 0) for state in ACCOUNT_STATES_ORDER}, "evaluated": account_sweep.get("evaluated", 0), "failed": account_sweep.get("failed", 0)}
+
+    human_attention = _human_attention(configuration_gaps, data_gaps, operational_issues, account_sweep, execution_sweep, market_intelligence)
+
+    return {
+        "overview": {
+            "total_companies": total_companies,
+            "opportunities_evaluated": execution_sweep.get("evaluated", 0),
+        },
+        "pipeline": {"stages": pipeline_stages},
+        "bottlenecks": [bottleneck] if bottleneck else [],
+        "configuration_gaps": configuration_gaps,
+        "data_gaps": data_gaps,
+        "operational_issues": operational_issues,
+        "market_intelligence": market_intelligence,
+        "account_distribution": account_distribution,
+        "execution_readiness": execution_sweep,
+        "learning": learning,
+        "human_attention": human_attention,
+    }
+
+
+def run_gtm_governance_readout(db: Session, tenant_id: int) -> dict:
+    """Thin, explicitly-named entry point for independent/manual invocation (Part 17) -- NOT a
+    second implementation. Identical to evaluate_gtm_governance(); kept as a separate name only
+    because the spec names both, and future callers may want a stable "run the readout" verb
+    distinct from "evaluate governance facts." NOT wired into the scheduler."""
+    return evaluate_gtm_governance(db, tenant_id)

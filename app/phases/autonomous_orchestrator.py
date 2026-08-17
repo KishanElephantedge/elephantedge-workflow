@@ -36,6 +36,7 @@ from app.phases.apify_discovery import run_apify_discovery
 from app.phases.decision_maker import find_decision_maker
 from app.jobo_client import JoboError
 from app.outreach.selector import get_outreach_channel
+from app.gtm_os.efficiency.activity_recorder import record_activity
 
 DEFAULT_DAILY_COMPANY_CAP = 5
 DEFAULT_DAILY_BUDGET_USD = 1.0
@@ -461,7 +462,7 @@ def run_daily_autonomous_cycle(db: Session, tenant_id: int) -> dict:
         cap = get_daily_company_cap(db, tenant_id)
         discovery_result = run_discovery(batch.id, db, tenant_id, target=cap, page_size=DISCOVERY_PAGE_SIZE, max_checked=DISCOVERY_MAX_CHECKED, budget_guard=guard)
         removed_dupes = _dedupe_against_prior_days(batch, db)
-        run_buying_signal_check(batch.id, db, budget_guard=guard)
+        buying_signal_result = run_buying_signal_check(batch.id, db, budget_guard=guard)
         run_tech_stack_check(batch.id, db, budget_guard=guard)
         run_scoring(batch.id, db)
         selected = _select_top_companies(batch, db, cap)
@@ -481,6 +482,19 @@ def run_daily_autonomous_cycle(db: Session, tenant_id: int) -> dict:
         run.contacts_found = decision_maker_result["decision_makers_found"]
         run.credits_spent_usd = final_spend
         run.budget_stopped_early = budget_stopped_early
+        run.duplicates_removed = removed_dupes
+
+        # V2 Efficiency -- record real activity volume from stages already computed above.
+        # `_dedupe_against_prior_days` runs immediately after discovery with no intervening
+        # company add/remove for this batch, so len(todays_companies) inside it equals
+        # discovery_result["companies_discovered"] at this point in the pipeline -- reused here
+        # rather than adding a second count. See app/gtm_os/efficiency/efficiency.py.
+        activity_date = (run.run_date or datetime.utcnow()).date()
+        record_activity(db, tenant_id, "company_discovery", activity_date, discovery_result["companies_discovered"], source="autonomous_run", source_run_id=run.id)
+        record_activity(db, tenant_id, "dedup_check", activity_date, discovery_result["companies_discovered"], source="autonomous_run", source_run_id=run.id, metadata={"duplicates_removed": removed_dupes})
+        record_activity(db, tenant_id, "hiring_signal_check", activity_date, buying_signal_result["companies_checked"], source="autonomous_run", source_run_id=run.id)
+        record_activity(db, tenant_id, "contact_enrichment", activity_date, decision_maker_result["decision_makers_found"], source="autonomous_run", source_run_id=run.id)
+        record_activity(db, tenant_id, "decision_maker_research", activity_date, decision_maker_result["decision_makers_found"] + decision_maker_result["companies_with_no_contact"], source="autonomous_run", source_run_id=run.id)
 
         if budget_stopped_early or decision_maker_result["decision_makers_found"] == 0:
             # Nothing to push -- no approval window needed, no Slack alert (that channel was

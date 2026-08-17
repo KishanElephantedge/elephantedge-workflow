@@ -12,7 +12,7 @@ route in app/routes/api.py for the tenant_id filter that enforces that boundary.
 
 from datetime import datetime
 
-from sqlalchemy import JSON, Boolean, Column, DateTime, Float, ForeignKey, Integer, String, Text
+from sqlalchemy import JSON, Boolean, Column, Date, DateTime, Float, ForeignKey, Integer, String, Text
 from sqlalchemy.orm import declarative_base, relationship
 
 Base = declarative_base()
@@ -275,6 +275,25 @@ class CalendarBooking(Base):
     raw_payload = Column(JSON, nullable=False)
     synced_at = Column(DateTime, default=datetime.utcnow)
 
+    # Meeting outcome (added for V2 Revenue Pace) -- human-recorded, not derived. `outcome_status`
+    # is the only new vocabulary this introduces (won | lost, null = pending/unset). See
+    # app/gtm_os/revenue/revenue_pace.py for validation and the ICP-snapshot capture logic.
+    outcome_status = Column(String, nullable=True)  # won | lost | null (pending)
+    outcome_company_id = Column(Integer, ForeignKey("companies.id"), nullable=True)
+    # V2 Overrides & Evals attribution link -- optional, human-supplied at outcome-recording
+    # time (never inferred). Lets a won/lost meeting be traced back to the Opportunity/
+    # GtmStrategy/MessageDraft that produced it. See app/gtm_os/learning/overrides_evals.py.
+    outcome_opportunity_id = Column(Integer, ForeignKey("opportunities.id"), nullable=True)
+    outcome_offering_name = Column(String, nullable=True)
+    outcome_amount_usd = Column(Float, nullable=True)  # only meaningful when outcome_status == "won"
+    outcome_reason = Column(Text, nullable=True)  # only meaningful when outcome_status == "lost"
+    outcome_notes = Column(Text, nullable=True)  # free-form summary, usable regardless of status
+    outcome_icp_snapshot = Column(JSON, nullable=True)  # system-captured at record time, never user-entered
+    outcome_recorded_at = Column(DateTime, nullable=True)
+    outcome_recorded_by = Column(String, nullable=True)  # the logged-in user's email, frontend-supplied
+
+    outcome_company = relationship("Company")
+
 
 class Notification(Base):
     """In-app notification feed -- separate from (not a replacement for) the existing Slack
@@ -317,6 +336,10 @@ class AutonomousRun(Base):
     # this long before actually pushing to the outreach channel, unless cancelled.
     awaiting_approval_until = Column(DateTime, nullable=True)
     cancelled = Column(Boolean, default=False)
+    # V2 Efficiency -- real count from _dedupe_against_prior_days() (autonomous_orchestrator.py),
+    # previously computed and returned in this function's response dict but never persisted. See
+    # app/gtm_os/efficiency/efficiency.py.
+    duplicates_removed = Column(Integer, nullable=True)
 
     batch = relationship("Batch")
 
@@ -477,4 +500,27 @@ class ReverseDiscoveryCandidate(Base):
     icp_status = Column(String, nullable=True)  # "qualified" | "rejected" | "unknown"
     icp_reasoning = Column(Text, nullable=True)
     posted_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class EfficiencyActivityEvent(Base):
+    """V2 Efficiency -- one recorded batch of REAL automated activity volume, inserted once per
+    (tenant, activity_type, activity_date, source, source_run_id) and never updated in place.
+    See app/gtm_os/efficiency/activity_recorder.py for the idempotent insert helper and
+    app/gtm_os/efficiency/efficiency.py for how this is aggregated into an hours-saved readout.
+
+    Deliberately NOT a place for every activity: message drafting (MessageDraft) and GTM-signal
+    capture (GtmSignal) are already real, insert-only event tables in their own right --
+    efficiency.py reads those directly at aggregation time instead of duplicating them here,
+    which would create a second, driftable source of truth for the same fact."""
+    __tablename__ = "efficiency_activity_events"
+
+    id = Column(Integer, primary_key=True)
+    tenant_id = Column(Integer, nullable=False)
+    activity_type = Column(String, nullable=False)
+    activity_date = Column(Date, nullable=False)  # calendar day this volume represents
+    volume = Column(Integer, nullable=False)
+    source = Column(String, nullable=False)  # e.g. "autonomous_run", "linkedin_monitor_sweep"
+    source_run_id = Column(Integer, ForeignKey("autonomous_runs.id"), nullable=True)
+    event_metadata = Column("metadata", JSON, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)

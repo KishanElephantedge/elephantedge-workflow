@@ -788,20 +788,10 @@ def _get_our_campaign_uuids(db: Session) -> list[str]:
     return []
 
 
-def _normalize_linkedin_url(url: str | None) -> str | None:
-    """LinkedIn URLs come in inconsistently from every source we deal with (our own decision-
-    maker search, SalesRobot's prospect records) -- with/without https://, with/without www.,
-    with/without a trailing slash, mixed case. Matching on raw strings silently drops real
-    matches. Normalizes to the bare "linkedin.com/in/handle" form for reliable comparison."""
-    if not url:
-        return None
-    normalized = url.strip().lower()
-    for prefix in ("https://", "http://"):
-        if normalized.startswith(prefix):
-            normalized = normalized[len(prefix):]
-    if normalized.startswith("www."):
-        normalized = normalized[4:]
-    return normalized.rstrip("/")
+# Moved to app/linkedin_utils.py (Step 11A) so the gtm_os intelligence layer can reuse it
+# without importing from app/routes/* -- kept under this module's original name here so every
+# existing call site below is unchanged.
+from app.linkedin_utils import normalize_linkedin_url as _normalize_linkedin_url  # noqa: E402
 
 
 @router.get("/salesrobot/campaigns")
@@ -1563,6 +1553,20 @@ def list_calendar_bookings(page: int = 1, page_size: int = 25, search: str = "",
                 "status": b.status,
                 "raw_payload": b.raw_payload,
                 "synced_at": b.synced_at,
+                # Meeting outcome (V2 Revenue Pace) -- additive fields, ignored by V1's
+                # Meetings.jsx since it doesn't reference them. See
+                # app/gtm_os/revenue/revenue_pace.py.
+                "outcome_status": b.outcome_status,
+                "outcome_company_id": b.outcome_company_id,
+                "outcome_company_name": b.outcome_company.name if b.outcome_company else None,
+                "outcome_opportunity_id": b.outcome_opportunity_id,
+                "outcome_offering_name": b.outcome_offering_name,
+                "outcome_amount_usd": b.outcome_amount_usd,
+                "outcome_reason": b.outcome_reason,
+                "outcome_notes": b.outcome_notes,
+                "outcome_icp_snapshot": b.outcome_icp_snapshot,
+                "outcome_recorded_at": b.outcome_recorded_at,
+                "outcome_recorded_by": b.outcome_recorded_by,
             }
             for b in bookings
         ],
@@ -1575,6 +1579,82 @@ def trigger_calendar_sync(db: Session = Depends(get_db)):
         return sync_calendar_bookings(db, ELEPHANT_EDGE_TENANT_ID)
     except GoogleCalendarError as e:
         raise HTTPException(status_code=502, detail=str(e))
+
+
+@router.patch("/calendar-bookings/{booking_id}/outcome")
+def patch_calendar_booking_outcome(booking_id: int, body: dict = Body(...), db: Session = Depends(get_db)):
+    """V2 Meetings tab -- records (or clears) a human-judged deal outcome for one booked meeting.
+    Thin wrapper over record_meeting_outcome() (app/gtm_os/revenue/revenue_pace.py); all
+    validation lives there. Same authorization note as every other write route in this file:
+    session-cookie auth via the gateway's reverse proxy is the existing mechanism (no
+    finer-grained role system exists in this codebase to gate on). `recorded_by` is supplied by
+    the frontend from the real, already-authenticated user (same pattern as Phase 7's
+    reviewed_by) -- this backend has no independent identity channel of its own."""
+    from app.gtm_os.revenue.revenue_pace import record_meeting_outcome
+    from app.gtm_os.opportunity.opportunity import Opportunity
+
+    try:
+        booking = record_meeting_outcome(
+            db,
+            ELEPHANT_EDGE_TENANT_ID,
+            booking_id,
+            status=body.get("status"),
+            company_id=body.get("company_id"),
+            offering_name=body.get("offering_name"),
+            amount_usd=body.get("amount_usd"),
+            reason=body.get("reason"),
+            notes=body.get("notes"),
+            recorded_by=body.get("recorded_by"),
+            opportunity_id=body.get("opportunity_id"),
+        )
+    except LookupError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    opportunity = db.get(Opportunity, booking.outcome_opportunity_id) if booking.outcome_opportunity_id else None
+    return {
+        "id": booking.id,
+        "outcome_status": booking.outcome_status,
+        "outcome_company_id": booking.outcome_company_id,
+        "outcome_company_name": booking.outcome_company.name if booking.outcome_company else None,
+        "outcome_opportunity_id": booking.outcome_opportunity_id,
+        "outcome_opportunity_statement": opportunity.opportunity_statement if opportunity else None,
+        "outcome_offering_name": booking.outcome_offering_name,
+        "outcome_amount_usd": booking.outcome_amount_usd,
+        "outcome_reason": booking.outcome_reason,
+        "outcome_notes": booking.outcome_notes,
+        "outcome_icp_snapshot": booking.outcome_icp_snapshot,
+        "outcome_recorded_at": booking.outcome_recorded_at,
+        "outcome_recorded_by": booking.outcome_recorded_by,
+    }
+
+
+@router.get("/gtm-os/revenue-pace")
+def get_gtm_os_revenue_pace(month: str | None = None, db: Session = Depends(get_db)):
+    """V2 Revenue Pace page -- read-only wrapper over get_revenue_pace()
+    (app/gtm_os/revenue/revenue_pace.py), itself a pure aggregation over meeting outcomes
+    recorded via PATCH /calendar-bookings/{id}/outcome above plus business_context's own
+    revenue_goal. Returns target_configured=False (not a guess) when no numeric target is set.
+    No cost-per-meeting, no forecast, no generated narrative -- see that module's own docstring
+    for why."""
+    from app.gtm_os.revenue.revenue_pace import get_revenue_pace
+
+    return get_revenue_pace(db, ELEPHANT_EDGE_TENANT_ID, month=month)
+
+
+@router.get("/gtm-os/revenue-pace/diagnosis")
+def get_gtm_os_revenue_pace_diagnosis(month: str | None = None, db: Session = Depends(get_db)):
+    """V2 Revenue Pace Diagnosis -- read-only composition over get_revenue_pace() (unchanged
+    source of truth), get_jobs_to_be_done() (blocked opportunities / missing decision-makers),
+    get_pipeline_item() (strategy/offering context), and get_overrides_evals() (confirmed
+    patterns only -- candidates are never treated as knowledge). See
+    app/gtm_os/revenue/revenue_pace_diagnosis.py for the full rule set. No LLM calls; every
+    diagnosis_summary clause and the single primary_constraint are produced by fixed,
+    documented, deterministic rules over real data."""
+    from app.gtm_os.revenue.revenue_pace_diagnosis import get_revenue_pace_diagnosis
+
+    return get_revenue_pace_diagnosis(db, ELEPHANT_EDGE_TENANT_ID, month=month)
 
 
 # ---- Daily Review (calendar) ----
@@ -3135,3 +3215,389 @@ def backfill_linkedin_monitor_names(db: Session = Depends(get_db)):
         db.commit()
 
     return {"checked": len(profiles), "updated": updated}
+
+
+@router.get("/gtm-os/business-context")
+def get_gtm_os_business_context(db: Session = Depends(get_db)):
+    """GTM OS foundation step -- read-only view of the company's own operating context (goals,
+    offerings, ICP, TAM, GTM motions, sales methodology, messaging). See
+    app/gtm_os/context/business_context.py. Purely additive: this is the only place anything
+    in app/gtm_os/ is wired into the running app, and it's a brand-new route, not a change to
+    any existing one."""
+    from app.gtm_os.context.business_context import get_business_context
+    return get_business_context(db, ELEPHANT_EDGE_TENANT_ID)
+
+
+@router.put("/gtm-os/business-context")
+def put_gtm_os_business_context(context: dict, db: Session = Depends(get_db)):
+    from app.gtm_os.context.business_context import set_business_context
+    set_business_context(db, ELEPHANT_EDGE_TENANT_ID, context)
+    return {"updated": True}
+
+
+@router.get("/gtm-os/accounts/{company_id}/brief")
+def get_gtm_os_account_brief(company_id: int, db: Session = Depends(get_db)):
+    """V2 Account 360 (Phase 2) -- read-only wrapper over the existing, unmodified
+    build_account_brief() (Batch 12). Same "purely additive, brand-new route" precedent as
+    /gtm-os/business-context above: this function contains zero business logic of its own, it
+    only calls the already-built aggregation and returns its JSON verbatim. 404 only when the
+    company_id doesn't resolve to a real row at all (mirrors the 404 pattern used elsewhere in
+    this file, e.g. GET /batches/{batch_id}) -- build_account_brief() itself already returns
+    that exact case as {"company": None, "account_status": "insufficient_context", ...}, so the
+    404 here is just translating that into a standard HTTP not-found rather than a 200 with a
+    null company."""
+    from app.gtm_os.account_agent.account_agent import build_account_brief
+
+    company = db.get(Company, company_id)
+    if company is None or company.batch.tenant_id != ELEPHANT_EDGE_TENANT_ID:
+        raise HTTPException(status_code=404, detail="Company not found")
+
+    return build_account_brief(db, ELEPHANT_EDGE_TENANT_ID, company_id)
+
+
+@router.get("/gtm-os/accounts/{company_id}/messages")
+def get_gtm_os_account_messages(company_id: int, db: Session = Depends(get_db)):
+    """V2 Account 360 Messages tab (Phase 3, Part 6) -- read-only wrapper over
+    list_messages_for_company() (Batch 7's MessageDraft, unmodified). Same additive-route
+    precedent as the two routes above. Never generates, never approves -- see that function's
+    own docstring for the exact safety guarantees."""
+    from app.gtm_os.learning.message_draft import list_messages_for_company
+
+    company = db.get(Company, company_id)
+    if company is None or company.batch.tenant_id != ELEPHANT_EDGE_TENANT_ID:
+        raise HTTPException(status_code=404, detail="Company not found")
+
+    return {"company_id": company_id, "messages": list_messages_for_company(db, ELEPHANT_EDGE_TENANT_ID, company_id)}
+
+
+@router.get("/gtm-os/accounts/summary")
+def get_gtm_os_accounts_summary(db: Session = Depends(get_db)):
+    """V2 Accounts list summary strip (Phase 3, Part 8) -- read-only wrapper over
+    summarize_account_states() (Batch 12's account_status ladder, reproduced via bulk queries
+    instead of build_account_brief() per company -- see that function's own docstring for why
+    and how it stays in exact agreement with the per-company version)."""
+    from app.gtm_os.account_agent.account_agent import summarize_account_states
+
+    return summarize_account_states(db, ELEPHANT_EDGE_TENANT_ID)
+
+
+@router.get("/gtm-os/pipeline")
+def get_gtm_os_pipeline(page: int = 1, page_size: int = 25, db: Session = Depends(get_db)):
+    """V2 Pipeline page (Phase 3, Part 2) -- read-only wrapper over list_pipeline_items()
+    (Batch 13's execution-readiness module, unmodified reuse of get_next_execution_action() and
+    recommend_gtm_motion() per item -- see that function's own docstring)."""
+    from app.gtm_os.execution.execution_readiness import list_pipeline_items
+
+    return list_pipeline_items(db, ELEPHANT_EDGE_TENANT_ID, page=page, page_size=page_size)
+
+
+@router.get("/gtm-os/market-intelligence")
+def get_gtm_os_market_intelligence(db: Session = Depends(get_db)):
+    """V2 Market Intelligence page (Phase 4, Part 4) -- read-only wrapper over
+    get_market_intelligence_overview() (Batch 2/6/11's trend intelligence + market-account
+    bridge, unmodified reuse of evaluate_topic_trend() per configured topic)."""
+    from app.gtm_os.content.trend_intelligence import get_market_intelligence_overview
+
+    return get_market_intelligence_overview(db, ELEPHANT_EDGE_TENANT_ID)
+
+
+@router.get("/gtm-os/demand-grid")
+def get_gtm_os_demand_grid(db: Session = Depends(get_db)):
+    """V2 Demand Grid page (Phase 4, Part 7) -- read-only wrapper over get_demand_grid()
+    (Batch 8/9's ICP + offering configuration, aggregated -- see that function's own docstring
+    for the exact "applicable" vs "matched_account_count" distinction it preserves)."""
+    from app.gtm_os.icp.icp_offering_matching import get_demand_grid
+
+    return get_demand_grid(db, ELEPHANT_EDGE_TENANT_ID)
+
+
+@router.get("/gtm-os/demand-grid/{icp_id}/companies")
+def get_gtm_os_demand_grid_companies(icp_id: str, db: Session = Depends(get_db)):
+    """Demand Grid drill-down (Phase 4, Part 12) -- read-only wrapper over
+    get_demand_grid_companies() (real ICPMatch rows only, see that function's own docstring)."""
+    from app.gtm_os.icp.icp_offering_matching import get_demand_grid_companies
+
+    return get_demand_grid_companies(db, ELEPHANT_EDGE_TENANT_ID, icp_id)
+
+
+@router.get("/gtm-os/icps-offerings")
+def get_gtm_os_icps_offerings(db: Session = Depends(get_db)):
+    """V2 ICPs & Offerings configuration page (Phase 5) -- read-only wrapper over
+    get_icps_offerings_overview() (ICP/offering/motion config readers + Demand Grid, all
+    unmodified -- see that function's own docstring)."""
+    from app.gtm_os.icp.icp_offering_matching import get_icps_offerings_overview
+
+    return get_icps_offerings_overview(db, ELEPHANT_EDGE_TENANT_ID)
+
+
+# ---- Configuration writes (Phase 5, Part 15) ----
+# AUTHORIZATION NOTE: this app has no role/permission system -- the gateway's own module
+# docstring is explicit ("Single shared login for the whole platform -- there is no per-tenant
+# auth. Any authenticated user may access any tenant"). That is the SAME mechanism every other
+# write in this file already relies on (PUT /gtm-os/business-context, PUT /parameters, PUT
+# /credentials, POST /batches, ...) -- reused here as-is, not a new or weaker gate invented for
+# this phase. Session-cookie auth (Depends(get_db) alone doesn't enforce it, but the gateway's
+# reverse proxy in front of this backend does -- see app/main.py) is the existing safe mechanism;
+# there is no finer-grained "who may edit business config" concept anywhere in this codebase to
+# reuse or fake. If tighter authorization is ever needed, that is a real gap for the gateway
+# layer, not something to invent here.
+@router.put("/gtm-os/icps")
+def put_gtm_os_icps(icps: list = Body(...), db: Session = Depends(get_db)):
+    """Reuses set_icp_config() (Batch 8) verbatim -- all validation lives there, not duplicated
+    here. Returns the freshly-read overview so the frontend never has to guess whether the write
+    landed."""
+    from app.gtm_os.icp.icp_config import IcpConfigError, set_icp_config
+    from app.gtm_os.icp.icp_offering_matching import get_icps_offerings_overview
+
+    try:
+        set_icp_config(db, ELEPHANT_EDGE_TENANT_ID, icps)
+    except IcpConfigError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return get_icps_offerings_overview(db, ELEPHANT_EDGE_TENANT_ID)
+
+
+@router.put("/gtm-os/offerings")
+def put_gtm_os_offerings(offerings: list = Body(...), db: Session = Depends(get_db)):
+    """Reuses set_offering_config() (Batch 4) verbatim."""
+    from app.gtm_os.icp.icp_offering_matching import get_icps_offerings_overview
+    from app.gtm_os.opportunity.offering_config import OfferingConfigError, set_offering_config
+
+    try:
+        set_offering_config(db, ELEPHANT_EDGE_TENANT_ID, offerings)
+    except OfferingConfigError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return get_icps_offerings_overview(db, ELEPHANT_EDGE_TENANT_ID)
+
+
+@router.put("/gtm-os/gtm-motions")
+def put_gtm_os_gtm_motions(motions: list = Body(...), db: Session = Depends(get_db)):
+    """Reuses set_gtm_motion_config() (Batch 10) verbatim."""
+    from app.gtm_os.gtm_motion.gtm_motion_config import GtmMotionConfigError, set_gtm_motion_config
+    from app.gtm_os.icp.icp_offering_matching import get_icps_offerings_overview
+
+    try:
+        set_gtm_motion_config(db, ELEPHANT_EDGE_TENANT_ID, motions)
+    except GtmMotionConfigError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return get_icps_offerings_overview(db, ELEPHANT_EDGE_TENANT_ID)
+
+
+@router.get("/gtm-os/briefing-governance")
+def get_gtm_os_briefing_governance(db: Session = Depends(get_db)):
+    """V2 Briefing/Governance page (Phase 6) -- the SAME "purely additive, brand-new route, zero
+    new business logic" pattern as every /gtm-os/* route above. Returns evaluate_gtm_governance()
+    (Batch 14) verbatim -- no field added, none removed, none renamed. Batch 14 has no single
+    overall "ready/blocked" status field and no separate "briefing" object; the frontend derives
+    only a presentational count (configuration_gaps.length, etc.) from these same real lists,
+    never a new score or narrative (see Phase 6 report for why no such backend field exists to
+    reuse). AUTHORIZATION: same note as every Phase 5 write route -- this app has no role/
+    permission system, only the gateway's existing "logged in or not" session-cookie gate."""
+    from app.gtm_os.governance.governance import evaluate_gtm_governance
+
+    return evaluate_gtm_governance(db, ELEPHANT_EDGE_TENANT_ID)
+
+
+@router.get("/gtm-os/pipeline/{opportunity_id}")
+def get_gtm_os_pipeline_item(opportunity_id: int, db: Session = Depends(get_db)):
+    """V2 Opportunity Detail (Phase 7) -- read-only wrapper over get_pipeline_item(), itself the
+    exact per-item computation list_pipeline_items() (Phase 3) already uses -- see that
+    function's own docstring. Combine with GET /gtm-os/accounts/{company_id}/brief (Phase 2, via
+    this item's own company_id) for the account-level ICP/offering/motion/governance context, and
+    GET /gtm-os/accounts/{company_id}/messages (Phase 3) for message review -- deliberately NOT
+    duplicated into one mega-endpoint (Part 13's own "prefer existing combined-read patterns"
+    instruction), since both of those already exist and already return everything this page needs
+    beyond the opportunity's own execution/strategy facts."""
+    from app.gtm_os.execution.execution_readiness import get_pipeline_item
+
+    item = get_pipeline_item(db, ELEPHANT_EDGE_TENANT_ID, opportunity_id)
+    if item is None:
+        raise HTTPException(status_code=404, detail="Opportunity not found")
+    return item
+
+
+@router.post("/gtm-os/messages/{message_draft_id}/review")
+def post_gtm_os_message_review(message_draft_id: int, payload: dict = Body(...), db: Session = Depends(get_db)):
+    """V2 human approval boundary (Phase 7, Part 8-10) -- the ONLY write route this phase adds.
+    Reuses approve_message_draft()/reject_message_draft()/request_changes_message_draft()
+    (Batch 7 + this phase's own additions, see message_draft.py) verbatim: this route is pure
+    dispatch + validation, no review logic of its own. A rejected precondition (wrong status)
+    raises ValueError from those functions, translated to 400 here -- never partially applied.
+
+    DOES NOT EXECUTE ANYTHING (Part 10): no email/LinkedIn send, no CRM write, no campaign
+    launch -- this function's only effect is a status/timestamp/note change on one MessageDraft
+    row. Nothing downstream is triggered by any outcome.
+
+    IDENTITY (Part 14): `reviewed_by` is REQUIRED in the payload and is trusted as supplied by
+    the caller -- this backend has no independent user-identity channel to check it against. The
+    gateway in front of this backend strips the session cookie before proxying and adds no
+    identity header (confirmed by inspecting gateway/app/main.py's proxy route directly), so the
+    only honest source for "who reviewed this" is the browser's own already-authenticated session
+    (TenantContext's real user.email), passed through by the frontend. This is not a fabricated
+    identity -- it's the real logged-in user, just supplied by the client because the backend has
+    no other way to learn it. Documented here per Part 14's own explicit instruction, same
+    limitation already named in the Phase 5 write routes: any authenticated user can perform this
+    action, since no role/permission system exists anywhere in this app."""
+    from app.gtm_os.learning.message_draft import (
+        approve_message_draft,
+        reject_message_draft,
+        request_changes_message_draft,
+    )
+
+    action = payload.get("action")
+    reviewed_by = payload.get("reviewed_by")
+    note = payload.get("note")
+
+    if action not in ("approve", "reject", "request_changes"):
+        raise HTTPException(status_code=400, detail="action must be one of: approve, reject, request_changes")
+    if not isinstance(reviewed_by, str) or not reviewed_by.strip():
+        raise HTTPException(status_code=400, detail="reviewed_by is required")
+
+    handler = {
+        "approve": lambda: approve_message_draft(db, ELEPHANT_EDGE_TENANT_ID, message_draft_id, reviewed_by),
+        "reject": lambda: reject_message_draft(db, ELEPHANT_EDGE_TENANT_ID, message_draft_id, reviewed_by, note),
+        "request_changes": lambda: request_changes_message_draft(db, ELEPHANT_EDGE_TENANT_ID, message_draft_id, reviewed_by, note),
+    }[action]
+
+    try:
+        draft = handler()
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    return {
+        "id": draft.id,
+        "status": draft.status,
+        "reviewed_at": draft.reviewed_at,
+        "reviewed_by": draft.reviewed_by,
+        "review_note": draft.review_note,
+        "approved_at": draft.approved_at,
+        "approved_by": draft.approved_by,
+    }
+
+
+# ---- V2 Efficiency (time-saved ledger) ----
+
+@router.get("/gtm-os/efficiency")
+def get_gtm_os_efficiency(month: str | None = None, db: Session = Depends(get_db)):
+    """V2 Efficiency page -- read-only wrapper over get_monthly_efficiency()
+    (app/gtm_os/efficiency/efficiency.py), a pure aggregation over EfficiencyActivityEvent (real
+    recorded activity volume, instrumented at the actual pipeline call sites -- see
+    app/phases/autonomous_orchestrator.py and app/main.py), MessageDraft (read directly, not
+    duplicated), and AutonomousRun's own started_at/completed_at. Never fabricates "equivalent
+    SDRs", "ran outside 9-5 %", or "admin time cut %" -- see that module's own docstring."""
+    from app.gtm_os.efficiency.efficiency import get_monthly_efficiency
+
+    return get_monthly_efficiency(db, ELEPHANT_EDGE_TENANT_ID, month=month)
+
+
+@router.get("/gtm-os/efficiency-benchmarks")
+def get_gtm_os_efficiency_benchmarks(db: Session = Depends(get_db)):
+    """V2 Settings Efficiency/Time Benchmarks section -- read-only wrapper over
+    get_efficiency_benchmarks() (app/gtm_os/efficiency/benchmark_config.py)."""
+    from app.gtm_os.efficiency.benchmark_config import get_efficiency_benchmarks
+
+    return {"benchmarks": get_efficiency_benchmarks(db, ELEPHANT_EDGE_TENANT_ID)}
+
+
+@router.put("/gtm-os/efficiency-benchmarks")
+def put_gtm_os_efficiency_benchmarks(benchmarks: list = Body(...), db: Session = Depends(get_db)):
+    """Reuses set_efficiency_benchmarks() verbatim -- all validation lives there. Same
+    authorization note as every other Settings/config write route in this file: session-cookie
+    auth via the gateway's reverse proxy is the existing mechanism; no finer-grained role system
+    exists in this codebase to gate on."""
+    from app.gtm_os.efficiency.benchmark_config import EfficiencyBenchmarkConfigError, get_efficiency_benchmarks, set_efficiency_benchmarks
+
+    try:
+        set_efficiency_benchmarks(db, ELEPHANT_EDGE_TENANT_ID, benchmarks)
+    except EfficiencyBenchmarkConfigError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"benchmarks": get_efficiency_benchmarks(db, ELEPHANT_EDGE_TENANT_ID)}
+
+
+@router.get("/gtm-os/jobs-to-be-done")
+def get_gtm_os_jobs_to_be_done(db: Session = Depends(get_db)):
+    """V2 Jobs to Be Done -- read-only composition of four existing, unmodified backend readers:
+    get_next_execution_action() (execution_readiness.py), Company.hot_lead/hot_lead_reasoning
+    (hot_leads.py), Company.decision_maker_searched_at + Contact, and GtmSignal/InterpretedSignal.
+    See app/gtm_os/jobs/jobs_to_be_done.py for the full priority-ordering rationale. "calls_to_make"
+    is always returned as an explicitly unavailable category -- no real qualifying data exists for
+    it yet, and this route never fabricates one. Nothing here is persisted; every call re-derives
+    the queue from current state."""
+    from app.gtm_os.jobs.jobs_to_be_done import get_jobs_to_be_done
+
+    return get_jobs_to_be_done(db, ELEPHANT_EDGE_TENANT_ID)
+
+
+# ---- V2 Overrides & Evals (learning foundation) ----
+
+@router.get("/gtm-os/overrides-evals")
+def get_gtm_os_overrides_evals(month: str | None = None, db: Session = Depends(get_db)):
+    """V2 Overrides & Evals -- read-only wrapper over get_overrides_evals()
+    (app/gtm_os/learning/overrides_evals.py), a pure aggregation over MessageDraft's own review
+    lifecycle and CalendarBooking's own outcome fields (both unmodified, no second review/outcome
+    engine). Candidate patterns are computed fresh on every call, never persisted -- only a
+    ConfirmedPattern row (created solely via the confirm/dismiss routes below) is durable. No
+    "accuracy %" is fabricated -- see that module's own docstring for why none is defensible yet."""
+    from app.gtm_os.learning.overrides_evals import get_overrides_evals
+
+    return get_overrides_evals(db, ELEPHANT_EDGE_TENANT_ID, month=month)
+
+
+@router.post("/gtm-os/patterns/{category}/confirm")
+def post_gtm_os_pattern_confirm(category: str, body: dict = Body(default={}), db: Session = Depends(get_db)):
+    """Human confirmation of a candidate pattern -- keyed by category (not a numeric id) because
+    a candidate is not a persisted row until this action (or dismiss, below) creates one; see
+    overrides_evals.py's own docstring for why. Writes ONLY to confirmed_patterns -- never
+    touches ICP/offering/GTM-motion config, GtmStrategy, MessageDraft, the revenue goal, or any
+    autonomous-run behavior (Part 6/9's explicit boundary). `confirmed_by` is supplied by the
+    frontend from the real, already-authenticated user, same pattern as every other reviewer-
+    identity field in this backend."""
+    from app.gtm_os.learning.overrides_evals import confirm_pattern
+
+    try:
+        row = confirm_pattern(db, ELEPHANT_EDGE_TENANT_ID, category, body.get("confirmed_by"))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    return {
+        "id": row.id, "category": row.category, "status": row.status,
+        "trigger_description": row.trigger_description, "pattern_description": row.pattern_description,
+        "source_event_refs": row.source_event_refs, "confirmed_by": row.confirmed_by, "confirmed_at": row.confirmed_at,
+    }
+
+
+@router.post("/gtm-os/patterns/{category}/dismiss")
+def post_gtm_os_pattern_dismiss(category: str, body: dict = Body(default={}), db: Session = Depends(get_db)):
+    """Human dismissal of a candidate pattern -- same write-boundary as confirm above (only ever
+    writes to confirmed_patterns)."""
+    from app.gtm_os.learning.overrides_evals import dismiss_pattern
+
+    try:
+        row = dismiss_pattern(db, ELEPHANT_EDGE_TENANT_ID, category, body.get("confirmed_by"))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    return {
+        "id": row.id, "category": row.category, "status": row.status,
+        "trigger_description": row.trigger_description, "pattern_description": row.pattern_description,
+        "source_event_refs": row.source_event_refs, "confirmed_by": row.confirmed_by, "confirmed_at": row.confirmed_at,
+    }
+
+
+@router.get("/gtm-os/pattern-detection-config")
+def get_gtm_os_pattern_detection_config(db: Session = Depends(get_db)):
+    """Detection sensitivity config (min_occurrences, lookback_days) -- Parameter-backed, same
+    pattern as every other V2 config."""
+    from app.gtm_os.learning.pattern_detection_config import get_pattern_detection_config
+
+    return get_pattern_detection_config(db, ELEPHANT_EDGE_TENANT_ID)
+
+
+@router.put("/gtm-os/pattern-detection-config")
+def put_gtm_os_pattern_detection_config(config: dict = Body(...), db: Session = Depends(get_db)):
+    from app.gtm_os.learning.pattern_detection_config import PatternDetectionConfigError, get_pattern_detection_config, set_pattern_detection_config
+
+    try:
+        set_pattern_detection_config(db, ELEPHANT_EDGE_TENANT_ID, config)
+    except PatternDetectionConfigError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return get_pattern_detection_config(db, ELEPHANT_EDGE_TENANT_ID)

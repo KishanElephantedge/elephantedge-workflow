@@ -8,3 +8,4 @@ httpx
 APScheduler
 redis
 dnspython
+feedparser

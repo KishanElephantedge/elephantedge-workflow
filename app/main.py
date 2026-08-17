@@ -1,3 +1,6 @@
+import logging
+from datetime import datetime
+
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from fastapi import FastAPI
@@ -5,9 +8,11 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.db.session import SessionLocal, ensure_indexes
 from app.google_calendar_client import GoogleCalendarError
+from app.gtm_os.orchestration.sweep import run_gtm_intelligence_sweep
 from app.phases.autonomous_orchestrator import get_autonomous_schedule_utc, resume_pending_approvals, run_daily_autonomous_cycle
 from app.phases.calendar_sync import sync_calendar_bookings
 from app.phases.linkedin_monitor import run_linkedin_monitor_sweep
+from app.gtm_os.efficiency.activity_recorder import record_activity
 from app.routes import api
 from app.routes.api import ELEPHANT_EDGE_TENANT_ID, refresh_active_batch_caches
 
@@ -84,7 +89,40 @@ def _scheduled_linkedin_monitor_sweep():
     for the full design (batched Apify calls, cost model, why this isn't Deepline Monitors)."""
     db = SessionLocal()
     try:
-        run_linkedin_monitor_sweep(db, tenant_id=ELEPHANT_EDGE_TENANT_ID)
+        result = run_linkedin_monitor_sweep(db, tenant_id=ELEPHANT_EDGE_TENANT_ID)
+        # V2 Efficiency -- this count was previously computed and discarded. No source_run_id
+        # here (this isn't tied to an AutonomousRun), so every sweep call inserts its own row;
+        # get_monthly_efficiency() SUMs across a day's rows rather than deduping them.
+        record_activity(
+            db, ELEPHANT_EDGE_TENANT_ID, "signal_monitoring", datetime.utcnow().date(),
+            result["profiles_checked"], source="linkedin_monitor_sweep",
+        )
+    finally:
+        db.close()
+
+
+def _scheduled_gtm_intelligence_cycle():
+    """Runs every 60 minutes -- the full GTM Intelligence sweep (app/gtm_os/orchestration/
+    sweep.py): sensing (TheirStack/LinkedIn replies/Hacker News/RSS) -> interpretation -> Problem/
+    Demand hypotheses, and independently, configured topic linking -> candidate extraction ->
+    candidate normalization -> candidate promotion -> trend intelligence (Step 16 Batch 2).
+
+    60 minutes, not the 45/15/5/3-minute cadence of the jobs above -- this cycle's
+    candidate_extraction stage makes real LLM calls (see sweep.py's own module docstring), so a
+    tighter interval would multiply that cost for no proven benefit yet at this feature's current
+    (low) real signal volume. This interval is itself an operational choice, not a calibrated
+    one -- easy to tighten later once real candidate/promotion volume is observed (Batch 1/2's
+    own calibration-default precedent).
+
+    Per this backend's own established single-tenant pattern (see _scheduled_autonomous_tick),
+    this dedicated backend only ever runs its own tenant's cycle -- never loops over the shared
+    `tenants` table. Never raises: run_gtm_intelligence_sweep's own per-source/per-stage error
+    isolation means a real failure is captured in its returned result and logged there, not
+    surfaced as an uncaught exception here."""
+    db = SessionLocal()
+    try:
+        result = run_gtm_intelligence_sweep(db, tenant_id=ELEPHANT_EDGE_TENANT_ID)
+        logging.getLogger(__name__).info("gtm_intelligence_cycle: %s", result)
     finally:
         db.close()
 
@@ -130,6 +168,7 @@ def on_startup():
     scheduler.add_job(_scheduled_cache_refresh, "interval", minutes=3, id="batch_cache_refresh")
     scheduler.add_job(_scheduled_calendar_sync, "interval", minutes=15, id="calendar_booking_sync")
     scheduler.add_job(_scheduled_linkedin_monitor_sweep, "interval", minutes=45, id="linkedin_monitor_sweep")
+    scheduler.add_job(_scheduled_gtm_intelligence_cycle, "interval", minutes=60, id="gtm_intelligence_cycle")
     scheduler.start()
 
 

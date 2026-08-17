@@ -114,3 +114,49 @@ def add_single_prospect(campaign_uuid: str, linkedin_account_uuid: str, prospect
     if response.status_code != 200:
         raise SalesRobotError(f"add-single-prospect failed ({response.status_code}): {response.text}")
     return response.json()
+
+
+def get_synced_messages(
+    linkedin_account_uuid: str,
+    db: Session,
+    tenant_id: int,
+    thread_id: str | None = None,
+    prospect_uuid_filter: list[str] | None = None,
+    page: int = 0,
+    size: int = 20,
+    inbox_type: str = "linkedinInbox",
+) -> dict:
+    """Real, confirmed-live endpoint (verified 2026-08-16, Step 10C): POST /api/syncedMessages
+    -- returns full LinkedIn conversation history (our sent messages AND the prospect's real
+    replies) for one or more threads, not just a status flag. This is the one gap
+    get_campaign_prospects() couldn't fill (per its own docstring): real message content.
+
+    Confirmed live quirk, not documented anywhere: `prospectUuidFilter` MUST be a list/array --
+    passing a bare string 400s with a Jackson deserialization error (real error message
+    confirmed live: "Cannot deserialize instance of `java.util.ArrayList`... out of
+    VALUE_STRING token").
+
+    Response shape (confirmed live, not just documented): `data` is a two-element array --
+    `data[0]` is an unrelated/empty pagination wrapper, `data[1]` is the real one, whose own
+    `data` is the list of thread objects. Each thread has a `prospectData.profileUrl` (vanity
+    URL, matches Contact.linkedin_url) DISTINCT from the thread-level `profileUrl` (opaque
+    internal LinkedIn ID, does NOT match) -- see sensing.py's own docstring for why this
+    matters. Each thread's `threadedMessages.messages` is the real, ordered (by `ordinal`)
+    conversation, each message carrying `messageId`/`messageText`/`sentTime`/`sender`/
+    `messageSentByMe`."""
+    api_key = _get_api_key(db, tenant_id)
+    body: dict = {"pg": {"page": page, "size": size, "sort": []}, "inboxType": inbox_type}
+    if thread_id:
+        body["threadId"] = thread_id
+    if prospect_uuid_filter:
+        body["prospectUuidFilter"] = prospect_uuid_filter
+    response = httpx.post(
+        f"{BASE_URL}/syncedMessages",
+        params={"linkedinAccountUuid": linkedin_account_uuid},
+        json=body,
+        headers={"X-API-KEY": api_key, "content-type": "application/json;charset=UTF-8"},
+        timeout=30,
+    )
+    if response.status_code != 200:
+        raise SalesRobotError(f"syncedMessages failed ({response.status_code}): {response.text}")
+    return response.json()
