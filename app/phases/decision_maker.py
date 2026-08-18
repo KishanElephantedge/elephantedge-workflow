@@ -28,7 +28,7 @@ from sqlalchemy.orm import Session
 
 from app.budget_guard import BudgetExceededError, BudgetGuard
 from app.db.models import Company, Contact
-from app.deepline_client import execute_tool, extract_rows
+from app.deepline_client import DeeplineError, execute_tool, extract_rows
 from app.hubspot_client import HubSpotError
 from app.phases.hiring_signal import assess_team_composition, has_qualifying_hiring_signal
 from app.phases.hubspot_sync import sync_to_hubspot
@@ -64,12 +64,30 @@ CANDIDATES_PER_SEARCH = 3
 
 
 def _run_search_contact(company: Company, extra_payload: dict) -> list[dict]:
+    """Real bug fix (2026-08-18): this call used to have no error handling at all -- a single
+    real failure (confirmed live: Deepline balance hit $0, crustdata_v3_person_search errored
+    out) propagated all the way up through find_decision_maker() and the per-company loop in
+    _run_apify_autonomous_cycle(), crashing the ENTIRE day's autonomous run outright, discarding
+    tracking of whatever companies discovery had already found that day (AutonomousRun.
+    companies_discovered was never set, since the crash happened before that assignment).
+
+    Now: a DeeplineError here is treated the same as a genuine "no candidates found" result for
+    THIS ONE company -- find_decision_maker() falls through to the sales-leader tier and then
+    to "no contact" exactly as it already does for a real empty response, and the run continues
+    to the next company instead of dying. The caller's own PAID_DECISION_MAKER_FALLBACK_CAP
+    still bounds how many companies can hit this failure in one run (a real, external outage
+    like a $0 Deepline balance won't resolve mid-run, so retrying every remaining company would
+    just repeat the same failure) -- this fix doesn't change that cap, only stops one company's
+    failure from being treated as the whole run's failure."""
     payload = {
         "domain": company.domain,
         "page_size": CANDIDATES_PER_SEARCH,
         **extra_payload,
     }
-    response = execute_tool("search_contact", payload)
+    try:
+        response = execute_tool("search_contact", payload)
+    except DeeplineError:
+        return []
     raw = response.get("toolResponse", {}).get("raw", {})
     if isinstance(raw, dict) and isinstance(raw.get("output"), dict):
         persons = raw["output"].get("persons")

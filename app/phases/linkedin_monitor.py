@@ -97,6 +97,72 @@ def set_keyword_tiers(db: Session, tenant_id: int, tiers: dict[str, list[str]]) 
     db.commit()
 
 
+SCHEDULE_PARAMETER_KEY = "linkedin_monitor_schedule"
+
+# Historical default -- this was hardcoded as `minutes=45` directly in main.py's
+# scheduler.add_job() call until 2026-08-18, with no way to change it without a code change/
+# redeploy, and the "Poll Interval" stat on the Targets page just displayed this same number as
+# a static string rather than reading anything real. Kept as the fallback default only; the
+# real, current interval is whatever's stored via set_monitor_schedule() below.
+DEFAULT_SCHEDULE = {"days": 0, "hours": 0, "minutes": 45, "enabled": True}
+
+# Real safety floor -- prevents an accidental 0/1-minute interval from hammering the Apify
+# actor (and this tenant's Apify spend) every time the scheduler ticks. 5 minutes is well
+# under any of this monitor's real use cases (checking a LinkedIn profile for new posts) but
+# still guards against a fat-fingered save.
+MIN_SCHEDULE_MINUTES = 5
+
+
+class ScheduleConfigError(ValueError):
+    """Raised when a schedule save fails validation -- never silently clamped or coerced."""
+
+
+def get_monitor_schedule(db: Session, tenant_id: int) -> dict:
+    """Returns {"days", "hours", "minutes", "enabled", "interval_minutes"} -- the first four are
+    exactly what a human edits (see Targets > Settings); interval_minutes is the same value
+    pre-computed as a single total, for callers (main.py's scheduler) that just need one
+    number, so that arithmetic lives in exactly one place."""
+    param = (
+        db.query(Parameter)
+        .filter(Parameter.tenant_id == tenant_id)
+        .filter(Parameter.key == SCHEDULE_PARAMETER_KEY)
+        .first()
+    )
+    schedule = dict(param.value) if param and isinstance(param.value, dict) and param.value else dict(DEFAULT_SCHEDULE)
+    for key, default in DEFAULT_SCHEDULE.items():
+        schedule.setdefault(key, default)
+    schedule["interval_minutes"] = schedule["days"] * 1440 + schedule["hours"] * 60 + schedule["minutes"]
+    return schedule
+
+
+def set_monitor_schedule(db: Session, tenant_id: int, days: int, hours: int, minutes: int, enabled: bool) -> dict:
+    """Validates and stores the real schedule a human configured, then returns it (via
+    get_monitor_schedule(), same shape every reader expects, including interval_minutes)."""
+    for name, value in (("days", days), ("hours", hours), ("minutes", minutes)):
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise ScheduleConfigError(f"{name!r} must be a non-negative integer")
+    if not isinstance(enabled, bool):
+        raise ScheduleConfigError("'enabled' must be true/false")
+    total_minutes = days * 1440 + hours * 60 + minutes
+    if total_minutes < MIN_SCHEDULE_MINUTES:
+        raise ScheduleConfigError(f"interval must be at least {MIN_SCHEDULE_MINUTES} minutes total (got {total_minutes})")
+
+    value = {"days": days, "hours": hours, "minutes": minutes, "enabled": enabled}
+    param = (
+        db.query(Parameter)
+        .filter(Parameter.tenant_id == tenant_id)
+        .filter(Parameter.key == SCHEDULE_PARAMETER_KEY)
+        .first()
+    )
+    if param:
+        param.value = value
+    else:
+        param = Parameter(tenant_id=tenant_id, key=SCHEDULE_PARAMETER_KEY, value=value, description="LinkedIn monitor poll interval + pause/resume, editable from Targets > Settings")
+        db.add(param)
+    db.commit()
+    return get_monitor_schedule(db, tenant_id)
+
+
 UNFILTERED_TIER = "Unfiltered"
 UNFILTERED_KEYWORD = "(no keyword filter configured -- capturing all activity)"
 
@@ -188,7 +254,18 @@ def run_linkedin_monitor_sweep(db: Session, tenant_id: int) -> dict:
     keyword-matches anything new, and alerts on a hit. Safe to call repeatedly (e.g. every
     30-60 min via the scheduler) -- already-seen posts are deduped by the unique
     (profile_id, post_urn) index, and a profile whose actor call fails is skipped for this
-    sweep (its last_checked_at is left untouched), not marked as checked."""
+    sweep (its last_checked_at is left untouched), not marked as checked.
+
+    PAUSE (Targets > Settings, 2026-08-18): the scheduler job itself keeps firing on its own
+    fixed cadence regardless -- pausing means this function no-ops immediately, same pattern as
+    autonomous_orchestrator.py's is_autonomous_enabled() check. Deliberately not an APScheduler
+    pause_job()/resume_job() call: that state lives only in the running process's memory and
+    would silently reset to "resumed" on every deploy/restart, whereas a DB flag is the real,
+    persistent source of truth a human actually set."""
+    schedule = get_monitor_schedule(db, tenant_id)
+    if not schedule["enabled"]:
+        return {"profiles_checked": 0, "signals_found": 0, "status": "paused"}
+
     profiles = (
         db.query(LinkedinMonitorProfile)
         .filter(LinkedinMonitorProfile.tenant_id == tenant_id)

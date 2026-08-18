@@ -3146,6 +3146,35 @@ def trigger_linkedin_monitor_sweep(db: Session = Depends(get_db)):
     return run_linkedin_monitor_sweep(db, ELEPHANT_EDGE_TENANT_ID)
 
 
+@router.get("/linkedin-monitor/schedule")
+def get_linkedin_monitor_schedule(db: Session = Depends(get_db)):
+    """Real, current poll interval + pause state -- replaces the "Every 45 min" string that used
+    to be hardcoded directly in the Targets page (Targets > Settings, 2026-08-18)."""
+    from app.phases.linkedin_monitor import get_monitor_schedule
+    return get_monitor_schedule(db, ELEPHANT_EDGE_TENANT_ID)
+
+
+@router.put("/linkedin-monitor/schedule")
+def put_linkedin_monitor_schedule(body: dict = Body(...), db: Session = Depends(get_db)):
+    """Saves the new interval/pause state AND reschedules the live scheduler job immediately
+    (see reschedule_linkedin_monitor_job in main.py) -- so a change here takes effect on this
+    process right away, not just on the next restart."""
+    from app.phases.linkedin_monitor import ScheduleConfigError, set_monitor_schedule
+    from app.main import reschedule_linkedin_monitor_job
+
+    try:
+        schedule = set_monitor_schedule(
+            db, ELEPHANT_EDGE_TENANT_ID,
+            days=body.get("days", 0), hours=body.get("hours", 0), minutes=body.get("minutes", 0),
+            enabled=body.get("enabled", True),
+        )
+    except ScheduleConfigError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    reschedule_linkedin_monitor_job(schedule["interval_minutes"])
+    return schedule
+
+
 # ---- GTM Partner Categorization -- which industry a watched profile is in, and who they sell
 # to, so the lead can spot cross-industry referral-partner candidates. See
 # app/phases/gtm_partner_classification.py for the full grounding/no-fabrication discipline. Not

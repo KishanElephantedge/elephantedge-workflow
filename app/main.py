@@ -3,6 +3,7 @@ from datetime import datetime
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.interval import IntervalTrigger
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -18,7 +19,7 @@ from app.gtm_os.orchestration.sweep import (
 )
 from app.phases.autonomous_orchestrator import get_autonomous_schedule_utc, resume_pending_approvals, run_daily_autonomous_cycle
 from app.phases.calendar_sync import sync_calendar_bookings
-from app.phases.linkedin_monitor import run_linkedin_monitor_sweep
+from app.phases.linkedin_monitor import get_monitor_schedule, run_linkedin_monitor_sweep
 from app.gtm_os.efficiency.activity_recorder import record_activity
 from app.routes import api
 from app.routes.api import ELEPHANT_EDGE_TENANT_ID, refresh_active_batch_caches
@@ -202,12 +203,23 @@ def reschedule_autonomous_job(hour: int, minute: int):
     )
 
 
+def reschedule_linkedin_monitor_job(interval_minutes: int):
+    """Called from PUT /linkedin-monitor/schedule so a new poll interval (Targets > Settings,
+    2026-08-18) takes effect immediately -- same "reschedule the live job, don't wait for a
+    restart" pattern as reschedule_autonomous_job above. The job itself keeps firing at this
+    cadence unconditionally; PAUSE is handled inside run_linkedin_monitor_sweep (an "enabled"
+    DB flag check, not an APScheduler pause_job() call) -- see that function's own docstring
+    for why a DB flag, not in-memory scheduler state, is the source of truth."""
+    scheduler.reschedule_job("linkedin_monitor_sweep", trigger=IntervalTrigger(minutes=interval_minutes))
+
+
 @app.on_event("startup")
 def on_startup():
     ensure_indexes()
     db = SessionLocal()
     try:
         hour, minute = get_autonomous_schedule_utc(db, ELEPHANT_EDGE_TENANT_ID)
+        linkedin_monitor_interval_minutes = get_monitor_schedule(db, ELEPHANT_EDGE_TENANT_ID)["interval_minutes"]
     finally:
         db.close()
     scheduler.add_job(
@@ -219,7 +231,9 @@ def on_startup():
     scheduler.add_job(_scheduled_approval_sweep, "interval", minutes=5, id="approval_window_sweep")
     scheduler.add_job(_scheduled_cache_refresh, "interval", minutes=3, id="batch_cache_refresh")
     scheduler.add_job(_scheduled_calendar_sync, "interval", minutes=15, id="calendar_booking_sync")
-    scheduler.add_job(_scheduled_linkedin_monitor_sweep, "interval", minutes=45, id="linkedin_monitor_sweep")
+    # Interval read from real, editable config (Targets > Settings) -- was hardcoded
+    # minutes=45 until 2026-08-18, with no way to change it without a code change/redeploy.
+    scheduler.add_job(_scheduled_linkedin_monitor_sweep, "interval", minutes=linkedin_monitor_interval_minutes, id="linkedin_monitor_sweep")
     scheduler.add_job(_scheduled_gtm_intelligence_cycle, "interval", minutes=60, id="gtm_intelligence_cycle")
     scheduler.add_job(_scheduled_governance_snapshot, "interval", minutes=60, id="governance_snapshot")
     scheduler.start()
