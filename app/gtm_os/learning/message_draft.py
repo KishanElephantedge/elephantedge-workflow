@@ -36,9 +36,24 @@ from sqlalchemy.orm import Session
 
 from app.db.models import Base
 from app.gtm_os.opportunity.opportunity import Opportunity
-from app.gtm_os.sales.sales_agent import evaluate_decision_maker, gather_account_research, prepare_message
+from app.gtm_os.sales.sales_agent import evaluate_decision_maker, evaluate_sales_readiness, gather_account_research, prepare_message
 from app.gtm_os.strategy.strategy import GtmStrategy
 from app.llm_client import generate_json
+
+# Autonomous-pipeline batch entry point (GTM-OS end-to-end wiring) -- until now,
+# generate_message_draft() had ZERO callers anywhere in this codebase (confirmed by a full-repo
+# grep): nothing ever looped over eligible Opportunities and invoked it, so no MessageDraft row
+# had ever been created automatically. This is the missing wrapper, same shape as every other
+# `run_*_sweep` in this feature (bounded `limit`, per-item failure isolation, idempotent).
+#
+# COST CONTAINMENT (real LLM spend per call): this codebase's BudgetGuard (app/budget_guard.py)
+# is Deepline-credit-specific -- it re-checks a real Deepline balance, which has no meaning for
+# Claude/Gemini token spend, so it cannot be reused here without inventing a mismatched concept
+# (violating "do not create a second spend-control mechanism" the other direction). Instead this
+# reuses the exact bounding convention every other sweep in this codebase already uses for cost
+# containment: a per-cycle `limit`, same as PROFILES_PER_BATCH/run_gtm_strategy_sweep's own
+# `limit=200`. Default kept intentionally small (20) specifically because this is the one stage
+# in the chain that spends real money per item, unlike its siblings.
 
 MESSAGE_STATUSES = {"insufficient_context", "draft", "ready_for_review", "approved", "rejected", "changes_requested"}
 
@@ -356,3 +371,76 @@ def list_messages_for_company(db: Session, tenant_id: int, company_id: int) -> l
         }
         for d in rows
     ]
+
+
+def _latest_strategy_for_opportunity(db: Session, tenant_id: int, opportunity_id: int) -> GtmStrategy | None:
+    return (
+        db.query(GtmStrategy)
+        .filter(GtmStrategy.tenant_id == tenant_id, GtmStrategy.opportunity_id == opportunity_id)
+        .order_by(GtmStrategy.id.desc())
+        .first()
+    )
+
+
+def run_message_generation_sweep(db: Session, tenant_id: int, limit: int = 20) -> dict:
+    """Evaluates up to `limit` Opportunities whose LATEST GtmStrategy has reached
+    evaluate_sales_readiness()'s "ready_for_message" state (the same readiness gate
+    account_agent.py/execution_readiness.py already use -- not re-derived here) and generates a
+    draft via generate_message_draft() (unmodified) for each.
+
+    IDEMPOTENT BY CONSTRUCTION: generate_message_draft() itself already looks up
+    (opportunity_id, gtm_strategy_id) before writing (see _existing_draft()) and returns the
+    existing row instead of creating a duplicate -- this sweep adds no additional dedup logic of
+    its own, it only decides WHICH opportunities are worth calling that already-idempotent
+    function for. A rerun against unchanged data creates zero new rows and spends zero additional
+    tokens (existing drafts are returned immediately, no LLM call).
+
+    Never regenerates an ALREADY-drafted/reviewed/approved message just because the strategy
+    hasn't changed -- only opportunities with no MessageDraft row for their current strategy
+    version are counted as "eligible" and passed to generate_message_draft().
+
+    One opportunity's failure never aborts the sweep. Makes real LLM calls (see
+    generate_message_draft()'s own module docstring) -- bounded by `limit`, see this module's own
+    cost-containment note above."""
+    counts = {"evaluated": 0, "eligible": 0, "drafted": 0, "already_drafted": 0, "not_ready": 0, "failed": 0}
+
+    opportunity_ids = [
+        row[0]
+        for row in db.query(Opportunity.id)
+        .filter(Opportunity.tenant_id == tenant_id)
+        .order_by(Opportunity.id)
+        .all()
+    ]
+
+    for opportunity_id in opportunity_ids:
+        if counts["drafted"] >= limit:
+            break
+        try:
+            opportunity = db.get(Opportunity, opportunity_id)
+            if opportunity is None or opportunity.tenant_id != tenant_id:
+                continue
+            counts["evaluated"] += 1
+
+            strategy = _latest_strategy_for_opportunity(db, tenant_id, opportunity.id)
+            if strategy is None:
+                counts["not_ready"] += 1
+                continue
+
+            readiness = evaluate_sales_readiness(strategy)
+            if readiness["status"] != "ready_for_message":
+                counts["not_ready"] += 1
+                continue
+
+            counts["eligible"] += 1
+            existing = _existing_draft(db, tenant_id, opportunity.id, strategy.id)
+            if existing is not None:
+                counts["already_drafted"] += 1
+                continue
+
+            generate_message_draft(db, tenant_id, opportunity, strategy)
+            counts["drafted"] += 1
+
+        except Exception:  # noqa: BLE001 -- one opportunity's failure must never block the others, same pattern as every other sweep in this feature
+            counts["failed"] += 1
+
+    return counts

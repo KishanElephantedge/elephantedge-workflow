@@ -3606,6 +3606,48 @@ def post_gtm_os_pattern_dismiss(category: str, body: dict = Body(default={}), db
     }
 
 
+# ---- GTM-OS Intelligence Runs (end-to-end autonomous pipeline observability) ----
+
+@router.get("/gtm-os/intelligence-runs")
+def list_gtm_intelligence_runs(limit: int = 20, db: Session = Depends(get_db)):
+    """Real, persisted run history for the hourly GTM-OS sweep (app/gtm_os/orchestration/
+    sweep.py) -- "what happened during the last run" as a queryable table, not just a log line.
+    Read-only."""
+    from app.gtm_os.orchestration.sweep import GtmIntelligenceRun
+
+    runs = (
+        db.query(GtmIntelligenceRun)
+        .filter(GtmIntelligenceRun.tenant_id == ELEPHANT_EDGE_TENANT_ID)
+        .order_by(GtmIntelligenceRun.id.desc())
+        .limit(limit)
+        .all()
+    )
+    return [
+        {
+            "id": r.id, "status": r.status, "stage_results": r.stage_results, "error_summary": r.error_summary,
+            "started_at": r.started_at, "completed_at": r.completed_at,
+        }
+        for r in runs
+    ]
+
+
+@router.post("/gtm-os/intelligence-runs/trigger")
+def trigger_gtm_intelligence_run(dry_run: bool = False, db: Session = Depends(get_db)):
+    """Manual trigger for testing -- the scheduled cycle runs automatically every 60 minutes; this
+    lets a run be checked immediately instead of waiting for the next tick. Same persisted
+    run-record as the scheduled path (unless dry_run=True, which persists nothing, matching
+    run_gtm_intelligence_sweep's own dry_run contract)."""
+    from app.gtm_os.orchestration.sweep import finish_gtm_intelligence_run, run_gtm_intelligence_sweep, start_gtm_intelligence_run
+
+    if dry_run:
+        return run_gtm_intelligence_sweep(db, ELEPHANT_EDGE_TENANT_ID, dry_run=True)
+
+    run = start_gtm_intelligence_run(db, ELEPHANT_EDGE_TENANT_ID)
+    result = run_gtm_intelligence_sweep(db, ELEPHANT_EDGE_TENANT_ID)
+    finish_gtm_intelligence_run(db, run, result)
+    return {"run_id": run.id, "status": run.status, "result": result}
+
+
 @router.get("/gtm-os/pattern-detection-config")
 def get_gtm_os_pattern_detection_config(db: Session = Depends(get_db)):
     """Detection sensitivity config (min_occurrences, lookback_days) -- Parameter-backed, same

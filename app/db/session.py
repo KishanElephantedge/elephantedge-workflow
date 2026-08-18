@@ -516,3 +516,18 @@ def ensure_indexes():
             )
         """))
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_confirmed_patterns_tenant_category ON confirmed_patterns (tenant_id, category)"))
+        # GTM-OS end-to-end wiring -- durable run-state for run_gtm_intelligence_sweep(), see
+        # app/gtm_os/orchestration/sweep.py's GtmIntelligenceRun for why this is its own table
+        # rather than a reuse of autonomous_runs.
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS gtm_intelligence_runs (
+                id SERIAL PRIMARY KEY,
+                tenant_id INTEGER NOT NULL,
+                status VARCHAR NOT NULL DEFAULT 'running',
+                stage_results JSON,
+                error_summary VARCHAR,
+                started_at TIMESTAMP,
+                completed_at TIMESTAMP
+            )
+        """))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_gtm_intelligence_runs_tenant_started ON gtm_intelligence_runs (tenant_id, started_at)"))

@@ -31,6 +31,40 @@ architecture diagram -- neither branch reads the other's output:
                        ▼
                    TREND INTELLIGENCE (run_trend_intelligence_sweep -- read-only, no LLM)
 
+A third branch (ACCOUNT_STRATEGY_STAGES), independently failure-isolated from both branches above,
+runs after Problem/Demand (it reads DemandHypothesis):
+
+    OPPORTUNITY (run_opportunity_intelligence_sweep)
+        │
+        ▼
+    ICP MATCHING (run_icp_matching_sweep -- persists ICPMatch; previously had ZERO callers
+        │          anywhere in this app until this wiring pass, see its own inline comment)
+        ▼
+    GTM STRATEGY (run_gtm_strategy_sweep -- internally calls match_offerings() per opportunity,
+        │          so offering-fit is already evaluated as part of this stage, not a separate one)
+        ▼
+    MESSAGE GENERATION (run_message_generation_sweep -- previously had ZERO callers anywhere;
+        │                the ONE stage here that spends real LLM $, bounded by its own small
+        │                limit. Produces MessageDraft rows in draft/ready_for_review/
+        │                insufficient_context state ONLY -- NEVER approved/sent/executed by
+        │                this sweep or anything it calls. approve_message_draft() is a separate,
+        │                human-only action (POST /gtm-os/messages/{id}/review). This is the
+        │                autonomous cycle's human-approval boundary.)
+        ▼
+    SALES READINESS (run_sales_agent_sweep -- read-only reporting, writes nothing)
+        │
+        ▼
+    OUTCOME DETECTION (run_outcome_detection_sweep)
+
+GTM Motion recommendation, Account Brief, and Governance evaluation are DELIBERATELY NOT separate
+scheduled stages here -- each is a pure, cheap, read-only computation with NO persistence table of
+its own (recommend_gtm_motion()/build_account_brief()/evaluate_gtm_governance() all write nothing,
+by design, per their own module docstrings). There is nothing for a batch stage to persist; they
+are correctly computed fresh whenever a human opens the relevant dashboard page (governance.py's
+own callers) rather than duplicated into a stale snapshot table. This is an intentional,
+already-made architecture decision, not a gap -- see the accompanying audit report for the
+reasoning in full.
+
 Content Intelligence stages never consult InterpretedSignal/ProblemHypothesis/DemandHypothesis,
 and Problem/Demand stages never consult ContentTopic/TopicCandidate -- both branches only ever
 read GtmSignal (or their own branch's prior stage output), by construction, matching Batch 2's
@@ -77,15 +111,18 @@ at ERROR level, so a fatal infrastructure issue is fully visible to any caller, 
 as structured failure data rather than a raised exception out of this function."""
 
 import logging
+from datetime import datetime
 
+from sqlalchemy import Column, DateTime, Integer, JSON, String
 from sqlalchemy.orm import Session
 
-from app.db.models import Parameter
+from app.db.models import Base, Parameter
 from app.gtm_os.content.candidate_extraction import run_candidate_extraction_sweep
 from app.gtm_os.content.candidate_normalization import run_candidate_normalization_sweep
 from app.gtm_os.content.promotion import run_candidate_promotion_sweep
 from app.gtm_os.content.topic_linking import run_content_topic_linking_sweep
 from app.gtm_os.content.trend_intelligence import run_trend_intelligence_sweep
+from app.gtm_os.icp.icp_matching import run_icp_matching_sweep
 from app.gtm_os.intelligence.demand_detection import run_demand_hypothesis_sweep
 from app.gtm_os.intelligence.interpretation import run_interpretation_sweep
 from app.gtm_os.intelligence.problem_detection import run_problem_hypothesis_sweep
@@ -95,12 +132,80 @@ from app.gtm_os.intelligence.sensing import (
     sense_rss_articles,
     sense_theirstack_jobs,
 )
+from app.gtm_os.learning.message_draft import run_message_generation_sweep
 from app.gtm_os.learning.outcome import run_outcome_detection_sweep
 from app.gtm_os.opportunity.opportunity import run_opportunity_intelligence_sweep
 from app.gtm_os.sales.sales_agent import run_sales_agent_sweep
 from app.gtm_os.strategy.strategy import run_gtm_strategy_sweep
 
 logger = logging.getLogger(__name__)
+
+
+class GtmIntelligenceRun(Base):
+    """One row per run_gtm_intelligence_sweep() invocation -- the durable run-state V1's
+    AutonomousRun already provides for its own daily cycle, mirrored here rather than left as
+    log-only output (the sweep previously only logged its result dict, with nothing queryable
+    afterward -- no dashboard-visible run history, no way to answer "did last night's run
+    actually complete," no stale-run detection). Deliberately its OWN table, not a reuse of
+    AutonomousRun itself: AutonomousRun's columns (companies_discovered, contacts_found, budget
+    fields, awaiting_approval_until, ...) are shaped for V1's sequential discovery/decision-maker/
+    outreach phases and don't correspond to this sweep's independent-branch stage list -- reusing
+    it would mean bolting on unrelated columns or leaving most of them permanently null. Same
+    "own table when the shape genuinely differs" precedent as GtmStrategy vs. the Score pipeline's
+    own tables."""
+    __tablename__ = "gtm_intelligence_runs"
+
+    id = Column(Integer, primary_key=True)
+    tenant_id = Column(Integer, nullable=False)
+
+    status = Column(String, nullable=False, default="running")  # "running" | "completed" | "partial" | "failed"
+    stage_results = Column(JSON, nullable=True)  # the full result dict run_gtm_intelligence_sweep() returns
+    error_summary = Column(String, nullable=True)  # short, human-readable summary when status != "completed"
+
+    started_at = Column(DateTime, default=datetime.utcnow)
+    completed_at = Column(DateTime, nullable=True)
+
+
+def start_gtm_intelligence_run(db: Session, tenant_id: int) -> GtmIntelligenceRun:
+    run = GtmIntelligenceRun(tenant_id=tenant_id, status="running")
+    db.add(run)
+    db.commit()
+    db.refresh(run)
+    return run
+
+
+def finish_gtm_intelligence_run(db: Session, run: GtmIntelligenceRun, result: dict) -> GtmIntelligenceRun:
+    failed_stages = [k for k, v in result.items() if isinstance(v, dict) and v.get("status") == "failed"]
+    run.status = result.get("status", "completed")
+    run.stage_results = result
+    run.error_summary = f"{len(failed_stages)} stage(s) failed: {', '.join(failed_stages)}" if failed_stages else None
+    run.completed_at = datetime.utcnow()
+    db.commit()
+    return run
+
+
+def recover_stale_gtm_intelligence_runs(db: Session, tenant_id: int, stale_after_minutes: int = 120) -> int:
+    """Mirrors V1's _clear_stale_running_flags() concurrency-safety pattern (autonomous_orchestrator.py):
+    a run that's been "running" for longer than any real sweep could plausibly take (a crashed
+    process, an unhandled exception before finish_gtm_intelligence_run() could be called) must not
+    stay "running" forever and must not silently block a real concurrency check from ever
+    proceeding again. Marked "failed", never silently deleted -- the record itself is real
+    evidence something went wrong."""
+    from datetime import timedelta
+
+    cutoff = datetime.utcnow() - timedelta(minutes=stale_after_minutes)
+    stale = (
+        db.query(GtmIntelligenceRun)
+        .filter(GtmIntelligenceRun.tenant_id == tenant_id, GtmIntelligenceRun.status == "running", GtmIntelligenceRun.started_at < cutoff)
+        .all()
+    )
+    for run in stale:
+        run.status = "failed"
+        run.error_summary = f"run exceeded {stale_after_minutes} minutes without completing -- marked failed by stale-run recovery"
+        run.completed_at = datetime.utcnow()
+    if stale:
+        db.commit()
+    return len(stale)
 
 # Content Intelligence sweep stages, run in this exact order after sensing -- each stage only
 # ever consumes the previous content-branch stage's output (or raw GtmSignal for the first one),
@@ -122,13 +227,27 @@ CONTENT_INTELLIGENCE_STAGES: list[tuple[str, callable]] = [
 # real data (each stage safely returns all-zero counts rather than fabricating output).
 ACCOUNT_STRATEGY_STAGES: list[tuple[str, callable]] = [
     ("opportunity", lambda db, tenant_id: run_opportunity_intelligence_sweep(db, tenant_id)),
+    # ICP matching (icp_matching.py) -- until this GTM-OS wiring pass, run_icp_matching_sweep()
+    # had ZERO callers anywhere in the app (confirmed by full-repo grep): not the scheduler, not
+    # any API route, not this orchestrator. The real ICPMatch table (read by the Demand Grid,
+    # Account 360, icp_candidates, offering_recommendation, and governance) was never populated by
+    # anything automatic. Placed here (after opportunity, before strategy) matching the spec's own
+    # dependency diagram; ICPMatch itself only depends on Company, not Opportunity, so this stage's
+    # own correctness doesn't depend on ordering, but the reading order matches intent. Reuses the
+    # sweep verbatim, unmodified -- no second ICP engine.
+    ("icp_matching", lambda db, tenant_id: run_icp_matching_sweep(db, tenant_id, limit=500)),
     ("gtm_strategy", lambda db, tenant_id: run_gtm_strategy_sweep(db, tenant_id)),
+    # Message generation (message_draft.py) -- makes a real LLM call per eligible Opportunity, so
+    # placed after strategy/before the cheap read-only stages below and bounded by its own small
+    # `limit` (see message_draft.py's own cost-containment note) rather than left permanently
+    # uncalled. Every draft this produces stops at status="draft"/"ready_for_review" --
+    # approve_message_draft() is a SEPARATE, human-only action (app/routes/api.py's
+    # POST /gtm-os/messages/{id}/review), never invoked by this sweep or anything it calls. This
+    # is the human-approval boundary the whole autonomous cycle stops at.
+    ("message_generation", lambda db, tenant_id: run_message_generation_sweep(db, tenant_id, limit=20)),
     ("sales_readiness", lambda db, tenant_id: run_sales_agent_sweep(db, tenant_id)),
     # Batch 7 -- outcome detection reuses existing linkedin_reply InterpretedSignal rows only
-    # (zero LLM/external calls, see outcome.py). Message generation (message_draft.py) is
-    # DELIBERATELY NOT included here -- it makes a real LLM call per opportunity, and Part Q's
-    # own instruction is to prefer keeping that independently callable rather than risk an
-    # unbounded per-cycle cost; see generate_message_draft(), called manually/on-demand only.
+    # (zero LLM/external calls, see outcome.py).
     ("outcome_detection", lambda db, tenant_id: run_outcome_detection_sweep(db, tenant_id)),
 ]
 
@@ -277,7 +396,9 @@ def run_gtm_intelligence_sweep(
         "candidate_promotion": {},
         "trend_intelligence": {},
         "opportunity": {},
+        "icp_matching": {},
         "gtm_strategy": {},
+        "message_generation": {},
         "sales_readiness": {},
         "outcome_detection": {},
     }

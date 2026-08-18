@@ -8,7 +8,13 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.db.session import SessionLocal, ensure_indexes
 from app.google_calendar_client import GoogleCalendarError
-from app.gtm_os.orchestration.sweep import run_gtm_intelligence_sweep
+from app.gtm_os.orchestration.sweep import (
+    GtmIntelligenceRun,
+    finish_gtm_intelligence_run,
+    recover_stale_gtm_intelligence_runs,
+    run_gtm_intelligence_sweep,
+    start_gtm_intelligence_run,
+)
 from app.phases.autonomous_orchestrator import get_autonomous_schedule_utc, resume_pending_approvals, run_daily_autonomous_cycle
 from app.phases.calendar_sync import sync_calendar_bookings
 from app.phases.linkedin_monitor import run_linkedin_monitor_sweep
@@ -104,24 +110,48 @@ def _scheduled_linkedin_monitor_sweep():
 def _scheduled_gtm_intelligence_cycle():
     """Runs every 60 minutes -- the full GTM Intelligence sweep (app/gtm_os/orchestration/
     sweep.py): sensing (TheirStack/LinkedIn replies/Hacker News/RSS) -> interpretation -> Problem/
-    Demand hypotheses, and independently, configured topic linking -> candidate extraction ->
-    candidate normalization -> candidate promotion -> trend intelligence (Step 16 Batch 2).
+    Demand hypotheses -> Opportunity -> ICP matching -> GTM strategy -> message generation ->
+    sales readiness -> outcome detection, and independently, configured topic linking -> candidate
+    extraction -> candidate normalization -> candidate promotion -> trend intelligence.
 
     60 minutes, not the 45/15/5/3-minute cadence of the jobs above -- this cycle's
-    candidate_extraction stage makes real LLM calls (see sweep.py's own module docstring), so a
-    tighter interval would multiply that cost for no proven benefit yet at this feature's current
-    (low) real signal volume. This interval is itself an operational choice, not a calibrated
-    one -- easy to tighten later once real candidate/promotion volume is observed (Batch 1/2's
-    own calibration-default precedent).
+    candidate_extraction and message_generation stages make real LLM calls (see sweep.py's own
+    module docstring), so a tighter interval would multiply that cost for no proven benefit yet at
+    this feature's current (low) real signal volume. This interval is itself an operational
+    choice, not a calibrated one -- easy to tighten later once real volume is observed.
 
     Per this backend's own established single-tenant pattern (see _scheduled_autonomous_tick),
     this dedicated backend only ever runs its own tenant's cycle -- never loops over the shared
-    `tenants` table. Never raises: run_gtm_intelligence_sweep's own per-source/per-stage error
-    isolation means a real failure is captured in its returned result and logged there, not
-    surfaced as an uncaught exception here."""
+    `tenants` table.
+
+    RUN STATE (GTM-OS end-to-end wiring): mirrors V1's own stale-run/concurrency-safety pattern
+    (_clear_stale_running_flags + a running-run check in autonomous_orchestrator.py) rather than
+    inventing a new one -- recover_stale_gtm_intelligence_runs() first, then skip starting a new
+    run entirely if one is still genuinely "running" (guards against two ticks overlapping if one
+    runs long), otherwise persist a GtmIntelligenceRun row for this run so "what happened during
+    the last run" is a real database query, not just a log line to grep for.
+
+    Never raises: run_gtm_intelligence_sweep's own per-source/per-stage error isolation means a
+    real failure is captured in its returned result (and now also in the persisted run's own
+    status/error_summary), not surfaced as an uncaught exception here."""
     db = SessionLocal()
     try:
+        recover_stale_gtm_intelligence_runs(db, ELEPHANT_EDGE_TENANT_ID)
+        already_running = (
+            db.query(GtmIntelligenceRun)
+            .filter(GtmIntelligenceRun.tenant_id == ELEPHANT_EDGE_TENANT_ID, GtmIntelligenceRun.status == "running")
+            .first()
+        )
+        if already_running is not None:
+            logging.getLogger(__name__).warning(
+                "gtm_intelligence_cycle: skipped -- run %s already in progress since %s",
+                already_running.id, already_running.started_at,
+            )
+            return
+
+        run = start_gtm_intelligence_run(db, ELEPHANT_EDGE_TENANT_ID)
         result = run_gtm_intelligence_sweep(db, tenant_id=ELEPHANT_EDGE_TENANT_ID)
+        finish_gtm_intelligence_run(db, run, result)
         logging.getLogger(__name__).info("gtm_intelligence_cycle: %s", result)
     finally:
         db.close()
