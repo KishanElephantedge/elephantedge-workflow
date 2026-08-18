@@ -141,6 +141,14 @@ def ensure_indexes():
             )
         """))
         conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ix_linkedin_monitor_profiles_tenant_url ON linkedin_monitor_profiles (tenant_id, linkedin_url)"))
+        # GTM partner categorization -- see app/phases/gtm_partner_classification.py.
+        conn.execute(text("ALTER TABLE linkedin_monitor_profiles ADD COLUMN IF NOT EXISTS industry VARCHAR"))
+        conn.execute(text("ALTER TABLE linkedin_monitor_profiles ADD COLUMN IF NOT EXISTS sells_to VARCHAR"))
+        conn.execute(text("ALTER TABLE linkedin_monitor_profiles ADD COLUMN IF NOT EXISTS classification_status VARCHAR"))
+        conn.execute(text("ALTER TABLE linkedin_monitor_profiles ADD COLUMN IF NOT EXISTS classification_confidence VARCHAR"))
+        conn.execute(text("ALTER TABLE linkedin_monitor_profiles ADD COLUMN IF NOT EXISTS classification_reasoning TEXT"))
+        conn.execute(text("ALTER TABLE linkedin_monitor_profiles ADD COLUMN IF NOT EXISTS classification_evidence_excerpt TEXT"))
+        conn.execute(text("ALTER TABLE linkedin_monitor_profiles ADD COLUMN IF NOT EXISTS classified_at TIMESTAMP"))
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS linkedin_monitor_signals (
                 id SERIAL PRIMARY KEY,

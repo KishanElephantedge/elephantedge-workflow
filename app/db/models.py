@@ -445,6 +445,19 @@ class LinkedinMonitorProfile(Base):
     last_checked_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
+    # GTM partner categorization (see app/phases/gtm_partner_classification.py) -- which
+    # industry this profile/company operates in, and who THEY sell to, so the lead can spot
+    # non-competing companies serving the same buyer type as candidate referral partners. Always
+    # grounded in real evidence (their own captured posts + the company name on file); never
+    # fabricated when that evidence is too thin -- see classification_status below.
+    industry = Column(String, nullable=True)
+    sells_to = Column(String, nullable=True)
+    classification_status = Column(String, nullable=True)  # "classified" | "insufficient_evidence"
+    classification_confidence = Column(String, nullable=True)  # "high" | "medium" | "low"
+    classification_reasoning = Column(Text, nullable=True)
+    classification_evidence_excerpt = Column(Text, nullable=True)
+    classified_at = Column(DateTime, nullable=True)
+
 
 class LinkedinMonitorSignal(Base):
     """A new post from a monitored profile that matched at least one keyword -- one row per

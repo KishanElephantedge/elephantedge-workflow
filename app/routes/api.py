@@ -3037,6 +3037,11 @@ def list_linkedin_monitor_profiles(db: Session = Depends(get_db)):
         {
             "id": p.id, "name": p.name, "linkedin_url": p.linkedin_url, "company": p.company,
             "active": p.active, "last_checked_at": p.last_checked_at,
+            "industry": p.industry, "sells_to": p.sells_to,
+            "classification_status": p.classification_status,
+            "classification_confidence": p.classification_confidence,
+            "classification_reasoning": p.classification_reasoning,
+            "classified_at": p.classified_at,
         }
         for p in profiles
     ]
@@ -3139,6 +3144,24 @@ def trigger_linkedin_monitor_sweep(db: Session = Depends(get_db)):
     this lets a test post be checked immediately instead of waiting for the next tick."""
     from app.phases.linkedin_monitor import run_linkedin_monitor_sweep
     return run_linkedin_monitor_sweep(db, ELEPHANT_EDGE_TENANT_ID)
+
+
+# ---- GTM Partner Categorization -- which industry a watched profile is in, and who they sell
+# to, so the lead can spot cross-industry referral-partner candidates. See
+# app/phases/gtm_partner_classification.py for the full grounding/no-fabrication discipline. Not
+# on the 45-min schedule (unlike the sweep above) -- classification quality depends on how many
+# real posts have accumulated, so it's manually triggered/refreshed, not run blindly every tick.
+
+@router.post("/linkedin-monitor/classify")
+def trigger_gtm_partner_classification(only_unclassified: bool = True, db: Session = Depends(get_db)):
+    from app.phases.gtm_partner_classification import run_gtm_partner_classification_sweep
+    return run_gtm_partner_classification_sweep(db, ELEPHANT_EDGE_TENANT_ID, only_unclassified=only_unclassified)
+
+
+@router.get("/linkedin-monitor/partner-matches")
+def get_gtm_partner_matches(db: Session = Depends(get_db)):
+    from app.phases.gtm_partner_classification import get_partner_matches
+    return get_partner_matches(db, ELEPHANT_EDGE_TENANT_ID)
 
 
 @router.get("/reverse-discovery/candidates")
