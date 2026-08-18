@@ -879,7 +879,7 @@ def _fetch_our_salesrobot_prospects(db: Session) -> dict[str, dict]:
 
 
 @router.get("/companies")
-def list_companies(page: int = 1, page_size: int = 25, search: str = "", qualified: str = "", db: Session = Depends(get_db)):
+def list_companies(page: int = 1, page_size: int = 25, search: str = "", qualified: str = "", account_filter: str = "", db: Session = Depends(get_db)):
     """Cross-batch company list -- previously the only way to see companies at all was per-
     batch (BatchDetail), with no single "everything we've researched" view. `qualified`
     ("true"/"false") filters by the exact same has_qualifying_hiring_signal check that's the
@@ -887,7 +887,15 @@ def list_companies(page: int = 1, page_size: int = 25, search: str = "", qualifi
     matches production behavior rather than an approximated definition. That check has no SQL
     column of its own (it's role-is-set OR product-fit-categories-is-set), so it's applied
     Python-side after a bounded DB fetch -- acceptable at today's real company volume (low
-    thousands), would need a computed/indexed column if that grows an order of magnitude."""
+    thousands), would need a computed/indexed column if that grows an order of magnitude.
+
+    `account_filter` (V2 Jobs-to-Be-Done wiring, 2026-08-19): "hot_leads" | "no_contact" |
+    "missing_email" -- the SAME real conditions app/gtm_os/jobs/jobs_to_be_done.py already uses
+    for those exact categories, reused verbatim (not re-derived) so a Jobs page count and its
+    "View all"/action link always agree on what they mean. Added because the Jobs page's CTAs
+    used to link to this same route unfiltered, which meant "View all 99" actually showed all
+    706 companies -- a real UX gap, not a display bug, fixed at the smallest necessary layer
+    (one query param here) rather than a new page."""
     query = (
         db.query(Company)
         .join(Batch)
@@ -906,6 +914,24 @@ def list_companies(page: int = 1, page_size: int = 25, search: str = "", qualifi
         companies = [c for c in companies if _is_company_qualified(c)]
     elif qualified == "false":
         companies = [c for c in companies if not _is_company_qualified(c)]
+
+    if account_filter == "hot_leads":
+        companies = [c for c in companies if c.hot_lead]
+    elif account_filter in ("no_contact", "missing_email"):
+        # Same OUTER company set as jobs_to_be_done.py's _contacts_to_find() -- confirmed live
+        # (2026-08-19) that omitting this decision_maker_searched_at gate over-counted
+        # "missing_email" by 25 companies (95 vs. the real 70): some Contact rows exist for
+        # companies whose decision-maker search was never actually run, which
+        # _contacts_to_find() correctly excludes and this filter must too, to keep the Jobs
+        # page's count and this filtered list in agreement.
+        companies = [c for c in companies if c.decision_maker_searched_at is not None]
+        company_ids = [c.id for c in companies]
+        ids_with_contacts = {row[0] for row in db.query(Contact.company_id).filter(Contact.company_id.in_(company_ids)).distinct().all()} if company_ids else set()
+        if account_filter == "no_contact":
+            companies = [c for c in companies if c.id not in ids_with_contacts]
+        else:
+            ids_missing_email = {row[0] for row in db.query(Contact.company_id).filter(Contact.company_id.in_(company_ids), Contact.email_source.is_(None)).distinct().all()} if company_ids else set()
+            companies = [c for c in companies if c.id in ids_missing_email]
 
     total = len(companies)
     page = max(page, 1)
