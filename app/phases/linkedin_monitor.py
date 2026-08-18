@@ -97,9 +97,26 @@ def set_keyword_tiers(db: Session, tenant_id: int, tiers: dict[str, list[str]]) 
     db.commit()
 
 
+UNFILTERED_TIER = "Unfiltered"
+UNFILTERED_KEYWORD = "(no keyword filter configured -- capturing all activity)"
+
+
+def is_unfiltered(keyword_tiers: dict[str, list[str]]) -> bool:
+    """True when every tier's keyword list has been explicitly cleared (all empty). This is
+    deliberately distinct from "no Parameter row at all" -- that case still falls back to
+    DEFAULT_KEYWORD_TIERS in get_keyword_tiers() and is never treated as unfiltered. Only a real,
+    stored, fully-emptied taxonomy means "capture everything, no filter" -- an intentional choice
+    made from the Targets > Settings tab, not an accidental/missing-config state."""
+    return sum(len(v) for v in keyword_tiers.values()) == 0
+
+
 def match_keywords(text: str, keyword_tiers: dict[str, list[str]]) -> list[tuple[str, str]]:
     """Case-insensitive substring match against every tier -- returns [(tier, keyword), ...]
-    for every keyword found, not just the first."""
+    for every keyword found, not just the first. When the taxonomy has been fully cleared
+    (is_unfiltered), every post is a match -- an empty filter means "capture all activity," never
+    "match nothing" (the previous, silent-failure behavior)."""
+    if is_unfiltered(keyword_tiers):
+        return [(UNFILTERED_TIER, UNFILTERED_KEYWORD)]
     text_lower = (text or "").lower()
     hits = []
     for tier, keywords in keyword_tiers.items():
@@ -232,7 +249,15 @@ def run_linkedin_monitor_sweep(db: Session, tenant_id: int) -> dict:
 
             matched_kw = [kw for _, kw in hits]
             tier = min({t for t, _ in hits})  # most senior (lowest tier number) wins
-            classification = classify_relevance(post.get("text") or "", matched_kw, tier, db, tenant_id)
+            if tier == UNFILTERED_TIER:
+                # The AI-SDR relevance screen (classify_relevance) exists to judge whether a
+                # KEYWORD MATCH is a real signal or a false positive -- meaningless with no
+                # keyword to judge, and would silently classify unrelated real activity as
+                # "ignore," muting exactly what unfiltered mode is supposed to surface. Every
+                # unfiltered post alerts -- see the "Only 'ignore' ... still alert" comment below.
+                classification = {"relevance_score": None, "recommended_action": "monitor", "reason": "unfiltered mode -- no keyword taxonomy configured, capturing and alerting all activity"}
+            else:
+                classification = classify_relevance(post.get("text") or "", matched_kw, tier, db, tenant_id)
 
             signal = LinkedinMonitorSignal(
                 tenant_id=tenant_id, profile_id=profile.id, post_urn=urn,
