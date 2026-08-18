@@ -49,9 +49,12 @@ PERSISTENCE DECISION: NO new table. evaluate_gtm_governance() is pure and comput
 every input is a cheap, already-indexed query or an already-existing sweep call. Nothing here
 needs its own history; each underlying layer already owns whatever history it needs."""
 
+from datetime import datetime
+
+from sqlalchemy import Column, DateTime, Integer, JSON, String
 from sqlalchemy.orm import Session
 
-from app.db.models import AutonomousRun, Batch, Company, Contact
+from app.db.models import AutonomousRun, Base, Batch, Company, Contact
 from app.gtm_os.account_agent.account_agent import ACCOUNT_STATES_ORDER, run_account_agent_sweep
 from app.gtm_os.content.topic import ContentTopic, ContentTopicEvidence
 from app.gtm_os.content.trend_intelligence import run_trend_intelligence_sweep
@@ -68,6 +71,28 @@ from app.gtm_os.opportunity.offering_config import get_offering_config
 # cumulative "reached this state or further" funnel counts (see module docstring's PIPELINE
 # FUNNEL section).
 _STATES_STRONGEST_FIRST = list(reversed(ACCOUNT_STATES_ORDER))
+
+# Every real `stage` value _pipeline_stages()/_detect_bottleneck() can produce -> a plain-English
+# label. Added alongside the V2 UI audit (2026-08-18) so the Briefing bottleneck card never has to
+# render a raw internal stage key like "icp_matched_or_further" -- the backend, which owns these
+# names, is the one place they're spelled out, not duplicated as a second map in the frontend.
+_STAGE_LABELS = {
+    "companies": "Companies",
+    "identified_or_further": "Identified",
+    "icp_matched_or_further": "ICP matched",
+    "opportunity_identified_or_further": "Opportunity identified",
+    "strategy_ready_or_further": "Strategy ready",
+    "sales_ready_or_further": "Sales ready",
+    "offering_matched": "Offering matched",
+    "motion_ready": "Motion ready",
+    "execution_ready": "Execution ready",
+    "message_ready": "Message ready",
+    "approved": "Approved",
+}
+
+
+def _stage_label(stage: str) -> str:
+    return _STAGE_LABELS.get(stage, stage.replace("_", " ").title())
 
 
 def _company_universe_count(db: Session, tenant_id: int) -> int:
@@ -141,6 +166,8 @@ def _pipeline_stages(total_companies: int, account_sweep: dict, offering_sweep: 
         "percentage": _pct(execution_sweep.get("approved", 0), execution_denominator),
         "source": "run_execution_readiness_sweep (Batch 13), denominator = Opportunities evaluated",
     })
+    for s in stages:
+        s["label"] = _stage_label(s["stage"])
     return stages
 
 
@@ -158,20 +185,33 @@ def _detect_bottleneck(company_funnel_stages: list[dict], configuration_gaps: li
             continue
         if largest is None or drop > largest["drop_count"]:
             reason = None
+            reason_short = None
             for gap in configuration_gaps:
                 if curr["stage"].startswith(gap.get("relates_to_stage") or "\0"):
                     reason = gap["description"]
+                    reason_short = gap.get("short_description")
                     break
             largest = {
                 "from": prev["stage"],
                 "to": curr["stage"],
+                "from_label": _stage_label(prev["stage"]),
+                "to_label": _stage_label(curr["stage"]),
                 "drop_count": drop,
                 "reason": reason or "no specific configuration gap traced to this stage in this readout -- see data_gaps/configuration_gaps for other possibly-relevant facts",
+                # Plain-English version of `reason`, for the primary UI -- None when `reason`
+                # itself is the fallback "no specific gap traced" sentence above (already short).
+                "reason_short": reason_short,
             }
     return largest
 
 
 def _configuration_gaps(db: Session, tenant_id: int) -> list[dict]:
+    """`title`/`short_description` (added alongside this UI audit, 2026-08-18) are plain-English
+    restatements of the SAME fact `description` already states in full sentence form -- never a
+    second, different claim. Added because the Briefing UI must not render raw sentences like
+    "offering 'Sales OS' has no applicable_icps configured -- it can never produce a
+    candidate_match" inline; `description`/`source` stay exactly as they were for the detail view
+    (BriefingCategoryDetail.jsx), which is allowed to show the full technical explanation."""
     gaps: list[dict] = []
 
     offerings = get_offering_config(db, tenant_id)
@@ -180,6 +220,8 @@ def _configuration_gaps(db: Session, tenant_id: int) -> list[dict]:
             gaps.append({
                 "category": "configuration",
                 "relates_to_stage": "offering_matched",
+                "title": offering["name"],
+                "short_description": "No ICP mapping configured",
                 "description": f"offering {offering['name']!r} has no applicable_icps configured -- it can never produce a candidate_match",
                 "source": "offering_config.get_offering_config",
             })
@@ -190,6 +232,8 @@ def _configuration_gaps(db: Session, tenant_id: int) -> list[dict]:
             gaps.append({
                 "category": "configuration",
                 "relates_to_stage": "motion_ready",
+                "title": f"{motion['motion'].replace('_', ' ').title()} motion",
+                "short_description": "No ICP/offering mapping configured",
                 "description": f"GTM motion {motion['motion']!r} has no applicable_icps or applicable_offerings configured -- it can never be recommended",
                 "source": "gtm_motion_config.get_gtm_motion_config",
             })
@@ -201,11 +245,23 @@ def _configuration_gaps(db: Session, tenant_id: int) -> list[dict]:
         gaps.append({
             "category": "configuration",
             "relates_to_stage": None,
+            "title": "Business goals",
+            "short_description": f"{len(missing_goals)} goal field{'s' if len(missing_goals) != 1 else ''} not yet set",
             "description": f"business_context goals not yet configured: {sorted(missing_goals)}",
             "source": "business_context.get_business_context",
         })
 
     return gaps
+
+
+# Real field -> plain-English label. Only covers the fields _data_gaps() itself actually checks
+# (Company.estimated_revenue_lower_usd, Company.employee_count, the derived decision-maker-contact
+# check) -- not a general-purpose field-name prettifier, just the ones this function produces.
+_DATA_GAP_FIELD_LABELS = {
+    "estimated_revenue_lower_usd": "revenue data",
+    "employee_count": "employee count",
+    "decision_maker_contact": "a decision-maker",
+}
 
 
 def _data_gaps(db: Session, tenant_id: int, total_companies: int) -> list[dict]:
@@ -226,19 +282,62 @@ def _data_gaps(db: Session, tenant_id: int, total_companies: int) -> list[dict]:
     )
     missing_contact = total_companies - companies_with_contact
 
+    def _gap(field: str, missing_count: int, source: str) -> dict:
+        # short_description mirrors the ChatGPT-reviewed example verbatim: "575 accounts need
+        # decision-makers" / "81% of identified accounts don't have X yet" -- percentage only
+        # ever shown when computed from these same two real numbers, never fabricated.
+        label = _DATA_GAP_FIELD_LABELS[field]
+        pct = _pct(missing_count, total_companies)
+        return {
+            "category": "data", "field": field, "missing_count": missing_count, "denominator": total_companies,
+            "title": f"{missing_count} compan{'y' if missing_count == 1 else 'ies'} missing {label}",
+            "short_description": f"{pct}% of accounts don't have {label} yet" if pct is not None else None,
+            "source": source,
+        }
+
     gaps = []
     if missing_revenue:
-        gaps.append({"category": "data", "field": "estimated_revenue_lower_usd", "missing_count": missing_revenue, "denominator": total_companies, "source": "Company"})
+        gaps.append(_gap("estimated_revenue_lower_usd", missing_revenue, "Company"))
     if missing_employee_count:
-        gaps.append({"category": "data", "field": "employee_count", "missing_count": missing_employee_count, "denominator": total_companies, "source": "Company"})
+        gaps.append(_gap("employee_count", missing_employee_count, "Company"))
     if missing_contact:
-        gaps.append({"category": "data", "field": "decision_maker_contact", "missing_count": missing_contact, "denominator": total_companies, "source": "Contact"})
+        gaps.append(_gap("decision_maker_contact", missing_contact, "Contact"))
     return gaps
 
 
+# Deterministic (source, matched-substring) -> short title -- covers the tool names actually
+# seen in real recorded AutonomousRun.error_message text for this tenant (confirmed against
+# production 2026-08-18). Not a general error-message summarizer: an unmatched message keeps its
+# own (truncated) text as the title rather than a guessed label.
+_V1_ERROR_TITLE_PATTERNS = [
+    ("crustdata", "Crustdata enrichment unavailable"),
+    ("linkedin jobs search", "LinkedIn jobs search limit reached"),
+    ("linkedin", "LinkedIn integration issue"),
+    ("theirstack", "TheirStack search issue"),
+]
+
+
+def _title_for_v1_error(message: str) -> str:
+    lowered = message.lower()
+    for needle, title in _V1_ERROR_TITLE_PATTERNS:
+        if needle in lowered:
+            return title
+    return message[:60] + ("…" if len(message) > 60 else "")
+
+
 def _operational_issues(db: Session, tenant_id: int, limit: int = 5) -> list[dict]:
-    """Only reports a REAL, already-recorded AutonomousRun failure for this tenant -- never
-    infers operational health from anything else. Empty when no failed run exists."""
+    """Only reports REAL, already-recorded run failures for this tenant -- never infers
+    operational health from anything else. Empty when no failed run exists.
+
+    V2 UI audit finding (2026-08-18): this used to read ONLY AutonomousRun -- the V1 discovery
+    pipeline's own run log (companies_discovered/contacts_found/credits_spent_usd -- unmistakably
+    V1-shaped columns, confirmed by reading app/db/models.py directly). That meant the Briefing
+    page's "Operational Issues" card was 100% legacy V1 failures (e.g. old Crustdata/LinkedIn-jobs
+    errors) while the NEW GTM-OS pipeline's own real failures (e.g. GtmIntelligenceRun's
+    theirstack_job hitting insufficient Deepline credits) were completely invisible on this page.
+    Every item below now carries `system`: "v1_discovery" or "gtm_os", so the frontend can label
+    them honestly instead of implying both are the same "system health." Neither source is
+    removed or altered -- this only adds the missing GTM-OS half and a label distinguishing them."""
     failed_runs = (
         db.query(AutonomousRun)
         .join(Batch, AutonomousRun.batch_id == Batch.id)
@@ -247,11 +346,13 @@ def _operational_issues(db: Session, tenant_id: int, limit: int = 5) -> list[dic
         .limit(limit)
         .all()
     )
-    return [
+    issues = [
         {
             "category": "operational",
+            "system": "v1_discovery",
             "run_id": run.id,
             "started_at": run.started_at,
+            "title": _title_for_v1_error(run.error_message),
             # truncated for readability only -- the full message remains on the real
             # AutonomousRun row (Batch 3's own field), never lost, just not repeated here
             "error_message": (run.error_message[:300] + "...") if len(run.error_message) > 300 else run.error_message,
@@ -260,6 +361,32 @@ def _operational_issues(db: Session, tenant_id: int, limit: int = 5) -> list[dic
         for run in failed_runs
         if run.error_message
     ]
+
+    from app.gtm_os.orchestration.sweep import GtmIntelligenceRun
+
+    non_completed_runs = (
+        db.query(GtmIntelligenceRun)
+        .filter(GtmIntelligenceRun.tenant_id == tenant_id, GtmIntelligenceRun.status.in_(["failed", "partial"]))
+        .order_by(GtmIntelligenceRun.started_at.desc())
+        .limit(limit)
+        .all()
+    )
+    for run in non_completed_runs:
+        # error_summary is the short human-readable field (sweep.py's finish_gtm_intelligence_run
+        # sets it from whichever stage actually failed) -- stage_results has the full detail if a
+        # future detail view needs it, deliberately not repeated here.
+        message = run.error_summary or f"run {run.id} finished with status={run.status!r} but no error_summary was recorded"
+        issues.append({
+            "category": "operational",
+            "system": "gtm_os",
+            "run_id": run.id,
+            "started_at": run.started_at,
+            "title": "GTM-OS sweep issue",
+            "error_message": (message[:300] + "...") if len(message) > 300 else message,
+            "source": "GtmIntelligenceRun",
+        })
+
+    return issues
 
 
 def _market_intelligence(db: Session, tenant_id: int) -> dict:
@@ -284,28 +411,48 @@ def _market_intelligence(db: Session, tenant_id: int) -> dict:
 def _human_attention(configuration_gaps: list[dict], data_gaps: list[dict], operational_issues: list[dict], account_sweep: dict, execution_sweep: dict, market_intelligence: dict) -> list[dict]:
     """Deterministic list of already-computed observations (Part 11) -- never a new computation,
     purely a curated pass over what this same readout already found. Never creates a task or
-    changes anything (Part 11's own boundary)."""
+    changes anything (Part 11's own boundary).
+
+    `title`/`subtitle` (added with the V2 UI audit, 2026-08-18) reuse each source's own
+    title/short_description where that source already computed one (configuration_gaps/
+    data_gaps/operational_issues), so this never re-derives a claim -- it just carries the
+    already-real short form through. `description` is kept unchanged for the detail view."""
     items: list[dict] = []
 
     if account_sweep.get("identified", 0) > 0:
-        items.append({"category": "coverage", "description": f"{account_sweep['identified']} identified companies currently have no ICP match"})
+        items.append({
+            "category": "coverage", "title": f"{account_sweep['identified']} companies", "subtitle": "No ICP match yet",
+            "description": f"{account_sweep['identified']} identified companies currently have no ICP match",
+        })
     if account_sweep.get("icp_matched", 0) > 0:
-        items.append({"category": "coverage", "description": f"{account_sweep['icp_matched']} ICP-matched companies have not yet produced an Opportunity"})
+        items.append({
+            "category": "coverage", "title": f"{account_sweep['icp_matched']} companies", "subtitle": "ICP matched, no Opportunity yet",
+            "description": f"{account_sweep['icp_matched']} ICP-matched companies have not yet produced an Opportunity",
+        })
 
     for gap in configuration_gaps:
-        items.append({"category": "configuration", "description": gap["description"]})
+        items.append({"category": "configuration", "title": gap.get("title"), "subtitle": gap.get("short_description"), "description": gap["description"]})
     for gap in data_gaps:
-        items.append({"category": "data", "description": f"{gap['missing_count']}/{gap['denominator']} companies missing {gap['field']}"})
+        items.append({"category": "data", "title": gap.get("title"), "subtitle": gap.get("short_description"), "description": f"{gap['missing_count']}/{gap['denominator']} companies missing {gap['field']}"})
     for issue in operational_issues:
-        items.append({"category": "operational", "description": f"AutonomousRun {issue['run_id']} failed: {issue['error_message']}"})
+        items.append({
+            "category": "operational", "title": issue.get("title"), "subtitle": issue.get("system") == "gtm_os" and "New GTM-OS pipeline" or "V1 discovery pipeline",
+            "description": f"{issue['source']} {issue['run_id']} failed: {issue['error_message']}",
+        })
 
     if execution_sweep.get("blocked", 0) > 0:
-        items.append({"category": "execution", "description": f"{execution_sweep['blocked']} opportunities are currently blocked on a sales-readiness prerequisite"})
+        items.append({
+            "category": "execution", "title": f"{execution_sweep['blocked']} opportunities", "subtitle": "Blocked on a sales-readiness prerequisite",
+            "description": f"{execution_sweep['blocked']} opportunities are currently blocked on a sales-readiness prerequisite",
+        })
     if execution_sweep.get("ready_for_review", 0) > 0:
-        items.append({"category": "execution", "description": f"{execution_sweep['ready_for_review']} message drafts are awaiting human review/approval"})
+        items.append({
+            "category": "execution", "title": f"{execution_sweep['ready_for_review']} message drafts", "subtitle": "Awaiting your review/approval",
+            "description": f"{execution_sweep['ready_for_review']} message drafts are awaiting human review/approval",
+        })
 
     if market_intelligence.get("note"):
-        items.append({"category": "market_intelligence", "description": market_intelligence["note"]})
+        items.append({"category": "market_intelligence", "title": "Market intelligence", "subtitle": market_intelligence["note"], "description": market_intelligence["note"]})
 
     return items
 
@@ -356,5 +503,69 @@ def run_gtm_governance_readout(db: Session, tenant_id: int) -> dict:
     """Thin, explicitly-named entry point for independent/manual invocation (Part 17) -- NOT a
     second implementation. Identical to evaluate_gtm_governance(); kept as a separate name only
     because the spec names both, and future callers may want a stable "run the readout" verb
-    distinct from "evaluate governance facts." NOT wired into the scheduler."""
+    distinct from "evaluate governance facts." NOT wired into the scheduler -- GovernanceSnapshot
+    below is; see its own docstring for why this function itself stays untouched."""
     return evaluate_gtm_governance(db, tenant_id)
+
+
+class GovernanceSnapshot(Base):
+    """V2 Briefing performance fix -- evaluate_gtm_governance() itself is unchanged (same
+    function, same logic, same numbers); what changes is WHEN it runs. Confirmed directly against
+    production (2026-08-18): a single live evaluate_gtm_governance() call synchronously runs 4+
+    full sweeps (run_account_agent_sweep/run_offering_matching_sweep/run_gtm_motion_sweep/
+    run_execution_readiness_sweep) over all 706 companies -- took over 5 minutes before being
+    killed. Computing that inside a GET request is the actual root cause of the Briefing page's
+    reported slow load, not a frontend problem.
+
+    Same "own table when the shape genuinely differs" precedent as GtmIntelligenceRun (sweep.py)
+    -- mirrors that table's shape (one row per computation, full result JSON, no attempt to make
+    the snapshot queryable field-by-field) rather than reusing it, since this stores a governance
+    readout, not a sweep-stage result. Every row is a real snapshot of evaluate_gtm_governance()'s
+    actual output at computed_at -- nothing here recomputes, filters, or reinterprets it."""
+    __tablename__ = "gtm_governance_snapshots"
+
+    id = Column(Integer, primary_key=True)
+    tenant_id = Column(Integer, nullable=False)
+
+    snapshot = Column(JSON, nullable=False)  # evaluate_gtm_governance()'s full return value, verbatim
+    computed_at = Column(DateTime, default=datetime.utcnow)
+
+
+def compute_and_store_governance_snapshot(db: Session, tenant_id: int) -> dict:
+    """The only writer of GovernanceSnapshot. Called from the hourly scheduler
+    (_scheduled_governance_snapshot, app/main.py) and from the manual "Refresh now" route
+    (POST /gtm-os/briefing-governance/refresh) -- same function either way, no separate
+    "scheduled" vs "manual" computation path to keep in sync.
+
+    evaluate_gtm_governance()'s real output contains real datetime objects (e.g.
+    operational_issues[].started_at, from AutonomousRun/GtmIntelligenceRun's own DateTime
+    columns) -- confirmed via a local-DB test run (2026-08-18) that this table's plain JSON
+    column cannot store as-is (psycopg2's default JSON adapter has no datetime encoder). Every
+    value here is still real; this only normalizes datetimes to ISO strings (json's own
+    `default=str`, the same fallback FastAPI's own JSON responses already apply to datetimes
+    elsewhere in this app) so the round-trip through Postgres JSON is lossless for every OTHER
+    field and merely re-typed (datetime -> str) for these few timestamp fields."""
+    import json
+
+    result = evaluate_gtm_governance(db, tenant_id)
+    json_safe_result = json.loads(json.dumps(result, default=str))
+    row = GovernanceSnapshot(tenant_id=tenant_id, snapshot=json_safe_result, computed_at=datetime.utcnow())
+    db.add(row)
+    db.commit()
+    return json_safe_result
+
+
+def get_latest_governance_snapshot(db: Session, tenant_id: int) -> tuple[dict, "datetime"] | None:
+    """Read path for GET /gtm-os/briefing-governance -- a single indexed read, no sweep
+    recomputation. Returns (snapshot_dict, computed_at) or None if no snapshot has ever been
+    computed for this tenant yet (the route's own caller decides how to bootstrap that case,
+    e.g. compute_and_store_governance_snapshot() once)."""
+    row = (
+        db.query(GovernanceSnapshot)
+        .filter(GovernanceSnapshot.tenant_id == tenant_id)
+        .order_by(GovernanceSnapshot.computed_at.desc())
+        .first()
+    )
+    if row is None:
+        return None
+    return row.snapshot, row.computed_at

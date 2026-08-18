@@ -8,6 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.db.session import SessionLocal, ensure_indexes
 from app.google_calendar_client import GoogleCalendarError
+from app.gtm_os.governance.governance import compute_and_store_governance_snapshot
 from app.gtm_os.orchestration.sweep import (
     GtmIntelligenceRun,
     finish_gtm_intelligence_run,
@@ -157,6 +158,27 @@ def _scheduled_gtm_intelligence_cycle():
         db.close()
 
 
+def _scheduled_governance_snapshot():
+    """Runs every 60 minutes -- V2 Briefing performance fix (see governance.py's
+    GovernanceSnapshot). evaluate_gtm_governance() itself is untouched; this just moves its
+    (confirmed, 5+ minute) live sweep off the Briefing page's request path onto this schedule, so
+    GET /gtm-os/briefing-governance becomes a single fast read of the latest stored snapshot.
+    A separate job (not folded into _scheduled_gtm_intelligence_cycle above) since governance
+    summarizes overall account/pipeline state, not specifically this hour's sweep activity --
+    keeping them independent means a slow/failed governance computation can never block or be
+    blocked by the intelligence cycle, or vice versa. Never raises: a failure here just means
+    Briefing keeps showing its last-known-good snapshot until the next successful tick, which is
+    materially better than the request-time exception a live-compute failure would have caused."""
+    db = SessionLocal()
+    try:
+        compute_and_store_governance_snapshot(db, ELEPHANT_EDGE_TENANT_ID)
+        logging.getLogger(__name__).info("governance_snapshot: computed and stored")
+    except Exception:
+        logging.getLogger(__name__).exception("governance_snapshot: failed, keeping last-known-good snapshot")
+    finally:
+        db.close()
+
+
 AUTONOMOUS_MISFIRE_GRACE_SECONDS = 7200
 
 
@@ -199,6 +221,7 @@ def on_startup():
     scheduler.add_job(_scheduled_calendar_sync, "interval", minutes=15, id="calendar_booking_sync")
     scheduler.add_job(_scheduled_linkedin_monitor_sweep, "interval", minutes=45, id="linkedin_monitor_sweep")
     scheduler.add_job(_scheduled_gtm_intelligence_cycle, "interval", minutes=60, id="gtm_intelligence_cycle")
+    scheduler.add_job(_scheduled_governance_snapshot, "interval", minutes=60, id="governance_snapshot")
     scheduler.start()
 
 

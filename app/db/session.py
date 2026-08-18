@@ -530,4 +530,16 @@ def ensure_indexes():
                 completed_at TIMESTAMP
             )
         """))
+        # V2 Briefing performance fix -- see governance.py's GovernanceSnapshot. Moves
+        # evaluate_gtm_governance()'s expensive live sweep off the request path onto the hourly
+        # scheduler; the API route reads the latest row here instead of recomputing.
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS gtm_governance_snapshots (
+                id SERIAL PRIMARY KEY,
+                tenant_id INTEGER NOT NULL,
+                snapshot JSON NOT NULL,
+                computed_at TIMESTAMP
+            )
+        """))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_gtm_governance_snapshots_tenant_computed ON gtm_governance_snapshots (tenant_id, computed_at DESC)"))
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_gtm_intelligence_runs_tenant_started ON gtm_intelligence_runs (tenant_id, started_at)"))

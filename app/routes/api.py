@@ -3409,15 +3409,47 @@ def put_gtm_os_gtm_motions(motions: list = Body(...), db: Session = Depends(get_
 def get_gtm_os_briefing_governance(db: Session = Depends(get_db)):
     """V2 Briefing/Governance page (Phase 6) -- the SAME "purely additive, brand-new route, zero
     new business logic" pattern as every /gtm-os/* route above. Returns evaluate_gtm_governance()
-    (Batch 14) verbatim -- no field added, none removed, none renamed. Batch 14 has no single
-    overall "ready/blocked" status field and no separate "briefing" object; the frontend derives
-    only a presentational count (configuration_gaps.length, etc.) from these same real lists,
-    never a new score or narrative (see Phase 6 report for why no such backend field exists to
-    reuse). AUTHORIZATION: same note as every Phase 5 write route -- this app has no role/
-    permission system, only the gateway's existing "logged in or not" session-cookie gate."""
-    from app.gtm_os.governance.governance import evaluate_gtm_governance
+    (Batch 14)'s output verbatim -- no field added, none removed, none renamed. Batch 14 has no
+    single overall "ready/blocked" status field and no separate "briefing" object; the frontend
+    derives only a presentational count (configuration_gaps.length, etc.) from these same real
+    lists, never a new score or narrative (see Phase 6 report for why no such backend field
+    exists to reuse).
 
-    return evaluate_gtm_governance(db, ELEPHANT_EDGE_TENANT_ID)
+    PERFORMANCE FIX (V2 UI audit, 2026-08-18): used to call evaluate_gtm_governance() live on
+    every request -- confirmed directly against production to take 5+ minutes (4+ full sweeps
+    over 706 companies), which was the actual cause of the Briefing page's reported slow load.
+    Now reads the latest GovernanceSnapshot (computed hourly by _scheduled_governance_snapshot,
+    app/main.py) instead -- same function, same numbers, just computed on a schedule rather than
+    per-request. Adds `computed_at` alongside the unchanged governance fields so the frontend can
+    show real staleness ("as of 12 minutes ago") rather than implying this is always live.
+    Bootstraps a snapshot synchronously ONLY on the very first-ever call for this tenant (no row
+    exists yet) -- every call after that is a fast read, even if slow.
+
+    AUTHORIZATION: same note as every Phase 5 write route -- this app has no role/permission
+    system, only the gateway's existing "logged in or not" session-cookie gate."""
+    from app.gtm_os.governance.governance import compute_and_store_governance_snapshot, get_latest_governance_snapshot
+
+    latest = get_latest_governance_snapshot(db, ELEPHANT_EDGE_TENANT_ID)
+    if latest is None:
+        snapshot = compute_and_store_governance_snapshot(db, ELEPHANT_EDGE_TENANT_ID)
+        computed_at = datetime.utcnow()
+    else:
+        snapshot, computed_at = latest
+    return {**snapshot, "computed_at": computed_at}
+
+
+@router.post("/gtm-os/briefing-governance/refresh")
+def post_gtm_os_briefing_governance_refresh(db: Session = Depends(get_db)):
+    """Manual 'Refresh now' for the Briefing page -- the ONLY other caller of
+    compute_and_store_governance_snapshot() besides the hourly scheduler. Deliberately synchronous
+    (the caller explicitly asked for a fresh recompute right now and the frontend shows a loading
+    state while it runs) rather than a background-job + poll pattern -- this is a rare, explicit,
+    human-initiated action, not the default page-load path, so the same multi-minute cost that
+    was wrong to pay on every GET is acceptable here exactly because it's opt-in."""
+    from app.gtm_os.governance.governance import compute_and_store_governance_snapshot
+
+    snapshot = compute_and_store_governance_snapshot(db, ELEPHANT_EDGE_TENANT_ID)
+    return {**snapshot, "computed_at": datetime.utcnow()}
 
 
 @router.get("/gtm-os/pipeline/{opportunity_id}")
