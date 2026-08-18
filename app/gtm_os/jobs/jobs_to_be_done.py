@@ -112,6 +112,11 @@ def _contacts_to_find(db: Session, tenant_id: int) -> list[dict]:
         if not contacts:
             items.append({
                 "category": "contacts_to_find",
+                # Jobs UI redesign (2026-08-19): explicit subcategory, not left for the frontend
+                # to re-derive by matching on `description` text -- the count breakdown shown in
+                # category_status below is computed from this same field, so there's exactly one
+                # place that decides which bucket an item is in.
+                "subcategory": "no_contact_found",
                 "title": c.name,
                 "description": "No decision-maker contact found",
                 "reason": "Decision-maker search completed but no contact was found",
@@ -133,6 +138,7 @@ def _contacts_to_find(db: Session, tenant_id: int) -> list[dict]:
                 name = f"{contact.first_name or ''} {contact.last_name or ''}".strip() or "Unnamed contact"
                 items.append({
                     "category": "contacts_to_find",
+                    "subcategory": "missing_email",
                     "title": c.name,
                     "description": "Incomplete contact information",
                     "reason": f"{name} was found, but no confirmed email is on file",
@@ -150,6 +156,13 @@ def _contacts_to_find(db: Session, tenant_id: int) -> list[dict]:
 
 
 def _worth_engaging(db: Session, tenant_id: int) -> list[dict]:
+    """NOT called by get_jobs_to_be_done() as of the Jobs UI redesign (2026-08-19) -- audit
+    established these are raw GtmSignal sensing records ("observed, not yet interpreted"), not
+    human jobs: a real GtmSignal existing doesn't mean a human has anything to do yet. Kept here,
+    unmodified and still fully correct, for the future Market Intelligence / Signal Feed page
+    this conceptually belongs to (explicitly deferred, not decided here) -- so that work can
+    reuse this query instead of re-deriving it. Does not touch the sensing/interpretation
+    pipeline itself; this function only ever reads GtmSignal/InterpretedSignal, never writes."""
     interpreted_signal_ids = {
         row[0] for row in db.query(InterpretedSignal.source_signal_id).filter(InterpretedSignal.tenant_id == tenant_id).all()
     }
@@ -187,31 +200,40 @@ def _worth_engaging(db: Session, tenant_id: int) -> list[dict]:
 
 
 def get_jobs_to_be_done(db: Session, tenant_id: int) -> dict:
+    """Jobs UI redesign (2026-08-19): no longer includes worth_engaging (see _worth_engaging()'s
+    own docstring for why) -- this response now represents only real human jobs, and the
+    sidebar badge (which sums every `available` category_status count, unchanged logic on the
+    frontend) automatically reflects that without a second counting system."""
     deal_needs_you = _deal_needs_you(db, tenant_id)
     hot_leads = _hot_leads_to_review(db, tenant_id)
     contacts_to_find = _contacts_to_find(db, tenant_id)
-    worth_engaging = _worth_engaging(db, tenant_id)
 
     all_items = []
-    for priority, group in enumerate((deal_needs_you, hot_leads, contacts_to_find, worth_engaging), start=1):
+    for priority, group in enumerate((deal_needs_you, hot_leads, contacts_to_find), start=1):
         for item in group:
             item = {k: v for k, v in item.items() if k != "_sort_key"}
             item["priority"] = priority
             all_items.append(item)
+
+    contacts_breakdown = {"no_contact_found": 0, "missing_email": 0}
+    for item in contacts_to_find:
+        contacts_breakdown[item["subcategory"]] = contacts_breakdown.get(item["subcategory"], 0) + 1
 
     return {
         "items": all_items,
         "category_status": {
             "deal_needs_you": {"count": len(deal_needs_you), "available": True},
             "hot_leads_to_review": {"count": len(hot_leads), "available": True},
-            "contacts_to_find": {"count": len(contacts_to_find), "available": True},
+            "contacts_to_find": {"count": len(contacts_to_find), "available": True, "breakdown": contacts_breakdown},
             "calls_to_make": {
+                # `available: False` is the real, structural signal the frontend uses to show
+                # "not available yet" vs. a genuine "zero right now" -- see JobsToBeDone.jsx for
+                # why `reason` below is never rendered directly (plain-language copy only).
                 "count": 0,
                 "available": False,
                 "reason": "No real reply/booking signal exists yet for this tenant "
                 "(SalesOutcome.positive_reply, CampaignEvent, and CalendarBooking outcomes are "
                 "all empty; CampaignEvent also has no tenant_id column).",
             },
-            "worth_engaging": {"count": len(worth_engaging), "available": True},
         },
     }
