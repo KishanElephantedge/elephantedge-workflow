@@ -3390,6 +3390,23 @@ def get_gtm_os_content_topics(db: Session = Depends(get_db)):
     return {"topics": get_content_topics(db, ELEPHANT_EDGE_TENANT_ID)}
 
 
+@router.put("/gtm-os/content-topics")
+def put_gtm_os_content_topics(body: dict = Body(...), db: Session = Depends(get_db)):
+    """Saves a human override of the topic list -- same Parameter-backed pattern as
+    pattern-detection-config above. Once saved, this list is the source of truth going forward
+    (see topics.py's set_content_topics() docstring)."""
+    from app.gtm_os.content.topics import TopicConfigError, get_content_topics, set_content_topics
+
+    topics = body.get("topics")
+    if not isinstance(topics, list):
+        raise HTTPException(status_code=400, detail="body must be an object with a 'topics' list")
+    try:
+        set_content_topics(db, ELEPHANT_EDGE_TENANT_ID, topics)
+    except TopicConfigError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"topics": get_content_topics(db, ELEPHANT_EDGE_TENANT_ID)}
+
+
 
 @router.get("/gtm-os/demand-grid")
 def get_gtm_os_demand_grid(db: Session = Depends(get_db)):
