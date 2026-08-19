@@ -3390,6 +3390,32 @@ def get_gtm_os_content_topics(db: Session = Depends(get_db)):
     return {"topics": get_content_topics(db, ELEPHANT_EDGE_TENANT_ID)}
 
 
+@router.get("/gtm-os/debug/signal-texts")
+def get_gtm_os_debug_signal_texts(limit: int = 500, db: Session = Depends(get_db)):
+    """TEMPORARY read-only diagnostic (2026-08-19) -- dumps the exact text topic_linking.py's
+    match_topic() actually searches (via its own unmodified extract_signal_text()), so real
+    alias/keyword gaps can be audited against real signal language before touching any matching
+    logic. No topic/matching/trend code is touched by this route. Intended to be removed once
+    the audit is done."""
+    from app.gtm_os.content.topic_linking import extract_signal_text
+    from app.gtm_os.intelligence.signal import GtmSignal
+
+    signals = (
+        db.query(GtmSignal)
+        .filter(GtmSignal.tenant_id == ELEPHANT_EDGE_TENANT_ID)
+        .order_by(GtmSignal.id)
+        .limit(limit)
+        .all()
+    )
+    return {
+        "count": len(signals),
+        "signals": [
+            {"id": s.id, "source": s.source, "observed_at": s.observed_at, "text": extract_signal_text(s)}
+            for s in signals
+        ],
+    }
+
+
 @router.get("/gtm-os/demand-grid")
 def get_gtm_os_demand_grid(db: Session = Depends(get_db)):
     """V2 Demand Grid page (Phase 4, Part 7) -- read-only wrapper over get_demand_grid()
