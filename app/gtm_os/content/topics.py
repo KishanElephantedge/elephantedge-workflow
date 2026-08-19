@@ -26,9 +26,16 @@ from app.db.models import Parameter
 
 TOPICS_PARAMETER_KEY = "content_intelligence_topics"
 
-# Deliberately empty -- unlike business_context.py's DEFAULT_BUSINESS_CONTEXT (a real
-# transcription of the founder's own notes), no real starter topic list has been provided yet.
-# An invented example list would misrepresent itself as real configuration.
+# Historical note: this used to be a hardcoded empty list, on the reasoning that no real starter
+# topic list had been provided and an invented example list would misrepresent itself as real
+# configuration. That reasoning still holds -- nothing below invents topics -- but it left
+# sense_hackernews_stories()/sense_rss_articles() permanently senseless (zero enabled topics ->
+# zero signals, forever, confirmed against production 2026-08-18) even after real RSS feeds were
+# configured. get_content_topics() below now computes a DERIVED default from this tenant's own
+# real ICP/offering/business-context config when no human override has been saved yet -- same
+# derivation module (business_terms.py) and same "no override -> compute fresh from live config"
+# pattern already proven by linkedin_search_config.py's get_linkedin_search_config(). Kept as an
+# empty list here only as the argument-signature fallback for callers that don't pass db/tenant_id.
 DEFAULT_TOPICS: list[dict] = []
 
 
@@ -93,16 +100,45 @@ def _normalize_topic(topic: dict) -> dict:
     }
 
 
+def derive_default_topics(icp_config: list[dict], offering_config: list[dict], business_context: dict) -> list[dict]:
+    """Pure function -- one Topic per real, deduped business term from ICP names, offering
+    names, and business-context icp_band profiles (app/gtm_os/context/business_terms.py, the
+    exact same derivation linkedin_search_config.py uses for its own search phrases -- same real
+    source data, reused rather than re-derived). No aliases generated (an alias would mean
+    guessing a paraphrase of the lead's own words, which this derivation deliberately does not
+    do) -- a human can add aliases later via set_content_topics() once real matching results show
+    which paraphrases are actually worth adding. `category`/`description` left null for the same
+    reason: no invented classification, only the real term itself as both name and match target."""
+    from app.gtm_os.context.business_terms import all_business_topic_terms
+
+    terms = all_business_topic_terms(icp_config, offering_config, business_context)
+    return [{"name": term, "aliases": [], "enabled": True, "description": None, "category": None} for term in terms]
+
+
 def get_content_topics(db: Session, tenant_id: int) -> list[dict]:
+    """No stored override yet -> topics are computed FRESH from this tenant's live ICP/offering/
+    business-context config (derive_default_topics() above), same "no override -> compute fresh"
+    pattern as linkedin_search_config.py's get_linkedin_search_config() -- not a frozen snapshot,
+    so editing ICP/offering config also updates what HN/RSS sensing looks for, without a separate
+    manual sync step. Once a human edits and saves via set_content_topics(), that saved list is
+    the source of truth going forward, exactly like the search-phrase config."""
     param = (
         db.query(Parameter)
         .filter(Parameter.tenant_id == tenant_id)
         .filter(Parameter.key == TOPICS_PARAMETER_KEY)
         .first()
     )
-    if param and isinstance(param.value, list):
+    if param and isinstance(param.value, list) and param.value:
         return param.value
-    return DEFAULT_TOPICS
+
+    # Same "empty saved value doesn't count as a real override" convention as
+    # linkedin_search_config.py's get_linkedin_search_config() -- falls through to the derived
+    # default rather than treating an empty list as "sensing intentionally disabled".
+    from app.gtm_os.context.business_context import get_business_context
+    from app.gtm_os.icp.icp_config import get_icp_config
+    from app.gtm_os.opportunity.offering_config import get_offering_config
+
+    return derive_default_topics(get_icp_config(db, tenant_id), get_offering_config(db, tenant_id), get_business_context(db, tenant_id))
 
 
 def get_enabled_content_topics(db: Session, tenant_id: int) -> list[dict]:
