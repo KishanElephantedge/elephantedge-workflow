@@ -12,7 +12,7 @@ locally by title-matching -- no additional paid call per role category.
 from sqlalchemy.orm import Session
 
 from app.db.models import Company
-from app.deepline_client import execute_tool
+from app.deepline_client import DeeplineError, execute_tool
 
 ROLE_KEYWORDS = {
     # Expanded from real, observed title-frequency data (a Jobo agent SQL query surfaced
@@ -156,14 +156,24 @@ def assess_team_composition(company: Company, db: Session) -> dict:
         -- real candidate, but lower priority than a cleaner team-gap company; never skipped,
         just ranked after "primary" companies when picking the target count.
       - "primary": a clear team gap -- best fit, matches what Kishan called "in need."
-    Persists the result directly on the Company row."""
+    Persists the result directly on the Company row.
+
+    Real bug fix (2026-08-19): _department_count() used to have no error handling at all --
+    confirmed live that a single real Deepline failure (balance at -0.96 credits) here crashed
+    the ENTIRE autonomous run, since this runs early in discovery, per company, for every branch
+    (apify_discovery.py/jd_first_discovery.py/decision_maker.py) -- the same class of bug
+    already fixed in decision_maker.py's _run_search_contact(), just a second, separate call
+    site that fix didn't cover. A failed count is now treated the same as "no domain to verify
+    against" above (tier="primary", the conservative "can't rule out a real gap" default) rather
+    than crashing -- this one company's tier becomes a guess-free "we don't know," not a reason
+    to lose the whole day's run."""
     if not company.domain:
         company.team_fit_tier = "primary"
         company.team_fit_reasoning = "no domain to verify team composition against"
         db.commit()
         return {"tier": "primary", "reasoning": company.team_fit_reasoning}
 
-    def _department_count(department: str) -> int:
+    def _department_count(department: str) -> int | None:
         filters = {
             "op": "and",
             "conditions": [
@@ -171,12 +181,23 @@ def assess_team_composition(company: Company, db: Session) -> dict:
                 {"field": "basic_profile.normalized_title.department", "type": "=", "value": department},
             ],
         }
-        response = execute_tool("crustdata_v3_person_search", {"filters": filters, "limit": 1})
+        try:
+            response = execute_tool("crustdata_v3_person_search", {"filters": filters, "limit": 1})
+        except DeeplineError:
+            return None
         raw = response.get("toolResponse", {}).get("raw", {})
         return raw.get("total_count", 0) if isinstance(raw, dict) else 0
 
     sales_count = _department_count("Sales & Revenue")
     marketing_count = _department_count("Marketing")
+
+    if sales_count is None or marketing_count is None:
+        tier = "primary"
+        reasoning = "team composition lookup failed -- could not verify, treated as an unconfirmed gap"
+        company.team_fit_tier = tier
+        company.team_fit_reasoning = reasoning
+        db.commit()
+        return {"tier": tier, "reasoning": reasoning, "sales_count": sales_count, "marketing_count": marketing_count}
 
     if sales_count >= FULL_TEAM_SALES_THRESHOLD or marketing_count >= FULL_TEAM_MARKETING_THRESHOLD:
         tier = "excluded"
