@@ -12,7 +12,7 @@ route in app/routes/api.py for the tenant_id filter that enforces that boundary.
 
 from datetime import datetime
 
-from sqlalchemy import JSON, Boolean, Column, Date, DateTime, Float, ForeignKey, Integer, String, Text
+from sqlalchemy import JSON, Boolean, Column, Date, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import declarative_base, relationship
 
 Base = declarative_base()
@@ -457,6 +457,93 @@ class LinkedinMonitorProfile(Base):
     classification_reasoning = Column(Text, nullable=True)
     classification_evidence_excerpt = Column(Text, nullable=True)
     classified_at = Column(DateTime, nullable=True)
+
+    # Captured from bulk imports (e.g. the GTM Partners community roster) but discarded until
+    # now -- title/team_size/location/company_website give the partner-matching engine (see
+    # app/phases/gtm_partner_matching.py) more signal than industry/sells_to alone.
+    # team_size is a band string ("0-1", "2-10", "50-200"), not a literal headcount, matching
+    # how the source data is actually reported -- do not coerce it into employee_count.
+    title = Column(String, nullable=True)
+    employee_count = Column(Integer, nullable=True)
+    team_size = Column(String, nullable=True)
+    location = Column(String, nullable=True)
+    company_website = Column(String, nullable=True)
+
+    # Full raw record from GTM University's public partners.json (icp, worksWith, keywords,
+    # partnerType, detailHtml, etc.) -- kept as one JSON blob rather than a column per field
+    # since the upstream schema isn't ours to define and may add/drop fields over time. This is
+    # the authoritative evidence source once synced -- more reliable than the LLM-inferred
+    # industry/sells_to below, which get overwritten from this data when available (see the
+    # one-off sync in this session; app/phases/gtm_partner_classification.py's evidence-gathering
+    # should prefer this over Google AI Overview/posts once that refactor lands).
+    gtm_university_data = Column(JSON, nullable=True)
+    gtm_university_synced_at = Column(DateTime, nullable=True)
+
+    # Where this profile came from -- "linkedin" (default, original monitor seed),
+    # "gtm_university_pdf", "gtm_university", "slack", "manual", etc. One profile table,
+    # multiple sources, so a given person doesn't need a new table each time a new roster is
+    # folded in.
+    source = Column(String, nullable=True, default="linkedin")
+
+    # Slack member id (e.g. "U0123ABC456") in the GTM Partners community workspace, used to
+    # actually deliver a recommendation message via DM (see app/slack_bot_client.py). Set only
+    # via an exact email lookup (users.lookupByEmail) or manual human confirmation -- deliberately
+    # NEVER fuzzy-matched by name, after a real prior incident this session's history flagged (a
+    # wrong-person LinkedIn message that couldn't be un-sent). A blank value here just means
+    # "can't auto-send yet," not an error -- the message stays deliverable manually either way.
+    slack_user_id = Column(String, nullable=True)
+
+
+class PartnerCompanyRecommendation(Base):
+    """One row = one Elephant Edge company proposed as a lead for one GTM partner (see
+    app/phases/gtm_partner_matching.py). Deliberately NOT folded into PersonalizedMessage --
+    that model is 1:1 with a Contact (unique FK), whereas this is many-companies-per-partner and
+    has its own approval gate (proposed/approved/rejected) before any message is ever drafted.
+
+    unique(profile_id, company_id) -- a company is never recommended twice to the same partner,
+    checked before insert (not just relied on at the DB level) so a re-run of the sweep just
+    skips what's already there instead of erroring."""
+    __tablename__ = "partner_company_recommendations"
+    __table_args__ = (UniqueConstraint("profile_id", "company_id", name="uq_partner_company_reco"),)
+
+    id = Column(Integer, primary_key=True)
+    tenant_id = Column(Integer, nullable=False)
+    profile_id = Column(Integer, ForeignKey("linkedin_monitor_profiles.id"), nullable=False)
+    company_id = Column(Integer, ForeignKey("companies.id"), nullable=False)
+    match_reasoning = Column(Text, nullable=True)
+    match_confidence = Column(String, nullable=True)  # "high" | "medium" | "low"
+    status = Column(String, default="proposed")  # proposed | approved | rejected
+    created_at = Column(DateTime, default=datetime.utcnow)
+    reviewed_at = Column(DateTime, nullable=True)
+
+    profile = relationship("LinkedinMonitorProfile")
+    company = relationship("Company")
+
+
+class PartnerRecommendationMessage(Base):
+    """The outreach message drafted for one partner once (some of) their recommended companies
+    are approved -- covers potentially several PartnerCompanyRecommendation rows at once (a
+    partner gets one message naming their 3-ish matched companies, not one message per company).
+    Second approval gate, mirroring PersonalizedMessage's draft/approved/rejected pattern
+    (app/phases/personalized_outreach.py) but for this partner-facing shape.
+
+    send_channel is set only once actually sent -- Slack/LinkedIn/email dispatch isn't wired up
+    yet (channel choice explicitly undecided as of this build), so "sent" here just means a human
+    manually delivered it and recorded how, giving future automation a real field to key off."""
+    __tablename__ = "partner_recommendation_messages"
+
+    id = Column(Integer, primary_key=True)
+    tenant_id = Column(Integer, nullable=False)
+    profile_id = Column(Integer, ForeignKey("linkedin_monitor_profiles.id"), nullable=False)
+    recommendation_ids = Column(JSON, nullable=False)  # list[int] of the approved PartnerCompanyRecommendation.id it covers
+    generated_message = Column(Text, nullable=True)
+    status = Column(String, default="draft")  # draft | approved | rejected | sent
+    generated_at = Column(DateTime, nullable=True)
+    reviewed_at = Column(DateTime, nullable=True)
+    sent_at = Column(DateTime, nullable=True)
+    send_channel = Column(String, nullable=True)  # "slack" | "linkedin" | "email" -- set at send time
+
+    profile = relationship("LinkedinMonitorProfile")
 
 
 class LinkedinMonitorSignal(Base):

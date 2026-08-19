@@ -19,6 +19,7 @@ from app.gtm_os.orchestration.sweep import (
 )
 from app.phases.autonomous_orchestrator import get_autonomous_schedule_utc, resume_pending_approvals, run_daily_autonomous_cycle
 from app.phases.calendar_sync import sync_calendar_bookings
+from app.phases.gtm_partner_matching import get_match_schedule, run_partner_matching_sweep
 from app.phases.linkedin_monitor import get_monitor_schedule, run_linkedin_monitor_sweep
 from app.gtm_os.efficiency.activity_recorder import record_activity
 from app.routes import api
@@ -105,6 +106,19 @@ def _scheduled_linkedin_monitor_sweep():
             db, ELEPHANT_EDGE_TENANT_ID, "signal_monitoring", datetime.utcnow().date(),
             result["profiles_checked"], source="linkedin_monitor_sweep",
         )
+    finally:
+        db.close()
+
+
+def _scheduled_partner_matching_sweep():
+    """Runs on its own schedule (default daily -- see get_match_schedule) -- proposes up to the
+    configured cap of company matches for each classified GTM partner without a pending batch.
+    See app/phases/gtm_partner_matching.py for the full design (candidate pre-filter, one
+    bounded LLM call per partner, no embeddings)."""
+    db = SessionLocal()
+    try:
+        result = run_partner_matching_sweep(db, tenant_id=ELEPHANT_EDGE_TENANT_ID)
+        logging.getLogger(__name__).info("partner_matching_sweep: %s", result)
     finally:
         db.close()
 
@@ -213,6 +227,14 @@ def reschedule_linkedin_monitor_job(interval_minutes: int):
     scheduler.reschedule_job("linkedin_monitor_sweep", trigger=IntervalTrigger(minutes=interval_minutes))
 
 
+def reschedule_partner_matching_job(interval_minutes: int):
+    """Called from PUT /linkedin-monitor/match-schedule -- same "reschedule the live job, don't
+    wait for a restart" pattern as reschedule_linkedin_monitor_job above. PAUSE is handled inside
+    run_partner_matching_sweep (an "enabled" DB flag check), not an APScheduler pause_job()
+    call, same reasoning as the LinkedIn monitor's own schedule."""
+    scheduler.reschedule_job("partner_matching_sweep", trigger=IntervalTrigger(minutes=interval_minutes))
+
+
 @app.on_event("startup")
 def on_startup():
     ensure_indexes()
@@ -220,6 +242,7 @@ def on_startup():
     try:
         hour, minute = get_autonomous_schedule_utc(db, ELEPHANT_EDGE_TENANT_ID)
         linkedin_monitor_interval_minutes = get_monitor_schedule(db, ELEPHANT_EDGE_TENANT_ID)["interval_minutes"]
+        partner_matching_interval_minutes = get_match_schedule(db, ELEPHANT_EDGE_TENANT_ID)["interval_minutes"]
     finally:
         db.close()
     scheduler.add_job(
@@ -234,6 +257,9 @@ def on_startup():
     # Interval read from real, editable config (Targets > Settings) -- was hardcoded
     # minutes=45 until 2026-08-18, with no way to change it without a code change/redeploy.
     scheduler.add_job(_scheduled_linkedin_monitor_sweep, "interval", minutes=linkedin_monitor_interval_minutes, id="linkedin_monitor_sweep")
+    # Interval read from real, editable config (Targets > Settings), default daily -- see
+    # app/phases/gtm_partner_matching.py.
+    scheduler.add_job(_scheduled_partner_matching_sweep, "interval", minutes=partner_matching_interval_minutes, id="partner_matching_sweep")
     scheduler.add_job(_scheduled_gtm_intelligence_cycle, "interval", minutes=60, id="gtm_intelligence_cycle")
     scheduler.add_job(_scheduled_governance_snapshot, "interval", minutes=60, id="governance_snapshot")
     scheduler.start()

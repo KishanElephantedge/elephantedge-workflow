@@ -12,7 +12,7 @@ from sqlalchemy import func, or_
 
 from app.cache import active_keys, bump_batch_version, cache_get, cache_set, get_batch_version, mark_active
 from app.claude_client import ClaudeError, call_claude_messages
-from app.db.models import AutonomousRun, Batch, CalendarBooking, CampaignEvent, CampaignPush, ChatConversation, ChatMessage, Company, Contact, Credential, DailyReview, LinkedinMonitorProfile, LinkedinMonitorSignal, Notification, Parameter, PersonalizedMessage, ReverseDiscoveryCandidate, ReviewComment, Score
+from app.db.models import AutonomousRun, Batch, CalendarBooking, CampaignEvent, CampaignPush, ChatConversation, ChatMessage, Company, Contact, Credential, DailyReview, LinkedinMonitorProfile, LinkedinMonitorSignal, Notification, Parameter, PartnerCompanyRecommendation, PartnerRecommendationMessage, PersonalizedMessage, ReverseDiscoveryCandidate, ReviewComment, Score
 from app.notifications import delete_expired_notifications
 from app.google_calendar_client import GoogleCalendarError
 from app.phases.hiring_signal import has_qualifying_hiring_signal
@@ -3107,7 +3107,7 @@ def delete_linkedin_monitor_profile(profile_id: int, db: Session = Depends(get_d
 
 
 @router.patch("/linkedin-monitor/profiles/{profile_id}")
-def update_linkedin_monitor_profile(profile_id: int, name: str | None = None, company: str | None = None, active: bool | None = None, db: Session = Depends(get_db)):
+def update_linkedin_monitor_profile(profile_id: int, name: str | None = None, company: str | None = None, active: bool | None = None, slack_user_id: str | None = None, db: Session = Depends(get_db)):
     profile = (
         db.query(LinkedinMonitorProfile)
         .filter(LinkedinMonitorProfile.id == profile_id)
@@ -3122,6 +3122,11 @@ def update_linkedin_monitor_profile(profile_id: int, name: str | None = None, co
         profile.company = company
     if active is not None:
         profile.active = active
+    if slack_user_id is not None:
+        # Manual confirmation path -- deliberately no validation against Slack's own API here
+        # (that would tempt auto-accepting anything that merely LOOKS like a user id). A human
+        # pasting this in is expected to have verified it's the right person themselves.
+        profile.slack_user_id = slack_user_id or None
     db.commit()
     return {"updated": True}
 
@@ -3293,6 +3298,178 @@ def backfill_linkedin_monitor_names(db: Session = Depends(get_db)):
         db.commit()
 
     return {"checked": len(profiles), "updated": updated}
+
+
+# ---- GTM Partner -> Company matching -- daily automated pipeline: match companies to a
+# partner's specialty, human approval, auto-draft an outreach message, human approval, manual
+# "mark sent" (no live send integration yet -- channel undecided). See
+# app/phases/gtm_partner_matching.py and app/phases/gtm_partner_messaging.py.
+
+@router.post("/linkedin-monitor/match-companies")
+def trigger_partner_matching_sweep(only_new_profiles: bool = True, db: Session = Depends(get_db)):
+    """Manual trigger for testing before trusting the daily schedule."""
+    from app.phases.gtm_partner_matching import run_partner_matching_sweep
+    return run_partner_matching_sweep(db, ELEPHANT_EDGE_TENANT_ID, only_new_profiles=only_new_profiles)
+
+
+@router.get("/linkedin-monitor/match-cap")
+def get_partner_match_cap(db: Session = Depends(get_db)):
+    from app.phases.gtm_partner_matching import get_match_cap
+    return {"cap": get_match_cap(db, ELEPHANT_EDGE_TENANT_ID)}
+
+
+@router.put("/linkedin-monitor/match-cap")
+def put_partner_match_cap(body: dict = Body(...), db: Session = Depends(get_db)):
+    from app.phases.gtm_partner_matching import ScheduleConfigError, set_match_cap
+    try:
+        cap = set_match_cap(db, ELEPHANT_EDGE_TENANT_ID, body.get("cap"))
+    except ScheduleConfigError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"cap": cap}
+
+
+@router.get("/linkedin-monitor/match-schedule")
+def get_partner_match_schedule(db: Session = Depends(get_db)):
+    from app.phases.gtm_partner_matching import get_match_schedule
+    return get_match_schedule(db, ELEPHANT_EDGE_TENANT_ID)
+
+
+@router.put("/linkedin-monitor/match-schedule")
+def put_partner_match_schedule(body: dict = Body(...), db: Session = Depends(get_db)):
+    """Saves the schedule AND reschedules the live scheduler job immediately -- same pattern as
+    PUT /linkedin-monitor/schedule (see reschedule_partner_matching_job in main.py)."""
+    from app.phases.gtm_partner_matching import ScheduleConfigError, set_match_schedule
+    from app.main import reschedule_partner_matching_job
+
+    try:
+        schedule = set_match_schedule(
+            db, ELEPHANT_EDGE_TENANT_ID,
+            days=body.get("days", 0), hours=body.get("hours", 0), minutes=body.get("minutes", 0),
+            enabled=body.get("enabled", True),
+        )
+    except ScheduleConfigError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    reschedule_partner_matching_job(schedule["interval_minutes"])
+    return schedule
+
+
+@router.get("/linkedin-monitor/recommendations")
+def list_partner_recommendations(status: str = "", profile_id: int | None = None, db: Session = Depends(get_db)):
+    from app.phases.gtm_partner_matching import get_all_recommendations, get_recommendations_for_profile
+    recs = (
+        get_recommendations_for_profile(db, ELEPHANT_EDGE_TENANT_ID, profile_id) if profile_id
+        else get_all_recommendations(db, ELEPHANT_EDGE_TENANT_ID, status=status or None)
+    )
+    if profile_id and status:
+        recs = [r for r in recs if r.status == status]
+    companies_by_id = {c.id: c for c in db.query(Company).filter(Company.id.in_([r.company_id for r in recs])).all()}
+    return [
+        {
+            "id": r.id, "profile_id": r.profile_id, "company_id": r.company_id,
+            "company_name": companies_by_id[r.company_id].name if r.company_id in companies_by_id else None,
+            "company_domain": companies_by_id[r.company_id].domain if r.company_id in companies_by_id else None,
+            "match_reasoning": r.match_reasoning, "match_confidence": r.match_confidence,
+            "status": r.status, "created_at": r.created_at, "reviewed_at": r.reviewed_at,
+        }
+        for r in recs
+    ]
+
+
+@router.patch("/linkedin-monitor/recommendations/{recommendation_id}")
+def update_partner_recommendation(recommendation_id: int, body: dict = Body(...), db: Session = Depends(get_db)):
+    from app.phases.gtm_partner_matching import ScheduleConfigError, update_recommendation_status
+    try:
+        rec = update_recommendation_status(db, ELEPHANT_EDGE_TENANT_ID, recommendation_id, body.get("status"))
+    except ScheduleConfigError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if not rec:
+        raise HTTPException(status_code=404, detail="Recommendation not found")
+    return {"updated": True, "status": rec.status}
+
+
+@router.post("/linkedin-monitor/recommendations/generate-message")
+def trigger_generate_recommendation_message(profile_id: int, db: Session = Depends(get_db)):
+    from app.phases.gtm_partner_messaging import generate_recommendation_message
+    msg = generate_recommendation_message(db, ELEPHANT_EDGE_TENANT_ID, profile_id)
+    if not msg:
+        return {"created": False, "reason": "no newly-approved recommendations to draft a message for"}
+    return {"created": True, "message_id": msg.id, "status": msg.status, "generated_message": msg.generated_message}
+
+
+@router.get("/linkedin-monitor/messages")
+def list_partner_recommendation_messages(profile_id: int, db: Session = Depends(get_db)):
+    from app.phases.gtm_partner_messaging import get_messages_for_profile
+    msgs = get_messages_for_profile(db, ELEPHANT_EDGE_TENANT_ID, profile_id)
+    return [
+        {
+            "id": m.id, "profile_id": m.profile_id, "recommendation_ids": m.recommendation_ids,
+            "generated_message": m.generated_message, "status": m.status,
+            "generated_at": m.generated_at, "reviewed_at": m.reviewed_at,
+            "sent_at": m.sent_at, "send_channel": m.send_channel,
+        }
+        for m in msgs
+    ]
+
+
+@router.patch("/linkedin-monitor/messages/{message_id}")
+def update_partner_recommendation_message(message_id: int, body: dict = Body(...), db: Session = Depends(get_db)):
+    from app.phases.gtm_partner_messaging import ScheduleConfigError, update_message_status
+    try:
+        msg = update_message_status(db, ELEPHANT_EDGE_TENANT_ID, message_id, body.get("status"))
+    except ScheduleConfigError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if not msg:
+        raise HTTPException(status_code=404, detail="Message not found")
+    return {"updated": True, "status": msg.status}
+
+
+@router.patch("/linkedin-monitor/messages/{message_id}/mark-sent")
+def mark_partner_recommendation_message_sent(message_id: int, body: dict = Body(...), db: Session = Depends(get_db)):
+    """For send_channel="slack" with a slack_user_id on file, this actually sends the DM (see
+    app/slack_bot_client.py) -- a real send failure returns 502, NOT marked sent, so the human
+    knows to retry or fall back to manual delivery rather than believing it went out."""
+    from app.phases.gtm_partner_messaging import ScheduleConfigError, mark_message_sent
+    from app.slack_bot_client import SlackBotError
+    try:
+        msg, auto_sent = mark_message_sent(db, ELEPHANT_EDGE_TENANT_ID, message_id, body.get("send_channel"))
+    except ScheduleConfigError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except SlackBotError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    if not msg:
+        raise HTTPException(status_code=404, detail="Message not found")
+    return {"updated": True, "status": msg.status, "send_channel": msg.send_channel, "auto_sent": auto_sent}
+
+
+@router.post("/linkedin-monitor/profiles/{profile_id}/slack-lookup")
+def lookup_partner_slack_id(profile_id: int, body: dict = Body(...), db: Session = Depends(get_db)):
+    """Exact-email Slack lookup only -- see app/slack_bot_client.py's module docstring for why
+    there's deliberately no fuzzy/name-based alternative. Sets slack_user_id on the profile only
+    when Slack itself confirms an exact match; returns found=False (not an error) otherwise, so
+    the UI can fall back to asking for a manually-confirmed id instead."""
+    email = (body.get("email") or "").strip()
+    if not email:
+        raise HTTPException(status_code=400, detail="email is required")
+    profile = (
+        db.query(LinkedinMonitorProfile)
+        .filter(LinkedinMonitorProfile.id == profile_id)
+        .filter(LinkedinMonitorProfile.tenant_id == ELEPHANT_EDGE_TENANT_ID)
+        .first()
+    )
+    if not profile:
+        raise HTTPException(status_code=404, detail="Profile not found")
+
+    from app.slack_bot_client import SlackBotError, lookup_user_id_by_email
+    try:
+        user_id = lookup_user_id_by_email(db, ELEPHANT_EDGE_TENANT_ID, email)
+    except SlackBotError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    if not user_id:
+        return {"found": False}
+    profile.slack_user_id = user_id
+    db.commit()
+    return {"found": True, "slack_user_id": user_id}
 
 
 @router.get("/gtm-os/business-context")
