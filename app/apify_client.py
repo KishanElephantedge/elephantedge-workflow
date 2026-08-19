@@ -24,6 +24,23 @@ class ApifyError(Exception):
     pass
 
 
+def _post(url: str, **kwargs) -> httpx.Response:
+    """Real bug fix (2026-08-19): every call site below used a bare httpx.post() with no
+    exception handling at all -- confirmed live (production batch 63) that a genuine network
+    timeout (httpx.ReadTimeout, "The read operation timed out") propagated all the way up
+    through find_free_decision_maker() -> find_decision_maker() -> the per-company loop in
+    autonomous_orchestrator.py, crashing the entire day's run outright after 15 companies had
+    already been discovered and 6 real contacts found. Every caller in this codebase already
+    only catches `ApifyError` (never a raw httpx exception), so a real network-level failure --
+    not a bad status code, an actual timeout/connection error -- was invisible to that handling.
+    This is the same class of bug already fixed twice elsewhere for Deepline (decision_maker.py,
+    hiring_signal.py); this is the equivalent fix for Apify's own client."""
+    try:
+        return httpx.post(url, **kwargs)
+    except httpx.HTTPError as e:
+        raise ApifyError(f"request to {url} failed: {e}") from e
+
+
 def _get_api_key(db: Session, tenant_id: int) -> str:
     cred = (
         db.query(Credential)
@@ -64,7 +81,7 @@ def search_linkedin_jobs(
         "descriptionType": "text",
         "limit": limit,
     }
-    response = httpx.post(
+    response = _post(
         f"{BASE_URL}/acts/{LINKEDIN_JOBS_ACTOR_ID}/run-sync-get-dataset-items",
         params={"token": api_key},
         json=payload,
@@ -96,7 +113,7 @@ GOOGLE_SEARCH_COST_PER_QUERY_USD = 0.0085  # $0.0045 page + $0.003 AI Overview +
 def search_google_ai_overview(api_key: str, query: str) -> str | None:
     """Returns the AI Overview's text content for one query, or None if Google didn't
     generate one (happens for some queries -- not an error)."""
-    response = httpx.post(
+    response = _post(
         f"{BASE_URL}/acts/{GOOGLE_SEARCH_ACTOR_ID}/run-sync-get-dataset-items",
         params={"token": api_key},
         json={"queries": query, "maxPagesPerQuery": 1, "aiOverview": {"enabled": True}},
@@ -140,7 +157,7 @@ def search_linkedin_posts(api_key: str, profile_urls: list[str], scrape_until: s
     payload = {"urls": profile_urls, "limitPerSource": limit_per_source, "deepScrape": False}
     if scrape_until:
         payload["scrapeUntil"] = scrape_until
-    response = httpx.post(
+    response = _post(
         f"{BASE_URL}/acts/{LINKEDIN_POST_ACTOR_ID}/run-sync-get-dataset-items",
         params={"token": api_key},
         json=payload,
@@ -159,7 +176,7 @@ def search_linkedin_people(api_key: str, first_name: str, last_name: str, compan
         "company": company,
         "maxResults": max_results,
     }
-    response = httpx.post(
+    response = _post(
         f"{BASE_URL}/acts/{PEOPLE_SEARCH_ACTOR_ID}/run-sync-get-dataset-items",
         params={"token": api_key},
         json=payload,
