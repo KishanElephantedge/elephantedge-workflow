@@ -3381,6 +3381,10 @@ def list_partner_recommendations(status: str = "", profile_id: int | None = None
 
 @router.patch("/linkedin-monitor/recommendations/{recommendation_id}")
 def update_partner_recommendation(recommendation_id: int, body: dict = Body(...), db: Session = Depends(get_db)):
+    """Approving a recommendation auto-drafts the outreach message right away (was previously a
+    separate manual "Draft message" click) -- generate_recommendation_message() already only
+    covers approved recs not yet part of a message, so this is safe to call on every approval,
+    not just the first. A generation failure never blocks the approval itself from succeeding."""
     from app.phases.gtm_partner_matching import ScheduleConfigError, update_recommendation_status
     try:
         rec = update_recommendation_status(db, ELEPHANT_EDGE_TENANT_ID, recommendation_id, body.get("status"))
@@ -3388,7 +3392,16 @@ def update_partner_recommendation(recommendation_id: int, body: dict = Body(...)
         raise HTTPException(status_code=400, detail=str(e))
     if not rec:
         raise HTTPException(status_code=404, detail="Recommendation not found")
-    return {"updated": True, "status": rec.status}
+
+    message_created = False
+    if rec.status == "approved":
+        from app.phases.gtm_partner_messaging import generate_recommendation_message
+        try:
+            message_created = bool(generate_recommendation_message(db, ELEPHANT_EDGE_TENANT_ID, rec.profile_id))
+        except Exception:  # noqa: BLE001 -- approval must succeed even if drafting fails
+            message_created = False
+
+    return {"updated": True, "status": rec.status, "message_drafted": message_created}
 
 
 @router.post("/linkedin-monitor/recommendations/generate-message")
