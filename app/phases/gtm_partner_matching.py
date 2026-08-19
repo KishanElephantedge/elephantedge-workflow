@@ -188,12 +188,21 @@ def _llm_match_companies(db: Session, tenant_id: int, profile: LinkedinMonitorPr
     return {"matches": matches, "insufficient_candidates": bool(result.get("insufficient_candidates")) and not matches}
 
 
-def run_partner_matching_sweep(db: Session, tenant_id: int, only_new_profiles: bool = True) -> dict:
+def run_partner_matching_sweep(db: Session, tenant_id: int, only_new_profiles: bool = True, profile_id: int | None = None) -> dict:
     """For each classified, active partner without a pending 'proposed' batch (only_new_profiles
     default True -- re-matching everyone on every tick would re-spend LLM calls for partners
     already awaiting review), proposes up to the configured cap of company matches. Safe to call
     repeatedly: existing (profile_id, company_id) pairs are skipped before insert, so a re-run
-    never duplicates a recommendation."""
+    never duplicates a recommendation.
+
+    profile_id, when given, scopes this to exactly ONE partner -- this is the real per-partner
+    "run" action the Recommended Companies detail view uses (a person clicking into one partner's
+    card and asking for matches must never fan out and spend LLM calls on everyone else too). The
+    schedule's own "enabled" pause flag is still honored either way (a paused schedule means no
+    matching runs at all, single-partner or not) -- and only the fully-unscoped call (no
+    profile_id) applies the only_new_profiles skip-list, since a deliberate single-partner
+    request should always run for that partner regardless of whether they already have a pending
+    batch."""
     schedule = get_match_schedule(db, tenant_id)
     if not schedule["enabled"]:
         return {"partners_evaluated": 0, "recommendations_created": 0, "status": "paused"}
@@ -206,7 +215,9 @@ def run_partner_matching_sweep(db: Session, tenant_id: int, only_new_profiles: b
         .filter(LinkedinMonitorProfile.active.is_(True))
         .filter(LinkedinMonitorProfile.classification_status == "classified")
     )
-    if only_new_profiles:
+    if profile_id is not None:
+        query = query.filter(LinkedinMonitorProfile.id == profile_id)
+    elif only_new_profiles:
         already_proposed_profile_ids = {
             r[0] for r in (
                 db.query(PartnerCompanyRecommendation.profile_id)

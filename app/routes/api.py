@@ -3306,10 +3306,13 @@ def backfill_linkedin_monitor_names(db: Session = Depends(get_db)):
 # app/phases/gtm_partner_matching.py and app/phases/gtm_partner_messaging.py.
 
 @router.post("/linkedin-monitor/match-companies")
-def trigger_partner_matching_sweep(only_new_profiles: bool = True, db: Session = Depends(get_db)):
-    """Manual trigger for testing before trusting the daily schedule."""
+def trigger_partner_matching_sweep(only_new_profiles: bool = True, profile_id: int | None = None, db: Session = Depends(get_db)):
+    """profile_id, when given, scopes this run to exactly that one partner -- the real
+    per-partner "Run matching" action in the Recommended Companies detail view. Without it, this
+    runs across every eligible partner at once, which should stay a deliberate bulk action (or
+    just let the daily schedule handle it), not the default click target."""
     from app.phases.gtm_partner_matching import run_partner_matching_sweep
-    return run_partner_matching_sweep(db, ELEPHANT_EDGE_TENANT_ID, only_new_profiles=only_new_profiles)
+    return run_partner_matching_sweep(db, ELEPHANT_EDGE_TENANT_ID, only_new_profiles=only_new_profiles, profile_id=profile_id)
 
 
 @router.get("/linkedin-monitor/match-cap")
