@@ -3379,6 +3379,17 @@ def get_gtm_os_market_intelligence(db: Session = Depends(get_db)):
     return get_market_intelligence_overview(db, ELEPHANT_EDGE_TENANT_ID)
 
 
+@router.get("/gtm-os/content-topics")
+def get_gtm_os_content_topics(db: Session = Depends(get_db)):
+    """Content Intelligence topic configuration (topics.py, Step 16A) -- READ-ONLY diagnostic.
+    No override saved yet returns the live-derived default (from this tenant's real
+    ICP/offering/business-context config), same "no override -> compute fresh" contract as
+    get_content_topics() itself."""
+    from app.gtm_os.content.topics import get_content_topics
+
+    return {"topics": get_content_topics(db, ELEPHANT_EDGE_TENANT_ID)}
+
+
 @router.get("/gtm-os/demand-grid")
 def get_gtm_os_demand_grid(db: Session = Depends(get_db)):
     """V2 Demand Grid page (Phase 4, Part 7) -- read-only wrapper over get_demand_grid()
