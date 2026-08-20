@@ -3053,6 +3053,8 @@ def deepline_balance():
 
 @router.get("/linkedin-monitor/profiles")
 def list_linkedin_monitor_profiles(db: Session = Depends(get_db)):
+    from app.phases.gtm_partner_matching import is_cro_focused
+
     profiles = (
         db.query(LinkedinMonitorProfile)
         .filter(LinkedinMonitorProfile.tenant_id == ELEPHANT_EDGE_TENANT_ID)
@@ -3068,6 +3070,7 @@ def list_linkedin_monitor_profiles(db: Session = Depends(get_db)):
             "classification_confidence": p.classification_confidence,
             "classification_reasoning": p.classification_reasoning,
             "classified_at": p.classified_at,
+            "is_cro": is_cro_focused(p),
         }
         for p in profiles
     ]
