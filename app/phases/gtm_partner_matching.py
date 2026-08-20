@@ -140,22 +140,43 @@ Partner's known industry: {industry}
 Partner's known buyer/who they sell to: {sells_to}
 Additional context about the partner: {reasoning}
 
-Candidate companies (id, name, industry, employee_count, location) -- pick ONLY from this list, \
-never invent a company:
+Candidate companies (id, name, industry, employee_count, location, hiring_signal) -- pick ONLY \
+from this list, never invent a company. hiring_signal, when present, names the sales role being \
+hired and how many qualifying sales roles are open AT ONCE at that company right now -- this is \
+a real urgency signal (a company hiring several sales roles simultaneously needs help NOW, not \
+someday), so when it's a close call between two similarly-fitting companies, prefer the one with \
+the stronger hiring signal, and mention the urgency explicitly in your reasoning when you use it \
+(e.g. "actively hiring 4 sales roles at once -- high urgency to reach out"):
 {candidates}
 
 Pick up to {cap} companies from the list above that are the STRONGEST fit for this partner's \
-stated specialty -- not just "vaguely B2B," a real fit based on industry/buyer alignment. If \
-fewer than {cap} are a genuinely strong fit, return fewer. If NONE are a good fit, say so \
-honestly rather than forcing weak matches.
+stated specialty -- not just "vaguely B2B," a real fit based on industry/buyer alignment (and, \
+as a tiebreaker/urgency signal, hiring intensity where relevant). If fewer than {cap} are a \
+genuinely strong fit, return fewer. If NONE are a good fit, say so honestly rather than forcing \
+weak matches.
 
 Return JSON exactly:
 {{"matches": [{{"company_id": <int>, "reasoning": "<one sentence citing what makes this a fit>", "confidence": "high" | "medium" | "low"}}], "insufficient_candidates": <true if no real matches found, else false>}}"""
 
 
+def _hiring_signal_text(c: Company) -> str:
+    """Real, already-computed data -- hiring_signal_posting_count is a free byproduct of
+    Discovery (see app/phases/apify_discovery.py's domain_posting_counts), the same field
+    hot_leads.py already uses for its "N sales roles open at once" hot-lead reason. Nothing new
+    to capture here -- just surfacing an existing signal to this prompt too."""
+    if not c.hiring_signal_role:
+        return "none on file"
+    role = c.hiring_signal_role.replace("_", " ")
+    count = c.hiring_signal_posting_count
+    if count and count > 1:
+        return f"hiring for {role} -- {count} qualifying sales roles open at once"
+    return f"hiring for {role}"
+
+
 def _format_candidates(companies: list[Company]) -> str:
     return "\n".join(
-        f"- id={c.id}, name={c.name!r}, industry={c.industry!r}, employee_count={c.employee_count}, location={c.location!r}"
+        f"- id={c.id}, name={c.name!r}, industry={c.industry!r}, employee_count={c.employee_count}, "
+        f"location={c.location!r}, hiring_signal={_hiring_signal_text(c)!r}"
         for c in companies
     )
 
@@ -188,21 +209,35 @@ def _llm_match_companies(db: Session, tenant_id: int, profile: LinkedinMonitorPr
     return {"matches": matches, "insufficient_candidates": bool(result.get("insufficient_candidates")) and not matches}
 
 
-def run_partner_matching_sweep(db: Session, tenant_id: int, only_new_profiles: bool = True, profile_id: int | None = None) -> dict:
-    """For each classified, active partner without a pending 'proposed' batch (only_new_profiles
-    default True -- re-matching everyone on every tick would re-spend LLM calls for partners
-    already awaiting review), proposes up to the configured cap of company matches. Safe to call
-    repeatedly: existing (profile_id, company_id) pairs are skipped before insert, so a re-run
-    never duplicates a recommendation.
+def is_cro_focused(profile: LinkedinMonitorProfile) -> bool:
+    """True when GTM University's own data tags this partner as CRO-background -- the exact
+    signal the lead asked us to scope to ("let's first focus on CROs"), from data already
+    synced, no new classification. Real distribution as of this filter's introduction: 39 of
+    157 classified partners have "CRO" in their keywords; the rest either name a different
+    function (CMO, RevOps-only, etc.) or have no GTM University data at all (older LinkedIn-only
+    profiles) -- both cases return False here, a deliberate exclusion of unknowns for this first
+    pass, not a bug. Loosen this (e.g. to include unknowns) if/when the lead says to expand
+    beyond CROs."""
+    keywords = ((profile.gtm_university_data or {}).get("keywords") or "").lower()
+    return "cro" in keywords
 
-    profile_id, when given, scopes this to exactly ONE partner -- this is the real per-partner
-    "run" action the Recommended Companies detail view uses (a person clicking into one partner's
-    card and asking for matches must never fan out and spend LLM calls on everyone else too). The
-    schedule's own "enabled" pause flag is still honored either way (a paused schedule means no
-    matching runs at all, single-partner or not) -- and only the fully-unscoped call (no
-    profile_id) applies the only_new_profiles skip-list, since a deliberate single-partner
-    request should always run for that partner regardless of whether they already have a pending
-    batch."""
+
+def run_partner_matching_sweep(db: Session, tenant_id: int, only_new_profiles: bool = True, profile_id: int | None = None) -> dict:
+    """For each classified, active, CRO-background partner (see is_cro_focused -- an explicit
+    lead decision to scope to CROs first, not a technical limitation) without a pending
+    'proposed' batch (only_new_profiles default True -- re-matching everyone on every tick would
+    re-spend LLM calls for partners already awaiting review), proposes up to the configured cap
+    of company matches. Safe to call repeatedly: existing (profile_id, company_id) pairs are
+    skipped before insert, so a re-run never duplicates a recommendation.
+
+    profile_id, when given, scopes this to exactly ONE partner AND skips the CRO filter -- a
+    human explicitly opening a specific partner's card and clicking "run" is a deliberate choice
+    that should always be honored, CRO-tagged or not; the CRO restriction only governs the
+    unscoped bulk/scheduled sweep, not an explicit single-partner request. The schedule's own
+    "enabled" pause flag is still honored either way (a paused schedule means no matching runs at
+    all, single-partner or not) -- and only the fully-unscoped call (no profile_id) applies the
+    only_new_profiles skip-list, since a deliberate single-partner request should always run for
+    that partner regardless of whether they already have a pending batch."""
     schedule = get_match_schedule(db, tenant_id)
     if not schedule["enabled"]:
         return {"partners_evaluated": 0, "recommendations_created": 0, "status": "paused"}
@@ -229,6 +264,11 @@ def run_partner_matching_sweep(db: Session, tenant_id: int, only_new_profiles: b
         if already_proposed_profile_ids:
             query = query.filter(LinkedinMonitorProfile.id.notin_(already_proposed_profile_ids))
     profiles = query.order_by(LinkedinMonitorProfile.id).all()
+    if profile_id is None:
+        # CRO-only scope for the bulk/scheduled path -- gtm_university_data is JSON, filtered in
+        # Python rather than a JSON-path SQL clause; the partner pool is small (~150), so this
+        # costs nothing meaningful and keeps is_cro_focused as the single source of truth.
+        profiles = [p for p in profiles if is_cro_focused(p)]
 
     partners_evaluated = 0
     recommendations_created = 0
