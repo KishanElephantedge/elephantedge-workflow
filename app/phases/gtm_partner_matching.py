@@ -209,17 +209,24 @@ def _llm_match_companies(db: Session, tenant_id: int, profile: LinkedinMonitorPr
     return {"matches": matches, "insufficient_candidates": bool(result.get("insufficient_candidates")) and not matches}
 
 
+CRO_BACKGROUND_TERMS = ["cro", "go-to-market strategist", "sales acceleration leader"]
+
+
 def is_cro_focused(profile: LinkedinMonitorProfile) -> bool:
-    """True when GTM University's own data tags this partner as CRO-background -- the exact
-    signal the lead asked us to scope to ("let's first focus on CROs"), from data already
-    synced, no new classification. Real distribution as of this filter's introduction: 39 of
-    157 classified partners have "CRO" in their keywords; the rest either name a different
-    function (CMO, RevOps-only, etc.) or have no GTM University data at all (older LinkedIn-only
-    profiles) -- both cases return False here, a deliberate exclusion of unknowns for this first
-    pass, not a bug. Loosen this (e.g. to include unknowns) if/when the lead says to expand
-    beyond CROs."""
+    """True when GTM University's own data tags this partner as sales/CRO-background -- the
+    scope the lead asked for ("let's first focus on CROs (Sales background)"). Deliberately NOT
+    broadened to any generic "sales" or "revenue" substring match -- checked the real data and
+    that would have pulled in a bunch of CMO-primary partners who just mention "revenue" as part
+    of a marketing-alignment title (e.g. "cmo, fractional cmo... revenue growth consultant"),
+    exactly the group meant to be excluded. CRO_BACKGROUND_TERMS is an explicit, human-reviewed
+    allowlist instead -- add a term here only after confirming (like go-to-market
+    strategist/sales acceleration leader were) that it doesn't also sweep in marketing-primary
+    people. Real distribution as of this filter's last update: 40 of 157 classified partners
+    match; the rest either name a different function (CMO, RevOps-only, etc.) or have no GTM
+    University data at all (older LinkedIn-only profiles) -- both cases return False, a
+    deliberate exclusion of unknowns for this first pass, not a bug."""
     keywords = ((profile.gtm_university_data or {}).get("keywords") or "").lower()
-    return "cro" in keywords
+    return any(term in keywords for term in CRO_BACKGROUND_TERMS)
 
 
 def run_partner_matching_sweep(db: Session, tenant_id: int, only_new_profiles: bool = True, profile_id: int | None = None) -> dict:
