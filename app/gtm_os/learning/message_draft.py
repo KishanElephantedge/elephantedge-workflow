@@ -78,11 +78,14 @@ STRICT RULES -- you must not violate any of these:
 initiative, metric, customer story, or product capability that is not explicitly listed above.
 - Do NOT reference specific numbers, dates, or claims unless they appear above.
 - If the information above is not enough to write a genuinely grounded, specific message, return \
-null for message_text rather than writing something generic or invented.
+null for both subject and message_text rather than writing something generic or invented.
 - Keep the message short (3-5 sentences), professional, and directly grounded in the facts above.
+- subject is a short email subject line grounded in the same facts (a few words, no invented \
+claims) -- only meaningful when channel is "email"; still provide a short one even when channel \
+is not email, it just won't be used for sending.
 
 Return JSON exactly:
-{{"message_text": "<the drafted message, or null>", "reason": "<one sentence explaining your decision>"}}"""
+{{"subject": "<the email subject line, or null>", "message_text": "<the drafted message, or null>", "reason": "<one sentence explaining your decision>"}}"""
 
 
 class MessageDraft(Base):
@@ -102,6 +105,12 @@ class MessageDraft(Base):
     evidence_basis = Column(JSON, nullable=True)
     personalization_inputs = Column(JSON, nullable=True)
 
+    # V2 Phase 7 follow-up (2026-08-21) -- generated in the SAME LLM call as message_text (see
+    # MESSAGE_GENERATION_PROMPT), never a second call. Nullable for backward compatibility --
+    # every draft created before this field existed has subject=NULL and stays fully readable;
+    # nothing re-generates or invalidates them. Null whenever message_text is also null
+    # (insufficient_context) or when the model itself returned null.
+    subject = Column(Text, nullable=True)
     message_text = Column(Text, nullable=True)  # null whenever status is insufficient_context
     generation_method = Column(String, nullable=False)  # "llm:generate_json" | "deterministic:insufficient_context"
     missing_information = Column(JSON, nullable=True)
@@ -125,11 +134,33 @@ class MessageDraft(Base):
 
 
 def _existing_draft(db: Session, tenant_id: int, opportunity_id: int, gtm_strategy_id: int) -> MessageDraft | None:
+    """ANY draft for this (opportunity, strategy) pair, regardless of which contact it targets
+    -- used only where "has generation been attempted for this strategy version at all" is the
+    real question (run_message_generation_sweep's own gate, unchanged since Phase 5/6/7). Since
+    V2 Phase 8, more than one row can exist here (one per contact in the sequence) -- this
+    function intentionally does not care which one it returns for that use case."""
     return (
         db.query(MessageDraft)
         .filter(MessageDraft.tenant_id == tenant_id, MessageDraft.opportunity_id == opportunity_id, MessageDraft.gtm_strategy_id == gtm_strategy_id)
         .first()
     )
+
+
+def _existing_draft_for_contact(db: Session, tenant_id: int, opportunity_id: int, gtm_strategy_id: int, contact_id: int | None) -> MessageDraft | None:
+    """V2 Phase 8 -- the real idempotency check generate_message_draft() itself uses: is there
+    ALREADY a draft for this exact (opportunity, strategy, contact) combination? Distinguishes
+    contact_id IS NULL (the insufficient_context/no-contact-yet case, still capped at one draft
+    per strategy version -- see the partial unique index in ensure_indexes()) from a specific
+    contact (one draft per contact, once contact discovery/sequencing has a real person to
+    target)."""
+    query = db.query(MessageDraft).filter(
+        MessageDraft.tenant_id == tenant_id, MessageDraft.opportunity_id == opportunity_id, MessageDraft.gtm_strategy_id == gtm_strategy_id
+    )
+    if contact_id is None:
+        query = query.filter(MessageDraft.contact_id.is_(None))
+    else:
+        query = query.filter(MessageDraft.contact_id == contact_id)
+    return query.first()
 
 
 PLACEHOLDER_MARKERS = ("[insert", "[company name]", "[your name]", "[placeholder]", "{{", "}}")
@@ -158,19 +189,30 @@ def _run_quality_gate(opportunity: Opportunity, strategy: GtmStrategy, contact_i
     return reasons
 
 
-def generate_message_draft(db: Session, tenant_id: int, opportunity: Opportunity, strategy: GtmStrategy) -> MessageDraft:
+def generate_message_draft(db: Session, tenant_id: int, opportunity: Opportunity, strategy: GtmStrategy, exclude_contact_ids=None) -> MessageDraft:
     """The only function that calls the LLM. Idempotent: an existing draft for this exact
-    (opportunity, strategy version) is reused/skipped -- never regenerated, and NEVER overwritten
-    once approved (Part N/K)."""
-    existing = _existing_draft(db, tenant_id, opportunity.id, strategy.id)
+    (opportunity, strategy version, TARGET CONTACT) is reused/skipped -- never regenerated, and
+    NEVER overwritten once approved (Part N/K).
+
+    exclude_contact_ids (V2 Phase 8, optional, default None -- every pre-Phase-8 caller passes
+    nothing and resolves the exact same primary contact as before): threaded straight into
+    evaluate_decision_maker(), so contacts[0] of what's left after exclusion becomes the target
+    -- this is how outreach_sequencing.py gets a real draft for "the next fallback contact"
+    without any separate contact-selection logic living here or there.
+
+    The target contact must be resolved BEFORE the idempotency check now (existence depends on
+    WHICH contact, not just the opportunity+strategy pair) -- this costs one extra read
+    (evaluate_decision_maker's own Contact query) on the steady-state "draft already exists"
+    path, compared to before Phase 8; still zero LLM/paid calls on that path."""
+    decision_maker = evaluate_decision_maker(db, tenant_id, opportunity.company_id, opportunity.affected_function, exclude_contact_ids=exclude_contact_ids)
+    contact_id = decision_maker["contacts"][0]["id"] if decision_maker["status"] == "known" and decision_maker["contacts"] else None
+
+    existing = _existing_draft_for_contact(db, tenant_id, opportunity.id, strategy.id, contact_id)
     if existing is not None:
         return existing
 
     research = gather_account_research(db, tenant_id, opportunity)
-    decision_maker = evaluate_decision_maker(db, tenant_id, opportunity.company_id)
     prep = prepare_message(db, tenant_id, opportunity, strategy, research, decision_maker)
-
-    contact_id = decision_maker["contacts"][0]["id"] if decision_maker["status"] == "known" and decision_maker["contacts"] else None
 
     if prep["status"] != "ready":
         draft = MessageDraft(
@@ -207,13 +249,14 @@ def generate_message_draft(db: Session, tenant_id: int, opportunity: Opportunity
         return draft
 
     message_text = result.get("message_text") if isinstance(result, dict) else None
+    subject = result.get("subject") if isinstance(result, dict) and isinstance(result.get("subject"), str) else None
 
     if not message_text or not isinstance(message_text, str):
         draft = MessageDraft(
             tenant_id=tenant_id, opportunity_id=opportunity.id, gtm_strategy_id=strategy.id, contact_id=contact_id,
             channel=prep["channel"], objective=prep["objective"], target_role=prep["target_role"],
             positioning_angle=prep["positioning_angle"], evidence_basis=prep["evidence_basis"],
-            personalization_inputs=prep["personalization_inputs"], message_text=None,
+            personalization_inputs=prep["personalization_inputs"], subject=None, message_text=None,
             generation_method="llm:generate_json",
             missing_information=prep["missing_information"] + [f"LLM declined to generate: {result.get('reason', 'no reason given') if isinstance(result, dict) else 'malformed output'}"],
             status="insufficient_context", quality_gate_reasons=None,
@@ -229,13 +272,59 @@ def generate_message_draft(db: Session, tenant_id: int, opportunity: Opportunity
         tenant_id=tenant_id, opportunity_id=opportunity.id, gtm_strategy_id=strategy.id, contact_id=contact_id,
         channel=prep["channel"], objective=prep["objective"], target_role=prep["target_role"],
         positioning_angle=prep["positioning_angle"], evidence_basis=prep["evidence_basis"],
-        personalization_inputs=prep["personalization_inputs"], message_text=message_text,
+        personalization_inputs=prep["personalization_inputs"], subject=subject, message_text=message_text,
         generation_method="llm:generate_json", missing_information=prep["missing_information"],
         status=status, quality_gate_reasons=quality_gate_reasons or None,
     )
     db.add(draft)
     db.commit()
     return draft
+
+
+def recover_message_draft_if_unblocked(
+    db: Session, tenant_id: int, opportunity: Opportunity, strategy: GtmStrategy, existing: MessageDraft
+) -> tuple[MessageDraft, bool]:
+    """V2 Phase 5 -- message-draft recovery. `existing` must be a real, already-found MessageDraft
+    for this exact (opportunity, strategy) pair (see _existing_draft) -- this function never
+    looks one up itself, to keep its precondition explicit at every call site.
+
+    Returns (draft, was_recovered). was_recovered=True ONLY when the stale draft was actually
+    deleted and regenerated by this call.
+
+    THE ONE RECOVERY CONDITION IMPLEMENTED (see module docstring's "First inspect" findings for
+    why not more): `existing.status == "insufficient_context"` AND `existing.contact_id IS NULL`
+    -- the exact, already-persisted, deterministic signal that decision_maker["status"] was NOT
+    "known" at draft-creation time (see generate_message_draft()'s own contact_id ternary: it is
+    set to None in EXACTLY that case, never for any other insufficient_context reason). This is
+    the literal "missing contact -> retry when an eligible Contact now exists" case the phase
+    asked for, using data the system already persists -- no new field, no string-matching
+    free-text missing_information.
+
+    Every OTHER insufficient_context reason (offering fit not confirmed, strategy not ready, an
+    already-selected contact simply lacking a channel, an LLM decline/failure) leaves contact_id
+    set or is a different generation_method entirely -- those are explicitly NOT treated as
+    recoverable here, per "do NOT guess new retry rules for unknown reasons." Every
+    non-insufficient_context status (draft, ready_for_review, approved, rejected,
+    changes_requested) is also returned completely untouched -- this function's very first
+    check already excludes them.
+
+    Re-checks evaluate_decision_maker() FRESH (never a cached/stale read) -- a suppressed-only
+    contact set, or a company that still has zero eligible contacts, correctly leaves the draft
+    exactly as it was. Deletes the stale row and calls generate_message_draft() -- completely
+    UNMODIFIED, zero business-logic changes beyond this recovery condition -- to regenerate,
+    rather than updating fields in place, so the existing (opportunity_id, gtm_strategy_id)
+    UNIQUE index is never violated by two rows coexisting even momentarily (delete, commit,
+    THEN insert)."""
+    if existing.status != "insufficient_context" or existing.contact_id is not None:
+        return existing, False
+
+    decision_maker = evaluate_decision_maker(db, tenant_id, opportunity.company_id, opportunity.affected_function)
+    if decision_maker["status"] != "known":
+        return existing, False
+
+    db.delete(existing)
+    db.commit()
+    return generate_message_draft(db, tenant_id, opportunity, strategy), True
 
 
 def approve_message_draft(db: Session, tenant_id: int, message_draft_id: int, approved_by: str) -> MessageDraft:
@@ -397,12 +486,16 @@ def run_message_generation_sweep(db: Session, tenant_id: int, limit: int = 20) -
 
     Never regenerates an ALREADY-drafted/reviewed/approved message just because the strategy
     hasn't changed -- only opportunities with no MessageDraft row for their current strategy
-    version are counted as "eligible" and passed to generate_message_draft().
+    version are counted as "eligible" and passed to generate_message_draft(). The ONE exception
+    (V2 Phase 5): an existing draft that's specifically stuck on a missing contact gets a
+    recovery check via recover_message_draft_if_unblocked() -- see that function's own
+    docstring for the exact, narrow condition; every other existing-draft case still just
+    counts as already_drafted, completely unchanged from before.
 
     One opportunity's failure never aborts the sweep. Makes real LLM calls (see
     generate_message_draft()'s own module docstring) -- bounded by `limit`, see this module's own
     cost-containment note above."""
-    counts = {"evaluated": 0, "eligible": 0, "drafted": 0, "already_drafted": 0, "not_ready": 0, "failed": 0}
+    counts = {"evaluated": 0, "eligible": 0, "drafted": 0, "recovered": 0, "already_drafted": 0, "not_ready": 0, "failed": 0}
 
     opportunity_ids = [
         row[0]
@@ -434,7 +527,11 @@ def run_message_generation_sweep(db: Session, tenant_id: int, limit: int = 20) -
             counts["eligible"] += 1
             existing = _existing_draft(db, tenant_id, opportunity.id, strategy.id)
             if existing is not None:
-                counts["already_drafted"] += 1
+                _recovered_draft, was_recovered = recover_message_draft_if_unblocked(db, tenant_id, opportunity, strategy, existing)
+                if was_recovered:
+                    counts["recovered"] += 1
+                else:
+                    counts["already_drafted"] += 1
                 continue
 
             generate_message_draft(db, tenant_id, opportunity, strategy)

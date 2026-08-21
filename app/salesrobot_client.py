@@ -100,6 +100,35 @@ def send_message_to_prospect(thread_id: str, prospect_uuid: str, linkedin_accoun
     return response.json()
 
 
+def send_connection_request(linkedin_profile_url: str, linkedin_account_uuid: str, message: str | None, db: Session, tenant_id: int) -> dict:
+    """V2 Phase 7 -- real, documented endpoint (confirmed live against current official docs,
+    2026-08-21: https://docs.salesrobot.co/reference/sendconnectionrequest), POST
+    /api/linkedin/connection-request. A genuine first-touch, arbitrary-custom-text connection
+    request -- distinct from add_single_prospect()'s campaign-template-merge-tag mechanism,
+    and NOT tied to any campaign enrollment. `message` is optional per the docs (a bare
+    connection request with no note is valid); pass None to send without one.
+
+    Response shape (per the doc): {"success": bool, "message": str, "data": {"status": str,
+    "invitationId": str, "failureReason": str|None, "resolvedMessage": str,
+    "profileData": {...}}}. Callers should persist data.invitationId + data.status as the real
+    provider reference -- this call submits the request; it does NOT confirm the request was
+    accepted or that any conversation resulted (see this module's own send_message_to_prospect
+    for that separate, existing-thread-only capability)."""
+    api_key = _get_api_key(db, tenant_id)
+    body = {"linkedinProfileUrl": linkedin_profile_url, "linkedinAccountUuid": linkedin_account_uuid}
+    if message:
+        body["message"] = message
+    response = httpx.post(
+        f"{BASE_URL}/linkedin/connection-request",
+        json=body,
+        headers={"X-API-KEY": api_key, "content-type": "application/json;charset=UTF-8"},
+        timeout=30,
+    )
+    if response.status_code != 200:
+        raise SalesRobotError(f"linkedin/connection-request failed ({response.status_code}): {response.text}")
+    return response.json()
+
+
 def add_single_prospect(campaign_uuid: str, linkedin_account_uuid: str, prospect: dict, db: Session, tenant_id: int) -> dict:
     """prospect: {"profileUrl": str, "firstName": str, "lastName": str, "jobTitle": str,
     "companyName": str, "customMap": {...}}"""

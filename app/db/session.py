@@ -33,6 +33,21 @@ def _set_statement_timeout(dbapi_connection, connection_record):
     cursor.close()
 
 
+# Found live (2026-08-21, Neon project migration) -- a pooled ("-pooler") connection can come
+# back with search_path effectively empty (confirmed via SHOW search_path returning blank),
+# which makes every unqualified table reference fail with "relation does not exist" even
+# though the tables genuinely exist in the public schema. An ALTER DATABASE ... SET
+# search_path database-level default does NOT reliably fix this for pooled connections --
+# same "unsupported startup parameter" class of restriction as statement_timeout above (a
+# startup-packet option is rejected outright), so the same fix applies: set it via a normal
+# post-connect query instead of relying on the startup packet or the database's own default.
+@event.listens_for(engine, "connect")
+def _set_search_path(dbapi_connection, connection_record):
+    cursor = dbapi_connection.cursor()
+    cursor.execute("SET search_path TO public")
+    cursor.close()
+
+
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 
@@ -371,6 +386,11 @@ def ensure_indexes():
         conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ix_opportunities_demand_hypothesis ON opportunities (demand_hypothesis_id)"))
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_opportunities_tenant_company ON opportunities (tenant_id, company_id)"))
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_opportunities_tenant_status ON opportunities (tenant_id, status)"))
+        # V2 Phase 2 -- ICP awareness (see app/gtm_os/icp/icp_matching.py::get_icp_context_for_company).
+        # Snapshot of already-computed ICPMatch rows at Opportunity-creation time -- a soft
+        # signal for Strategy/Account Agent prioritization, never a re-computation and never a
+        # hard eligibility gate (Problem+Demand eligibility above is completely unchanged).
+        conn.execute(text("ALTER TABLE opportunities ADD COLUMN IF NOT EXISTS icp_context JSON"))
         # Batch 5 -- GTM Strategy + Action Planning (see app/gtm_os/strategy/strategy.py). Multiple
         # rows per opportunity_id are expected (historical versions, never overwritten) -- no
         # unique constraint here, unlike opportunities' own demand_hypothesis_id.
@@ -396,6 +416,12 @@ def ensure_indexes():
             )
         """))
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_gtm_strategies_tenant_opportunity ON gtm_strategies (tenant_id, opportunity_id)"))
+        # V2 Phase 6 -- decision-maker/contact staleness fix (see strategy.py's GtmStrategy
+        # docstring). Existing rows get NULL here (never backfilled with a guess), which
+        # _facts_changed() will correctly treat as "changed" against a real True/False the very
+        # next time each is evaluated -- a one-time, harmless re-versioning catch-up, not a
+        # repeating instability.
+        conn.execute(text("ALTER TABLE gtm_strategies ADD COLUMN IF NOT EXISTS decision_maker_known BOOLEAN"))
         # Batch 7 -- Learning/Evaluation foundation (see app/gtm_os/learning/). SalesOutcome
         # reuses InterpretedSignal's own dedup guarantee via the unique interpreted_signal_id
         # index below; MessageDraft is unique per (opportunity, strategy version).
@@ -440,7 +466,24 @@ def ensure_indexes():
                 last_updated_at TIMESTAMP
             )
         """))
-        conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ix_message_drafts_opportunity_strategy ON message_drafts (opportunity_id, gtm_strategy_id)"))
+        # V2 Phase 8 -- widened from a single (opportunity_id, gtm_strategy_id) unique index to
+        # two PARTIAL unique indexes, so a strategy version can have at most one no-contact
+        # draft (contact_id IS NULL, the insufficient_context case -- preserves the exact
+        # Phase 5/6/7 guarantee unchanged) AND at most one draft PER CONTACT once contact
+        # discovery/sequencing has real people to target (the new Phase 8 guarantee -- lets
+        # the primary's and each fallback's drafts coexist, each with their own real send
+        # history, rather than overwriting/deleting one to make room for the next). The old
+        # single index is dropped first -- it would otherwise block the second contact's draft
+        # outright.
+        conn.execute(text("DROP INDEX IF EXISTS ix_message_drafts_opportunity_strategy"))
+        conn.execute(text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS ix_message_drafts_opp_strategy_no_contact "
+            "ON message_drafts (opportunity_id, gtm_strategy_id) WHERE contact_id IS NULL"
+        ))
+        conn.execute(text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS ix_message_drafts_opp_strategy_contact "
+            "ON message_drafts (opportunity_id, gtm_strategy_id, contact_id) WHERE contact_id IS NOT NULL"
+        ))
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_message_drafts_tenant_status ON message_drafts (tenant_id, status)"))
         # Phase 7 (V2 human review) -- generalized review fields alongside the existing
         # approved_at/approved_by (never renamed/removed -- Phase 3's V2 Messages tab already
@@ -452,6 +495,32 @@ def ensure_indexes():
         conn.execute(text("ALTER TABLE message_drafts ADD COLUMN IF NOT EXISTS reviewed_at TIMESTAMP"))
         conn.execute(text("ALTER TABLE message_drafts ADD COLUMN IF NOT EXISTS reviewed_by VARCHAR"))
         conn.execute(text("ALTER TABLE message_drafts ADD COLUMN IF NOT EXISTS review_note TEXT"))
+        # V2 Phase 7 follow-up -- subject, generated in the SAME LLM call as message_text (see
+        # message_draft.py's MESSAGE_GENERATION_PROMPT). Existing rows get NULL, stay fully
+        # readable; nothing re-generates them.
+        conn.execute(text("ALTER TABLE message_drafts ADD COLUMN IF NOT EXISTS subject TEXT"))
+        # V2 Phase 7 -- send state (see app/gtm_os/send/send_state.py). Insert-only, one row per
+        # real send ATTEMPT -- same discipline as campaign_pushes, kept as its own table (not a
+        # reuse of campaign_pushes) since a V2 send is keyed to a MessageDraft, which
+        # campaign_pushes has no concept of at all.
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS message_send_attempts (
+                id SERIAL PRIMARY KEY,
+                tenant_id INTEGER NOT NULL,
+                message_draft_id INTEGER NOT NULL REFERENCES message_drafts(id),
+                contact_id INTEGER NOT NULL REFERENCES contacts(id),
+                channel VARCHAR NOT NULL,
+                provider VARCHAR NOT NULL,
+                status VARCHAR NOT NULL,
+                provider_ref VARCHAR,
+                error_message TEXT,
+                retryable BOOLEAN,
+                attempted_at TIMESTAMP
+            )
+        """))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_message_send_attempts_draft ON message_send_attempts (message_draft_id)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_message_send_attempts_contact ON message_send_attempts (contact_id)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_message_send_attempts_tenant_status ON message_send_attempts (tenant_id, status)"))
         # Backend Batch 8 -- ICP + Trigger Intelligence (see app/gtm_os/icp/icp_matching.py). One
         # row per (company, ICP) pair that CURRENTLY matches -- unique constraint enforces the
         # upsert-in-place idempotency at the DB level too.
@@ -516,6 +585,24 @@ def ensure_indexes():
             )
         """))
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_confirmed_patterns_tenant_category ON confirmed_patterns (tenant_id, category)"))
+        # GTM-OS architecture upgrade -- human-provided knowledge (see
+        # app/gtm_os/learning/human_knowledge.py). Explicit provenance/status columns; never
+        # written to by anything except submit_/confirm_/dismiss_human_knowledge().
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS human_knowledge (
+                id SERIAL PRIMARY KEY,
+                tenant_id INTEGER NOT NULL,
+                original_text TEXT NOT NULL,
+                source VARCHAR NOT NULL DEFAULT 'human_input',
+                interpretation TEXT,
+                status VARCHAR NOT NULL DEFAULT 'pending_review',
+                created_by VARCHAR,
+                created_at TIMESTAMP,
+                confirmed_by VARCHAR,
+                confirmed_at TIMESTAMP
+            )
+        """))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_human_knowledge_tenant_status ON human_knowledge (tenant_id, status)"))
         # GTM-OS end-to-end wiring -- durable run-state for run_gtm_intelligence_sweep(), see
         # app/gtm_os/orchestration/sweep.py's GtmIntelligenceRun for why this is its own table
         # rather than a reuse of autonomous_runs.
@@ -529,6 +616,30 @@ def ensure_indexes():
                 started_at TIMESTAMP,
                 completed_at TIMESTAMP
             )
+        """))
+        # Unresolved-company ProblemHypothesis dedup fix -- see problem_detection.py's
+        # _get_open_hypothesis(). person_name_raw is the fallback grouping identity when
+        # company_id can't be resolved (e.g. a LinkedIn post whose author's employer couldn't be
+        # parsed). The three unique indexes below are the real fix for the duplicate-hypothesis
+        # bug confirmed against production on 2026-08-18 (two ProblemHypothesis rows opened from
+        # one InterpretedSignal by two concurrent sweep calls) -- app-level "check then create" is
+        # not race-safe by itself; these make the DB reject the second concurrent insert instead
+        # of silently creating a duplicate, and evaluate_interpreted_signal() catches that
+        # IntegrityError and re-reads the real row rather than raising.
+        conn.execute(text("ALTER TABLE problem_hypotheses ADD COLUMN IF NOT EXISTS person_name_raw VARCHAR"))
+        conn.execute(text("""
+            CREATE UNIQUE INDEX IF NOT EXISTS ix_problem_hypotheses_company_unique
+            ON problem_hypotheses (tenant_id, affected_function, company_id)
+            WHERE company_id IS NOT NULL
+        """))
+        conn.execute(text("""
+            CREATE UNIQUE INDEX IF NOT EXISTS ix_problem_hypotheses_person_unique
+            ON problem_hypotheses (tenant_id, affected_function, person_name_raw)
+            WHERE company_id IS NULL AND person_name_raw IS NOT NULL
+        """))
+        conn.execute(text("""
+            CREATE UNIQUE INDEX IF NOT EXISTS ix_problem_hypothesis_evidence_signal_unique
+            ON problem_hypothesis_evidence (interpreted_signal_id)
         """))
         # V2 Briefing performance fix -- see governance.py's GovernanceSnapshot. Moves
         # evaluate_gtm_governance()'s expensive live sweep off the request path onto the hourly

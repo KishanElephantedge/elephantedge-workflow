@@ -25,6 +25,7 @@ is the intended, conservative behavior."""
 
 from datetime import datetime
 
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.gtm_os.intelligence.interpreted_signal import InterpretedSignal
@@ -124,15 +125,41 @@ def _recompute_confidence(db: Session, hypothesis: ProblemHypothesis) -> None:
     }
 
 
-def _get_open_hypothesis(db: Session, tenant_id: int, company_id: int | None, affected_function: str) -> ProblemHypothesis | None:
-    if company_id is None:
+def _get_open_hypothesis(
+    db: Session, tenant_id: int, company_id: int | None, affected_function: str, person_name_raw: str | None = None
+) -> ProblemHypothesis | None:
+    """Real, resolved company_id is still the primary grouping key when available -- unchanged.
+
+    UNRESOLVED-COMPANY FALLBACK: when company_id is None, this used to always return None,
+    meaning every piece of unresolved-company evidence opened a brand-new ProblemHypothesis --
+    confirmed against real production data (2026-08-18): the same real person (Jennie Marshall,
+    a real LinkedIn poster with no resolvable company) produced two separate near-duplicate
+    hypotheses from what should have been one accumulating claim. Falls back to matching on
+    person_name_raw (passed through unchanged from InterpretedSignal.person_name_raw, never
+    re-derived) -- the one real identity signal available when company resolution fails, already
+    flowing through this pipeline, not invented for this fix. Still scoped to company_id IS NULL
+    so a resolved-company hypothesis is never matched by name instead. If person_name_raw is also
+    unavailable, still returns None (opens a new hypothesis) -- there is no real identity left to
+    group on, and guessing would be worse than opening a fresh, honestly-unlinked one."""
+    if company_id is not None:
+        return (
+            db.query(ProblemHypothesis)
+            .filter(
+                ProblemHypothesis.tenant_id == tenant_id,
+                ProblemHypothesis.company_id == company_id,
+                ProblemHypothesis.affected_function == affected_function,
+            )
+            .first()
+        )
+    if not person_name_raw:
         return None
     return (
         db.query(ProblemHypothesis)
         .filter(
             ProblemHypothesis.tenant_id == tenant_id,
-            ProblemHypothesis.company_id == company_id,
+            ProblemHypothesis.company_id.is_(None),
             ProblemHypothesis.affected_function == affected_function,
+            ProblemHypothesis.person_name_raw == person_name_raw,
         )
         .first()
     )
@@ -169,8 +196,11 @@ def evaluate_interpreted_signal(
     every current hiring_activity interpretation until a declared/implied_gap source exists)."""
     tier = classify_evidence_tier(interpreted_signal)
     dedup_key = _dedup_key_for(db, interpreted_signal)
+    affected_function = interpreted_signal.affected_function or "unknown"
 
-    hypothesis = _get_open_hypothesis(db, tenant_id, interpreted_signal.company_id, interpreted_signal.affected_function or "unknown")
+    hypothesis = _get_open_hypothesis(
+        db, tenant_id, interpreted_signal.company_id, affected_function, interpreted_signal.person_name_raw
+    )
 
     if hypothesis is None:
         if tier not in OPENING_TIERS:
@@ -179,14 +209,28 @@ def evaluate_interpreted_signal(
             tenant_id=tenant_id,
             company_id=interpreted_signal.company_id,
             company_name_raw=interpreted_signal.company_name_raw,
-            affected_function=interpreted_signal.affected_function or "unknown",
+            person_name_raw=interpreted_signal.person_name_raw if interpreted_signal.company_id is None else None,
+            affected_function=affected_function,
             problem_statement=interpreted_signal.business_change or _generic_problem_statement(interpreted_signal),
             reasoning_note=f"Opened by {tier}-tier evidence: {interpreted_signal.business_change}",
             first_observed_at=interpreted_signal.observed_at,
             last_updated_at=datetime.utcnow(),
         )
         db.add(hypothesis)
-        db.flush()  # need hypothesis.id before creating the evidence link
+        try:
+            db.flush()  # need hypothesis.id before creating the evidence link
+        except IntegrityError:
+            # Race: a concurrent call opened the same hypothesis (same company_id, or same
+            # person_name_raw when company_id is unresolved) between our read above and this
+            # insert -- caught by the unique constraints added alongside this fix (see
+            # ensure_indexes() in app/db/session.py). Roll back our attempted insert and re-read
+            # the real, now-existing row instead of leaving two competing hypotheses.
+            db.rollback()
+            hypothesis = _get_open_hypothesis(
+                db, tenant_id, interpreted_signal.company_id, affected_function, interpreted_signal.person_name_raw
+            )
+            if hypothesis is None:
+                raise
     elif _already_linked(db, hypothesis, dedup_key):
         return hypothesis  # same underlying event already counted -- not linked again, not double-counted
 
@@ -199,7 +243,20 @@ def evaluate_interpreted_signal(
         note=f"{interpreted_signal.event_type} ({tier}): {interpreted_signal.business_change}",
     )
     db.add(evidence)
-    db.flush()
+    try:
+        db.flush()
+    except IntegrityError:
+        # Race: the same InterpretedSignal was concurrently linked to a hypothesis by another
+        # call (unique constraint on interpreted_signal_id -- one signal evidences at most one
+        # ProblemHypothesis, see problem_hypothesis.py). Not an error case: return whichever
+        # hypothesis actually won, rather than leaving a duplicate evidence row.
+        db.rollback()
+        existing = (
+            db.query(ProblemHypothesisEvidence)
+            .filter(ProblemHypothesisEvidence.interpreted_signal_id == interpreted_signal.id)
+            .first()
+        )
+        return db.query(ProblemHypothesis).filter(ProblemHypothesis.id == existing.problem_hypothesis_id).first() if existing else None
 
     if interpreted_signal.observed_at and (hypothesis.first_observed_at is None or interpreted_signal.observed_at < hypothesis.first_observed_at):
         hypothesis.first_observed_at = interpreted_signal.observed_at

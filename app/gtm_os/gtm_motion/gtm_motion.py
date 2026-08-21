@@ -21,6 +21,32 @@ market/account boundary (Batch 4)."""
 from app.db.models import Batch, Company
 from app.gtm_os.gtm_motion.gtm_motion_config import get_gtm_motion_config
 from app.gtm_os.icp.icp_offering_matching import match_offerings_for_company
+from app.gtm_os.intelligence.demand_hypothesis import DemandHypothesis
+from app.gtm_os.intelligence.problem_hypothesis import ProblemHypothesis
+
+# Account-aware "why" (architecture upgrade, Part 5). NOT a persona/channel/sequence engine --
+# no such data model exists anywhere in this codebase (confirmed: no persona/channel/cadence
+# field on any GTM-OS model). Rather than fabricate one, this dict is always returned with every
+# value explicitly None plus a real reason, so the frontend can show "why this channel?" honestly
+# as "not yet supported by the data model" instead of a silently-missing section.
+_CHANNEL_PERSONA_SEQUENCE_UNSUPPORTED = {
+    "persona": None,
+    "channel": None,
+    "sequence": None,
+    "note": "no persona/channel/sequence data model exists yet -- motion recommendation is currently ICP x offering rule-based only, not persona- or channel-level",
+}
+
+
+def _account_context(db, tenant_id: int, company_id: int) -> list[str]:
+    """Real ProblemHypothesis/DemandHypothesis statements for this account -- the "why" behind an
+    account-aware motion recommendation beyond bare ICP x offering config. Read-only, reuses the
+    same models account_agent.py already queries; never re-derives problem/demand evidence."""
+    context = []
+    for p in db.query(ProblemHypothesis).filter(ProblemHypothesis.tenant_id == tenant_id, ProblemHypothesis.company_id == company_id).order_by(ProblemHypothesis.id).all():
+        context.append(f"problem evidence ({p.affected_function}): {p.problem_statement}")
+    for d in db.query(DemandHypothesis).filter(DemandHypothesis.tenant_id == tenant_id, DemandHypothesis.company_id == company_id).order_by(DemandHypothesis.id).all():
+        context.append(f"demand evidence ({d.affected_function}): {d.demand_statement}")
+    return context
 
 
 def recommend_gtm_motion(db, tenant_id: int, company_id: int) -> dict:
@@ -47,6 +73,8 @@ def recommend_gtm_motion(db, tenant_id: int, company_id: int) -> dict:
         "evidence": [],
         "allocation": None,
         "allocation_reason": "no historical motion-performance data or configured allocation rule exists yet",
+        "account_context": _account_context(db, tenant_id, company_id),
+        "channel_persona_sequence": dict(_CHANNEL_PERSONA_SEQUENCE_UNSUPPORTED),
     }
 
     if not icp_offering_result["icp_matches"]:

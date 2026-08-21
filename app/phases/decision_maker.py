@@ -1,11 +1,16 @@
 """
 Phase 6 — Decision Maker Intelligence.
 
-Single-threaded target, not multi-persona simultaneous search like Synefi's. Per Gokul's
-confirmed guidance: Founder/CEO/Co-Founder is the primary target; a Head of Sales/VP Sales/
-Head of GTM person is a secondary target, tried only when no primary contact exists at all
-(not pursued in parallel) -- covers companies with no findable founder/CEO record (e.g. no
-public leadership data indexed for that domain) rather than leaving them with zero contact.
+Multi-persona target (raised from a single-threaded target, 2026-08-20, per an urgent live
+product decision -- outreach to one contact per company means the whole company's chance
+depends on one person's inbox habits): up to MAX_CONTACTS_PER_COMPANY real people per company,
+spanning BOTH the Founder/CEO/Co-Founder family and the Head of Sales/VP Sales/Head of GTM
+family, not "secondary tier only when the primary is missing." Deterministic role relevance
+only (title-keyword matching) -- no numeric lead score is invented to rank within a tier.
+
+At most 2 search_contact calls per company regardless (one per tier), same cost-bounding as
+the original single-contact design -- the sales-leader tier is only called when the CEO tier's
+own already-paid-for candidates (CANDIDATES_PER_SEARCH per call) didn't fill the quota.
 
 One search_contact call per target tier, using a boolean title filter rather than a sequence
 of exact-title steps. Real-world titles are frequently compound free text ("CEO and Co-Founder",
@@ -52,6 +57,25 @@ SALES_LEADER_TITLE_KEYWORDS = [
     "chief revenue officer", "cro",
 ]
 
+# Third fallback tier (2026-08-20, explicit product decision): tried only when the CEO/Founder
+# tier and the sales-leader tier together still haven't filled the contact quota for a
+# company. Broadens beyond "sales leadership specifically" to any other real senior leader --
+# Vice President generally (not just VP Sales) and CTO/Chief Technology Officer, both
+# deliberately excluded from the tiers above (VP was excluded from the CEO tier's bare-
+# "president" check specifically to avoid false-positiving on "Vice President"; CTO was never
+# searched for at all until now). CEO/Founder/Co-Founder/President are included again here too
+# -- a company can have more than one person in that family (e.g. two co-founders), and this
+# tier's title match runs against whatever this call's own candidates are, independent of who
+# the earlier tiers already found (seen_keys dedup still applies).
+BROADER_LEADERSHIP_FILTER = (
+    "CEO OR Chief Executive Officer OR Founder OR Co-Founder OR President OR Vice President OR "
+    "VP OR CTO OR Chief Technology Officer"
+)
+BROADER_LEADERSHIP_TITLE_KEYWORDS = [
+    "ceo", "chief executive officer", "founder", "president", "vice president", "vp",
+    "cto", "chief technology officer",
+]
+
 # search_contact's own tool guidance: broad OR-filters like ours rank less precisely than
 # narrow ones, and recommends a small page_size (1-3) specifically "so you can inspect
 # candidate quality" -- confirmed live (Gulf & Western Industries: the #1-ranked result was
@@ -96,22 +120,40 @@ def _run_search_contact(company: Company, extra_payload: dict) -> list[dict]:
     return extract_rows(response, "persons")
 
 
-def _best_matching_person(persons: list[dict], title_keywords: list[str], require_bare_president: bool = False) -> dict | None:
-    """Picks the first candidate whose actual title contains one of our target keywords,
-    rather than blindly trusting persons[0]'s relevance rank -- the rank can and does put
-    the wrong person first (e.g. an Executive Vice President ranked above the real CEO).
+def _matching_persons(
+    persons: list[dict], title_keywords: list[str], require_bare_president: bool = False, exclude_keys: set | None = None
+) -> list[dict]:
+    """Returns EVERY candidate whose actual title contains one of our target keywords, not
+    just the first -- the same broad OR-filter call already returns up to CANDIDATES_PER_SEARCH
+    real people in one billed request; previously only persons[0]'s match was kept and the
+    rest silently discarded even when several were real, distinct decision-makers (e.g. both a
+    Founder and a Co-Founder). Rank is still not blindly trusted -- a title-keyword match is
+    required, same as before, since the provider's own relevance rank can and does put the
+    wrong person first (e.g. an Executive Vice President ranked above the real CEO).
 
     require_bare_president=True additionally accepts a title containing "president" on its
     own (the CEO tier's case) -- but only if it's NOT one of the "Vice President" family,
     since "president" is a substring of "Vice President"/"Executive Vice President" and a
-    naive `in` check would otherwise accept those too (confirmed live: this exact bug)."""
+    naive `in` check would otherwise accept those too (confirmed live: this exact bug).
+
+    exclude_keys, if given, is both read AND mutated in place -- callers pass the same set
+    across multiple tiers/sources so a person already picked up (free layer, or the CEO tier
+    call) is never counted twice against the same company's contact quota."""
+    exclude_keys = exclude_keys if exclude_keys is not None else set()
+    matches = []
     for person in persons:
         title = (person.get("title") or "").lower()
-        if any(keyword in title for keyword in title_keywords):
-            return person
-        if require_bare_president and "president" in title and not any(excl in title for excl in CEO_TITLE_PRESIDENT_EXCLUSIONS):
-            return person
-    return None
+        is_match = any(keyword in title for keyword in title_keywords)
+        if not is_match and require_bare_president and "president" in title and not any(excl in title for excl in CEO_TITLE_PRESIDENT_EXCLUSIONS):
+            is_match = True
+        if not is_match:
+            continue
+        key = (str(person.get("first_name") or "").strip().lower(), str(person.get("last_name") or "").strip().lower())
+        if key in exclude_keys:
+            continue
+        exclude_keys.add(key)
+        matches.append(person)
+    return matches
 
 
 def _make_contact(company: Company, db: Session, tenant_id: int, person: dict, reasoning: str, thread_role: str) -> Contact:
@@ -147,42 +189,103 @@ def _make_contact(company: Company, db: Session, tenant_id: int, person: dict, r
     return contact
 
 
-def find_decision_maker(company: Company, db: Session, tenant_id: int, allow_paid_fallback: bool = True) -> tuple[Contact | None, bool]:
-    """Returns (contact, used_paid_fallback). used_paid_fallback is True whenever the paid
-    Deepline search_contact path was actually called -- regardless of whether it found
-    anyone -- since search_contact bills per call, not per hit. Callers that need to bound
-    real spend across a batch (see autonomous_orchestrator.py's per-run paid-fallback cap,
-    added 2026-08-11) count on this to know when money was actually spent, not just when a
-    contact was found.
+MAX_CONTACTS_PER_COMPANY = 3
 
-    allow_paid_fallback=False skips the paid path entirely on a free miss -- used once a
-    caller's own per-run cap on paid attempts has been reached, so remaining companies that
-    miss the free layer simply get no contact instead of costing more."""
-    # Free/cheap resolution first (Jobo leadership + verified Apify LinkedIn lookup) -- a miss
-    # here costs nothing and falls straight through to the existing paid Deepline flow below,
-    # unchanged. Deferred import: free_decision_maker.py imports the title-keyword constants
-    # from this module, so a top-level import here would be circular.
-    from app.phases.free_decision_maker import find_free_decision_maker
-    free_person = find_free_decision_maker(db, tenant_id, company)
-    if free_person:
-        return _make_contact(company, db, tenant_id, free_person, free_person["reasoning"], free_person["thread_role"]), False
 
-    if not allow_paid_fallback:
-        return None, False
+def find_decision_makers(
+    company: Company, db: Session, tenant_id: int, allow_paid_fallback: bool = True, max_contacts: int = MAX_CONTACTS_PER_COMPANY,
+    existing_contacts: list[Contact] | None = None,
+) -> tuple[list[Contact], bool]:
+    """Multi-contact version -- fetches up to max_contacts real decision-makers per company,
+    spanning both the founder/CEO/Co-Founder family and the sales-leader family (Head of
+    Sales/VP Sales/Head of GTM/etc.), rather than a single primary contact with a sales-leader
+    fallback tried only when the primary is missing. Real-work rationale: outreach to a single
+    contact per company means the whole company's chance depends on one person's inbox habits;
+    multiple real, role-relevant contacts at the same company materially raises the odds of a
+    reply. Deterministic role relevance only (title-keyword matching, same as before) -- no
+    numeric lead score is invented for ranking within the tiers.
 
+    existing_contacts (V2 Phase 3 addition, optional, default None -- V1's own callers never
+    pass this, so their behavior is completely unchanged): Contact rows this company ALREADY
+    has (e.g. from a prior run). When given, max_contacts is treated as the TOTAL desired
+    contact count for the company (existing + new), not "new contacts on top of existing" --
+    and every existing contact's name is seeded into the dedup set, so a fresh search that
+    happens to surface the same real person again never creates a duplicate Contact row for
+    them. This is what lets a caller "top up" a company that already has 1 of 3 desired
+    contacts without re-fetching (and re-paying for) someone already known.
+
+    Returns (contacts, used_paid_fallback) -- contacts here are only the NEWLY created rows,
+    never re-wraps existing_contacts. used_paid_fallback is True whenever the paid Deepline
+    search_contact path was actually called -- regardless of how many (if any) it found --
+    since search_contact bills per call, not per hit. Callers that need to bound real spend
+    across a batch (see autonomous_orchestrator.py's per-run paid-fallback cap) count on this
+    to know when money was actually spent, not just when a contact was found.
+
+    allow_paid_fallback=False skips the paid path entirely once the free layer's contacts are
+    collected -- used once a caller's own per-run cap on paid attempts has been reached, so
+    remaining companies that miss/undershoot the free layer simply get fewer contacts instead
+    of costing more."""
+    seen_keys: set[tuple[str, str]] = set()
+    for existing in existing_contacts or []:
+        seen_keys.add((str(existing.first_name or "").strip().lower(), str(existing.last_name or "").strip().lower()))
+    target = max(0, max_contacts - len(existing_contacts or []))
+    contacts: list[Contact] = []
+
+    # Free/cheap resolution first (Jobo leadership + verified Apify LinkedIn lookup, now
+    # multi-candidate) -- a miss here costs nothing and falls straight through to the existing
+    # paid Deepline flow below for whatever quota it leaves unfilled. Deferred import:
+    # free_decision_maker.py imports the title-keyword constants from this module, so a
+    # top-level import here would be circular.
+    from app.phases.free_decision_maker import find_free_decision_makers
+    for free_person in find_free_decision_makers(db, tenant_id, company, target):
+        key = (str(free_person.get("first_name") or "").strip().lower(), str(free_person.get("last_name") or "").strip().lower())
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        contacts.append(_make_contact(company, db, tenant_id, free_person, free_person["reasoning"], free_person["thread_role"]))
+        if len(contacts) >= target:
+            break
+
+    if len(contacts) >= target or not allow_paid_fallback:
+        return contacts, False
+
+    used_paid = False
+
+    # CEO/Founder tier -- search_contact already returns up to CANDIDATES_PER_SEARCH real
+    # candidates in this one billed call; every one whose title actually matches is kept (not
+    # just the top-ranked), filling the quota from a call we're already paying for.
     persons = _run_search_contact(company, {"title_filters": [{"name": "ceo_filter", "filter": CEO_FILTER}]})
-    person = _best_matching_person(persons, CEO_TITLE_KEYWORDS, require_bare_president=True)
-    if person:
-        return _make_contact(company, db, tenant_id, person, f"title_filter={CEO_FILTER}, verified_title={person.get('title')!r}", "founder_ceo"), True
+    used_paid = True
+    for person in _matching_persons(persons, CEO_TITLE_KEYWORDS, require_bare_president=True, exclude_keys=seen_keys):
+        if len(contacts) >= target:
+            break
+        contacts.append(_make_contact(company, db, tenant_id, person, f"title_filter={CEO_FILTER}, verified_title={person.get('title')!r}", "founder_ceo"))
 
-    # No primary (founder/CEO) contact exists at all for this domain -- try the secondary
-    # sales-leader target rather than leaving the company with zero contact.
-    persons = _run_search_contact(company, {"title_filters": [{"name": "sales_leader_filter", "filter": SALES_LEADER_FILTER}]})
-    person = _best_matching_person(persons, SALES_LEADER_TITLE_KEYWORDS)
-    if person:
-        return _make_contact(company, db, tenant_id, person, f"title_filter={SALES_LEADER_FILTER}, verified_title={person.get('title')!r}", "sales_leader"), True
+    # Sales-leader tier -- only called if the quota still isn't filled (same cost-bounding
+    # principle throughout: never more paid calls than the quota genuinely still needs), not
+    # "only when zero primary found" -- a company can genuinely want both a founder AND a
+    # sales-leader contact.
+    if len(contacts) < target:
+        persons = _run_search_contact(company, {"title_filters": [{"name": "sales_leader_filter", "filter": SALES_LEADER_FILTER}]})
+        used_paid = True
+        for person in _matching_persons(persons, SALES_LEADER_TITLE_KEYWORDS, exclude_keys=seen_keys):
+            if len(contacts) >= target:
+                break
+            contacts.append(_make_contact(company, db, tenant_id, person, f"title_filter={SALES_LEADER_FILTER}, verified_title={person.get('title')!r}", "sales_leader"))
 
-    return None, True
+    # Broader leadership tier -- last resort, only called if the first two tiers together
+    # still haven't filled the quota. Widens to Vice President generally and CTO, plus another
+    # pass at CEO/Founder/President in case this call's own candidate set surfaces someone the
+    # first (differently-ranked) CEO-tier call didn't.
+    if len(contacts) < target:
+        persons = _run_search_contact(company, {"title_filters": [{"name": "broader_leadership_filter", "filter": BROADER_LEADERSHIP_FILTER}]})
+        used_paid = True
+        for person in _matching_persons(persons, BROADER_LEADERSHIP_TITLE_KEYWORDS, exclude_keys=seen_keys):
+            if len(contacts) >= target:
+                break
+            contacts.append(_make_contact(company, db, tenant_id, person, f"title_filter={BROADER_LEADERSHIP_FILTER}, verified_title={person.get('title')!r}", "other_leadership"))
+
+    return contacts, used_paid
 
 
 def run_decision_maker_id(batch_id: int, db: Session, tenant_id: int, retry_company_ids: list[int] | None = None, budget_guard: BudgetGuard | None = None) -> dict:
@@ -251,20 +354,22 @@ def run_decision_maker_id(batch_id: int, db: Session, tenant_id: int, retry_comp
         if team_fit["tier"] == "excluded":
             excluded_full_team += 1
             continue
-        contact, _ = find_decision_maker(company, db, tenant_id)
+        contacts, _ = find_decision_makers(company, db, tenant_id)
         company.decision_maker_searched_at = datetime.utcnow()
         db.commit()
-        if contact:
-            found += 1
+        if contacts:
+            found += len(contacts)
             # HubSpot sync is a side effect of a successful search, not a precondition for
             # it -- a HubSpot outage or bad token must never fail the Decision Maker phase.
             # The error is still surfaced in the response, not swallowed silently, so a bad
-            # token doesn't go unnoticed.
-            try:
-                sync_to_hubspot(company, contact, db, tenant_id)
-                hubspot_synced += 1
-            except HubSpotError as e:
-                hubspot_errors.append(f"{company.name}: {e}")
+            # token doesn't go unnoticed. Every contact for this company is synced, not just
+            # one -- HubSpot's own object model already supports multiple contacts per company.
+            for contact in contacts:
+                try:
+                    sync_to_hubspot(company, contact, db, tenant_id)
+                    hubspot_synced += 1
+                except HubSpotError as e:
+                    hubspot_errors.append(f"{company.name} ({contact.first_name} {contact.last_name}): {e}")
         else:
             not_found += 1
 

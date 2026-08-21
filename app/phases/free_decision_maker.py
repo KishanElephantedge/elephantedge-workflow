@@ -40,6 +40,7 @@ from app.jobo_client import JoboError, find_company_id_by_name, get_company_prof
 from app.jobo_client import _get_api_key as _get_jobo_api_key
 from app.llm_client import generate_json
 from app.phases.decision_maker import (
+    BROADER_LEADERSHIP_TITLE_KEYWORDS,
     CEO_TITLE_KEYWORDS,
     CEO_TITLE_PRESIDENT_EXCLUSIONS,
     SALES_LEADER_TITLE_KEYWORDS,
@@ -180,21 +181,26 @@ def _resolve_linkedin_url_strict(db: Session, tenant_id: int, first_name: str, l
     return None
 
 
-def _find_via_google_search(db: Session, tenant_id: int, company: Company) -> dict | None:
+def _find_via_google_search_candidates(db: Session, tenant_id: int, company: Company, max_candidates: int) -> list[dict]:
     """Third free/cheap layer, tried after Jobo misses -- Google's AI Overview (via Apify,
     ~$0.0085/query) often has real leadership data (confirmed live 2026-08-11: correct,
     verified answers for DAKCS and GovEase, both companies Jobo had no data for at all). The
     query is domain-qualified and the result goes through strict LinkedIn verification
     (name AND current company) before being trusted -- see _resolve_linkedin_url_strict's
-    docstring for why name-match alone isn't enough for this particular source."""
-    if not company.domain:
-        return None
+    docstring for why name-match alone isn't enough for this particular source.
+
+    Returns up to max_candidates verified people, not just the single best one -- the
+    extraction prompt already asks for up to 2 candidates (current leader + original founder,
+    when they're different people); this collects every one that verifies, rather than
+    stopping at the first."""
+    if not company.domain or max_candidates <= 0:
+        return []
     query = f"{company.name} {company.domain} founder CEO"
     try:
         api_key = _get_apify_api_key(db, tenant_id)
         content = search_google_ai_overview(api_key, query)
     except ApifyError:
-        return None
+        return []
     if not content:
         # Confirmed live (2026-08-12): Google's AI Overview is non-deterministic -- the exact
         # same domain-qualified query returned nothing once, then a real, verifiable answer
@@ -203,9 +209,9 @@ def _find_via_google_search(db: Session, tenant_id: int, company: Company) -> di
         try:
             content = search_google_ai_overview(api_key, query)
         except ApifyError:
-            return None
+            return []
     if not content:
-        return None
+        return []
 
     try:
         extracted = generate_json(
@@ -213,17 +219,19 @@ def _find_via_google_search(db: Session, tenant_id: int, company: Company) -> di
             db, tenant_id, max_tokens=400,
         )
     except Exception:
-        return None
+        return []
 
     if not extracted.get("confident_same_company"):
-        return None
+        return []
 
-    # Try each candidate in the LLM's priority order (current active leader first, historical
+    # Try every candidate in the LLM's priority order (current active leader first, historical
     # founder second) -- confirmed live 2026-08-11 this matters: a real case (DAKCS) named
     # both Kent Green (1980s founder, LinkedIn verification correctly failed -- long retired)
-    # and Andy Shumway (current President, actually verifiable) in the same AI Overview. Only
-    # trying the first candidate silently lost a real, findable contact.
+    # and Andy Shumway (current President, actually verifiable) in the same AI Overview.
+    results = []
     for candidate in extracted.get("candidates") or []:
+        if len(results) >= max_candidates:
+            break
         first_name, last_name = candidate.get("first_name"), candidate.get("last_name")
         if not first_name or not last_name:
             continue
@@ -234,15 +242,15 @@ def _find_via_google_search(db: Session, tenant_id: int, company: Company) -> di
             continue
 
         thread_role = "sales_leader" if _matches_title(title, SALES_LEADER_TITLE_KEYWORDS) else "founder_ceo"
-        return {
+        results.append({
             "first_name": first_name,
             "last_name": last_name,
             "title": title,
             "linkedin_url": linkedin_url,
             "thread_role": thread_role,
             "reasoning": f"Google AI Overview match (title={title!r}), LinkedIn resolved+verified (name+current-company match)",
-        }
-    return None
+        })
+    return results
 
 
 def resolve_fallback_email(db: Session, tenant_id: int, company: Company, first_name: str) -> tuple[str, str] | None:
@@ -281,36 +289,70 @@ def resolve_fallback_email(db: Session, tenant_id: int, company: Company, first_
     return None
 
 
-def find_free_decision_maker(db: Session, tenant_id: int, company: Company) -> dict | None:
-    """Tries three free/cheap layers in order, each falling through cleanly to the next on a
-    miss -- caller (decision_maker.find_decision_maker) only falls through to the paid
-    Deepline path if ALL of these miss:
+def _dedup_key(first_name: str, last_name: str) -> tuple[str, str]:
+    return (first_name or "").strip().lower(), (last_name or "").strip().lower()
+
+
+def find_free_decision_makers(db: Session, tenant_id: int, company: Company, max_contacts: int = 3) -> list[dict]:
+    """Multi-contact version of the free/cheap resolution waterfall -- collects up to
+    max_contacts real people spanning all three target tiers (founder/CEO/Co-Founder family,
+    then Head of Sales/VP Sales family, then a last-resort broader tier -- VP generally, CTO),
+    not just a single first match. Same three SOURCE layers/fallback order as before (Jobo
+    leadership -> Google AI Overview), just no longer stopping at the first hit. Caller
+    (decision_maker.find_decision_makers) only falls through to the paid Deepline path for
+    whatever quota this leaves unfilled:
     1. Jobo's free company-profile leadership list (name + title) -> Apify people-search
-       (~$0.02, name-verified) to resolve a real LinkedIn URL.
-    2. Google's AI Overview (~$0.0085/query, see _find_via_google_search) when Jobo has no
-       data for this company at all -- validated live 2026-08-11 as a real, meaningful lift
-       (found DAKCS and GovEase's real founders, both companies absent from Jobo's index)."""
+       (~$0.02, name-verified) to resolve a real LinkedIn URL. A company's own leadership list
+       can legitimately contain several qualifying people (e.g. both a Founder and a
+       Co-Founder) -- all of them are collected here, not just the first.
+    2. Google's AI Overview (~$0.0085/query) for whatever's still unfilled after Jobo --
+       validated live 2026-08-11 as a real, meaningful lift (found DAKCS and GovEase's real
+       founders, both companies absent from Jobo's index)."""
+    found: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+
     leadership = _jobo_leadership_candidates(db, tenant_id, company)
     for keywords, require_bare_president, thread_role in [
         (CEO_TITLE_KEYWORDS, True, "founder_ceo"),
         (SALES_LEADER_TITLE_KEYWORDS, False, "sales_leader"),
+        # Same last-resort broadening as the paid layer (decision_maker.py) -- Vice President
+        # generally and CTO, tried only once the two tiers above haven't filled the quota from
+        # this company's own free leadership list.
+        (BROADER_LEADERSHIP_TITLE_KEYWORDS, False, "other_leadership"),
     ]:
+        if len(found) >= max_contacts:
+            break
         for person in leadership:
+            if len(found) >= max_contacts:
+                break
             title = person.get("title") or ""
             if not _matches_title(title, keywords, require_bare_president):
                 continue
             first_name, last_name = _split_name(person.get("name") or "")
             if not first_name or not last_name:
                 continue
+            key = _dedup_key(first_name, last_name)
+            if key in seen:
+                continue
             linkedin_url = _resolve_linkedin_url(db, tenant_id, first_name, last_name, company.name)
-            if linkedin_url:
-                return {
-                    "first_name": first_name,
-                    "last_name": last_name,
-                    "title": title,
-                    "linkedin_url": linkedin_url,
-                    "thread_role": thread_role,
-                    "reasoning": f"Jobo leadership match (title={title!r}), LinkedIn resolved+verified via Apify people-search",
-                }
+            if not linkedin_url:
+                continue
+            seen.add(key)
+            found.append({
+                "first_name": first_name,
+                "last_name": last_name,
+                "title": title,
+                "linkedin_url": linkedin_url,
+                "thread_role": thread_role,
+                "reasoning": f"Jobo leadership match (title={title!r}), LinkedIn resolved+verified via Apify people-search",
+            })
 
-    return _find_via_google_search(db, tenant_id, company)
+    if len(found) < max_contacts:
+        for candidate in _find_via_google_search_candidates(db, tenant_id, company, max_contacts - len(found)):
+            key = _dedup_key(candidate["first_name"], candidate["last_name"])
+            if key in seen:
+                continue
+            seen.add(key)
+            found.append(candidate)
+
+    return found

@@ -17,6 +17,7 @@ history on every call, unlike every other source's small-incremental-results sha
 
 import hashlib
 from datetime import datetime
+from urllib.parse import quote
 
 from sqlalchemy.orm import Session
 
@@ -160,6 +161,39 @@ def sense_linkedin_posts(
         db.add(signal)
         signals.append(signal)
     db.commit()
+    return signals
+
+
+def sense_linkedin_post_search(db: Session, tenant_id: int) -> list[GtmSignal]:
+    """GTM-OS end-to-end wiring -- the one gap that was actually blocking ProblemHypothesis/
+    DemandHypothesis from ever opening (see app/gtm_os/intelligence/problem_detection.py's own
+    tier map: only linkedin_post evidence can OPEN a new hypothesis, every other currently-sensed
+    source is contextual-only). Reuses sense_linkedin_posts() (this same file, unmodified) with
+    real LinkedIn keyword-SEARCH URLs instead of a fixed profile-URL list -- the exact same
+    `supreme_coder/linkedin-post` actor input shape already proven working in
+    reverse_discovery.py's own broad-search feature, just a different caller.
+
+    EXPLICITLY NOT the Network/LinkedIn-monitor watch-list (LinkedinMonitorProfile) -- this
+    function never imports or queries that table; see linkedin_search_config.py's own module
+    docstring for the full reasoning.
+
+    Search phrases come from linkedin_search_config.py, DERIVED from this tenant's real ICP/
+    offering/business-context config, never hardcoded here -- and are rate-limited per-phrase
+    (select_due_phrases/record_phrases_searched) so the same query isn't re-billed to Apify every
+    single hourly tick."""
+    from app.gtm_os.intelligence.linkedin_search_config import get_linkedin_search_config, record_phrases_searched, select_due_phrases
+
+    config = get_linkedin_search_config(db, tenant_id)
+    due_phrases = select_due_phrases(config)
+    if not due_phrases:
+        return []
+
+    search_urls = [
+        f"https://www.linkedin.com/search/results/content/?keywords={quote(phrase)}&datePosted=%22{config['date_posted_filter']}%22&origin=FACETED_SEARCH"
+        for phrase in due_phrases
+    ]
+    signals = sense_linkedin_posts(db, tenant_id, search_urls, limit_per_source=config["posts_per_phrase"])
+    record_phrases_searched(db, tenant_id, config, due_phrases)
     return signals
 
 

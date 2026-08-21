@@ -46,10 +46,11 @@ without a schema change."""
 
 from datetime import datetime
 
-from sqlalchemy import Column, DateTime, ForeignKey, Integer, JSON, String, Text
+from sqlalchemy import Column, DateTime, ForeignKey, Integer, JSON, String, Text, exists
 from sqlalchemy.orm import Session
 
 from app.db.models import Base
+from app.gtm_os.icp.icp_matching import ICPMatch, get_icp_context_for_company
 from app.gtm_os.intelligence.demand_detection import DEMAND_QUALIFYING_TIERS
 from app.gtm_os.intelligence.demand_hypothesis import DemandHypothesis
 from app.gtm_os.intelligence.problem_detection import OPENING_TIERS
@@ -81,6 +82,14 @@ class Opportunity(Base):
     # instruction). Keys: qualifying_problem, qualifying_demand, independent_evidence_count,
     # sufficiently_independent, recent_enough, no_overwhelming_contradiction, has_company_identity.
     confidence = Column(JSON, nullable=True)
+
+    # V2 Phase 2 -- ICP awareness (app/gtm_os/icp/icp_matching.py::get_icp_context_for_company).
+    # A SOFT signal snapshot, taken at creation time, never a gate -- Problem+Demand eligibility
+    # above is what actually decided this row exists. Keys: has_icp_match, matches (list of
+    # {icp_id, icp_name, reasons, evaluated_at}), status ("matched" | "no_match_recorded" |
+    # "no_company_identity"). No numeric ICP score anywhere -- see that function's own docstring
+    # for why "no_match_recorded" is deliberately not split into a 3rd "insufficient" state.
+    icp_context = Column(JSON, nullable=True)
 
     first_observed_at = Column(DateTime, nullable=True)  # copied from the DemandHypothesis at creation time
     last_updated_at = Column(DateTime, default=datetime.utcnow)
@@ -169,7 +178,11 @@ def _existing_opportunity_id(db: Session, tenant_id: int, demand_hypothesis_id: 
 def create_opportunity(db: Session, tenant_id: int, problem: ProblemHypothesis, demand: DemandHypothesis, eligibility: dict) -> Opportunity:
     """The only function in this module that writes. Never modifies ProblemHypothesis,
     DemandHypothesis, or their evidence rows -- purely a new, additive classification on top of
-    already-complete, already-evidenced data."""
+    already-complete, already-evidenced data.
+
+    icp_context is a read-only snapshot (get_icp_context_for_company reads existing ICPMatch
+    rows, never re-evaluates them) -- a soft signal attached for downstream Strategy/Account
+    Agent visibility, never part of the eligibility decision above."""
     opportunity = Opportunity(
         tenant_id=tenant_id,
         company_id=demand.company_id,
@@ -181,6 +194,7 @@ def create_opportunity(db: Session, tenant_id: int, problem: ProblemHypothesis, 
         reasoning_note=f"Opportunity opened: {eligibility['reason']}",
         status="candidate",
         confidence=eligibility,
+        icp_context=get_icp_context_for_company(db, tenant_id, demand.company_id),
         first_observed_at=demand.first_observed_at,
     )
     db.add(opportunity)
@@ -207,11 +221,20 @@ def run_opportunity_intelligence_sweep(db: Session, tenant_id: int, limit: int =
         "failures": 0,
     }
 
+    # V2 Phase 2 prioritization -- ICP-matched companies' DemandHypothesis rows are evaluated
+    # FIRST (still subject to the same `limit`), so when there are more pending hypotheses than
+    # `limit` allows evaluating this pass, ICP-matched ones become Opportunities sooner. A
+    # correlated EXISTS against the already-computed ICPMatch table, not a new computation and
+    # not a numeric score -- pure boolean ORDER BY, same eligibility logic below either way.
+    icp_matched_exists = (
+        exists()
+        .where(ICPMatch.tenant_id == tenant_id, ICPMatch.company_id == DemandHypothesis.company_id)
+    )
     demand_ids = [
         row[0]
         for row in db.query(DemandHypothesis.id)
         .filter(DemandHypothesis.tenant_id == tenant_id)
-        .order_by(DemandHypothesis.id)
+        .order_by(icp_matched_exists.desc(), DemandHypothesis.id)
         .limit(limit)
         .all()
     ]

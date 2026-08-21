@@ -33,7 +33,7 @@ from app.phases.tech_stack import run_tech_stack_check
 from app.phases.jobo_discovery import run_jobo_discovery
 from app.phases.jd_first_discovery import run_jd_first_discovery
 from app.phases.apify_discovery import run_apify_discovery
-from app.phases.decision_maker import find_decision_maker
+from app.phases.decision_maker import find_decision_makers
 from app.jobo_client import JoboError
 from app.outreach.selector import get_outreach_channel
 from app.gtm_os.efficiency.activity_recorder import record_activity
@@ -696,24 +696,26 @@ def _run_jd_first_autonomous_cycle(batch: Batch, run: AutonomousRun, db: Session
     cap = get_daily_company_cap(db, tenant_id)
     result = run_jd_first_discovery(batch.id, db, tenant_id, target=cap, jobs_per_page=min(cap, 10))
 
-    found = 0
+    found = 0  # total decision-makers found across all companies, not company count
+    companies_with_contact = 0
     paid_fallback_used = 0
     companies = db.query(Company).filter(Company.batch_id == batch.id).all()
     for company in companies:
         allow_paid = paid_fallback_used < PAID_DECISION_MAKER_FALLBACK_CAP
-        contact, used_paid = find_decision_maker(company, db, tenant_id, allow_paid_fallback=allow_paid)
+        contacts, used_paid = find_decision_makers(company, db, tenant_id, allow_paid_fallback=allow_paid)
         if used_paid:
             paid_fallback_used += 1
         company.decision_maker_searched_at = datetime.utcnow()
         db.commit()
-        if contact:
-            found += 1
+        if contacts:
+            found += len(contacts)
+            companies_with_contact += 1
 
     final_spend = None  # no guard tracking this run -- see docstring above
     decision_maker_result = {
         "companies_checked": result["companies_discovered"],
         "decision_makers_found": found,
-        "companies_with_no_contact": result["companies_discovered"] - found,
+        "companies_with_no_contact": result["companies_discovered"] - companies_with_contact,
         "companies_skipped_already_resolved": 0,
         "hubspot_synced": 0,
         "hubspot_errors": [],
@@ -807,24 +809,26 @@ def _run_apify_autonomous_cycle(batch: Batch, run: AutonomousRun, db: Session, t
         _send_failure_alert(batch, run, result["api_error"], db, tenant_id)
         return {"status": "failed", "batch_id": batch.id, "source": "apify", "error": result["api_error"]}
 
-    found = 0
+    found = 0  # total decision-makers found across all companies, not company count
+    companies_with_contact = 0
     paid_fallback_used = 0
     companies = db.query(Company).filter(Company.batch_id == batch.id).all()
     for company in companies:
         allow_paid = paid_fallback_used < PAID_DECISION_MAKER_FALLBACK_CAP
-        contact, used_paid = find_decision_maker(company, db, tenant_id, allow_paid_fallback=allow_paid)
+        contacts, used_paid = find_decision_makers(company, db, tenant_id, allow_paid_fallback=allow_paid)
         if used_paid:
             paid_fallback_used += 1
         company.decision_maker_searched_at = datetime.utcnow()
         db.commit()
-        if contact:
-            found += 1
+        if contacts:
+            found += len(contacts)
+            companies_with_contact += 1
 
     final_spend = result.get("estimated_cost_usd")
     decision_maker_result = {
         "companies_checked": result["companies_discovered"],
         "decision_makers_found": found,
-        "companies_with_no_contact": result["companies_discovered"] - found,
+        "companies_with_no_contact": result["companies_discovered"] - companies_with_contact,
         "companies_skipped_already_resolved": 0,
         "hubspot_synced": 0,
         "hubspot_errors": [],

@@ -10,6 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.db.session import SessionLocal, ensure_indexes
 from app.google_calendar_client import GoogleCalendarError
 from app.gtm_os.governance.governance import compute_and_store_governance_snapshot
+from app.gtm_os.orchestration.control import ControlPlaneHalted, check_can_run
 from app.gtm_os.orchestration.sweep import (
     GtmIntelligenceRun,
     finish_gtm_intelligence_run,
@@ -149,9 +150,20 @@ def _scheduled_gtm_intelligence_cycle():
 
     Never raises: run_gtm_intelligence_sweep's own per-source/per-stage error isolation means a
     real failure is captured in its returned result (and now also in the persisted run's own
-    status/error_summary), not surfaced as an uncaught exception here."""
+    status/error_summary), not surfaced as an uncaught exception here.
+
+    V2 CONTROL PLANE (Phase 0): check_can_run() gates this before anything else -- when the
+    control plane's state is "paused"/"stopped", this tick no-ops entirely (no GtmIntelligenceRun
+    row is even created) rather than running and only skipping the write-side stages, per the
+    approved "paused/stopped must prevent new autonomous actions" decision."""
     db = SessionLocal()
     try:
+        try:
+            check_can_run(db, ELEPHANT_EDGE_TENANT_ID)
+        except ControlPlaneHalted as e:
+            logging.getLogger(__name__).info("gtm_intelligence_cycle: skipped -- %s", e)
+            return
+
         recover_stale_gtm_intelligence_runs(db, ELEPHANT_EDGE_TENANT_ID)
         already_running = (
             db.query(GtmIntelligenceRun)
@@ -252,8 +264,16 @@ def on_startup():
         misfire_grace_time=AUTONOMOUS_MISFIRE_GRACE_SECONDS,
     )
     scheduler.add_job(_scheduled_approval_sweep, "interval", minutes=5, id="approval_window_sweep")
-    scheduler.add_job(_scheduled_cache_refresh, "interval", minutes=3, id="batch_cache_refresh")
-    scheduler.add_job(_scheduled_calendar_sync, "interval", minutes=15, id="calendar_booking_sync")
+    # Widened from 3/15 minutes (2026-08-21) -- a 3-minute cache warmer and a 15-minute calendar
+    # sync individually cost little, but together with every other job on this scheduler they
+    # kept the DB compute effectively always-on, never idle long enough for the host's
+    # auto-suspend to kick in -- confirmed the real driver behind burning through a full month's
+    # free-tier compute-hour quota in under three weeks despite near-zero real data/traffic.
+    # Both are pure convenience/freshness jobs (a warm cache for whoever's actively viewing a
+    # batch page; a periodic pull of calendar bookings) -- correctness never depends on this
+    # cadence, only how fresh a background view can be, so widening costs nothing but staleness.
+    scheduler.add_job(_scheduled_cache_refresh, "interval", minutes=15, id="batch_cache_refresh")
+    scheduler.add_job(_scheduled_calendar_sync, "interval", minutes=300, id="calendar_booking_sync")
     # Interval read from real, editable config (Targets > Settings) -- was hardcoded
     # minutes=45 until 2026-08-18, with no way to change it without a code change/redeploy.
     scheduler.add_job(_scheduled_linkedin_monitor_sweep, "interval", minutes=linkedin_monitor_interval_minutes, id="linkedin_monitor_sweep")

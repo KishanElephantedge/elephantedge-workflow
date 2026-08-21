@@ -121,22 +121,71 @@ def gather_account_research(db, tenant_id: int, opportunity: Opportunity) -> dic
     return research
 
 
-def evaluate_decision_maker(db, tenant_id: int, company_id: int | None) -> dict:
+def evaluate_decision_maker(db, tenant_id: int, company_id: int | None, affected_function: str | None = None, exclude_contact_ids=None) -> dict:
     """Decision-maker discovery abstraction (Part F) -- read-only against already-known Contact
-    rows. Never performs external discovery, never invents a name."""
+    rows. Never performs external discovery, never invents a name.
+
+    V2 Phase 3/4 update: suppressed contacts (Contact.excluded_from_push) are excluded from
+    selection entirely -- a suppressed person must never become "the" decision maker a message
+    gets prepared for. The remaining eligible contacts are ordered via the deterministic
+    ranking layer (app/gtm_os/sales/contact_ranking.py), so contacts[0] is a genuine,
+    explainable "primary" contact, not whatever order the DB happened to return -- which is
+    exactly what every real caller (build_sales_handoff below, and
+    app/gtm_os/learning/message_draft.py's generate_message_draft) already relies on via
+    `contacts[0]`. `already_pushed` (from CampaignPush.status == "pushed", the same real signal
+    run_campaign_execution itself uses) is surfaced per contact so a future send-time check can
+    avoid re-targeting someone already under an active campaign -- this function itself does
+    not filter on it, since "already pushed" isn't the same as "ineligible to be the known
+    decision maker for this record."
+
+    exclude_contact_ids (V2 Phase 8, optional, default None -- every existing caller passes
+    nothing and is completely unaffected): contact ids to drop from consideration before
+    ranking. This is what lets outreach_sequencing.py get "the next fallback" out of this exact
+    same ranking logic -- exclude everyone already tried, and contacts[0] of what's left IS the
+    next eligible contact, deterministically, with no separate fallback-selection logic
+    duplicated anywhere."""
     if company_id is None:
         return {"status": "required", "reason": "no_company_identity", "contacts": []}
 
-    contacts = db.query(Contact).filter(Contact.company_id == company_id).all()
-    if not contacts:
+    all_contacts = db.query(Contact).filter(Contact.company_id == company_id).all()
+    if not all_contacts:
         return {"status": "required", "reason": "no_relevant_contact_available", "contacts": []}
+
+    exclude_ids = set(exclude_contact_ids or [])
+    eligible = [c for c in all_contacts if not c.excluded_from_push and c.id not in exclude_ids]
+    if not eligible:
+        all_suppressed = all(c.excluded_from_push for c in all_contacts)
+        reason = "all_known_contacts_suppressed" if all_suppressed else "no_eligible_contacts_remaining_after_exclusions"
+        return {"status": "required", "reason": reason, "contacts": []}
+
+    from app.db.models import CampaignPush
+    pushed_contact_ids = {
+        p.contact_id
+        for p in db.query(CampaignPush.contact_id)
+        .filter(CampaignPush.contact_id.in_([c.id for c in eligible]), CampaignPush.status == "pushed")
+        .all()
+    }
+
+    from app.gtm_os.sales.contact_ranking import rank_contacts
+    ranked = rank_contacts(eligible, affected_function)
 
     return {
         "status": "known",
         "reason": None,
         "contacts": [
-            {"id": c.id, "name": f"{c.first_name or ''} {c.last_name or ''}".strip() or None, "title": c.title, "linkedin_url": c.linkedin_url, "has_email": c.email is not None}
-            for c in contacts
+            {
+                "id": r["contact"].id,
+                "name": f"{r['contact'].first_name or ''} {r['contact'].last_name or ''}".strip() or None,
+                "title": r["contact"].title,
+                "linkedin_url": r["contact"].linkedin_url,
+                "has_email": r["contact"].email is not None,
+                "role_tier": r["role_tier"],
+                "rank": r["rank"],
+                "rank_label": r["rank_label"],
+                "rank_reasoning": r["reasoning"],
+                "already_pushed": r["contact"].id in pushed_contact_ids,
+            }
+            for r in ranked
         ],
     }
 
@@ -147,7 +196,7 @@ def build_sales_handoff(db, tenant_id: int, opportunity: Opportunity, strategy: 
     -- it never independently reinterprets business_context or invents an opportunity; the
     Strategy remains the decision layer, this is purely an assembled read of what already exists."""
     research = gather_account_research(db, tenant_id, opportunity)
-    decision_maker = evaluate_decision_maker(db, tenant_id, opportunity.company_id)
+    decision_maker = evaluate_decision_maker(db, tenant_id, opportunity.company_id, opportunity.affected_function)
     business_context = get_business_context(db, tenant_id)
 
     return {

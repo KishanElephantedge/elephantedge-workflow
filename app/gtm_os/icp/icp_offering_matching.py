@@ -12,23 +12,20 @@ matching path that Section 5 of the Batch 9 spec explicitly asks for: "this batc
 the matcher specifically through the new ICPMatch relationship," a different (and today, richer)
 signal than `affected_function` alone.
 
-ICP -> OFFERING MAPPING (transcribed from the lead's reference material, per "where the lead has
-given an explicit rule, represent it" -- stored in offering_config.py's own
-`_APPLICABLE_ICPS_BY_OFFERING`, not duplicated here):
+ICP -> OFFERING MAPPING (approved by the lead, GTM-OS acceptance-test follow-up, stored in
+offering_config.py's own `applicable_icps` per offering, not duplicated here):
     ICP 1 "Stuck in Sales"              -> Consulting, Workshop, Digital Playbook
-    ICP 2 "Upgrading With AI"           -> Execution, Sales Products
-    ICP 3 "Needs Fractional Leadership" -> deliberately left UNMAPPED
+    ICP 2 "Upgrading With AI"           -> Sales OS
+    ICP 3 "Needs Fractional Leadership" -> Execution
+    Sales Products                      -> deliberately left unmapped to any ICP for now (real,
+                                            named open question -- see offering_config.py)
 
-WHY ICP 3 IS LEFT UNMAPPED: the lead's reference names ICP 3's best-fit offering as "Fractional
-Sales/GTM Leadership." The six EXISTING, canonical offering names (from business_context.py,
-repeated verbatim across every batch since Batch 4) are Consulting/Execution/Workshop/Sales OS/
-Sales Products/Digital Playbook -- none of which literally says "Fractional Leadership." The
-closest candidate by name is "Sales OS" (the founder's own raw transcript describes it as "a
-sales operating system for this business"), but that is this implementation's own guess, not a
-confirmed 1:1 mapping -- forcing it would violate this batch's explicit "do not invent additional
-qualification rules" instruction. Left unmapped (`applicable_icps: []` for "Sales OS") and
-flagged prominently in the final report as a real, named ambiguity requiring lead confirmation,
-rather than silently guessed.
+Superseded an earlier draft mapping (ICP 2 -> Execution/Sales Products, ICP 3 unmapped) that
+guessed "Sales OS" might be ICP 3's fit purely from the word "Fractional" in ICP 3's name -- the
+lead's own real product-pillar breakdown confirmed Sales OS (AI SDR/Sales Automation, "Agentic
+layers for sales") is the ICP 2 fit (ICP 2's trigger is literally hiring a GTM-engineer-type
+role), and Execution (Fractional VP Sales) is the ICP 3 fit (ICP 3's trigger is literally hiring a
+VP/Head of Sales they'd prefer fractional) -- both confirmed by the lead, not re-guessed here.
 
 Deterministic only -- no LLM, no embeddings (per scope boundary).
 
@@ -42,11 +39,70 @@ duplicate state that's already fully reconstructable from two existing, cheap-to
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from app.db.models import Batch, Company
+from app.db.models import Batch, CalendarBooking, Company
+from app.gtm_os.content.topic import ContentTopic
+from app.gtm_os.content.trend_config import get_trend_config
+from app.gtm_os.content.trend_intelligence import evaluate_topic_trend
 from app.gtm_os.gtm_motion.gtm_motion_config import get_gtm_motion_config
 from app.gtm_os.icp.icp_config import get_icp_config
 from app.gtm_os.icp.icp_matching import ICPMatch
+from app.gtm_os.intelligence.demand_hypothesis import DemandHypothesis
 from app.gtm_os.opportunity.offering_config import MATCHING_RELEVANT_FIELDS, get_offering_config
+from app.gtm_os.opportunity.offering_matcher import match_offering, match_offerings
+from app.gtm_os.opportunity.opportunity import Opportunity
+
+# Trend states ranked strongest -> weakest, for picking the single best-matching topic's state as
+# an offering's market_demand summary when multiple configured topics relate to it (Part 1's own
+# "market demand exists" question -- never a numeric score, just the real evaluate_topic_trend()
+# classification, reused unmodified from trend_intelligence.py).
+_TREND_STRENGTH_ORDER = ["accelerating", "emerging", "persistent", "stable", "declining", "insufficient_evidence"]
+
+
+def _topic_relates_to_offering(topic_terms: set[str], offering: dict) -> bool:
+    """Deliberately simple, deterministic, inspectable keyword overlap -- NOT semantic/embedding
+    matching (no such capability exists anywhere in this codebase, and Part 10 forbids adding
+    unnecessary LLM calls for something a plain substring check can do honestly). No ICP/offering
+    <-> ContentTopic association table exists yet (confirmed: ContentTopic has no offering_name/
+    icp_id field) -- this is the documented, minimal foundation until a real tagging mechanism is
+    built. A topic "relates" to an offering when the topic's own name/aliases share a word with
+    the offering's name or configured target_functions -- real text, no invented taxonomy."""
+    offering_terms = {w.lower() for w in offering.get("name", "").replace("-", " ").split()}
+    for tf in offering.get("target_functions") or []:
+        offering_terms.add(str(tf).lower())
+    return bool(topic_terms & offering_terms)
+
+
+def _market_demand_by_offering(db: Session, tenant_id: int, offerings: list[dict]) -> dict[str, dict]:
+    """One evaluate_topic_trend() call per configured ContentTopic (small, tenant-owned set, same
+    performance precedent as get_market_intelligence_overview()), then a pure in-memory keyword
+    match against each offering -- never a query per offering."""
+    topics = db.query(ContentTopic).filter(ContentTopic.tenant_id == tenant_id).all()
+    if not topics:
+        return {o["name"]: {"state": "no_related_topic", "relevant_signals": 0, "related_topics": []} for o in offerings}
+
+    trend_config = get_trend_config(db, tenant_id)
+    topic_trends = []
+    for topic in topics:
+        terms = {topic.canonical_name.lower()} | {a.lower() for a in (topic.aliases or [])}
+        trend = evaluate_topic_trend(db, tenant_id, topic, trend_config)
+        topic_trends.append((terms, topic.canonical_name, trend))
+
+    result = {}
+    for offering in offerings:
+        matched = [(name, trend) for terms, name, trend in topic_trends if _topic_relates_to_offering(terms, offering)]
+        if not matched:
+            result[offering["name"]] = {"state": "no_related_topic", "relevant_signals": 0, "related_topics": []}
+            continue
+        best_state = min(
+            (trend["state"] for _name, trend in matched),
+            key=lambda s: _TREND_STRENGTH_ORDER.index(s) if s in _TREND_STRENGTH_ORDER else len(_TREND_STRENGTH_ORDER),
+        )
+        result[offering["name"]] = {
+            "state": best_state,
+            "relevant_signals": sum(trend["recent_observation_count"] for _name, trend in matched),
+            "related_topics": [name for name, _trend in matched],
+        }
+    return result
 
 
 def match_offerings_for_company(db: Session, tenant_id: int, company_id: int) -> dict:
@@ -138,6 +194,50 @@ def match_offerings_for_company(db: Session, tenant_id: int, company_id: int) ->
     }
 
 
+def match_offerings_for_opportunity(db: Session, tenant_id: int, opportunity: Opportunity) -> list[dict]:
+    """The real connection this batch's acceptance test found missing: strategy.py's
+    generate_strategy_facts() was calling offering_matcher.py's match_offerings() directly --
+    target_functions/exclusions only, blind to ICP applicability -- so a company clearly matched
+    to one ICP could still get pitched an offering configured for a completely different ICP,
+    just because it happened to sort first among target_functions-compatible offerings.
+
+    Deliberately reads Opportunity.icp_context (the Batch 8/Phase 2 snapshot taken at Opportunity
+    creation time) rather than re-querying live ICPMatch rows: Opportunity should retain the ICP
+    reasoning state it was actually created from, strategy generation should be deterministic
+    against that stored context (not silently drift if ICP config changes later), and this avoids
+    a second live ICP evaluation on every strategy sweep. Genuinely NOT a third offering matcher --
+    reuses match_offering() (offering_matcher.py, unmodified per-offering target_functions/
+    exclusions logic) for every offering this function decides is even in play; the only new
+    logic here is which offerings are in play at all.
+
+    Multi-ICP aware: if icp_context.matches names more than one ICP, an offering is in play if
+    its applicable_icps intersects ANY of them (a real, deterministic union -- no score, no
+    precedence rule invented). Offering-config list order is preserved through filtering, so the
+    existing "first candidate_match wins" best-fit behavior in generate_strategy_facts() is
+    unchanged for however many offerings survive the ICP filter.
+
+    Falls back to the plain, unfiltered match_offerings() when this Opportunity has no real ICP
+    match recorded (icp_context missing, or has_icp_match is not True, or matches is empty) --
+    ICP applicability is additive offering-selection input, never a hard gate on opportunities
+    that never matched an ICP in the first place (those still deserve honest target_functions-only
+    matching, not silent insufficient_offering_context)."""
+    icp_context = opportunity.icp_context or {}
+    matches = icp_context.get("matches") or []
+    if not icp_context.get("has_icp_match") or not matches:
+        return match_offerings(db, tenant_id, opportunity)
+
+    matched_icp_ids = {m.get("icp_id") for m in matches if m.get("icp_id")}
+    offerings = get_offering_config(db, tenant_id)
+    icp_applicable_offerings = [o for o in offerings if matched_icp_ids & set(o.get("applicable_icps") or [])]
+
+    # Same "omit, don't fabricate no_match" convention match_offerings_for_company() already
+    # established for offerings with no relationship to the matched ICP(s) at all -- an empty
+    # list here (this Opportunity's matched ICP(s) have zero offerings configured for them) flows
+    # straight into generate_strategy_facts()'s existing "insufficient_offering_context" bucket,
+    # an honest, already-existing status -- no new vocabulary invented for this case.
+    return [match_offering(offering, opportunity) for offering in icp_applicable_offerings]
+
+
 def run_offering_matching_sweep(db: Session, tenant_id: int, limit: int = 200, dry_run: bool = False) -> dict:
     """Bounded, standalone, tenant-scoped, read-only reporting sweep -- writes NOTHING regardless
     of `dry_run` (accepted purely for interface consistency with this feature's other sweeps, see
@@ -183,29 +283,88 @@ def run_offering_matching_sweep(db: Session, tenant_id: int, limit: int = 200, d
     return counts
 
 
+def _opportunity_and_outcome_evidence(db: Session, tenant_id: int, icp_ids: list[str], matched_company_ids_by_icp: dict[str, set[int]]) -> tuple[dict, dict]:
+    """Real commercial-demand evidence per (icp_id, offering) cell -- Part 1's "is it turning into
+    opportunities / meetings / wins / revenue" question. Two bulk queries (never per-cell):
+    every Opportunity for any matched company (then offering_matcher.py's own match_offerings(),
+    unmodified, run once per opportunity -- real problem/demand alignment, not a new matcher), and
+    every won/lost CalendarBooking outcome with an offering_name set (outcome_icp_snapshot is
+    already a real, server-captured fact -- see revenue_pace.py)."""
+    all_matched_company_ids = {cid for ids in matched_company_ids_by_icp.values() for cid in ids}
+    opportunities_by_cell: dict[tuple[str, str], list[str]] = {}
+    if all_matched_company_ids:
+        opportunities = (
+            db.query(Opportunity)
+            .filter(Opportunity.tenant_id == tenant_id, Opportunity.company_id.in_(all_matched_company_ids))
+            .all()
+        )
+        for opp in opportunities:
+            candidate_offerings = {r["offering"] for r in match_offerings(db, tenant_id, opp) if r["status"] == "candidate_match"}
+            for icp_id in icp_ids:
+                if opp.company_id in matched_company_ids_by_icp.get(icp_id, ()):
+                    for offering_name in candidate_offerings:
+                        opportunities_by_cell.setdefault((icp_id, offering_name), []).append(opp.opportunity_statement)
+
+    outcomes_by_cell: dict[tuple[str, str], dict] = {}
+    bookings = (
+        db.query(CalendarBooking)
+        .join(Company, CalendarBooking.outcome_company_id == Company.id)
+        .join(Batch, Company.batch_id == Batch.id)
+        .filter(Batch.tenant_id == tenant_id, CalendarBooking.outcome_status.in_(("won", "lost")), CalendarBooking.outcome_offering_name.isnot(None))
+        .all()
+    )
+    for booking in bookings:
+        snapshot_icp_ids = {e.get("icp_id") for e in (booking.outcome_icp_snapshot or [])}
+        for icp_id in snapshot_icp_ids & set(icp_ids):
+            key = (icp_id, booking.outcome_offering_name)
+            entry = outcomes_by_cell.setdefault(key, {"meetings": 0, "won": 0, "revenue_usd": 0})
+            entry["meetings"] += 1
+            if booking.outcome_status == "won":
+                entry["won"] += 1
+                entry["revenue_usd"] += booking.outcome_amount_usd or 0
+
+    return opportunities_by_cell, outcomes_by_cell
+
+
 def get_demand_grid(db: Session, tenant_id: int) -> dict:
-    """V2 Demand Grid page (Phase 4, Parts 7-10) -- an ICP x Offering AGGREGATE view, distinct
-    from match_offerings_for_company()'s per-company view above (reused for its config-reading
-    logic, never re-implemented). A cell's status is a pure function of the existing offering
-    config (applicable_icps/exclusions) -- the same three facts icp_offering_matching.py's own
-    per-company loop already checks, just not re-evaluated per company here:
-        "excluded"     -- icp_id is in this offering's exclusions
-        "applicable"   -- icp_id is in this offering's applicable_icps (and not excluded)
-        "unconfigured" -- neither -- no relationship has been configured for this pair at all
+    """V2 Demand Grid -- redefined (architecture upgrade, Parts 1-2) from a bare ICP x Offering
+    APPLICABILITY matrix into a demand-INTELLIGENCE surface, answering "where is demand highest
+    right now?" instead of just "what's configured?".
 
-    NEVER "applicable" -> "demand exists" (Part 8's own explicit warning): `matched_account_count`
-    is a SEPARATE field, real evidence from ICPMatch (Batch 8), not a rephrasing of the
-    configuration fact. A cell can be "applicable" with matched_account_count == 0 (configured,
-    but no company has matched that ICP yet) -- that distinction is preserved, never collapsed.
+    `status`/`matched_account_count` are UNCHANGED (backward-compatible: get_icps_offerings_overview()
+    and the V2 ICPs & Offerings config page both still read them exactly as before). Every
+    "applicable" cell additionally carries a real `evidence` object distinguishing the four levels
+    the spec asks for, NEVER collapsed into one number and never a fabricated score:
+        market_demand         -- ContentTopic trend state (trend_intelligence.py, unmodified),
+                                  keyword-matched to this offering; "no_related_topic" if none
+                                  configured relates to it -- an honest absence, not a zero score.
+        account_demand        -- matched_account_count, restated here for convenience (same real
+                                  ICPMatch count, not a second computation) + real DemandHypothesis
+                                  count among those same matched companies (evidence a specific
+                                  account is outward-looking, not just ICP-shaped).
+        opportunities          -- real Opportunity count among matched companies whose
+                                  offering_matcher.py match is candidate_match for THIS offering
+                                  (problem/demand-aligned, not just ICP-aligned).
+        commercial (meetings/won/revenue) -- real CalendarBooking outcomes (Revenue Pace's own
+                                  data, unmodified) whose outcome_icp_snapshot includes this ICP
+                                  and outcome_offering_name matches this offering.
+        evidence_strength      -- "sufficient" | "thin" | "none", a plain-English label derived
+                                  from whether ANY of the above is nonzero -- never a weighted
+                                  numeric score (Part 1's explicit "no score unless defensible").
+    Unconfigured/excluded cells report no evidence at all (status alone already explains why),
+    same discipline as the original matched_account_count rule.
 
-    PERFORMANCE (Part 14): one GROUP BY query gets every ICP's matched-company count up front;
-    per-cell status is then pure in-memory config lookup (no query at all) for every
-    ICP x offering pair -- never a call to match_offerings_for_company() per company."""
+    PERFORMANCE: matched-company-ids, opportunities, outcomes, and market-topic trends are each
+    fetched with a small, fixed number of bulk queries up front (never per-cell, never per-company
+    inside the cell loop) -- same "bulk first, compose in memory" discipline this function already
+    used for matched_account_count."""
     icps = get_icp_config(db, tenant_id)
     offerings = get_offering_config(db, tenant_id)
     icp_ids = [icp["id"] for icp in icps]
 
     matched_counts: dict[str, int] = {}
+    matched_company_ids_by_icp: dict[str, set[int]] = {}
+    demand_hypothesis_counts: dict[str, int] = {}
     if icp_ids:
         matched_counts = dict(
             db.query(ICPMatch.icp_id, func.count(ICPMatch.id))
@@ -213,6 +372,17 @@ def get_demand_grid(db: Session, tenant_id: int) -> dict:
             .group_by(ICPMatch.icp_id)
             .all()
         )
+        for icp_id, company_id in db.query(ICPMatch.icp_id, ICPMatch.company_id).filter(ICPMatch.tenant_id == tenant_id, ICPMatch.icp_id.in_(icp_ids)).all():
+            matched_company_ids_by_icp.setdefault(icp_id, set()).add(company_id)
+
+        demand_company_ids = {
+            row[0] for row in db.query(DemandHypothesis.company_id).filter(DemandHypothesis.tenant_id == tenant_id, DemandHypothesis.company_id.isnot(None)).all()
+        }
+        for icp_id, company_ids in matched_company_ids_by_icp.items():
+            demand_hypothesis_counts[icp_id] = len(company_ids & demand_company_ids)
+
+    opportunities_by_cell, outcomes_by_cell = _opportunity_and_outcome_evidence(db, tenant_id, icp_ids, matched_company_ids_by_icp)
+    market_demand_by_offering = _market_demand_by_offering(db, tenant_id, offerings)
 
     rows = []
     for icp in icps:
@@ -227,13 +397,35 @@ def get_demand_grid(db: Session, tenant_id: int) -> dict:
             else:
                 status = "unconfigured"
 
+            account_demand = matched_counts.get(icp["id"], 0) if status == "applicable" else 0
+            evidence = None
+            if status == "applicable":
+                market = market_demand_by_offering.get(offering["name"], {"state": "no_related_topic", "relevant_signals": 0, "related_topics": []})
+                opp_statements = opportunities_by_cell.get((icp["id"], offering["name"]), [])
+                outcome = outcomes_by_cell.get((icp["id"], offering["name"]), {"meetings": 0, "won": 0, "revenue_usd": 0})
+                has_evidence_anywhere = (
+                    account_demand > 0 or market["state"] not in ("no_related_topic", "insufficient_evidence") or opp_statements or outcome["meetings"] > 0
+                )
+                has_deep_evidence = bool(opp_statements) and account_demand > 0
+                evidence = {
+                    "market_demand": market,
+                    "account_demand": {
+                        "matched_account_count": account_demand,
+                        "demand_hypothesis_count": demand_hypothesis_counts.get(icp["id"], 0),
+                    },
+                    "opportunities": {"count": len(opp_statements), "sample_statements": opp_statements[:3]},
+                    "commercial": outcome,
+                    "evidence_strength": "sufficient" if has_deep_evidence else ("thin" if has_evidence_anywhere else "none"),
+                }
+
             cells.append({
                 "offering": offering["name"],
                 "status": status,
                 # Only a real, configured cell can meaningfully report account evidence -- an
                 # unconfigured/excluded cell reporting a nonzero count would misleadingly imply
                 # a relationship the config doesn't actually establish.
-                "matched_account_count": matched_counts.get(icp["id"], 0) if status == "applicable" else 0,
+                "matched_account_count": account_demand,
+                "evidence": evidence,
             })
         rows.append({"icp_id": icp["id"], "icp_name": icp["name"], "cells": cells})
 

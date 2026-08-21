@@ -40,11 +40,13 @@ somewhere else in already-persisted form."""
 
 from datetime import datetime
 
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.db.models import Batch, Company, Contact
 from app.gtm_os.content.topic import ContentTopicEvidence
 from app.gtm_os.gtm_motion.gtm_motion import recommend_gtm_motion
+from app.gtm_os.icp.icp_candidates import get_icp_candidates_for_company
 from app.gtm_os.icp.icp_config import get_icp_config
 from app.gtm_os.icp.icp_matching import ICPMatch
 from app.gtm_os.icp.icp_offering_matching import match_offerings_for_company
@@ -52,6 +54,7 @@ from app.gtm_os.intelligence.demand_hypothesis import DemandHypothesis
 from app.gtm_os.intelligence.problem_hypothesis import ProblemHypothesis
 from app.gtm_os.intelligence.signal import GtmSignal
 from app.gtm_os.market_account.market_account_context import get_market_context_for_company
+from app.gtm_os.opportunity.offering_recommendation import get_offering_recommendation_for_company
 from app.gtm_os.opportunity.opportunity import Opportunity
 from app.gtm_os.sales.sales_agent import evaluate_decision_maker, evaluate_sales_readiness
 from app.gtm_os.strategy.strategy import GtmStrategy
@@ -348,6 +351,12 @@ def build_account_brief(db: Session, tenant_id: int, company_id: int) -> dict:
         "decision_maker": decision_maker,
         "icp": icp_section,
         "triggers": [m["trigger_evidence"] for m in icp_section["matches"]],
+        # Cross-ICP / problem-following offering recommendation (architecture upgrade, Parts 3-4)
+        # -- additive, does not replace `icp`/`offerings` above (kept for backward compatibility),
+        # just adds the primary-vs-alternative-vs-insufficient-evidence distinction and the
+        # problem-aligned offering explanation neither of those fields express on their own.
+        "icp_candidates": get_icp_candidates_for_company(db, tenant_id, company_id),
+        "offering_recommendation": get_offering_recommendation_for_company(db, tenant_id, company_id),
         "offerings": offering_section,
         "gtm_motion": motion_result,
         "problems": problem_section,
@@ -529,3 +538,127 @@ def summarize_account_states(db: Session, tenant_id: int, limit: int = 5000) -> 
         counts[account_status] += 1
 
     return {"total_accounts": len(company_ids), "account_states": counts}
+
+
+def list_account_states(db: Session, tenant_id: int, company_ids: list[int]) -> dict[int, dict]:
+    """V2 Accounts list enrichment -- the SAME account_status ladder and bulk-query shape as
+    summarize_account_states() above, scoped to an explicit, caller-supplied set of company_ids
+    (a single list page's ~25 rows, not the whole tenant) instead of every company. Exists
+    because the Accounts list previously showed zero GTM-OS state per row -- ICP match,
+    offering fit, and GTM motion are real, already-computed concepts, but computing them via
+    build_account_brief() for every row of a page would mean 25x the backend work per list
+    view (see Accounts.jsx's own comment on this exact tradeoff). This reuses
+    summarize_account_states()'s exact bulk-query pattern instead of build_account_brief(), so
+    the added cost is six fixed queries scoped to ~25 ids, not 25 separate ~10-query briefs.
+
+    Adds two counts summarize_account_states() computes internally but discards:
+    opportunity_count (free -- already grouped by company in that function, just never
+    returned) and signal_count (one query changed from a distinct-existence set to a
+    GROUP BY count, same cost).
+
+    Returns {company_id: {"account_status": str, "signal_count": int, "opportunity_count": int}}
+    for every id in company_ids -- callers merge this into their own per-company response dicts
+    rather than this function assuming any particular response shape."""
+    if not company_ids:
+        return {}
+
+    def _company_ids_with(model, id_field=None) -> set[int]:
+        col = id_field if id_field is not None else model.company_id
+        return {row[0] for row in db.query(col).filter(model.tenant_id == tenant_id, col.in_(company_ids)).distinct().all()}
+
+    icp_matched_ids = _company_ids_with(ICPMatch)
+
+    contact_ids = {
+        row[0]
+        for row in db.query(Contact.company_id)
+        .join(Company, Contact.company_id == Company.id)
+        .join(Batch, Company.batch_id == Batch.id)
+        .filter(Batch.tenant_id == tenant_id, Contact.company_id.in_(company_ids))
+        .distinct()
+        .all()
+    }
+    problem_ids = _company_ids_with(ProblemHypothesis)
+    demand_ids = _company_ids_with(DemandHypothesis)
+
+    # Same market-account bridge as summarize_account_states(), but grouped for a real count
+    # instead of a plain existence set -- same query cost, one more aggregate column.
+    signal_count_by_company: dict[int, int] = {
+        row[0]: row[1]
+        for row in db.query(GtmSignal.company_id, func.count(GtmSignal.id))
+        .join(ContentTopicEvidence, ContentTopicEvidence.gtm_signal_id == GtmSignal.id)
+        .filter(
+            GtmSignal.tenant_id == tenant_id,
+            ContentTopicEvidence.tenant_id == tenant_id,
+            GtmSignal.company_id.in_(company_ids),
+        )
+        .group_by(GtmSignal.company_id)
+        .all()
+    }
+    market_context_ids = set(signal_count_by_company.keys())
+
+    opportunities = (
+        db.query(Opportunity)
+        .filter(Opportunity.tenant_id == tenant_id, Opportunity.company_id.in_(company_ids))
+        .all()
+    )
+    opportunity_ids_by_company: dict[int, list[int]] = {}
+    for o in opportunities:
+        opportunity_ids_by_company.setdefault(o.company_id, []).append(o.id)
+    all_opportunity_ids = [o.id for o in opportunities]
+
+    latest_strategy_by_opportunity: dict[int, GtmStrategy] = {}
+    if all_opportunity_ids:
+        latest_strategies = (
+            db.query(GtmStrategy)
+            .filter(GtmStrategy.tenant_id == tenant_id, GtmStrategy.opportunity_id.in_(all_opportunity_ids))
+            .distinct(GtmStrategy.opportunity_id)
+            .order_by(GtmStrategy.opportunity_id, GtmStrategy.id.desc())
+            .all()
+        )
+        latest_strategy_by_opportunity = {s.opportunity_id: s for s in latest_strategies}
+
+    result: dict[int, dict] = {}
+    for company_id in company_ids:
+        has_icp_match = company_id in icp_matched_ids
+        opp_ids = opportunity_ids_by_company.get(company_id, [])
+        has_opportunity = bool(opp_ids)
+
+        best_strategy_type = None
+        has_sales_ready = False
+        for opp_id in opp_ids:
+            strategy = latest_strategy_by_opportunity.get(opp_id)
+            if strategy is None:
+                continue
+            if strategy.strategy_type != "insufficient_context" and best_strategy_type is None:
+                best_strategy_type = strategy.strategy_type
+            if evaluate_sales_readiness(strategy)["status"] == "ready_for_message":
+                has_sales_ready = True
+
+        # Same ladder as summarize_account_states() / build_account_brief() -- see those
+        # functions' own docstrings for why this must stay copied line-for-line, not re-derived.
+        account_status = "identified"
+        if has_icp_match:
+            account_status = "icp_matched"
+        if has_opportunity:
+            account_status = "opportunity_identified"
+        if best_strategy_type is not None:
+            account_status = "strategy_ready"
+        if has_sales_ready:
+            account_status = "sales_ready"
+        if (
+            not has_icp_match
+            and not has_opportunity
+            and company_id not in contact_ids
+            and company_id not in problem_ids
+            and company_id not in demand_ids
+            and company_id not in market_context_ids
+        ):
+            account_status = "insufficient_context"
+
+        result[company_id] = {
+            "account_status": account_status,
+            "signal_count": signal_count_by_company.get(company_id, 0),
+            "opportunity_count": len(opp_ids),
+        }
+
+    return result

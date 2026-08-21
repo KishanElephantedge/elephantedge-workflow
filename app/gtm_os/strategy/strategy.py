@@ -38,7 +38,7 @@ structurally never change the decision itself."""
 
 from datetime import datetime
 
-from sqlalchemy import Column, DateTime, ForeignKey, Integer, JSON, String, Text
+from sqlalchemy import Boolean, Column, DateTime, ForeignKey, Integer, JSON, String, Text
 from sqlalchemy.orm import Session
 
 from app.db.models import Base, Contact
@@ -48,7 +48,7 @@ from app.gtm_os.content.trend_config import get_trend_config
 from app.gtm_os.intelligence.demand_detection import DEMAND_QUALIFYING_TIERS
 from app.gtm_os.intelligence.demand_hypothesis import DemandHypothesis
 from app.gtm_os.intelligence.problem_hypothesis import ProblemHypothesis
-from app.gtm_os.opportunity.offering_matcher import match_offerings
+from app.gtm_os.icp.icp_offering_matching import match_offerings_for_opportunity
 from app.gtm_os.opportunity.opportunity import Opportunity
 
 STRATEGY_TYPES = {"insufficient_context", "diagnostic", "consultative", "execution-led", "nurture"}
@@ -102,6 +102,16 @@ class GtmStrategy(Base):
     action_plan = Column(JSON, nullable=True)  # list[{action_type, objective, target_function, rationale, prerequisite, status}]
     recommended_next_step = Column(String, nullable=True)  # the first action_type in action_plan, for quick access
 
+    # V2 Phase 6 (upstream staleness fix, 2026-08-21) -- the exact _decision_maker_known() value
+    # this strategy was built from, snapshotted as its own narrow, dedicated field rather than
+    # inferred from action_plan/recommended_next_step (which don't reliably change when this
+    # flips -- recommended_next_step is always "research_account", the first action added
+    # unconditionally). Added to _COMPARABLE_KEYS below so _facts_changed() detects a real
+    # false->true (or true->false, e.g. a contact getting suppressed) transition and
+    # run_gtm_strategy_sweep() re-versions -- see that function's own docstring for why this was
+    # previously a silent dead end.
+    decision_maker_known = Column(Boolean, nullable=True)
+
     reasoning_note = Column(Text, nullable=True)
 
     created_at = Column(DateTime, default=datetime.utcnow)
@@ -109,7 +119,18 @@ class GtmStrategy(Base):
 
 
 def _decision_maker_known(db: Session, company_id: int) -> bool:
-    return db.query(Contact.id).filter(Contact.company_id == company_id).first() is not None
+    """V2 Phase 3/4 fix: a suppressed Contact (excluded_from_push) must NOT count as "known" --
+    previously any Contact row at all satisfied this, including one nobody could actually be
+    messaged through. Still only requires ONE eligible contact to be considered "known" (not
+    the full up-to-3 target) -- that higher bar is V2's OWN contact-discovery-stage top-up
+    eligibility check (app/gtm_os/sales/contact_discovery.py), a different question from
+    "can the action chain move past identify_decision_maker at all.\""""
+    return (
+        db.query(Contact.id)
+        .filter(Contact.company_id == company_id, Contact.excluded_from_push.isnot(True))
+        .first()
+        is not None
+    )
 
 
 def market_context(db: Session, tenant_id: int) -> list[dict]:
@@ -158,16 +179,22 @@ def _select_strategy_type(problem: ProblemHypothesis, demand: DemandHypothesis, 
 
 
 def _build_action_plan(
-    db: Session,
     problem: ProblemHypothesis,
     demand: DemandHypothesis,
     opportunity: Opportunity,
     offering_fit_status: str,
+    decision_maker_known: bool,
 ) -> list[dict]:
     """Deterministic, explainable action chain (Part J) -- stops recommending downstream actions
     the moment a real prerequisite is missing, never guesses past a gap. Every action carries
     status="recommended" -- nothing in this function or anywhere in this package executes
-    anything (Part K)."""
+    anything (Part K).
+
+    decision_maker_known is passed in (V2 Phase 6), computed ONCE by the caller
+    (generate_strategy_facts), rather than re-queried here -- the caller also needs this exact
+    value as its own top-level fact for staleness detection (see _COMPARABLE_KEYS), so a single
+    source of truth avoids two independent DB reads of the same real answer within one facts
+    computation."""
     plan: list[dict] = []
     prerequisite = None
 
@@ -185,7 +212,6 @@ def _build_action_plan(
 
     add("research_account", f"Understand {opportunity.company_name_raw or 'the account'}'s current situation before any outreach.", "Baseline research always precedes account-specific outreach.")
 
-    decision_maker_known = _decision_maker_known(db, opportunity.company_id) if opportunity.company_id else False
     if not decision_maker_known:
         add("identify_decision_maker", "Find the right person to engage for this opportunity.", "No known Contact exists for this account yet -- required before any message can be prepared.")
         return plan  # cannot safely recommend anything past this without a person to address
@@ -216,7 +242,12 @@ def generate_strategy_facts(db: Session, tenant_id: int, opportunity: Opportunit
     problem = db.get(ProblemHypothesis, opportunity.problem_hypothesis_id)
     demand = db.get(DemandHypothesis, opportunity.demand_hypothesis_id)
 
-    offering_matches = match_offerings(db, tenant_id, opportunity)
+    # V2 Phase 6 -- computed ONCE here (single source of truth for both the action chain below
+    # and this function's own returned fact, used by _facts_changed() for staleness detection).
+    # Already suppression-aware (Phase 3/4's fix to _decision_maker_known itself).
+    decision_maker_known = _decision_maker_known(db, opportunity.company_id) if opportunity.company_id else False
+
+    offering_matches = match_offerings_for_opportunity(db, tenant_id, opportunity)
     candidate_matches = [m for m in offering_matches if m["status"] == "candidate_match"]
     if candidate_matches:
         offering_fit_status = "candidate_match"
@@ -244,6 +275,10 @@ def generate_strategy_facts(db: Session, tenant_id: int, opportunity: Opportunit
         "demand_independent_evidence_count": (demand.confidence or {}).get("independent_evidence_count"),
         "offering_matches": offering_matches,
         "market_context": market_context_list,
+        # V2 Phase 2 -- read-only exposure of the Opportunity's own ICP snapshot (see
+        # opportunity.py::Opportunity.icp_context). A soft signal for visibility only; nothing
+        # in _select_strategy_type/_build_action_plan reads this -- ICP is not a strategy gate.
+        "icp_context": opportunity.icp_context,
     }
 
     constraints: list[str] = []
@@ -270,10 +305,11 @@ def generate_strategy_facts(db: Session, tenant_id: int, opportunity: Opportunit
             "nurture": "Stay on radar -- evidence supports a real problem/demand, but no configured offering currently fits.",
         }.get(strategy_type)
         positioning_angle = f"Lead with the confirmed {opportunity.affected_function} problem" + (f", positioned around {matched_offering_name}" if matched_offering_name else "") + "."
-        action_plan = _build_action_plan(db, problem, demand, opportunity, offering_fit_status)
+        action_plan = _build_action_plan(problem, demand, opportunity, offering_fit_status, decision_maker_known)
 
     return {
         "strategy_type": strategy_type,
+        "decision_maker_known": decision_maker_known,
         "recommended_approach": recommended_approach,
         "target_function": opportunity.affected_function,
         "positioning_angle": positioning_angle,
@@ -288,7 +324,7 @@ def generate_strategy_facts(db: Session, tenant_id: int, opportunity: Opportunit
     }
 
 
-_COMPARABLE_KEYS = ("strategy_type", "offering_fit_status", "matched_offering_name", "target_function", "missing_information", "recommended_next_step")
+_COMPARABLE_KEYS = ("strategy_type", "offering_fit_status", "matched_offering_name", "target_function", "missing_information", "recommended_next_step", "decision_maker_known")
 
 
 def _latest_strategy_for_opportunity(db: Session, tenant_id: int, opportunity_id: int) -> GtmStrategy | None:
@@ -322,6 +358,7 @@ def create_strategy(db: Session, tenant_id: int, opportunity: Opportunity, facts
         missing_information=facts["missing_information"],
         action_plan=facts["action_plan"],
         recommended_next_step=facts["recommended_next_step"],
+        decision_maker_known=facts["decision_maker_known"],
         reasoning_note=facts["reasoning_note"],
     )
     db.add(strategy)
@@ -338,7 +375,9 @@ def run_gtm_strategy_sweep(db: Session, tenant_id: int, limit: int = 200, dry_ru
     Zero outbound API calls, zero LLM calls, zero CRM writes anywhere in this function or
     anything it calls (Part K/M) -- confirmed by construction: generate_strategy_facts() only
     ever reads DemandHypothesis/ProblemHypothesis/ContentTopic/Contact and calls
-    match_offerings(), all pure reads.
+    match_offerings_for_opportunity() (icp_offering_matching.py -- ICP-aware when Opportunity.
+    icp_context has a real match, falls back to offering_matcher.py's own match_offerings()
+    otherwise), all pure reads.
 
     One opportunity's failure never aborts the sweep -- same per-item error-isolation style as
     every other sweep in this feature."""

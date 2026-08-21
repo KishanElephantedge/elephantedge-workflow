@@ -33,6 +33,13 @@ class ProblemHypothesis(Base):
 
     company_id = Column(Integer, ForeignKey("companies.id"), nullable=True)
     company_name_raw = Column(String, nullable=True)
+    # Fallback identity for the unresolved-company case (company_id AND company_name_raw both
+    # None -- e.g. a LinkedIn post whose author's employer couldn't be parsed from their
+    # occupation string). Mirrors InterpretedSignal.person_name_raw verbatim, passed through
+    # unchanged, never re-derived here -- see _get_open_hypothesis()'s own docstring for why this
+    # exists: without SOME real identity to group on, every piece of unresolved-company evidence
+    # would open a brand-new hypothesis forever, even from the same real person.
+    person_name_raw = Column(String, nullable=True)
     affected_function = Column(String, nullable=False)  # reused from InterpretedSignal's own vocabulary
 
     problem_statement = Column(Text, nullable=False)  # plain language, source-grounded -- never a demand/opportunity claim

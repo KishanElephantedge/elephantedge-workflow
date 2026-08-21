@@ -175,6 +175,48 @@ def record_icp_match(db: Session, tenant_id: int, company_id: int, result: dict)
     return match
 
 
+def get_icp_context_for_company(db: Session, tenant_id: int, company_id: int | None) -> dict:
+    """V2 Phase 2 -- read-only lookup of whatever run_icp_matching_sweep has ALREADY recorded
+    for this company. Never re-evaluates ICP checks itself (that would be a duplicate ICP
+    calculation, explicitly ruled out) -- this only reads existing ICPMatch rows.
+
+    "status" is intentionally a 2-way split, not 3-way: "matched" (>=1 real ICPMatch row) or
+    "no_match_recorded". The latter honestly covers BOTH "evaluated, didn't match" and "not yet
+    evaluated" -- ICPMatch only ever persists POSITIVE matches (see this module's own docstring,
+    "only positive evidence" discipline), so there is no persisted negative-evaluation record to
+    distinguish those two cases from. Inventing a 3rd "insufficient_information" status here
+    would mean either re-running evaluate_icp_matches_for_company() (a duplicate calculation) or
+    fabricating a distinction the underlying data doesn't actually support -- neither is done.
+
+    No numeric score is computed or returned anywhere in this function."""
+    if company_id is None:
+        return {"has_icp_match": False, "matches": [], "status": "no_company_identity"}
+
+    matches = (
+        db.query(ICPMatch)
+        .filter(ICPMatch.tenant_id == tenant_id, ICPMatch.company_id == company_id)
+        .order_by(ICPMatch.icp_id)
+        .all()
+    )
+    if not matches:
+        return {"has_icp_match": False, "matches": [], "status": "no_match_recorded"}
+
+    icp_names = {icp["id"]: icp["name"] for icp in get_icp_config(db, tenant_id)}
+    return {
+        "has_icp_match": True,
+        "matches": [
+            {
+                "icp_id": m.icp_id,
+                "icp_name": icp_names.get(m.icp_id, m.icp_id),
+                "reasons": m.reasons,
+                "evaluated_at": m.evaluated_at.isoformat() if m.evaluated_at else None,
+            }
+            for m in matches
+        ],
+        "status": "matched",
+    }
+
+
 def run_icp_matching_sweep(db: Session, tenant_id: int, limit: int = 200, dry_run: bool = False) -> dict:
     """Evaluates up to `limit` companies (tenant-scoped via Batch.tenant_id) against the tenant's
     configured ICPs. `dry_run=True` computes everything but writes nothing. One company's failure

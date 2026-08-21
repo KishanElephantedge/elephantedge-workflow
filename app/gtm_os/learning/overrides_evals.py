@@ -27,6 +27,7 @@ from sqlalchemy import Column, DateTime, Integer, JSON, String, Text
 from sqlalchemy.orm import Session
 
 from app.db.models import Base, Batch, CalendarBooking, Company
+from app.gtm_os.learning.human_knowledge import list_human_knowledge
 from app.gtm_os.learning.message_draft import MessageDraft
 from app.gtm_os.learning.pattern_detection_config import get_pattern_detection_config
 from app.gtm_os.opportunity.opportunity import Opportunity
@@ -225,6 +226,15 @@ def get_overrides_evals(db: Session, tenant_id: int, month: str | None = None) -
         .filter(CalendarBooking.outcome_recorded_at >= period_start, CalendarBooking.outcome_recorded_at < period_end)
         .count()
     )
+    # V2 Phase 9 -- total lost count (mirrors won_this_month exactly), not just the "with a real
+    # reason" subset already computed above -- Outcome Summary needs the real total to sit
+    # alongside "Won", the same way meetings_lost_with_reason already sits inside Failure Reasons.
+    lost_this_month = (
+        _tenant_scoped_bookings(db, tenant_id)
+        .filter(CalendarBooking.outcome_status == "lost")
+        .filter(CalendarBooking.outcome_recorded_at >= period_start, CalendarBooking.outcome_recorded_at < period_end)
+        .count()
+    )
     attributable_outcomes_this_month = (
         _tenant_scoped_bookings(db, tenant_id)
         .filter(CalendarBooking.outcome_status.in_(("won", "lost")))
@@ -324,6 +334,7 @@ def get_overrides_evals(db: Session, tenant_id: int, month: str | None = None) -
             "messages_changes_requested": changes_requested_this_month,
             "messages_reviewed_with_reason": reviewed_with_reason_this_month,
             "meetings_lost_with_reason": lost_with_reason_this_month,
+            "meetings_lost": lost_this_month,
             "meetings_won": won_this_month,
             "outcomes_linked_to_opportunity": attributable_outcomes_this_month,
             "outcomes_total": total_outcomes_this_month,
@@ -336,6 +347,10 @@ def get_overrides_evals(db: Session, tenant_id: int, month: str | None = None) -
         "confirmed_patterns": confirmed_patterns,
         "dismissed_patterns": dismissed_patterns,
         "detection_config": config,
+        # Part 7 -- human-provided knowledge as another learning input, alongside overrides/
+        # outcomes/confirmed patterns. Read-only surface only: this never feeds back into ICP/
+        # offering/motion config (see human_knowledge.py's own governance boundary).
+        "human_knowledge": list_human_knowledge(db, tenant_id, limit=RECENT_LIMIT),
     }
 
 

@@ -938,6 +938,14 @@ def list_companies(page: int = 1, page_size: int = 25, search: str = "", qualifi
     page_size = max(1, min(page_size, 100))
     page_items = companies[(page - 1) * page_size: page * page_size]
 
+    # V2 Accounts list enrichment (2026-08-19) -- real GTM-OS state per row (account_status,
+    # signal_count, opportunity_count), scoped to only this page's companies via
+    # list_account_states()'s bulk-query pattern (six fixed queries, not one per company). See
+    # that function's own docstring for why this is safe at list-page cost.
+    from app.gtm_os.account_agent.account_agent import list_account_states
+
+    states_by_id = list_account_states(db, ELEPHANT_EDGE_TENANT_ID, [c.id for c in page_items])
+
     return {
         "page": page,
         "page_size": page_size,
@@ -959,6 +967,7 @@ def list_companies(page: int = 1, page_size: int = 25, search: str = "", qualifi
                 "created_at": c.created_at,
                 "hot_lead": c.hot_lead,
                 "hot_lead_reasoning": c.hot_lead_reasoning,
+                **states_by_id.get(c.id, {"account_status": "insufficient_context", "signal_count": 0, "opportunity_count": 0}),
             }
             for c in page_items
         ],
@@ -3577,10 +3586,9 @@ def get_gtm_os_market_intelligence(db: Session = Depends(get_db)):
 
 @router.get("/gtm-os/content-topics")
 def get_gtm_os_content_topics(db: Session = Depends(get_db)):
-    """Content Intelligence topic configuration (topics.py, Step 16A) -- READ-ONLY diagnostic.
-    No override saved yet returns the live-derived default (from this tenant's real
-    ICP/offering/business-context config), same "no override -> compute fresh" contract as
-    get_content_topics() itself."""
+    """Content Intelligence topic configuration (topics.py, Step 16A) -- no override saved yet
+    returns the live-derived default (from this tenant's real ICP/offering/business-context
+    config), same "no override -> compute fresh" contract as get_content_topics() itself."""
     from app.gtm_os.content.topics import get_content_topics
 
     return {"topics": get_content_topics(db, ELEPHANT_EDGE_TENANT_ID)}
@@ -3602,6 +3610,31 @@ def put_gtm_os_content_topics(body: dict = Body(...), db: Session = Depends(get_
         raise HTTPException(status_code=400, detail=str(e))
     return {"topics": get_content_topics(db, ELEPHANT_EDGE_TENANT_ID)}
 
+
+@router.get("/gtm-os/debug/signal-texts")
+def get_gtm_os_debug_signal_texts(limit: int = 500, db: Session = Depends(get_db)):
+    """TEMPORARY read-only diagnostic (2026-08-19) -- dumps the exact text topic_linking.py's
+    match_topic() actually searches (via its own unmodified extract_signal_text()), so real
+    alias/keyword gaps can be audited against real signal language before touching any matching
+    logic. No topic/matching/trend code is touched by this route. Intended to be removed once
+    the audit is done."""
+    from app.gtm_os.content.topic_linking import extract_signal_text
+    from app.gtm_os.intelligence.signal import GtmSignal
+
+    signals = (
+        db.query(GtmSignal)
+        .filter(GtmSignal.tenant_id == ELEPHANT_EDGE_TENANT_ID)
+        .order_by(GtmSignal.id)
+        .limit(limit)
+        .all()
+    )
+    return {
+        "count": len(signals),
+        "signals": [
+            {"id": s.id, "source": s.source, "observed_at": s.observed_at, "text": extract_signal_text(s)}
+            for s in signals
+        ],
+    }
 
 
 @router.get("/gtm-os/demand-grid")
@@ -3848,6 +3881,20 @@ def put_gtm_os_efficiency_benchmarks(benchmarks: list = Body(...), db: Session =
     return {"benchmarks": get_efficiency_benchmarks(db, ELEPHANT_EDGE_TENANT_ID)}
 
 
+@router.get("/gtm-os/learning-readout")
+def get_gtm_os_learning_readout(db: Session = Depends(get_db)):
+    """V2 Settings Performance tab -- read-only wrapper over evaluate_learning_readout()
+    (app/gtm_os/learning/evaluation.py). This is the SAME real message-funnel/reply-outcome/
+    strategy-type readout governance.py's own snapshot already computes internally for Briefing
+    -- never a second evaluation engine, just exposing the existing one directly so Settings can
+    show real operational counts instead of an unavailable state. No accuracy/hit-rate/success
+    percentage is computed here or in evaluation.py itself -- see that module's own docstring for
+    why none is defensible yet."""
+    from app.gtm_os.learning.evaluation import evaluate_learning_readout
+
+    return evaluate_learning_readout(db, ELEPHANT_EDGE_TENANT_ID)
+
+
 @router.get("/gtm-os/jobs-to-be-done")
 def get_gtm_os_jobs_to_be_done(db: Session = Depends(get_db)):
     """V2 Jobs to Be Done -- read-only composition of four existing, unmodified backend readers:
@@ -3918,6 +3965,75 @@ def post_gtm_os_pattern_dismiss(category: str, body: dict = Body(default={}), db
     }
 
 
+@router.get("/gtm-os/accounts/{company_id}/icp-candidates")
+def get_gtm_os_icp_candidates(company_id: int, db: Session = Depends(get_db)):
+    """Cross-ICP matching (architecture upgrade, Part 3) -- read-only wrapper over
+    get_icp_candidates_for_company() (app/gtm_os/icp/icp_candidates.py), itself a pure
+    composition over evaluate_icp_matches_for_company() (Batch 8, unmodified). Distinguishes
+    primary vs alternative confirmed ICP matches vs insufficient-evidence candidates -- never a
+    second ICP engine."""
+    from app.gtm_os.icp.icp_candidates import get_icp_candidates_for_company
+
+    return get_icp_candidates_for_company(db, ELEPHANT_EDGE_TENANT_ID, company_id)
+
+
+@router.get("/gtm-os/accounts/{company_id}/offering-recommendation")
+def get_gtm_os_offering_recommendation(company_id: int, db: Session = Depends(get_db)):
+    """Offering-recommendation-follows-the-problem (architecture upgrade, Part 4) -- read-only
+    wrapper over get_offering_recommendation_for_company() (app/gtm_os/opportunity/
+    offering_recommendation.py), a composition over match_offerings_for_company() and
+    match_offerings() (both unmodified) -- never a third offering matcher."""
+    from app.gtm_os.opportunity.offering_recommendation import get_offering_recommendation_for_company
+
+    return get_offering_recommendation_for_company(db, ELEPHANT_EDGE_TENANT_ID, company_id)
+
+
+# ---- V2 Human-Provided Knowledge (architecture upgrade, Parts 6-9) ----
+# GOVERNANCE: submit/confirm/dismiss below write ONLY to the human_knowledge table -- never to
+# ICP/offering/GTM-motion config, the revenue goal, or any other authoritative configuration (see
+# human_knowledge.py's own module docstring for the full boundary).
+
+@router.get("/gtm-os/knowledge")
+def get_gtm_os_knowledge(status: str | None = None, db: Session = Depends(get_db)):
+    from app.gtm_os.learning.human_knowledge import list_human_knowledge
+
+    return {"items": list_human_knowledge(db, ELEPHANT_EDGE_TENANT_ID, status=status)}
+
+
+@router.post("/gtm-os/knowledge")
+def post_gtm_os_knowledge(body: dict = Body(...), db: Session = Depends(get_db)):
+    """Submits one free-text human observation. Makes exactly one bounded LLM call to interpret
+    it into an inspectable structure (see human_knowledge.py) -- never loops, never chains
+    further calls, and never fails to persist original_text even if interpretation fails."""
+    from app.gtm_os.learning.human_knowledge import submit_human_knowledge
+
+    text = body.get("text")
+    if not isinstance(text, str) or not text.strip():
+        raise HTTPException(status_code=400, detail="text is required")
+
+    return submit_human_knowledge(db, ELEPHANT_EDGE_TENANT_ID, text, body.get("created_by"))
+
+
+@router.post("/gtm-os/knowledge/{knowledge_id}/confirm")
+def post_gtm_os_knowledge_confirm(knowledge_id: int, body: dict = Body(default={}), db: Session = Depends(get_db)):
+    from app.gtm_os.learning.human_knowledge import confirm_human_knowledge
+
+    try:
+        return confirm_human_knowledge(db, ELEPHANT_EDGE_TENANT_ID, knowledge_id, body.get("confirmed_by"))
+    except LookupError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@router.post("/gtm-os/knowledge/{knowledge_id}/dismiss")
+def post_gtm_os_knowledge_dismiss(knowledge_id: int, body: dict = Body(default={}), db: Session = Depends(get_db)):
+    from app.gtm_os.learning.human_knowledge import dismiss_human_knowledge
+
+    try:
+        return dismiss_human_knowledge(db, ELEPHANT_EDGE_TENANT_ID, knowledge_id, body.get("confirmed_by"))
+    except LookupError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
 # ---- GTM-OS Intelligence Runs (end-to-end autonomous pipeline observability) ----
 
 @router.get("/gtm-os/intelligence-runs")
@@ -3948,11 +4064,21 @@ def trigger_gtm_intelligence_run(dry_run: bool = False, db: Session = Depends(ge
     """Manual trigger for testing -- the scheduled cycle runs automatically every 60 minutes; this
     lets a run be checked immediately instead of waiting for the next tick. Same persisted
     run-record as the scheduled path (unless dry_run=True, which persists nothing, matching
-    run_gtm_intelligence_sweep's own dry_run contract)."""
+    run_gtm_intelligence_sweep's own dry_run contract).
+
+    V2 CONTROL PLANE (Phase 0): dry_run is always allowed (introspection only, no writes/external
+    calls -- useful for checking what a sweep WOULD do while paused). A real run is blocked when
+    the control plane isn't "running", same as the scheduled tick."""
+    from app.gtm_os.orchestration.control import ControlPlaneHalted, check_can_run
     from app.gtm_os.orchestration.sweep import finish_gtm_intelligence_run, run_gtm_intelligence_sweep, start_gtm_intelligence_run
 
     if dry_run:
         return run_gtm_intelligence_sweep(db, ELEPHANT_EDGE_TENANT_ID, dry_run=True)
+
+    try:
+        check_can_run(db, ELEPHANT_EDGE_TENANT_ID)
+    except ControlPlaneHalted as e:
+        raise HTTPException(status_code=409, detail=str(e))
 
     run = start_gtm_intelligence_run(db, ELEPHANT_EDGE_TENANT_ID)
     result = run_gtm_intelligence_sweep(db, ELEPHANT_EDGE_TENANT_ID)
@@ -3978,3 +4104,33 @@ def put_gtm_os_pattern_detection_config(config: dict = Body(...), db: Session = 
     except PatternDetectionConfigError as e:
         raise HTTPException(status_code=400, detail=str(e))
     return get_pattern_detection_config(db, ELEPHANT_EDGE_TENANT_ID)
+
+
+@router.get("/gtm-os/control")
+def get_gtm_os_control(db: Session = Depends(get_db)):
+    """V2 control plane config (Phase 0) -- state (running/paused/stopped, doubling as the kill
+    switch), safety limits, business-hours window, discovery cadence/target, retry policy.
+    Parameter-backed, same pattern as every other V2 config."""
+    from app.gtm_os.orchestration.control import get_control_config
+
+    return get_control_config(db, ELEPHANT_EDGE_TENANT_ID)
+
+
+@router.put("/gtm-os/control")
+def put_gtm_os_control(config: dict = Body(...), db: Session = Depends(get_db)):
+    from app.gtm_os.orchestration.control import ControlPlaneConfigError, get_control_config, set_control_config
+
+    try:
+        set_control_config(db, ELEPHANT_EDGE_TENANT_ID, config)
+    except ControlPlaneConfigError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return get_control_config(db, ELEPHANT_EDGE_TENANT_ID)
+
+
+@router.get("/gtm-os/control/status")
+def get_gtm_os_control_status(db: Session = Depends(get_db)):
+    """Current control-plane state plus the latest GtmIntelligenceRun (status/failure state) --
+    reuses GtmIntelligenceRun as-is, no new run-tracking table."""
+    from app.gtm_os.orchestration.control import get_control_status
+
+    return get_control_status(db, ELEPHANT_EDGE_TENANT_ID)

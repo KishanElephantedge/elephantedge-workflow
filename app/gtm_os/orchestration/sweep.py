@@ -7,7 +7,8 @@ Two independent branches, both rooted in the same raw GtmSignal sensing stage, p
 architecture diagram -- neither branch reads the other's output:
 
     SOURCE SENSING (sense_theirstack_jobs / sense_linkedin_replies / sense_hackernews_stories /
-                     sense_rss_articles -- independent per source, own failure boundary each)
+                     sense_rss_articles / sense_linkedin_post_search -- independent per source,
+                     own failure boundary each)
               │
               ├──▶ INTERPRETATION (run_interpretation_sweep, ALL_INTERPRETED_SOURCES)
               │        │
@@ -128,6 +129,7 @@ from app.gtm_os.intelligence.interpretation import run_interpretation_sweep
 from app.gtm_os.intelligence.problem_detection import run_problem_hypothesis_sweep
 from app.gtm_os.intelligence.sensing import (
     sense_hackernews_stories,
+    sense_linkedin_post_search,
     sense_linkedin_replies,
     sense_rss_articles,
     sense_theirstack_jobs,
@@ -135,7 +137,11 @@ from app.gtm_os.intelligence.sensing import (
 from app.gtm_os.learning.message_draft import run_message_generation_sweep
 from app.gtm_os.learning.outcome import run_outcome_detection_sweep
 from app.gtm_os.opportunity.opportunity import run_opportunity_intelligence_sweep
+from app.gtm_os.orchestration.discovery import run_v2_discovery_if_due
+from app.gtm_os.sales.contact_discovery import run_v2_contact_discovery_sweep
+from app.gtm_os.sales.outreach_sequencing import run_v2_outreach_sequencing_sweep
 from app.gtm_os.sales.sales_agent import run_sales_agent_sweep
+from app.gtm_os.send.send import run_v2_send_sweep
 from app.gtm_os.strategy.strategy import run_gtm_strategy_sweep
 
 logger = logging.getLogger(__name__)
@@ -225,7 +231,7 @@ CONTENT_INTELLIGENCE_STAGES: list[tuple[str, callable]] = [
 # (see opportunity.py/strategy.py/sales_agent.py's own docstrings) -- zero LLM calls, zero
 # external API calls, zero CRM/outbound writes, safe to run on every cycle even with near-zero
 # real data (each stage safely returns all-zero counts rather than fabricating output).
-ACCOUNT_STRATEGY_STAGES: list[tuple[str, callable]] = [
+ACCOUNT_STRATEGY_STAGES_PRE_CONTACT: list[tuple[str, callable]] = [
     ("opportunity", lambda db, tenant_id: run_opportunity_intelligence_sweep(db, tenant_id)),
     # ICP matching (icp_matching.py) -- until this GTM-OS wiring pass, run_icp_matching_sweep()
     # had ZERO callers anywhere in the app (confirmed by full-repo grep): not the scheduler, not
@@ -237,6 +243,17 @@ ACCOUNT_STRATEGY_STAGES: list[tuple[str, callable]] = [
     # sweep verbatim, unmodified -- no second ICP engine.
     ("icp_matching", lambda db, tenant_id: run_icp_matching_sweep(db, tenant_id, limit=500)),
     ("gtm_strategy", lambda db, tenant_id: run_gtm_strategy_sweep(db, tenant_id)),
+]
+
+# V2 Phase 3/4 contact discovery (app/gtm_os/sales/contact_discovery.py) runs BETWEEN these two
+# groups -- deliberately NOT folded into the generic ACCOUNT_STRATEGY_STAGES loop below like its
+# neighbors, same reasoning as V2 discovery (Phase 1): it needs its own explicit
+# succeeded/skipped/failed handling (a "skipped" contact-discovery tick -- paused, unconfigured
+# budget, nothing eligible -- must NOT count toward any_succeeded the way every other stage's
+# mere non-exception completion does). Must run AFTER gtm_strategy (eligibility depends on a
+# real GtmStrategy existing for the Opportunity) and BEFORE message_generation (so a contact
+# found this same tick is immediately available to be drafted for).
+ACCOUNT_STRATEGY_STAGES_CONTACT_TO_MESSAGE: list[tuple[str, callable]] = [
     # Message generation (message_draft.py) -- makes a real LLM call per eligible Opportunity, so
     # placed after strategy/before the cheap read-only stages below and bounded by its own small
     # `limit` (see message_draft.py's own cost-containment note) rather than left permanently
@@ -245,11 +262,28 @@ ACCOUNT_STRATEGY_STAGES: list[tuple[str, callable]] = [
     # POST /gtm-os/messages/{id}/review), never invoked by this sweep or anything it calls. This
     # is the human-approval boundary the whole autonomous cycle stops at.
     ("message_generation", lambda db, tenant_id: run_message_generation_sweep(db, tenant_id, limit=20)),
+]
+
+# V2 Phase 7 send (app/gtm_os/send/send.py) runs BETWEEN message_generation and the two stages
+# below -- same reasoning as V2 discovery/contact_discovery: needs its own explicit
+# succeeded/skipped/failed handling (a "skipped" send tick -- paused, missing safety config,
+# outside business hours -- must not count as any_succeeded the way every other stage's mere
+# non-exception completion does), so it sits outside the generic ACCOUNT_STRATEGY_STAGES loop.
+# Must run AFTER message_generation (nothing to send before a draft exists) and BEFORE
+# outcome_detection (which reads reply signals that only matter once something was actually sent).
+ACCOUNT_STRATEGY_STAGES_POST_SEND: list[tuple[str, callable]] = [
     ("sales_readiness", lambda db, tenant_id: run_sales_agent_sweep(db, tenant_id)),
     # Batch 7 -- outcome detection reuses existing linkedin_reply InterpretedSignal rows only
     # (zero LLM/external calls, see outcome.py).
     ("outcome_detection", lambda db, tenant_id: run_outcome_detection_sweep(db, tenant_id)),
 ]
+
+# Kept as a single flat list too -- dry_run's own preview loop and any other code that wants
+# "every account/strategy stage key" iterates this, rather than remembering to combine every
+# segment everywhere.
+ACCOUNT_STRATEGY_STAGES: list[tuple[str, callable]] = (
+    ACCOUNT_STRATEGY_STAGES_PRE_CONTACT + ACCOUNT_STRATEGY_STAGES_CONTACT_TO_MESSAGE + ACCOUNT_STRATEGY_STAGES_POST_SEND
+)
 
 # The complete, CURRENT set of sources the interpretation/detection layers know how to handle
 # (interpretation.py::_INTERPRETERS, kept in sync manually -- see module docstring for why this
@@ -335,17 +369,30 @@ def _run_rss(db: Session, tenant_id: int):
     return sense_rss_articles(db, tenant_id)
 
 
+def _run_linkedin_post_search(db: Session, tenant_id: int):
+    # No MissingSourceConfiguration needed -- linkedin_search_config.py always has a derived
+    # default (computed from live ICP/offering/business-context config) even with zero saved
+    # overrides, same "empty config is a valid state" reasoning as HN/RSS above. Rate-limited
+    # internally (select_due_phrases) -- may legitimately return [] on a tick where every
+    # configured phrase was searched too recently to search again.
+    return sense_linkedin_post_search(db, tenant_id)
+
+
 # Source registration -- (name, runner(db, tenant_id) -> list[GtmSignal]). A future source
 # (Reddit/X/YouTube/etc., none added in this step) means adding one entry here; the sweep loop
 # below never branches on source name (Step 13 design doc §14). hackernews_story/rss_article
 # added in Batch 2 -- both were built (Step 16C/16D) and tested but never wired into any
 # recurring sweep until now; Content Intelligence's own stages (CONTENT_INTELLIGENCE_STAGES)
-# have nothing real to process without them.
+# have nothing real to process without them. linkedin_post_search added in the GTM-OS end-to-end
+# wiring pass -- the one source capable of OPENING a new ProblemHypothesis (see
+# problem_detection.py's own tier map); explicitly NOT the Network/LinkedIn-monitor watch-list,
+# see sense_linkedin_post_search()'s own docstring.
 SWEEPABLE_SOURCES: list[tuple[str, callable]] = [
     ("theirstack_job", _run_theirstack),
     ("linkedin_reply", _run_linkedin_replies),
     ("hackernews_story", _run_hackernews),
     ("rss_article", _run_rss),
+    ("linkedin_post_search", _run_linkedin_post_search),
 ]
 
 
@@ -386,6 +433,7 @@ def run_gtm_intelligence_sweep(
     selected = sources if sources is not None else [name for name, _ in SWEEPABLE_SOURCES]
     result: dict = {
         "status": "completed",
+        "discovery": {},
         "sources": {},
         "interpretation": {},
         "problem_detection": {},
@@ -398,12 +446,22 @@ def run_gtm_intelligence_sweep(
         "opportunity": {},
         "icp_matching": {},
         "gtm_strategy": {},
+        "contact_discovery": {},
+        "send": {},
+        "outreach_sequencing": {},
         "message_generation": {},
         "sales_readiness": {},
         "outcome_detection": {},
     }
 
     if dry_run:
+        # Free (read-only, no provider call) -- reports the real current due/not-due state,
+        # matching this whole branch's own "reports what WOULD happen" contract, rather than a
+        # placeholder like the stages below (those genuinely can't preview without a paid call;
+        # this one can for free).
+        from app.gtm_os.orchestration.discovery import is_discovery_due
+        due, reason = is_discovery_due(db, tenant_id)
+        result["discovery"] = {"status": "would_run" if due else "would_skip", "reason": reason}
         for name, _runner in SWEEPABLE_SOURCES:
             if name not in selected:
                 result["sources"][name] = {"status": "skipped", "reason": "not selected"}
@@ -416,10 +474,29 @@ def run_gtm_intelligence_sweep(
             result[stage_key] = {"status": "would_run"}
         for stage_key, _runner in ACCOUNT_STRATEGY_STAGES:
             result[stage_key] = {"status": "would_run"}
+        result["contact_discovery"] = {"status": "would_run"}
+        result["send"] = {"status": "would_run"}
+        result["outreach_sequencing"] = {"status": "would_run"}
         return result
 
     any_succeeded = False
     any_failed = False
+
+    # V2-owned discovery (Phase 1, app/gtm_os/orchestration/discovery.py) -- runs first, before
+    # sensing, since a company it finds this tick is what makes opportunity/icp_matching below
+    # have anything new to work with. Never raises (see that module's own docstring) and
+    # internally no-ops (real, logged skip -- never silently invisible) unless the control
+    # plane is running AND cadence/daily_target are configured AND enough time has passed since
+    # the last V2 discovery run -- this is what keeps every hourly tick from spending discovery
+    # budget by default (see control.py's DEFAULT_GTM_OS_CONTROL_CONFIG: both are None/
+    # unconfigured until an operator sets them).
+    discovery_result = run_v2_discovery_if_due(db, tenant_id)
+    result["discovery"] = discovery_result
+    if discovery_result.get("status") == "succeeded":
+        any_succeeded = True
+    elif discovery_result.get("status") == "failed":
+        any_failed = True
+        logger.error("gtm_intelligence_sweep: discovery failed -- %s", discovery_result.get("error"))
 
     for name, runner in SWEEPABLE_SOURCES:
         if name not in selected:
@@ -491,7 +568,7 @@ def run_gtm_intelligence_sweep(
     # stage is a pure/idempotent read-or-additive-insert sweep with zero LLM/external/CRM calls
     # (see opportunity.py/strategy.py/sales_agent.py docstrings) -- safe to run every cycle even
     # with near-zero real data.
-    for stage_key, runner in ACCOUNT_STRATEGY_STAGES:
+    for stage_key, runner in ACCOUNT_STRATEGY_STAGES_PRE_CONTACT:
         try:
             stage_result = runner(db, tenant_id)
             result[stage_key] = {"status": "succeeded", **stage_result}
@@ -501,6 +578,63 @@ def run_gtm_intelligence_sweep(
             result[stage_key] = {"status": "failed", "error": str(e)}
             any_failed = True
             logger.error("gtm_intelligence_sweep: %s failed -- %s", stage_key, e)
+
+    # V2-owned contact discovery (Phase 3/4, app/gtm_os/sales/contact_discovery.py) -- see
+    # ACCOUNT_STRATEGY_STAGES_POST_CONTACT's own comment above for why this sits here, outside
+    # the generic loop, with its own explicit succeeded/skipped/failed handling.
+    contact_discovery_result = run_v2_contact_discovery_sweep(db, tenant_id, limit=50)
+    result["contact_discovery"] = contact_discovery_result
+    if contact_discovery_result.get("status") == "succeeded":
+        any_succeeded = True
+    elif contact_discovery_result.get("status") == "failed":
+        any_failed = True
+        logger.error("gtm_intelligence_sweep: contact_discovery failed -- %s", contact_discovery_result.get("error"))
+
+    for stage_key, runner in ACCOUNT_STRATEGY_STAGES_CONTACT_TO_MESSAGE:
+        try:
+            stage_result = runner(db, tenant_id)
+            result[stage_key] = {"status": "succeeded", **stage_result}
+            any_succeeded = True
+            logger.info("gtm_intelligence_sweep: %s succeeded -- %s", stage_key, stage_result)
+        except Exception as e:  # noqa: BLE001 -- one stage's failure must never block the others; see module docstring
+            result[stage_key] = {"status": "failed", "error": str(e)}
+            any_failed = True
+            logger.error("gtm_intelligence_sweep: %s failed -- %s", stage_key, e)
+
+    # V2-owned send (Phase 7, app/gtm_os/send/send.py) -- see ACCOUNT_STRATEGY_STAGES_POST_SEND's
+    # own comment above for why this sits here, outside the generic loop, with its own explicit
+    # succeeded/skipped/failed handling.
+    send_result = run_v2_send_sweep(db, tenant_id, limit=50)
+    result["send"] = send_result
+    if send_result.get("status") == "succeeded":
+        any_succeeded = True
+    elif send_result.get("status") == "failed":
+        any_failed = True
+        logger.error("gtm_intelligence_sweep: send failed -- %s", send_result.get("error"))
+
+    for stage_key, runner in ACCOUNT_STRATEGY_STAGES_POST_SEND:
+        try:
+            stage_result = runner(db, tenant_id)
+            result[stage_key] = {"status": "succeeded", **stage_result}
+            any_succeeded = True
+            logger.info("gtm_intelligence_sweep: %s succeeded -- %s", stage_key, stage_result)
+        except Exception as e:  # noqa: BLE001 -- one stage's failure must never block the others; see module docstring
+            result[stage_key] = {"status": "failed", "error": str(e)}
+            any_failed = True
+            logger.error("gtm_intelligence_sweep: %s failed -- %s", stage_key, e)
+
+    # V2-owned multi-contact outreach sequencing (Phase 8, app/gtm_os/sales/outreach_sequencing.py)
+    # -- runs LAST, after outcome_detection, so it sees this same tick's freshest SalesOutcome
+    # data before deciding whether to advance any opportunity to a fallback contact. Same
+    # explicit succeeded/skipped/failed handling as discovery/contact_discovery/send, outside
+    # the generic loop.
+    outreach_sequencing_result = run_v2_outreach_sequencing_sweep(db, tenant_id, limit=50)
+    result["outreach_sequencing"] = outreach_sequencing_result
+    if outreach_sequencing_result.get("status") == "succeeded":
+        any_succeeded = True
+    elif outreach_sequencing_result.get("status") == "failed":
+        any_failed = True
+        logger.error("gtm_intelligence_sweep: outreach_sequencing failed -- %s", outreach_sequencing_result.get("error"))
 
     if any_failed and any_succeeded:
         result["status"] = "partial"
