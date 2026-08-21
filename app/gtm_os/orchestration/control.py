@@ -1,0 +1,260 @@
+"""V2 Control Plane -- Phase 0 of the Autonomous GTM Flow build-out (see progress-log.md).
+
+Same Parameter-backed storage pattern as every other V2 config module (business_context.py/
+icp_config.py/pattern_detection_config.py/...). One config object, one authoritative `state`
+field (`"running" | "paused" | "stopped"`) -- per the approved architecture's "use ONE
+authoritative tenant-level control" instruction, this doubles as the kill switch: there is no
+separate boolean flag that could disagree with `state`. `"paused"` and `"stopped"` are treated
+identically by `check_can_run()` (both block new autonomous actions) -- the approved decisions
+described their required behavior jointly without specifying a functional difference between
+them, so none is invented here; the distinction exists only so a human can express "temporary"
+vs. "deliberate/indefinite" intent in the UI later.
+
+Limit fields (`max_sends_per_day`, `max_contacts_per_day`, cooldown days, discovery
+cadence/target) default to `None` ("unconfigured" / no limit), never a guessed number -- these
+are real business/operational decisions nobody has made yet, not technical constants. Only
+`retry` gets real seeded defaults (max_attempts/backoff_minutes) -- a technical tuning knob, the
+same category as e.g. pattern_detection_config.py's occurrence-threshold defaults, not a
+business claim.
+
+This module owns configuration and the run/halt check only. It does NOT implement daily-count
+enforcement, cooldown tracking, or duplicate suppression yet -- there is nothing to count or
+suppress until a phase that actually performs sends/contact-discovery exists (Phase 3/4/7).
+Building that bookkeeping now, with nothing to call it, would be exactly the premature
+abstraction this codebase avoids elsewhere; it belongs with the phase that produces the actions
+being throttled, reusing this module's config as the limit source at that time.
+"""
+from datetime import datetime
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+from sqlalchemy.orm import Session
+
+from app.db.models import Parameter
+
+GTM_OS_CONTROL_CONFIG_PARAMETER_KEY = "gtm_os_control_config"
+
+VALID_STATES = ("running", "paused", "stopped")
+
+DEFAULT_GTM_OS_CONTROL_CONFIG: dict = {
+    "state": "running",
+    "limits": {
+        "max_sends_per_day": None,
+        "max_contacts_per_day": None,
+        "company_cooldown_days": None,
+        "contact_cooldown_days": None,
+        # V2-owned contact-discovery budget (Phase 3/4, 2026-08-21) -- same "dedicated, not
+        # shared with V1" principle as discovery.daily_budget_usd above. None (unconfigured)
+        # until an operator sets a real number.
+        "contact_discovery_daily_budget_usd": None,
+    },
+    "business_hours": {
+        "enabled": False,
+        "start_hour": 9,
+        "end_hour": 17,
+        "timezone": "UTC",
+    },
+    "discovery": {
+        "cadence_hours": None,
+        "daily_target": None,
+        # V2-owned discovery budget (Phase 1 correction, 2026-08-21) -- deliberately separate
+        # from V1's daily_credit_budget_usd, not shared/aggregated with it. Reusing V1's number
+        # meant two independent BudgetGuard instances could each spend up to that same figure
+        # on the same calendar day with no cross-awareness; a dedicated V2 figure removes that
+        # ambiguity without needing real cross-run spend tracking (explicitly out of scope for
+        # now). None (unconfigured) until an operator sets a real number -- same "don't invent
+        # a business figure" treatment as cadence_hours/daily_target above.
+        "daily_budget_usd": None,
+    },
+    "retry": {
+        "max_attempts": 3,
+        "backoff_minutes": 15,
+    },
+    # V2 Phase 8 -- multi-contact outreach sequencing. None (unconfigured) until an operator
+    # sets a real number -- same "don't invent a business figure" treatment as every other real
+    # business decision in this config (discovery cadence/target, budgets). Unconfigured means
+    # the outreach-sequencing stage never advances to a fallback contact; primary-contact
+    # outreach (Phase 3-7) is completely unaffected either way. Explicitly NOT seeded with a
+    # default interval -- "do not start with aggressive multi-contact sequencing" was given as
+    # an explicit instruction, and the safest way to honor that is to require a human to choose
+    # a real number before any fallback ever fires, not to guess a "conservative" one.
+    "sequencing": {
+        "fallback_delay_hours": None,
+    },
+}
+
+
+class ControlPlaneConfigError(ValueError):
+    """Raised when control-plane configuration fails validation -- never silently coerced."""
+
+
+class ControlPlaneHalted(Exception):
+    """Raised by check_can_run() when the control plane's state is not "running". Callers decide
+    what "halted" means for them (skip a scheduled tick, reject a manual trigger, etc.) -- this
+    module never itself skips work, it only reports the state."""
+
+    def __init__(self, state: str):
+        self.state = state
+        super().__init__(f"gtm_os control plane is '{state}' -- new autonomous actions are blocked")
+
+
+def _validate_positive_int_or_none(value, field_name: str) -> None:
+    if value is None:
+        return
+    if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+        raise ControlPlaneConfigError(f"'{field_name}' must be a positive integer or null")
+
+
+def _validate_positive_number_or_none(value, field_name: str) -> None:
+    if value is None:
+        return
+    if not isinstance(value, (int, float)) or isinstance(value, bool) or value <= 0:
+        raise ControlPlaneConfigError(f"'{field_name}' must be a positive number or null")
+
+
+def _validate_control_config(config: dict) -> None:
+    if not isinstance(config, dict):
+        raise ControlPlaneConfigError("Control config must be an object")
+
+    state = config.get("state")
+    if state not in VALID_STATES:
+        raise ControlPlaneConfigError(f"'state' must be one of {VALID_STATES}")
+
+    limits = config.get("limits")
+    if not isinstance(limits, dict):
+        raise ControlPlaneConfigError("'limits' must be an object")
+    for field_name in ("max_sends_per_day", "max_contacts_per_day", "company_cooldown_days", "contact_cooldown_days"):
+        _validate_positive_int_or_none(limits.get(field_name), f"limits.{field_name}")
+    _validate_positive_number_or_none(limits.get("contact_discovery_daily_budget_usd"), "limits.contact_discovery_daily_budget_usd")
+
+    business_hours = config.get("business_hours")
+    if not isinstance(business_hours, dict):
+        raise ControlPlaneConfigError("'business_hours' must be an object")
+    if not isinstance(business_hours.get("enabled"), bool):
+        raise ControlPlaneConfigError("'business_hours.enabled' must be a boolean")
+    start_hour = business_hours.get("start_hour")
+    end_hour = business_hours.get("end_hour")
+    if not isinstance(start_hour, int) or isinstance(start_hour, bool) or not (0 <= start_hour <= 23):
+        raise ControlPlaneConfigError("'business_hours.start_hour' must be an integer 0-23")
+    if not isinstance(end_hour, int) or isinstance(end_hour, bool) or not (0 <= end_hour <= 23):
+        raise ControlPlaneConfigError("'business_hours.end_hour' must be an integer 0-23")
+    if not isinstance(business_hours.get("timezone"), str) or not business_hours.get("timezone"):
+        raise ControlPlaneConfigError("'business_hours.timezone' must be a non-empty string")
+
+    discovery = config.get("discovery")
+    if not isinstance(discovery, dict):
+        raise ControlPlaneConfigError("'discovery' must be an object")
+    _validate_positive_int_or_none(discovery.get("cadence_hours"), "discovery.cadence_hours")
+    _validate_positive_int_or_none(discovery.get("daily_target"), "discovery.daily_target")
+    _validate_positive_number_or_none(discovery.get("daily_budget_usd"), "discovery.daily_budget_usd")
+
+    retry = config.get("retry")
+    if not isinstance(retry, dict):
+        raise ControlPlaneConfigError("'retry' must be an object")
+    max_attempts = retry.get("max_attempts")
+    backoff_minutes = retry.get("backoff_minutes")
+    if not isinstance(max_attempts, int) or isinstance(max_attempts, bool) or max_attempts < 1:
+        raise ControlPlaneConfigError("'retry.max_attempts' must be a positive integer")
+    if not isinstance(backoff_minutes, int) or isinstance(backoff_minutes, bool) or backoff_minutes < 1:
+        raise ControlPlaneConfigError("'retry.backoff_minutes' must be a positive integer")
+
+    sequencing = config.get("sequencing")
+    if not isinstance(sequencing, dict):
+        raise ControlPlaneConfigError("'sequencing' must be an object")
+    _validate_positive_int_or_none(sequencing.get("fallback_delay_hours"), "sequencing.fallback_delay_hours")
+
+
+def get_control_config(db: Session, tenant_id: int) -> dict:
+    param = (
+        db.query(Parameter)
+        .filter(Parameter.tenant_id == tenant_id)
+        .filter(Parameter.key == GTM_OS_CONTROL_CONFIG_PARAMETER_KEY)
+        .first()
+    )
+    if param and isinstance(param.value, dict):
+        return param.value
+    return DEFAULT_GTM_OS_CONTROL_CONFIG
+
+
+def set_control_config(db: Session, tenant_id: int, config: dict) -> None:
+    _validate_control_config(config)
+    param = (
+        db.query(Parameter)
+        .filter(Parameter.tenant_id == tenant_id)
+        .filter(Parameter.key == GTM_OS_CONTROL_CONFIG_PARAMETER_KEY)
+        .first()
+    )
+    if param:
+        param.value = config
+    else:
+        param = Parameter(
+            tenant_id=tenant_id,
+            key=GTM_OS_CONTROL_CONFIG_PARAMETER_KEY,
+            value=config,
+            description="V2 GTM-OS control plane (state, safety limits, business hours, discovery "
+            "cadence, retry policy) -- see app/gtm_os/orchestration/control.py",
+        )
+        db.add(param)
+    db.commit()
+
+
+def check_can_run(db: Session, tenant_id: int) -> None:
+    """The single gate every V2 autonomous stage/scheduler entry point must call before starting
+    NEW work. Raises ControlPlaneHalted when state != "running". Never blocks an already-started
+    atomic operation (per the approved "an in-flight operation may finish" rule) -- callers only
+    ever call this before beginning a new unit of work, never mid-operation."""
+    state = get_control_config(db, tenant_id).get("state", "running")
+    if state != "running":
+        raise ControlPlaneHalted(state)
+
+
+def is_within_business_hours(config: dict, now: datetime | None = None) -> bool:
+    """Pure check against the configured business-hours window. Returns True when the window is
+    disabled (no restriction configured).
+
+    V2 Phase 7 fix: now genuinely timezone-aware, per the explicit Phase 0 follow-up
+    requirement ("It MUST be timezone-correct before Phase 7 uses it for real sends. Do not
+    silently use server-local now.hour for production send decisions."). `now` (UTC, naive or
+    aware) is converted into `business_hours.timezone` (a real IANA zone name, e.g.
+    "America/New_York") via the stdlib `zoneinfo` -- no new dependency -- before extracting the
+    hour to compare. An invalid/unknown timezone string fails safe to UTC rather than raising
+    and blocking the whole send stage on a bad config value."""
+    business_hours = config.get("business_hours", {})
+    if not business_hours.get("enabled"):
+        return True
+    now = now or datetime.utcnow()
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=ZoneInfo("UTC"))
+    tz_name = business_hours.get("timezone") or "UTC"
+    try:
+        local_now = now.astimezone(ZoneInfo(tz_name))
+    except (ZoneInfoNotFoundError, ValueError):
+        local_now = now.astimezone(ZoneInfo("UTC"))
+    start_hour = business_hours.get("start_hour", 0)
+    end_hour = business_hours.get("end_hour", 23)
+    return start_hour <= local_now.hour < end_hour
+
+
+def get_control_status(db: Session, tenant_id: int) -> dict:
+    """Current run status/failure state -- reuses GtmIntelligenceRun as-is (no new run-tracking
+    table), per the approved Phase 0 reuse instruction."""
+    from app.gtm_os.orchestration.sweep import GtmIntelligenceRun
+
+    config = get_control_config(db, tenant_id)
+    latest_run = (
+        db.query(GtmIntelligenceRun)
+        .filter(GtmIntelligenceRun.tenant_id == tenant_id)
+        .order_by(GtmIntelligenceRun.started_at.desc())
+        .first()
+    )
+    return {
+        "state": config.get("state", "running"),
+        "latest_run": None
+        if latest_run is None
+        else {
+            "id": latest_run.id,
+            "status": latest_run.status,
+            "error_summary": latest_run.error_summary,
+            "started_at": latest_run.started_at,
+            "completed_at": latest_run.completed_at,
+        },
+    }
