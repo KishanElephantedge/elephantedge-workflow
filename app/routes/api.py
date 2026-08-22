@@ -5,7 +5,7 @@ import json
 from collections import Counter
 from datetime import datetime, timedelta
 
-from fastapi import APIRouter, Body, Depends, HTTPException, Request
+from fastapi import APIRouter, Body, Depends, HTTPException, Request, Response
 from pydantic import BaseModel
 from sqlalchemy.orm import Session, selectinload
 from sqlalchemy import func, or_
@@ -4134,3 +4134,135 @@ def get_gtm_os_control_status(db: Session = Depends(get_db)):
     from app.gtm_os.orchestration.control import get_control_status
 
     return get_control_status(db, ELEPHANT_EDGE_TENANT_ID)
+
+
+# ---- Inbound Data reporting -- Google Analytics (traffic/channels) + Search Console (SEO/
+# search performance), live-queried on each request (no snapshot storage yet -- these are cheap,
+# infrequent, human-viewed reads, not something a background job needs to pre-compute). A third
+# source (inbound leads/forms) is still being scoped and not wired up yet. See
+# app/google_analytics_client.py and app/google_search_console_client.py -- both explicitly kept
+# separate from the existing Google Calendar integration.
+
+@router.get("/inbound/analytics/overview")
+def get_inbound_analytics_overview(start_date: str = "7daysAgo", end_date: str = "today", db: Session = Depends(get_db)):
+    from app.google_analytics_client import GoogleAnalyticsError, get_traffic_overview
+    try:
+        return get_traffic_overview(db, ELEPHANT_EDGE_TENANT_ID, start_date, end_date)
+    except GoogleAnalyticsError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+@router.get("/inbound/analytics/top-pages")
+def get_inbound_analytics_top_pages(start_date: str = "7daysAgo", end_date: str = "today", limit: int = 10, db: Session = Depends(get_db)):
+    from app.google_analytics_client import GoogleAnalyticsError, get_top_pages
+    try:
+        return get_top_pages(db, ELEPHANT_EDGE_TENANT_ID, start_date, end_date, limit)
+    except GoogleAnalyticsError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+@router.get("/inbound/analytics/trend")
+def get_inbound_analytics_trend(start_date: str = "30daysAgo", end_date: str = "today", db: Session = Depends(get_db)):
+    from app.google_analytics_client import GoogleAnalyticsError, get_daily_trend
+    try:
+        return get_daily_trend(db, ELEPHANT_EDGE_TENANT_ID, start_date, end_date)
+    except GoogleAnalyticsError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+def _default_search_console_dates() -> tuple[str, str]:
+    """Search Console data has a real ~2-3 day reporting lag (Google's own documented
+    behavior, not a bug here) -- "today" isn't populated yet, so the default end date is 3 days
+    back, not today, to avoid every default-range query silently showing a truncated last few
+    days as if they were complete."""
+    from datetime import datetime, timedelta
+    end = datetime.utcnow().date() - timedelta(days=3)
+    start = end - timedelta(days=28)
+    return start.isoformat(), end.isoformat()
+
+
+@router.get("/inbound/search-console/top-queries")
+def get_inbound_search_console_top_queries(start_date: str | None = None, end_date: str | None = None, limit: int = 20, db: Session = Depends(get_db)):
+    from app.google_search_console_client import GoogleSearchConsoleError, get_top_queries
+    default_start, default_end = _default_search_console_dates()
+    try:
+        return get_top_queries(db, ELEPHANT_EDGE_TENANT_ID, start_date or default_start, end_date or default_end, limit)
+    except GoogleSearchConsoleError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+@router.get("/inbound/search-console/top-pages")
+def get_inbound_search_console_top_pages(start_date: str | None = None, end_date: str | None = None, limit: int = 20, db: Session = Depends(get_db)):
+    from app.google_search_console_client import GoogleSearchConsoleError, get_top_pages
+    default_start, default_end = _default_search_console_dates()
+    try:
+        return get_top_pages(db, ELEPHANT_EDGE_TENANT_ID, start_date or default_start, end_date or default_end, limit)
+    except GoogleSearchConsoleError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+@router.get("/inbound/search-console/trend")
+def get_inbound_search_console_trend(start_date: str | None = None, end_date: str | None = None, db: Session = Depends(get_db)):
+    from app.google_search_console_client import GoogleSearchConsoleError, get_daily_trend
+    default_start, default_end = _default_search_console_dates()
+    try:
+        return get_daily_trend(db, ELEPHANT_EDGE_TENANT_ID, start_date or default_start, end_date or default_end)
+    except GoogleSearchConsoleError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+# ---- Website visitor identification (company-level only -- see
+# app/website_visitor_tracking.py's module docstring for why this can never be person-level).
+# /inbound/visitor-ping is deliberately PUBLIC (no tenant-slug prefix, no auth) -- it's called
+# directly by a tracking snippet embedded in the public marketing site (hosted separately on
+# Replit), which has no session/auth context of its own. It only ever accepts a beacon and
+# returns a minimal ack; it never returns anything the caller doesn't already know.
+
+_VISITOR_PING_CORS_HEADERS = {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type",
+}
+
+
+@router.options("/inbound/visitor-ping")
+async def options_inbound_visitor_ping():
+    """CORS preflight -- handled explicitly here rather than widening the app-wide
+    CORSMiddleware (app/main.py), which is scoped to the dashboard's own origin. This one route
+    is meant to be called cross-origin from the public marketing site, and returns nothing
+    sensitive either way, so a wildcard origin is safe here without loosening it elsewhere."""
+    return Response(status_code=200, headers=_VISITOR_PING_CORS_HEADERS)
+
+
+@router.post("/inbound/visitor-ping")
+async def post_inbound_visitor_ping(request: Request, body: dict = Body(default={}), db: Session = Depends(get_db)):
+    from app.website_visitor_tracking import extract_client_ip, record_visit
+
+    client_ip = request.client.host if request.client else None
+    ip_address = extract_client_ip(dict(request.headers), client_ip)
+    record_visit(
+        db, ELEPHANT_EDGE_TENANT_ID, ip_address,
+        page_path=body.get("page_path"), referrer=body.get("referrer"),
+        user_agent=request.headers.get("user-agent"),
+    )
+    # Always 200/ok -- a beacon caller (the public website) never needs to handle a failure
+    # case, and a resolution failure is already captured server-side via company_lookup_status.
+    return Response(status_code=200, headers=_VISITOR_PING_CORS_HEADERS, content='{"ok": true}', media_type="application/json")
+
+
+@router.get("/inbound/visitors")
+def get_inbound_visitors(limit: int = 50, resolved_only: bool = True, db: Session = Depends(get_db)):
+    from app.website_visitor_tracking import get_recent_visitors
+
+    visitors = get_recent_visitors(db, ELEPHANT_EDGE_TENANT_ID, limit=limit, resolved_only=resolved_only)
+    return [
+        {
+            "id": v.id, "ip_address": v.ip_address, "page_path": v.page_path, "referrer": v.referrer,
+            "company_name": v.company_name, "company_domain": v.company_domain, "company_website": v.company_website,
+            "company_industry": v.company_industry, "company_employee_range": v.company_employee_range,
+            "company_city": v.company_city, "company_state": v.company_state, "company_country": v.company_country,
+            "is_fuzzy_match": v.is_fuzzy_match, "company_lookup_status": v.company_lookup_status,
+            "created_at": v.created_at,
+        }
+        for v in visitors
+    ]

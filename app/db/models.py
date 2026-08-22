@@ -546,6 +546,40 @@ class PartnerRecommendationMessage(Base):
     profile = relationship("LinkedinMonitorProfile")
 
 
+class WebsiteVisitor(Base):
+    """One row per page-view beacon received from the marketing site's tracking snippet (see
+    app/website_visitor_tracking.py) -- company-level identification only (via Deepline's
+    deepline_ip_to_company_find_company_by_ip), never person-level. An IP maps to a network,
+    not an individual, so this table intentionally has no name/email/contact fields for the
+    visitor themselves -- see that module's docstring for the fuller reasoning (and why a
+    person-level tool would be a different, separate integration, not an extension of this one).
+
+    company_lookup_status distinguishes "we tried Deepline and it found nothing" from "we
+    haven't successfully looked this IP up yet" (e.g. Deepline was down) -- never silently
+    conflated, so a later reprocessing pass can tell which rows are worth retrying."""
+    __tablename__ = "website_visitors"
+
+    id = Column(Integer, primary_key=True)
+    tenant_id = Column(Integer, nullable=False)
+    ip_address = Column(String, nullable=False)
+    page_path = Column(String, nullable=True)
+    referrer = Column(String, nullable=True)
+    user_agent = Column(String, nullable=True)
+
+    company_name = Column(String, nullable=True)
+    company_domain = Column(String, nullable=True)
+    company_website = Column(String, nullable=True)
+    company_industry = Column(String, nullable=True)
+    company_employee_range = Column(String, nullable=True)
+    company_city = Column(String, nullable=True)
+    company_state = Column(String, nullable=True)
+    company_country = Column(String, nullable=True)
+    is_fuzzy_match = Column(Boolean, nullable=True)  # Deepline's own "fuzzy" flag -- probabilistic, not confirmed
+    company_lookup_status = Column(String, nullable=True)  # "resolved" | "no_match" | "lookup_failed"
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
 class LinkedinMonitorSignal(Base):
     """A new post from a monitored profile that matched at least one keyword -- one row per
     (profile, post), never re-alerted once created (see the unique index on profile_id+post_urn
