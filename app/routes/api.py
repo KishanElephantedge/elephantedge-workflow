@@ -4068,9 +4068,18 @@ def trigger_gtm_intelligence_run(dry_run: bool = False, db: Session = Depends(ge
 
     V2 CONTROL PLANE (Phase 0): dry_run is always allowed (introspection only, no writes/external
     calls -- useful for checking what a sweep WOULD do while paused). A real run is blocked when
-    the control plane isn't "running", same as the scheduled tick."""
+    the control plane isn't "running", same as the scheduled tick.
+
+    Autonomous Sensing Phase S7 -- now also respects the same single-concurrency guard as the
+    scheduled tick (_scheduled_gtm_intelligence_cycle, app/main.py): recovers any stale "running"
+    run first, then refuses to start a second overlapping run rather than silently double-running
+    the sweep. Mirrors V1's manual "trigger-now" route (autonomous_orchestrator.py), which the
+    daily cycle's own concurrency guard already covers identically."""
     from app.gtm_os.orchestration.control import ControlPlaneHalted, check_can_run
-    from app.gtm_os.orchestration.sweep import finish_gtm_intelligence_run, run_gtm_intelligence_sweep, start_gtm_intelligence_run
+    from app.gtm_os.orchestration.sweep import (
+        GtmIntelligenceRun, finish_gtm_intelligence_run, recover_stale_gtm_intelligence_runs,
+        run_gtm_intelligence_sweep, start_gtm_intelligence_run,
+    )
 
     if dry_run:
         return run_gtm_intelligence_sweep(db, ELEPHANT_EDGE_TENANT_ID, dry_run=True)
@@ -4079,6 +4088,15 @@ def trigger_gtm_intelligence_run(dry_run: bool = False, db: Session = Depends(ge
         check_can_run(db, ELEPHANT_EDGE_TENANT_ID)
     except ControlPlaneHalted as e:
         raise HTTPException(status_code=409, detail=str(e))
+
+    recover_stale_gtm_intelligence_runs(db, ELEPHANT_EDGE_TENANT_ID)
+    already_running = (
+        db.query(GtmIntelligenceRun)
+        .filter(GtmIntelligenceRun.tenant_id == ELEPHANT_EDGE_TENANT_ID, GtmIntelligenceRun.status == "running")
+        .first()
+    )
+    if already_running is not None:
+        raise HTTPException(status_code=409, detail=f"a run ({already_running.id}) is already in progress since {already_running.started_at}")
 
     run = start_gtm_intelligence_run(db, ELEPHANT_EDGE_TENANT_ID)
     result = run_gtm_intelligence_sweep(db, ELEPHANT_EDGE_TENANT_ID)

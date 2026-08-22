@@ -41,6 +41,15 @@ def _post(url: str, **kwargs) -> httpx.Response:
         raise ApifyError(f"request to {url} failed: {e}") from e
 
 
+def _get(url: str, **kwargs) -> httpx.Response:
+    """Same network-exception-wrapping discipline as _post() above, for the read-only account/
+    usage endpoints (Phase S8) -- these are plain GETs, not actor-run calls."""
+    try:
+        return httpx.get(url, **kwargs)
+    except httpx.HTTPError as e:
+        raise ApifyError(f"request to {url} failed: {e}") from e
+
+
 def _get_api_key(db: Session, tenant_id: int) -> str:
     cred = (
         db.query(Credential)
@@ -185,3 +194,30 @@ def search_linkedin_people(api_key: str, first_name: str, last_name: str, compan
     if response.status_code >= 300:
         raise ApifyError(f"LinkedIn people search failed ({response.status_code}): {response.text[:500]}")
     return response.json()
+
+
+# GET /v2/users/me/usage/monthly -- Phase S8 (Apify budget guard). Confirmed via Apify's own
+# official docs (docs.apify.com/api/v2/users-me-usage-monthly-get, fetched 2026-08-22): returns
+# the SAME data shown on the account's own Billing > Historical usage page -- explicitly NOT
+# real-time ("the same information you will see on your account's Billing page"), so this is the
+# best real spend signal available, not an instant balance. Real, literal response shape
+# (confirmed from the docs' own example, not guessed):
+#   {"data": {
+#       "usageCycle": {"startAt": "...", "endAt": "..."},
+#       "monthlyServiceUsage": {...per-service breakdown...},
+#       "dailyServiceUsages": [{"date": "2022-10-02T00:00:00.000Z", "serviceUsage": {...},
+#                                "totalUsageCreditsUsd": 0.047...}, ...],
+#       "totalUsageCreditsUsdBeforeVolumeDiscount": 0.786...,
+#       "totalUsageCreditsUsdAfterVolumeDiscount": 0.786...
+#   }}
+# There is NO pre-call balance/remaining-credit endpoint anywhere in Apify's real API -- actor
+# runs only report their own usageTotalUsd AFTER completing (Apify's own docs call this
+# "informational only, not exact figures"), and this monthly-usage endpoint is the only real,
+# queryable "spend so far" figure that exists before making a new call. apify_budget_guard.py
+# uses dailyServiceUsages' per-day totalUsageCreditsUsd and totalUsageCreditsUsdAfterVolumeDiscount
+# as the real (if slightly lagged) spend figures -- never a locally-accumulated estimate.
+def get_monthly_usage(api_key: str) -> dict:
+    response = _get(f"{BASE_URL}/users/me/usage/monthly", params={"token": api_key}, timeout=30)
+    if response.status_code >= 300:
+        raise ApifyError(f"Apify monthly usage fetch failed ({response.status_code}): {response.text[:500]}")
+    return response.json().get("data", {})

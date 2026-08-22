@@ -43,11 +43,21 @@ DECLARED_PROBLEM_PHRASES = [
 
 # Requires the phrase AND a trailing "?" -- a narrow subset of questions, specifically ones
 # asking how others solve/handle something, not every question mark on LinkedIn.
+#
+# 2026-08-22 addition (real-production-sample audit): rhetorical FIRST-PERSON difficulty
+# questions -- a real, observed missed shape (e.g. "What's harder right now? Getting the
+# enquiry? Getting hold of them?") that "how are other teams"-style phrases don't cover at all.
+# Deliberately narrow and specific ("what's harder"/"what's hardest about"/"do you struggle
+# with") -- NOT a bare "struggling" keyword match, which would catch third-party advice-giving
+# ("if you are a struggling coach...") the same audit confirmed must stay rejected. Each of these
+# still requires the SAME trailing "?" the rest of this list already requires.
 QUESTION_LEAD_PHRASES = [
     "how are other teams", "how is everyone", "how do you all", "how are you all",
     "any recommendations for", "any suggestions for", "has anyone found",
     "has anyone tried", "what are others using", "what is everyone using",
     "does anyone have", "looking for advice on", "looking for recommendations",
+    "what's harder", "whats harder", "what's hardest about", "whats hardest about",
+    "do you struggle with", "do you also struggle with",
 ]
 
 # Split into ONGOING vs RESOLVED per Step 7's approved adjustment -- the tense carries real

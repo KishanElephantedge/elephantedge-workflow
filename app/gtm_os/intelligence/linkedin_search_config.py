@@ -9,42 +9,77 @@ linkedin_monitor.py) -- per direct user instruction, that table exists to watch 
 purpose (finding UNKNOWN companies showing real problem/demand evidence). This module never
 imports or queries that table.
 
-DERIVATION, NOT A HARDCODED LIST (per explicit instruction): every phrase below is built from
-two real, already-existing sources, combined, never invented:
-  1. The exact structural trigger phrases linkedin_post_interpretation.py ALREADY recognizes as
-     declared-problem / solution-question / solution-evaluation evidence (imported verbatim from
-     that module, never re-typed here) -- so a phrase this module searches for has a real chance
-     of ALSO surviving that module's own phrase-match interpretation gate, not just being
-     topically related.
-  2. The real, lead-authored topic language already sitting in this tenant's own ICP config
-     (icp_config.py -- each ICP's own short `name`, e.g. "Stuck in Sales", "Upgrading With AI"),
-     offering config (offering_config.py's real offering names), and business_context's
-     `icp_bands[].profile` strings (business_context.py, e.g. "Companies stuck in sales",
-     "Looking for FDEs in Sales/GTM") -- the lead's own words for who has the problem, not a
-     generic "AI sales" keyword list. Longer explanatory fields (an ICP's own `trigger_description`
-     sentence) are deliberately NOT used as search phrases -- see `_icp_topic_terms()`.
+REDESIGNED (2026-08-22, real-production-sample audit): the original derivation mechanically
+built queries as `f"{trigger} {label}"`, concatenating a fixed interpretation-layer trigger
+phrase with an internal ICP/offering CONFIG LABEL (icp_config.py's own `name` field, e.g. "Stuck
+in Sales"; offering_config.py's own `name` field, e.g. "Sales OS") -- producing real, live
+production queries like "struggling to Stuck in Sales" and "how are other teams sales os". These
+are internal taxonomy labels, not language a real prospect would ever write or that would match
+one -- confirmed against a real 29-post production sample: zero of those posts were a genuine
+prospect describing their own situation; every on-topic hit was a coincidental keyword overlap
+inside otherwise-irrelevant thought-leadership/vendor content.
 
-Config is Parameter-backed (same get/set/validate pattern as every other GTM-OS config in this
-codebase) -- fully overridable/tunable from the dashboard without a code change, per instruction.
-When no override has been saved yet, get_linkedin_search_phrases() computes the derived default
-FRESH from whatever ICP/offering/business-context config is live right now (not a frozen
-snapshot) -- so editing the ICP config also naturally updates what this module searches for,
-without a separate manual sync step."""
+This module is now intentionally DECOUPLED from business_terms.py's label-derivation functions
+(icp_topic_terms/offering_topic_terms/business_context_topic_terms/all_business_topic_terms) --
+those remain completely unmodified and untouched here, since they're also used by
+content/topics.py for a genuinely different purpose (Market Intelligence topic matching against
+external content, not Problem/Demand sensing search input; conflating the two was itself part of
+what produced label-shaped queries here). See QUERY_CATALOG below: a small, hand-curated,
+CONCEPTUALLY grounded (not string-derived) set of real prospect-language search patterns, each
+one a plausible sentence a real operator/founder would actually write, tagged with which ICP/
+offering concept it represents (by id, not by label-matching a config string) purely for
+provenance/traceability -- never used to construct the query text itself.
+
+Config is STILL Parameter-backed (same get/set/validate pattern as every other GTM-OS config in
+this codebase) -- fully overridable/tunable from the dashboard without a code change. When no
+override has been saved yet, get_linkedin_search_config() computes the curated default fresh."""
 
 from datetime import datetime, timedelta
 
 from sqlalchemy.orm import Session
 
 from app.db.models import Parameter
-from app.gtm_os.context.business_context import get_business_context
-from app.gtm_os.context.business_terms import all_business_topic_terms
-from app.gtm_os.icp.icp_config import get_icp_config
-from app.gtm_os.intelligence.linkedin_post_interpretation import (
-    DECLARED_PROBLEM_PHRASES,
-    ONGOING_SOLUTION_PHRASES,
-    QUESTION_LEAD_PHRASES,
-)
-from app.gtm_os.opportunity.offering_config import get_offering_config
+
+# Each entry: a real, natural sentence a prospect/operator might actually write, never an
+# internal ICP/offering label. `source` and `intent_family` are provenance metadata only --
+# purely for a human auditing why a query exists, never fed back into query construction (which
+# would risk reintroducing the exact label-echoing bug this catalog replaces). `pattern` names
+# which interpretation-layer trigger family this sentence is shaped like (declared_problem /
+# question_lead / ongoing_evaluation / hiring_trigger) -- hiring_trigger is a real fourth shape
+# this module didn't previously have a category for at all: a person announcing they're actively
+# hiring for a role is a genuine trigger signal in its own right, distinct from a declared
+# personal problem statement or a solution-evaluation mention.
+QUERY_CATALOG: list[dict] = [
+    # ICP1 "Stuck in Sales" -- first-person growth-plateau / capacity pain, never the label itself.
+    {"text": "our sales team is stretched thin", "source": "icp:icp_1", "intent_family": "capacity_problem", "pattern": "declared_problem"},
+    {"text": "struggling to scale our sales", "source": "icp:icp_1", "intent_family": "growth_plateau", "pattern": "declared_problem"},
+    {"text": "sales growth has stalled", "source": "icp:icp_1", "intent_family": "growth_plateau", "pattern": "declared_problem"},
+    {"text": "can't keep up with sales demand", "source": "icp:icp_1", "intent_family": "capacity_problem", "pattern": "declared_problem"},
+
+    # ICP2 "Upgrading With AI" -- the real hiring trigger (a GTM engineer role) and real
+    # sales-automation evaluation language, never "Upgrading With AI" or "sales os" themselves.
+    {"text": "hiring our first gtm engineer", "source": "icp:icp_2", "intent_family": "gtm_engineer_hiring", "pattern": "hiring_trigger"},
+    {"text": "looking for a gtm engineer", "source": "icp:icp_2", "intent_family": "gtm_engineer_hiring", "pattern": "hiring_trigger"},
+    {"text": "building an ai sdr", "source": "icp:icp_2", "intent_family": "sales_automation", "pattern": "declared_problem"},
+    {"text": "evaluating sales automation tools", "source": "icp:icp_2", "intent_family": "sales_automation", "pattern": "ongoing_evaluation"},
+
+    # ICP3 "Needs Fractional Leadership" -- the real hiring trigger (VP/Head of Sales, fractional
+    # preference), never "Needs Fractional Leadership" itself.
+    {"text": "looking for a fractional vp of sales", "source": "icp:icp_3", "intent_family": "fractional_leadership_hiring", "pattern": "hiring_trigger"},
+    {"text": "hiring a head of sales", "source": "icp:icp_3", "intent_family": "fractional_leadership_hiring", "pattern": "hiring_trigger"},
+    {"text": "need a fractional sales leader", "source": "icp:icp_3", "intent_family": "fractional_leadership_hiring", "pattern": "declared_problem"},
+    {"text": "considering a fractional sales leader", "source": "icp:icp_3", "intent_family": "fractional_leadership_hiring", "pattern": "ongoing_evaluation"},
+
+    # Offering-derived -- ONLY where real, distinct prospect intent exists beyond the ICP queries
+    # above. Execution/Sales OS have no distinct prospect language beyond ICP3/ICP2's own hiring-
+    # trigger queries (Execution literally IS the fractional-VP-Sales hiring need already
+    # covered) -- deliberately not duplicated. Workshop/Sales Products/Digital Playbook have no
+    # real, observed prospect-language pattern to ground a query in ("I need a digital playbook"
+    # is not a real sentence anyone writes) -- deliberately excluded per the explicit "do not
+    # generate noise just to create more queries" instruction, not an oversight.
+    {"text": "looking for a sales consultant", "source": "offering:Consulting", "intent_family": "external_advisory_need", "pattern": "hiring_trigger"},
+    {"text": "need outside help with our sales process", "source": "offering:Consulting", "intent_family": "external_advisory_need", "pattern": "declared_problem"},
+]
 
 SEARCH_CONFIG_PARAMETER_KEY = "gtm_os_linkedin_search_config"
 
@@ -69,25 +104,25 @@ class SearchConfigError(ValueError):
     """Raised when search config fails validation -- never silently coerced."""
 
 
-def derive_default_search_phrases(icp_config: list[dict], offering_config: list[dict], business_context: dict) -> list[str]:
-    """Pure function -- combines a small, curated subset of the SAME structural trigger phrases
-    linkedin_post_interpretation.py already recognizes with real topic terms pulled from ICP/
-    offering/business-context config (app/gtm_os/context/business_terms.py, shared with
-    content/topics.py's default topic derivation -- same real config, same derivation logic,
-    reused rather than duplicated). Deterministic, no LLM, fully inspectable (every phrase traces
-    back to one real config field + one real interpretation-layer trigger, see module docstring).
-    Deliberately NOT a full cross-product (that would produce dozens of near-duplicate queries for
-    no real coverage gain) -- one representative structural trigger per topic term, rotating
-    through the three trigger categories so the result covers all three event types
-    (problem_statement / solution_question / solution_evaluation_mention), not just one."""
-    deduped_topics = all_business_topic_terms(icp_config, offering_config, business_context)
-    triggers = [DECLARED_PROBLEM_PHRASES[0], QUESTION_LEAD_PHRASES[0], ONGOING_SOLUTION_PHRASES[0]]
+def derive_default_search_phrases() -> list[str]:
+    """Returns the curated QUERY_CATALOG's query text only, in catalog order -- no longer takes
+    icp_config/offering_config/business_context params (kept as a no-arg function since the
+    catalog is hand-curated, not derived live from those configs anymore -- see module docstring
+    for why). Callers needing the provenance metadata (source/intent_family/pattern) should read
+    QUERY_CATALOG directly; this function exists only for the 'phrases' list shape
+    select_due_phrases()/sense_linkedin_post_search() already expect, unchanged."""
+    return [entry["text"] for entry in QUERY_CATALOG]
 
-    phrases = []
-    for i, topic in enumerate(deduped_topics):
-        trigger = triggers[i % len(triggers)]
-        phrases.append(f"{trigger} {topic}".strip())
-    return phrases
+
+def get_query_metadata(query_text: str) -> dict | None:
+    """Looks up the provenance (source/intent_family/pattern) for one query's text, for
+    reporting/debugging only -- never used to construct or alter the query itself. Returns None
+    for a query not in the current catalog (e.g. a human-edited override phrase saved via
+    set_linkedin_search_config that isn't one of the curated defaults)."""
+    for entry in QUERY_CATALOG:
+        if entry["text"] == query_text:
+            return {"source": entry["source"], "intent_family": entry["intent_family"], "pattern": entry["pattern"]}
+    return None
 
 
 def _validate_search_config(config: dict) -> None:
@@ -105,8 +140,8 @@ def _validate_search_config(config: dict) -> None:
 
 def get_linkedin_search_config(db: Session, tenant_id: int) -> dict:
     """Returns {"phrases": [...], "max_phrases_per_cycle": int, "posts_per_phrase": int,
-    "date_posted_filter": str}. No stored override yet -> phrases are computed FRESH from live
-    ICP/offering/business-context config (see module docstring); once a human edits and saves via
+    "date_posted_filter": str}. No stored override yet -> phrases are the curated QUERY_CATALOG
+    defaults (see module docstring); once a human edits and saves via
     set_linkedin_search_config(), that saved list is the source of truth going forward."""
     param = (
         db.query(Parameter)
@@ -117,9 +152,7 @@ def get_linkedin_search_config(db: Session, tenant_id: int) -> dict:
     if param and isinstance(param.value, dict) and param.value.get("phrases"):
         config = dict(param.value)
     else:
-        config = {"phrases": derive_default_search_phrases(
-            get_icp_config(db, tenant_id), get_offering_config(db, tenant_id), get_business_context(db, tenant_id),
-        )}
+        config = {"phrases": derive_default_search_phrases()}
     config.setdefault("max_phrases_per_cycle", DEFAULT_MAX_PHRASES_PER_CYCLE)
     config.setdefault("posts_per_phrase", DEFAULT_POSTS_PER_PHRASE)
     config.setdefault("date_posted_filter", DEFAULT_DATE_POSTED_FILTER)

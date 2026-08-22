@@ -126,6 +126,7 @@ from app.gtm_os.content.trend_intelligence import run_trend_intelligence_sweep
 from app.gtm_os.icp.icp_matching import run_icp_matching_sweep
 from app.gtm_os.intelligence.demand_detection import run_demand_hypothesis_sweep
 from app.gtm_os.intelligence.interpretation import run_interpretation_sweep
+from app.gtm_os.intelligence.investigation_cycle import run_investigation_cycle
 from app.gtm_os.intelligence.problem_detection import run_problem_hypothesis_sweep
 from app.gtm_os.intelligence.sensing import (
     sense_hackernews_stories,
@@ -137,6 +138,7 @@ from app.gtm_os.intelligence.sensing import (
 from app.gtm_os.learning.message_draft import run_message_generation_sweep
 from app.gtm_os.learning.outcome import run_outcome_detection_sweep
 from app.gtm_os.opportunity.opportunity import run_opportunity_intelligence_sweep
+from app.gtm_os.orchestration.control import get_control_config
 from app.gtm_os.orchestration.discovery import run_v2_discovery_if_due
 from app.gtm_os.sales.contact_discovery import run_v2_contact_discovery_sweep
 from app.gtm_os.sales.outreach_sequencing import run_v2_outreach_sequencing_sweep
@@ -212,6 +214,50 @@ def recover_stale_gtm_intelligence_runs(db: Session, tenant_id: int, stale_after
     if stale:
         db.commit()
     return len(stale)
+
+
+def _last_outbound_cycle_at(db: Session, tenant_id: int) -> datetime | None:
+    """Anchor for the outbound cadence gate (Phase S7) -- derived from existing
+    GtmIntelligenceRun.stage_results rather than a new table/column/timestamp, per the "reuse the
+    existing run entity, do not invent another run-history mechanism" instruction. gtm_strategy's
+    own runner never itself returns status=="skipped" (see its own docstring: "safe to run every
+    cycle even with near-zero real data" -- it always succeeds/fails, never self-skips), so a
+    "skipped" gtm_strategy entry in a past run can only mean THIS cadence gate produced it --
+    making "the most recent run where gtm_strategy is present and not 'skipped'" an exact,
+    non-invented anchor for "the last time outbound genuinely ran"."""
+    runs = (
+        db.query(GtmIntelligenceRun)
+        .filter(GtmIntelligenceRun.tenant_id == tenant_id)
+        .order_by(GtmIntelligenceRun.started_at.desc())
+        .limit(50)
+        .all()
+    )
+    for run in runs:
+        stage_result = (run.stage_results or {}).get("gtm_strategy") or {}
+        if stage_result.get("status") not in (None, "skipped"):
+            return run.started_at
+    return None
+
+
+def is_outbound_cycle_due(db: Session, tenant_id: int, now: datetime | None = None) -> tuple[bool, str]:
+    """Returns (due, reason). Never due while outbound.cadence_hours is unconfigured -- same
+    "None never means unlimited/immediate" discipline as discovery.is_discovery_due(). Gates only
+    the Strategy/Contact-discovery/Message-generation/Send/outreach-sequencing stages -- Opportunity
+    and ICP matching are deliberately NOT gated by this (see control.py's own comment on why)."""
+    config = get_control_config(db, tenant_id)
+    cadence_hours = (config.get("outbound") or {}).get("cadence_hours")
+    if not cadence_hours:
+        return False, "outbound.cadence_hours not configured"
+
+    last_at = _last_outbound_cycle_at(db, tenant_id)
+    if last_at is None:
+        return True, "no prior outbound cycle"
+
+    now = now or datetime.utcnow()
+    elapsed_hours = (now - last_at).total_seconds() / 3600
+    if elapsed_hours < cadence_hours:
+        return False, f"last outbound cycle {elapsed_hours:.1f}h ago, cadence is {cadence_hours}h"
+    return True, f"last outbound cycle {elapsed_hours:.1f}h ago, cadence is {cadence_hours}h -- due"
 
 # Content Intelligence sweep stages, run in this exact order after sensing -- each stage only
 # ever consumes the previous content-branch stage's output (or raw GtmSignal for the first one),
@@ -435,6 +481,7 @@ def run_gtm_intelligence_sweep(
         "status": "completed",
         "discovery": {},
         "sources": {},
+        "investigation_cycle": {},
         "interpretation": {},
         "problem_detection": {},
         "demand_detection": {},
@@ -467,16 +514,31 @@ def run_gtm_intelligence_sweep(
                 result["sources"][name] = {"status": "skipped", "reason": "not selected"}
                 continue
             result["sources"][name] = _dry_run_source_status(db, tenant_id, name)
+
+        # Autonomous Sensing Phase S7 -- free, read-only preview of the same real gates
+        # run_investigation_cycle() itself checks, no S3-S6 side effects.
+        investigation_config = get_control_config(db, tenant_id)
+        max_per_tick = investigation_config.get("investigation", {}).get("max_objectives_per_tick")
+        if max_per_tick:
+            result["investigation_cycle"] = {"status": "would_run", "max_objectives_per_tick": max_per_tick}
+        else:
+            result["investigation_cycle"] = {"status": "configuration_required", "reason": "investigation.max_objectives_per_tick is not configured"}
+
         result["interpretation"] = {"status": "would_run", "sources": ALL_INTERPRETED_SOURCES}
         result["problem_detection"] = {"status": "would_run", "sources": ALL_INTERPRETED_SOURCES}
         result["demand_detection"] = {"status": "would_run", "sources": ALL_INTERPRETED_SOURCES}
         for stage_key, _runner in CONTENT_INTELLIGENCE_STAGES:
             result[stage_key] = {"status": "would_run"}
+
+        outbound_due, outbound_reason = is_outbound_cycle_due(db, tenant_id)
         for stage_key, _runner in ACCOUNT_STRATEGY_STAGES:
-            result[stage_key] = {"status": "would_run"}
-        result["contact_discovery"] = {"status": "would_run"}
-        result["send"] = {"status": "would_run"}
-        result["outreach_sequencing"] = {"status": "would_run"}
+            if stage_key in ("gtm_strategy", "message_generation"):
+                result[stage_key] = {"status": "would_run" if outbound_due else "would_skip", "reason": outbound_reason}
+            else:
+                result[stage_key] = {"status": "would_run"}
+        result["contact_discovery"] = {"status": "would_run" if outbound_due else "would_skip", "reason": outbound_reason}
+        result["send"] = {"status": "would_run" if outbound_due else "would_skip", "reason": outbound_reason}
+        result["outreach_sequencing"] = {"status": "would_run" if outbound_due else "would_skip", "reason": outbound_reason}
         return result
 
     any_succeeded = False
@@ -515,6 +577,25 @@ def run_gtm_intelligence_sweep(
             result["sources"][name] = {"status": "failed", "error": str(e)}
             any_failed = True
             logger.error("gtm_intelligence_sweep: sensing %s failed -- %s", name, e)
+
+    # Autonomous Sensing Phase S7 (app/gtm_os/intelligence/investigation_cycle.py) -- runs BEFORE
+    # interpretation/problem/demand below so any GtmSignal rows S5 execution created this same
+    # tick get picked up by the SAME existing interpretation pass, not a following one. Bounded
+    # per control.investigation.max_objectives_per_tick; S2 gap-identification itself always runs
+    # (free/local), S3-S6 are skipped with an explicit configuration_required status while that
+    # cap is unconfigured. Never raises -- same per-stage error isolation as every other stage here.
+    try:
+        investigation_result = run_investigation_cycle(db, tenant_id)
+        result["investigation_cycle"] = investigation_result
+        if investigation_result.get("status") in ("succeeded", "partial"):
+            any_succeeded = True
+        if investigation_result.get("status") == "partial":
+            any_failed = True
+        logger.info("gtm_intelligence_sweep: investigation_cycle %s", investigation_result.get("status"))
+    except Exception as e:  # noqa: BLE001 -- see module docstring
+        result["investigation_cycle"] = {"status": "failed", "error": str(e)}
+        any_failed = True
+        logger.error("gtm_intelligence_sweep: investigation_cycle failed -- %s", e)
 
     try:
         interpreted = run_interpretation_sweep(db, tenant_id, sources=ALL_INTERPRETED_SOURCES)
@@ -568,7 +649,19 @@ def run_gtm_intelligence_sweep(
     # stage is a pure/idempotent read-or-additive-insert sweep with zero LLM/external/CRM calls
     # (see opportunity.py/strategy.py/sales_agent.py docstrings) -- safe to run every cycle even
     # with near-zero real data.
+    #
+    # Autonomous Sensing Phase S7 -- approved hybrid-cadence architecture: "opportunity"/
+    # "icp_matching" are pure evidence-evaluation stages, not outbound ACTIONS, so they stay
+    # UNGATED and run every hourly tick same as always. "gtm_strategy" onward through
+    # "outreach_sequencing" (contact_discovery, message_generation, send) ARE the
+    # downstream/outbound-adjacent stages named in the approved design -- gated to the slower
+    # is_outbound_cycle_due() cadence, never executed autonomously every hour. sales_readiness/
+    # outcome_detection remain ungated too -- both are read-only reporting/detection, not actions.
+    outbound_due, outbound_reason = is_outbound_cycle_due(db, tenant_id)
     for stage_key, runner in ACCOUNT_STRATEGY_STAGES_PRE_CONTACT:
+        if stage_key == "gtm_strategy" and not outbound_due:
+            result[stage_key] = {"status": "skipped", "reason": outbound_reason}
+            continue
         try:
             stage_result = runner(db, tenant_id)
             result[stage_key] = {"status": "succeeded", **stage_result}
@@ -581,8 +674,12 @@ def run_gtm_intelligence_sweep(
 
     # V2-owned contact discovery (Phase 3/4, app/gtm_os/sales/contact_discovery.py) -- see
     # ACCOUNT_STRATEGY_STAGES_POST_CONTACT's own comment above for why this sits here, outside
-    # the generic loop, with its own explicit succeeded/skipped/failed handling.
-    contact_discovery_result = run_v2_contact_discovery_sweep(db, tenant_id, limit=50)
+    # the generic loop, with its own explicit succeeded/skipped/failed handling. Outbound-gated
+    # (S7) -- see comment above the gtm_strategy loop.
+    if not outbound_due:
+        contact_discovery_result = {"status": "skipped", "reason": outbound_reason}
+    else:
+        contact_discovery_result = run_v2_contact_discovery_sweep(db, tenant_id, limit=50)
     result["contact_discovery"] = contact_discovery_result
     if contact_discovery_result.get("status") == "succeeded":
         any_succeeded = True
@@ -591,6 +688,9 @@ def run_gtm_intelligence_sweep(
         logger.error("gtm_intelligence_sweep: contact_discovery failed -- %s", contact_discovery_result.get("error"))
 
     for stage_key, runner in ACCOUNT_STRATEGY_STAGES_CONTACT_TO_MESSAGE:
+        if not outbound_due:
+            result[stage_key] = {"status": "skipped", "reason": outbound_reason}
+            continue
         try:
             stage_result = runner(db, tenant_id)
             result[stage_key] = {"status": "succeeded", **stage_result}
@@ -603,8 +703,11 @@ def run_gtm_intelligence_sweep(
 
     # V2-owned send (Phase 7, app/gtm_os/send/send.py) -- see ACCOUNT_STRATEGY_STAGES_POST_SEND's
     # own comment above for why this sits here, outside the generic loop, with its own explicit
-    # succeeded/skipped/failed handling.
-    send_result = run_v2_send_sweep(db, tenant_id, limit=50)
+    # succeeded/skipped/failed handling. Outbound-gated (S7).
+    if not outbound_due:
+        send_result = {"status": "skipped", "reason": outbound_reason}
+    else:
+        send_result = run_v2_send_sweep(db, tenant_id, limit=50)
     result["send"] = send_result
     if send_result.get("status") == "succeeded":
         any_succeeded = True
@@ -627,8 +730,11 @@ def run_gtm_intelligence_sweep(
     # -- runs LAST, after outcome_detection, so it sees this same tick's freshest SalesOutcome
     # data before deciding whether to advance any opportunity to a fallback contact. Same
     # explicit succeeded/skipped/failed handling as discovery/contact_discovery/send, outside
-    # the generic loop.
-    outreach_sequencing_result = run_v2_outreach_sequencing_sweep(db, tenant_id, limit=50)
+    # the generic loop. Outbound-gated (S7).
+    if not outbound_due:
+        outreach_sequencing_result = {"status": "skipped", "reason": outbound_reason}
+    else:
+        outreach_sequencing_result = run_v2_outreach_sequencing_sweep(db, tenant_id, limit=50)
     result["outreach_sequencing"] = outreach_sequencing_result
     if outreach_sequencing_result.get("status") == "succeeded":
         any_succeeded = True

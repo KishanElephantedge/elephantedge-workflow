@@ -80,6 +80,41 @@ DEFAULT_GTM_OS_CONTROL_CONFIG: dict = {
     "sequencing": {
         "fallback_delay_hours": None,
     },
+    # Autonomous Sensing Phase S7 -- the hourly tick's per-cycle bound on how many
+    # InvestigationObjective rows S3->S6 may act on this tick (S2 gap-identification itself is
+    # free/local and always runs regardless). None (unconfigured) until an operator sets a real
+    # number -- same "don't invent a business figure" discipline as every other cap in this
+    # config. Unconfigured means S7 explicitly reports "configuration_required" and skips S3-S6
+    # entirely for this tick, never treating None as unlimited.
+    "investigation": {
+        "max_objectives_per_tick": None,
+    },
+    # Autonomous Sensing Phase S7 -- gates the existing Strategy/Contact-discovery/Message-
+    # generation/Send/outreach-sequencing stages to a slower, day-scale cadence, separate from
+    # the hourly sensing tick (approved hybrid-cadence architecture: sensing runs every tick,
+    # outbound-adjacent stages do not). None (unconfigured) means those stages never run
+    # autonomously -- same discipline as discovery.cadence_hours; a human must set a real
+    # interval before autonomous outbound execution begins. Opportunity/ICP-matching are
+    # deliberately NOT gated by this -- they're pure, read-only-or-additive evidence evaluation
+    # (see sweep.py's own docstring), safe and valuable to keep current every hourly tick, not an
+    # "outbound" action.
+    "outbound": {
+        "cadence_hours": None,
+    },
+    # Autonomous Sensing Phase S8 -- real Apify budget guard (app/apify_budget_guard.py).
+    # Deliberately kept as its own dedicated block, same "extend the existing budget-config style,
+    # don't build a parallel system" pattern as discovery.daily_budget_usd/outbound.cadence_hours
+    # above -- but a DIFFERENT number from discovery.daily_budget_usd (that one caps V2's own
+    # company-discovery spend; this one caps Apify-backed autonomous SENSING spend, a distinct
+    # real cost source with its own real usage API, see apify_client.get_monthly_usage()). Both
+    # None (unconfigured) until an operator sets real numbers -- never invented, never treated as
+    # unlimited. monthly_budget_usd is optional (Apify's own account-level cap is a real, separate
+    # platform setting an operator can already set directly in Apify's own dashboard/limits API;
+    # this field lets V2 additionally self-enforce a monthly ceiling from inside the app if wanted).
+    "apify": {
+        "daily_budget_usd": None,
+        "monthly_budget_usd": None,
+    },
 }
 
 
@@ -156,6 +191,22 @@ def _validate_control_config(config: dict) -> None:
         raise ControlPlaneConfigError("'retry.max_attempts' must be a positive integer")
     if not isinstance(backoff_minutes, int) or isinstance(backoff_minutes, bool) or backoff_minutes < 1:
         raise ControlPlaneConfigError("'retry.backoff_minutes' must be a positive integer")
+
+    investigation = config.get("investigation")
+    if not isinstance(investigation, dict):
+        raise ControlPlaneConfigError("'investigation' must be an object")
+    _validate_positive_int_or_none(investigation.get("max_objectives_per_tick"), "investigation.max_objectives_per_tick")
+
+    outbound = config.get("outbound")
+    if not isinstance(outbound, dict):
+        raise ControlPlaneConfigError("'outbound' must be an object")
+    _validate_positive_int_or_none(outbound.get("cadence_hours"), "outbound.cadence_hours")
+
+    apify = config.get("apify")
+    if not isinstance(apify, dict):
+        raise ControlPlaneConfigError("'apify' must be an object")
+    _validate_positive_number_or_none(apify.get("daily_budget_usd"), "apify.daily_budget_usd")
+    _validate_positive_number_or_none(apify.get("monthly_budget_usd"), "apify.monthly_budget_usd")
 
     sequencing = config.get("sequencing")
     if not isinstance(sequencing, dict):

@@ -231,6 +231,11 @@ def ensure_indexes():
         """))
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_gtm_signals_dedup_key ON gtm_signals (dedup_key)"))
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_gtm_signals_tenant_source ON gtm_signals (tenant_id, source)"))
+        # Person -> Company resolution (app/gtm_os/intelligence/company_resolution.py).
+        conn.execute(text("ALTER TABLE gtm_signals ADD COLUMN IF NOT EXISTS company_resolution_status VARCHAR"))
+        conn.execute(text("ALTER TABLE gtm_signals ADD COLUMN IF NOT EXISTS company_resolution_method VARCHAR"))
+        conn.execute(text("ALTER TABLE gtm_signals ADD COLUMN IF NOT EXISTS company_resolution_reason TEXT"))
+        conn.execute(text("ALTER TABLE gtm_signals ADD COLUMN IF NOT EXISTS company_resolved_at TIMESTAMP"))
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS interpreted_signals (
                 id SERIAL PRIMARY KEY,
@@ -654,3 +659,26 @@ def ensure_indexes():
         """))
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_gtm_governance_snapshots_tenant_computed ON gtm_governance_snapshots (tenant_id, computed_at DESC)"))
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_gtm_intelligence_runs_tenant_started ON gtm_intelligence_runs (tenant_id, started_at)"))
+        # Autonomous Sensing Phase S1 -- see app/gtm_os/intelligence/investigation_memory.py.
+        # The structured InvestigationObjective is the durable memory; no query text is stored.
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS investigation_objectives (
+                id SERIAL PRIMARY KEY,
+                tenant_id INTEGER NOT NULL,
+                icp_id VARCHAR NOT NULL,
+                target_company_id INTEGER REFERENCES companies(id),
+                claim TEXT NOT NULL,
+                evidence_sought VARCHAR NOT NULL,
+                reason TEXT NOT NULL,
+                status VARCHAR NOT NULL DEFAULT 'open',
+                attempts INTEGER NOT NULL DEFAULT 0,
+                last_attempted_at TIMESTAMP,
+                next_eligible_at TIMESTAMP,
+                stopped_reason TEXT,
+                source_attempted VARCHAR,
+                created_at TIMESTAMP,
+                updated_at TIMESTAMP
+            )
+        """))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_investigation_objectives_tenant_icp_company ON investigation_objectives (tenant_id, icp_id, target_company_id)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_investigation_objectives_tenant_status ON investigation_objectives (tenant_id, status)"))

@@ -48,10 +48,23 @@ def _build_search_url(keyword: str) -> str:
     return f"https://www.linkedin.com/search/results/content/?keywords={quote(keyword)}&datePosted=%22{DATE_POSTED_FILTER}%22&origin=FACETED_SEARCH"
 
 
-def _guess_company_name(occupation: str) -> str | None:
+def _guess_company_name(headline: str) -> str | None:
+    """Deterministic, narrow parser for the two real observed LinkedIn headline shapes --
+    deliberately not a broad fuzzy parser. "Title at Company" / "Title @ Company" (unchanged,
+    original behavior) take everything after the LAST such separator. "Title, Company" (added
+    2026-08-22, a real, separately-observed headline shape -- e.g. "Founder, SocialThink Media |
+    Digital Growth Strategist") is narrower on purpose: only the segment immediately after the
+    first comma, stopping at the next "|" -- real headlines commonly chain multiple pipe-
+    separated taglines after the actual company name, and naively taking everything after the
+    comma would fold those taglines into "company_name_raw", which would then never exact-match
+    a real Company row. If no pattern is found, returns None -- no company identity is invented."""
     for sep in (" at ", " @ ", "@"):
-        if sep in occupation:
-            return occupation.split(sep)[-1].strip() or None
+        if sep in headline:
+            return headline.split(sep)[-1].strip() or None
+    if "," in headline:
+        after_comma = headline.split(",", 1)[-1]
+        company = after_comma.split("|")[0].strip()
+        return company or None
     return None
 
 

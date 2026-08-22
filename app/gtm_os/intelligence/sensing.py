@@ -123,16 +123,22 @@ def sense_linkedin_posts(
     by reading the real fields:
       - observed_at <- postedAtISO (falls back to the never-seen postedAt/date names harmlessly,
         in case a different actor version ever does use them).
-      - company_name_raw <- parsed from author.occupation via the SAME deterministic
-        _guess_company_name() parser reverse_discovery.py already uses for this exact purpose
-        (occupation is a free-text "Title at Company" string, only reliably populated when the
-        actor scrapes a profile directly -- true here, since this function is always called with
-        real profile_urls, unlike reverse_discovery's broad keyword-search path). This is a raw,
-        unverified guess (matching the field's own "_raw" naming), not a resolved company_id --
-        no paid verification call (Jobo/Google ICP-floor check) is made here, keeping this layer
-        purely observational and free, per the sensing layer's own discipline.
-    occupation and author_profile_url are also preserved in extracted_info -- real source-level
-    identifiers a later, not-yet-built entity-resolution layer will need, not derived judgments."""
+      - company_name_raw <- parsed from the author's real headline text via the SAME
+        deterministic _guess_company_name() parser reverse_discovery.py already uses for this
+        exact purpose.
+
+    REAL-PAYLOAD FIX (2026-08-22, production-sample audit): `author.occupation` was NEVER a real
+    field in this actor's response -- confirmed empty across every real production signal
+    inspected. The real field is `author.headline` (falls back to the top-level `authorHeadline`,
+    seen present even when the nested `author` object itself is thin/missing) -- e.g. a real
+    production headline: "Founder and Learning Alchemist @ Wren Learning Consultancy | ...". This
+    silently meant company_name_raw was empty for every single linkedin_post signal this source
+    ever produced, regardless of how good the interpretation/company-resolution logic downstream
+    was. Also now preserves authorProfileId/author.publicId/authorUrn/authorType in
+    extracted_info -- real, already-present identity fields nothing previously captured, kept for
+    a future entity-resolution layer even though none of them alone resolve a company (no
+    structured company/organization field exists anywhere in this payload; the headline free-text
+    is the only company-bearing field at all)."""
     api_key = _get_apify_api_key(db, tenant_id)
     items = search_linkedin_posts(api_key, profile_urls, scrape_until=scrape_until, limit_per_source=limit_per_source)
     signals = []
@@ -141,7 +147,7 @@ def sense_linkedin_posts(
         if not source_ref:
             continue
         author = item.get("author") or {}
-        occupation = author.get("occupation") or ""
+        headline = author.get("headline") or item.get("authorHeadline") or ""
         signal = GtmSignal(
             tenant_id=tenant_id,
             source="linkedin_post",
@@ -149,12 +155,16 @@ def sense_linkedin_posts(
             signal_type="post",
             observed_at=_parse_dt(item.get("postedAtISO") or item.get("postedAt") or item.get("date")),
             person_name_raw=item.get("authorName") or item.get("author"),
-            company_name_raw=_guess_company_name(occupation),
+            company_name_raw=_guess_company_name(headline),
             raw_evidence=item,
             extracted_info={
                 "text": item.get("text") or item.get("content"),
-                "occupation": occupation or None,
+                "headline": headline or None,
                 "author_profile_url": item.get("authorProfileUrl") or item.get("inputUrl"),
+                "author_profile_id": item.get("authorProfileId") or author.get("id"),
+                "author_public_id": author.get("publicId"),
+                "author_urn": item.get("authorUrn"),
+                "author_type": item.get("authorType"),
             },
             dedup_key=_dedup_key("linkedin_post", source_ref),
         )

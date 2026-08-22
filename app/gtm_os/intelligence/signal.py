@@ -50,3 +50,13 @@ class GtmSignal(Base):
     dedup_key = Column(String, nullable=False)  # hash of (source, source_ref) -- used to flag repeats, never to block insert
 
     created_at = Column(DateTime, default=datetime.utcnow)
+
+    # Person -> Company resolution bookkeeping (app/gtm_os/intelligence/company_resolution.py).
+    # All four NULL means "never attempted" -- distinguishable from every real outcome. Populated
+    # only for signals whose evidence tier already qualifies to open a hypothesis (contextual-tier
+    # evidence, the majority of real signals today, is never resolved -- see that module's own
+    # docstring). Categorical status only, never a numeric confidence score.
+    company_resolution_status = Column(String, nullable=True)  # "resolved" | "unresolved" | "ambiguous"
+    company_resolution_method = Column(String, nullable=True)  # "explicit" | "exact_name_match" | "enrichment_domain_match"
+    company_resolution_reason = Column(Text, nullable=True)  # human-readable explanation, esp. for unresolved/ambiguous
+    company_resolved_at = Column(DateTime, nullable=True)

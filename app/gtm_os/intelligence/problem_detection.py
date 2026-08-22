@@ -28,6 +28,7 @@ from datetime import datetime
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.gtm_os.intelligence.company_resolution import ensure_company_resolved_if_needed
 from app.gtm_os.intelligence.interpreted_signal import InterpretedSignal
 from app.gtm_os.intelligence.problem_hypothesis import ProblemHypothesis, ProblemHypothesisEvidence
 from app.gtm_os.intelligence.signal import GtmSignal
@@ -195,6 +196,7 @@ def evaluate_interpreted_signal(
     evidence with no existing hypothesis to attach to -- the intended, conservative outcome for
     every current hiring_activity interpretation until a declared/implied_gap source exists)."""
     tier = classify_evidence_tier(interpreted_signal)
+    ensure_company_resolved_if_needed(db, tenant_id, interpreted_signal, opening_tier=tier in OPENING_TIERS)
     dedup_key = _dedup_key_for(db, interpreted_signal)
     affected_function = interpreted_signal.affected_function or "unknown"
 
