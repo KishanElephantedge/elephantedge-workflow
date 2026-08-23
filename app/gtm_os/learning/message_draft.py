@@ -36,6 +36,7 @@ from sqlalchemy.orm import Session
 
 from app.db.models import Base
 from app.gtm_os.opportunity.opportunity import Opportunity
+from app.gtm_os.sales.contact_discovery import get_eligible_contacts
 from app.gtm_os.sales.sales_agent import evaluate_decision_maker, evaluate_sales_readiness, gather_account_research, prepare_message
 from app.gtm_os.strategy.strategy import GtmStrategy
 from app.llm_client import generate_json
@@ -327,6 +328,56 @@ def recover_message_draft_if_unblocked(
     return generate_message_draft(db, tenant_id, opportunity, strategy), True
 
 
+def regenerate_message_draft(db: Session, tenant_id: int, draft_id: int, contact_id: int | None = None) -> MessageDraft:
+    """V2 Frontend Phase (Message Workspace) -- the real single-draft regeneration this project
+    never had (V1's own "Regenerate" is just a full re-run of /generate-message overwriting the
+    one PersonalizedMessage row; V2 had no regenerate path at all before this).
+
+    Adapted from recover_message_draft_if_unblocked()'s already-proven delete-then-generate
+    pattern: delete the existing row, commit, THEN call generate_message_draft() completely
+    UNMODIFIED -- so every real constraint it already enforces (idempotency, the
+    (opportunity_id, gtm_strategy_id[, contact_id]) unique index, the same contact-ranking
+    (contact_ranking.py) and suppression rules (Contact.excluded_from_push) via
+    evaluate_decision_maker(), the same deterministic quality gate, the same subject/message_text
+    generation) is preserved exactly. Zero new business logic beyond a controlled re-invocation of
+    what already exists.
+
+    Does NOT touch MessageSendAttempt history -- a separate table, untouched here; regenerating a
+    draft's content has no bearing on what was already (attempted to be) sent under a prior
+    version of that draft.
+
+    contact_id, if given, MUST already be one of get_eligible_contacts()'s real results for this
+    opportunity's company -- checked here, not left to the caller, so a suppressed/ineligible
+    contact can never be forced onto a regenerated draft even if a stale id reaches this
+    function. To force evaluate_decision_maker() to resolve to exactly that contact, every OTHER
+    eligible contact is passed as exclude_contact_ids -- the exact same real exclusion mechanism
+    outreach_sequencing.py already relies on for its own fallback-contact selection, not a second
+    contact-selection path."""
+    draft = db.get(MessageDraft, draft_id)
+    if draft is None or draft.tenant_id != tenant_id:
+        raise ValueError(f"no MessageDraft {draft_id} for tenant {tenant_id}")
+
+    opportunity = db.get(Opportunity, draft.opportunity_id)
+    if opportunity is None or opportunity.tenant_id != tenant_id:
+        raise ValueError(f"no Opportunity for MessageDraft {draft_id}")
+
+    strategy = db.get(GtmStrategy, draft.gtm_strategy_id)
+    if strategy is None or strategy.tenant_id != tenant_id:
+        raise ValueError(f"no GtmStrategy for MessageDraft {draft_id}")
+
+    exclude_contact_ids = None
+    if contact_id is not None:
+        eligible = get_eligible_contacts(db, opportunity.company_id)
+        eligible_ids = {c.id for c in eligible}
+        if contact_id not in eligible_ids:
+            raise ValueError(f"contact {contact_id} is not an eligible contact for this opportunity's company")
+        exclude_contact_ids = [c.id for c in eligible if c.id != contact_id]
+
+    db.delete(draft)
+    db.commit()
+    return generate_message_draft(db, tenant_id, opportunity, strategy, exclude_contact_ids=exclude_contact_ids)
+
+
 def approve_message_draft(db: Session, tenant_id: int, message_draft_id: int, approved_by: str) -> MessageDraft:
     """The ONLY function that ever sets status='approved'. Requires the draft to already be
     ready_for_review -- cannot approve a draft/insufficient_context message (forces the
@@ -446,6 +497,7 @@ def list_messages_for_company(db: Session, tenant_id: int, company_id: int) -> l
             "objective": d.objective,
             "target_role": d.target_role,
             "positioning_angle": d.positioning_angle,
+            "subject": d.subject,  # V2 Frontend Phase (Message Workspace) -- real column, was never selected here before
             "message_text": d.message_text,
             "status": d.status,
             "missing_information": d.missing_information,

@@ -90,7 +90,7 @@ def _company_dict(company: Company) -> dict:
         "last_funding_date", "headcount_growth_12m_percent", "hiring_signal_role",
         "hiring_signal_hire_type", "hiring_signal_strength", "hiring_signal_reasoning",
         "hiring_signal_posting_count", "active_job_title", "detected_tech_stack",
-        "has_outbound_tooling", "has_ai_sdr_tool", "hot_lead", "hot_lead_reasoning",
+        "has_outbound_tooling", "has_ai_sdr_tool", "hot_lead", "hot_lead_reasoning", "created_at",
     )
     return {field: getattr(company, field, None) for field in fields}
 

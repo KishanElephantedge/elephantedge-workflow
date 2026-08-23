@@ -6,7 +6,7 @@ an already-built, already-tested sweep function from elsewhere in app/gtm_os.
 Two independent branches, both rooted in the same raw GtmSignal sensing stage, per Batch 2's own
 architecture diagram -- neither branch reads the other's output:
 
-    SOURCE SENSING (sense_theirstack_jobs / sense_linkedin_replies / sense_hackernews_stories /
+    SOURCE SENSING (sense_linkedin_jobs / sense_linkedin_replies / sense_hackernews_stories /
                      sense_rss_articles / sense_linkedin_post_search -- independent per source,
                      own failure boundary each)
               │
@@ -130,10 +130,10 @@ from app.gtm_os.intelligence.investigation_cycle import run_investigation_cycle
 from app.gtm_os.intelligence.problem_detection import run_problem_hypothesis_sweep
 from app.gtm_os.intelligence.sensing import (
     sense_hackernews_stories,
+    sense_linkedin_jobs,
     sense_linkedin_post_search,
     sense_linkedin_replies,
     sense_rss_articles,
-    sense_theirstack_jobs,
 )
 from app.gtm_os.learning.message_draft import run_message_generation_sweep
 from app.gtm_os.learning.outcome import run_outcome_detection_sweep
@@ -342,6 +342,14 @@ class MissingSourceConfiguration(Exception):
     configuration isn't set -- caught and reported as a "skipped" source, never a crash."""
 
 
+class SourceBudgetBlocked(Exception):
+    """Raised by a source wrapper (never by the sweep loop itself) when a real, configured
+    budget guard blocks the call -- caught and reported as a "skipped" source, same as
+    MissingSourceConfiguration, never a "failed" source. A budget block is an intentional safety
+    gate working as designed, not an error -- conflating the two would misreport GtmIntelligenceRun
+    as "partial" (mixed success/failure) for a tick where nothing actually went wrong."""
+
+
 def _get_salesrobot_config(db: Session, tenant_id: int) -> tuple[str, list[str]] | None:
     """Mirrors app/routes/api.py's _get_salesrobot_linkedin_account_uuid()/_get_our_campaign_uuids()
     exactly -- same Parameter keys, same fallback from salesrobot_our_campaign_uuids to the
@@ -384,10 +392,46 @@ def _get_salesrobot_config(db: Session, tenant_id: int) -> tuple[str, list[str]]
     return account_uuid, campaign_uuids
 
 
-def _run_theirstack(db: Session, tenant_id: int):
-    # No new search criteria invented -- uses sense_theirstack_jobs' own existing defaults
-    # exactly, per the Step 13 spec's explicit instruction.
-    return sense_theirstack_jobs(db, tenant_id)
+def _run_linkedin_jobs(db: Session, tenant_id: int):
+    """Replaces theirstack_job (Deepline) as this sweep's job-posting sensing source, 2026-08-23
+    -- theirstack_job_search was failing every tick on a real, persistent Deepline credit
+    exhaustion (workspace balance -0.96), with no fallback. sense_linkedin_jobs (Apify) already
+    existed, already fully wired through interpretation/problem_detection/demand_detection
+    (ALL_INTERPRETED_SOURCES already lists "linkedin_job" first), and was simply never
+    registered in SWEEPABLE_SOURCES -- this is that wiring, not new capability.
+
+    Reuses V1's own real, validated filter constants from app/phases/apify_discovery.py
+    (APIFY_TITLE_SEARCH/APIFY_INDUSTRY_FILTER/APIFY_EMPLOYEE_MIN/MAX) rather than inventing a
+    second set. limit=25 mirrors sense_theirstack_jobs' own prior default (worst-case
+    25*$0.005+$0.01 = $0.135/tick) -- deliberately smaller than V1's discovery-run sizing
+    (target*20, up to 150), since this runs once a DAY now (see control.py's
+    get_intelligence_schedule_utc) as an incremental "what's new" signal, not a bulk discovery
+    sweep.
+
+    Unlike sense_theirstack_jobs, this source makes a REAL PAID Apify call with no budget check
+    of its own -- so, unlike the old wrapper, this one checks apify_budget_guard itself before
+    calling, the same real guard S7 investigation already uses. A block is reported as
+    "skipped" (SourceBudgetBlocked), never "failed" -- deliberately blocked by budget is not the
+    same thing as broken."""
+    from app.apify_client import estimate_cost_usd
+    from app.apify_budget_guard import STATUS_ALLOWED, check_apify_budget
+    from app.phases.apify_discovery import APIFY_EMPLOYEE_MAX, APIFY_EMPLOYEE_MIN, APIFY_INDUSTRY_FILTER, APIFY_TITLE_SEARCH
+
+    limit = 25
+    budget_result = check_apify_budget(db, tenant_id, estimate_cost_usd(limit))
+    if budget_result["status"] != STATUS_ALLOWED:
+        raise SourceBudgetBlocked(budget_result["reason"])
+
+    return sense_linkedin_jobs(
+        db, tenant_id,
+        title_search=APIFY_TITLE_SEARCH,
+        location_search=["United States"],
+        organization_employees_gte=APIFY_EMPLOYEE_MIN,
+        organization_employees_lte=APIFY_EMPLOYEE_MAX,
+        industry_filter=APIFY_INDUSTRY_FILTER,
+        time_range="24h",
+        limit=limit,
+    )
 
 
 def _run_linkedin_replies(db: Session, tenant_id: int):
@@ -434,7 +478,7 @@ def _run_linkedin_post_search(db: Session, tenant_id: int):
 # problem_detection.py's own tier map); explicitly NOT the Network/LinkedIn-monitor watch-list,
 # see sense_linkedin_post_search()'s own docstring.
 SWEEPABLE_SOURCES: list[tuple[str, callable]] = [
-    ("theirstack_job", _run_theirstack),
+    ("linkedin_job", _run_linkedin_jobs),
     ("linkedin_reply", _run_linkedin_replies),
     ("hackernews_story", _run_hackernews),
     ("rss_article", _run_rss),
@@ -573,6 +617,9 @@ def run_gtm_intelligence_sweep(
         except MissingSourceConfiguration as e:
             result["sources"][name] = {"status": "skipped", "reason": str(e)}
             logger.warning("gtm_intelligence_sweep: sensing %s skipped -- %s", name, e)
+        except SourceBudgetBlocked as e:
+            result["sources"][name] = {"status": "skipped", "reason": str(e)}
+            logger.info("gtm_intelligence_sweep: sensing %s skipped (budget) -- %s", name, e)
         except Exception as e:  # noqa: BLE001 -- one source's failure must never block the others; see module docstring
             result["sources"][name] = {"status": "failed", "error": str(e)}
             any_failed = True

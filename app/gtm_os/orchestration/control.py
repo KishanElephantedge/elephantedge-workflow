@@ -309,3 +309,50 @@ def get_control_status(db: Session, tenant_id: int) -> dict:
             "completed_at": latest_run.completed_at,
         },
     }
+
+
+GTM_INTELLIGENCE_SCHEDULE_PARAMETER_KEY = "gtm_intelligence_schedule_utc"
+
+# V1's own daily autonomous cycle fires at 9:00 UTC (see autonomous_orchestrator.py's
+# DEFAULT_SCHEDULE_HOUR_UTC/MINUTE_UTC) -- this cycle defaults to an hour later so the two never
+# compete for the same DB/Apify budget window, not because the hour itself is meaningful.
+DEFAULT_INTELLIGENCE_SCHEDULE_HOUR_UTC = 10
+DEFAULT_INTELLIGENCE_SCHEDULE_MINUTE_UTC = 0
+
+
+def get_intelligence_schedule_utc(db: Session, tenant_id: int) -> tuple[int, int]:
+    """Fixed wall-clock time (UTC) the GTM intelligence sensing cycle fires at -- one run per
+    day, same CronTrigger-at-a-fixed-time pattern as V1's autonomous_schedule_utc (see that
+    module's own docstring for why a fixed time, not an interval timer, is used: an interval's
+    countdown restarts on every deploy, so its actual fire time silently drifts). Replaces the
+    old hardcoded IntervalTrigger(minutes=60) -- this cycle used to run hourly with no way to
+    change that without a code change/redeploy."""
+    param = (
+        db.query(Parameter)
+        .filter(Parameter.tenant_id == tenant_id)
+        .filter(Parameter.key == GTM_INTELLIGENCE_SCHEDULE_PARAMETER_KEY)
+        .first()
+    )
+    if param and param.value and "hour" in param.value and "minute" in param.value:
+        return int(param.value["hour"]), int(param.value["minute"])
+    return DEFAULT_INTELLIGENCE_SCHEDULE_HOUR_UTC, DEFAULT_INTELLIGENCE_SCHEDULE_MINUTE_UTC
+
+
+def set_intelligence_schedule_utc(db: Session, tenant_id: int, hour: int, minute: int) -> None:
+    if not (0 <= hour <= 23) or not (0 <= minute <= 59):
+        raise ControlPlaneConfigError("hour must be 0-23, minute must be 0-59")
+    param = (
+        db.query(Parameter)
+        .filter(Parameter.tenant_id == tenant_id)
+        .filter(Parameter.key == GTM_INTELLIGENCE_SCHEDULE_PARAMETER_KEY)
+        .first()
+    )
+    if param:
+        param.value = {"hour": hour, "minute": minute}
+    else:
+        param = Parameter(
+            tenant_id=tenant_id, key=GTM_INTELLIGENCE_SCHEDULE_PARAMETER_KEY, value={"hour": hour, "minute": minute},
+            description="Fixed daily UTC time the GTM intelligence sensing cycle fires at",
+        )
+        db.add(param)
+    db.commit()

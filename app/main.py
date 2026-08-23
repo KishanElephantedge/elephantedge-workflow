@@ -10,7 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.db.session import SessionLocal, ensure_indexes
 from app.google_calendar_client import GoogleCalendarError
 from app.gtm_os.governance.governance import compute_and_store_governance_snapshot
-from app.gtm_os.orchestration.control import ControlPlaneHalted, check_can_run
+from app.gtm_os.orchestration.control import ControlPlaneHalted, check_can_run, get_intelligence_schedule_utc
 from app.gtm_os.orchestration.sweep import (
     GtmIntelligenceRun,
     finish_gtm_intelligence_run,
@@ -125,17 +125,20 @@ def _scheduled_partner_matching_sweep():
 
 
 def _scheduled_gtm_intelligence_cycle():
-    """Runs every 60 minutes -- the full GTM Intelligence sweep (app/gtm_os/orchestration/
-    sweep.py): sensing (TheirStack/LinkedIn replies/Hacker News/RSS) -> interpretation -> Problem/
-    Demand hypotheses -> Opportunity -> ICP matching -> GTM strategy -> message generation ->
-    sales readiness -> outcome detection, and independently, configured topic linking -> candidate
-    extraction -> candidate normalization -> candidate promotion -> trend intelligence.
+    """Runs once daily, at a fixed configurable UTC time (see control.py's
+    get_intelligence_schedule_utc/set_intelligence_schedule_utc, default 10:00 UTC) -- the full
+    GTM Intelligence sweep (app/gtm_os/orchestration/sweep.py): sensing (TheirStack/LinkedIn
+    replies/Hacker News/RSS) -> interpretation -> Problem/Demand hypotheses -> Opportunity -> ICP
+    matching -> GTM strategy -> message generation -> sales readiness -> outcome detection, and
+    independently, configured topic linking -> candidate extraction -> candidate normalization ->
+    candidate promotion -> trend intelligence.
 
-    60 minutes, not the 45/15/5/3-minute cadence of the jobs above -- this cycle's
+    Was IntervalTrigger(minutes=60) until 2026-08-23 -- changed to a once-daily CronTrigger to
+    match V1's own daily autonomous cycle cadence/pattern (see reschedule_autonomous_job's own
+    docstring for why a fixed wall-clock time beats an interval timer: an interval's countdown
+    restarts on every deploy, so its actual fire time silently drifts). This cycle's
     candidate_extraction and message_generation stages make real LLM calls (see sweep.py's own
-    module docstring), so a tighter interval would multiply that cost for no proven benefit yet at
-    this feature's current (low) real signal volume. This interval is itself an operational
-    choice, not a calibrated one -- easy to tighten later once real volume is observed.
+    module docstring), so daily also keeps that cost bounded and predictable.
 
     Per this backend's own established single-tenant pattern (see _scheduled_autonomous_tick),
     this dedicated backend only ever runs its own tenant's cycle -- never loops over the shared
@@ -247,6 +250,22 @@ def reschedule_partner_matching_job(interval_minutes: int):
     scheduler.reschedule_job("partner_matching_sweep", trigger=IntervalTrigger(minutes=interval_minutes))
 
 
+INTELLIGENCE_CYCLE_MISFIRE_GRACE_SECONDS = 7200
+
+
+def reschedule_gtm_intelligence_job(hour: int, minute: int):
+    """Called from PUT /gtm-os/intelligence-schedule -- same "reschedule the live job, don't wait
+    for a restart" pattern as reschedule_autonomous_job above, and the same misfire_grace_time
+    reasoning: once this only fires once a day, a missed exact-second trigger (e.g. a deploy
+    landing mid-tick) would otherwise silently cost a full day's sensing cycle instead of firing
+    late as soon as the process is back."""
+    scheduler.reschedule_job(
+        "gtm_intelligence_cycle",
+        trigger=CronTrigger(hour=hour, minute=minute, timezone="UTC"),
+        misfire_grace_time=INTELLIGENCE_CYCLE_MISFIRE_GRACE_SECONDS,
+    )
+
+
 @app.on_event("startup")
 def on_startup():
     ensure_indexes()
@@ -255,6 +274,7 @@ def on_startup():
         hour, minute = get_autonomous_schedule_utc(db, ELEPHANT_EDGE_TENANT_ID)
         linkedin_monitor_interval_minutes = get_monitor_schedule(db, ELEPHANT_EDGE_TENANT_ID)["interval_minutes"]
         partner_matching_interval_minutes = get_match_schedule(db, ELEPHANT_EDGE_TENANT_ID)["interval_minutes"]
+        intelligence_hour, intelligence_minute = get_intelligence_schedule_utc(db, ELEPHANT_EDGE_TENANT_ID)
     finally:
         db.close()
     scheduler.add_job(
@@ -280,7 +300,15 @@ def on_startup():
     # Interval read from real, editable config (Targets > Settings), default daily -- see
     # app/phases/gtm_partner_matching.py.
     scheduler.add_job(_scheduled_partner_matching_sweep, "interval", minutes=partner_matching_interval_minutes, id="partner_matching_sweep")
-    scheduler.add_job(_scheduled_gtm_intelligence_cycle, "interval", minutes=60, id="gtm_intelligence_cycle")
+    # Once daily, fixed UTC time -- matches V1's own daily autonomous cycle cadence/pattern
+    # (CronTrigger at a configured hour/minute, not an interval timer whose "next fire" drifts on
+    # every deploy). Was IntervalTrigger(minutes=60) until 2026-08-23.
+    scheduler.add_job(
+        _scheduled_gtm_intelligence_cycle,
+        CronTrigger(hour=intelligence_hour, minute=intelligence_minute, timezone="UTC"),
+        id="gtm_intelligence_cycle",
+        misfire_grace_time=INTELLIGENCE_CYCLE_MISFIRE_GRACE_SECONDS,
+    )
     scheduler.add_job(_scheduled_governance_snapshot, "interval", minutes=60, id="governance_snapshot")
     scheduler.start()
 

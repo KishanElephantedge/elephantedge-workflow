@@ -3842,6 +3842,61 @@ def post_gtm_os_message_review(message_draft_id: int, payload: dict = Body(...),
     }
 
 
+@router.post("/gtm-os/messages/{message_draft_id}/regenerate")
+def post_gtm_os_message_regenerate(message_draft_id: int, payload: dict = Body(default={}), db: Session = Depends(get_db)):
+    """V2 Frontend Phase (Message Workspace) -- the real single-draft regeneration V2 never had.
+    Thin dispatch over regenerate_message_draft() (message_draft.py), which itself is a controlled
+    re-invocation of the existing, unmodified generate_message_draft() -- no new generation logic
+    lives in this route. Optional `contact_id` re-targets the regenerated draft at a different
+    eligible contact (validated against get_eligible_contacts() inside regenerate_message_draft()
+    itself, never trusted blindly); omitted or null regenerates for the same contact/decision-maker
+    resolution as before. Same real LLM call/cost profile as the existing generation path -- no
+    new spend mechanism, no bulk/batch behavior, exactly one draft per call."""
+    from app.gtm_os.learning.message_draft import regenerate_message_draft
+
+    contact_id = payload.get("contact_id")
+
+    try:
+        draft = regenerate_message_draft(db, ELEPHANT_EDGE_TENANT_ID, message_draft_id, contact_id=contact_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    return {
+        "id": draft.id, "opportunity_id": draft.opportunity_id, "contact_id": draft.contact_id,
+        "channel": draft.channel, "subject": draft.subject, "message_text": draft.message_text,
+        "status": draft.status, "missing_information": draft.missing_information,
+        "quality_gate_reasons": draft.quality_gate_reasons, "created_at": draft.created_at,
+    }
+
+
+@router.get("/gtm-os/opportunities/{opportunity_id}/eligible-contacts")
+def get_gtm_os_opportunity_eligible_contacts(opportunity_id: int, db: Session = Depends(get_db)):
+    """V2 Frontend Phase (Message Workspace) -- read-only wrapper over the existing
+    get_eligible_contacts() (app/gtm_os/sales/contact_discovery.py), unmodified. Real suppression
+    rule only (Contact.excluded_from_push) -- no new eligibility concept invented. Used by the
+    Message Workspace's "change recipient" control so only real, non-suppressed contacts for this
+    opportunity's company can ever be offered/selected."""
+    from app.gtm_os.opportunity.opportunity import Opportunity
+    from app.gtm_os.sales.contact_discovery import get_eligible_contacts
+
+    opportunity = db.get(Opportunity, opportunity_id)
+    if opportunity is None or opportunity.tenant_id != ELEPHANT_EDGE_TENANT_ID:
+        raise HTTPException(status_code=404, detail=f"no Opportunity {opportunity_id}")
+    if opportunity.company_id is None:
+        return {"contacts": []}
+
+    contacts = get_eligible_contacts(db, opportunity.company_id)
+    return {
+        "contacts": [
+            {
+                "id": c.id, "first_name": c.first_name, "last_name": c.last_name, "title": c.title,
+                "email": c.email, "linkedin_url": c.linkedin_url,
+            }
+            for c in contacts
+        ]
+    }
+
+
 # ---- V2 Efficiency (time-saved ledger) ----
 
 @router.get("/gtm-os/efficiency")
@@ -4152,6 +4207,35 @@ def get_gtm_os_control_status(db: Session = Depends(get_db)):
     from app.gtm_os.orchestration.control import get_control_status
 
     return get_control_status(db, ELEPHANT_EDGE_TENANT_ID)
+
+
+@router.get("/gtm-os/intelligence-schedule")
+def get_gtm_os_intelligence_schedule(db: Session = Depends(get_db)):
+    """Fixed daily UTC time the sensing cycle fires at -- was a hardcoded hourly interval until
+    2026-08-23, changed to once-daily to match V1's autonomous cycle's own cadence/pattern."""
+    from app.gtm_os.orchestration.control import get_intelligence_schedule_utc
+
+    hour, minute = get_intelligence_schedule_utc(db, ELEPHANT_EDGE_TENANT_ID)
+    return {"hour": hour, "minute": minute}
+
+
+@router.put("/gtm-os/intelligence-schedule")
+def put_gtm_os_intelligence_schedule(body: dict = Body(...), db: Session = Depends(get_db)):
+    """Applies immediately (no redeploy needed) -- reschedule_gtm_intelligence_job calls
+    scheduler.reschedule_job on the live APScheduler instance, same pattern as
+    /autonomous/schedule. Import deferred to avoid a circular import (main.py imports this
+    router; this route needs something back from main.py)."""
+    from app.gtm_os.orchestration.control import ControlPlaneConfigError, set_intelligence_schedule_utc
+
+    hour, minute = body.get("hour"), body.get("minute")
+    try:
+        set_intelligence_schedule_utc(db, ELEPHANT_EDGE_TENANT_ID, hour, minute)
+    except ControlPlaneConfigError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    from app.main import reschedule_gtm_intelligence_job
+    reschedule_gtm_intelligence_job(hour, minute)
+    return {"hour": hour, "minute": minute}
 
 
 # ---- Inbound Data reporting -- Google Analytics (traffic/channels) + Search Console (SEO/
