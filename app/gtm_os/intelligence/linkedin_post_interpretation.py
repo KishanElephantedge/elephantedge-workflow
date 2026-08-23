@@ -27,6 +27,8 @@ left for an explicitly-scoped future LLM-assisted pass, not guessed at with weak
 
 No LLM calls in this module."""
 
+import re
+
 from app.gtm_os.intelligence.interpreted_signal import InterpretedSignal
 from app.gtm_os.intelligence.signal import GtmSignal
 
@@ -119,6 +121,31 @@ def _matches_any(text_lower: str, phrases: list[str]) -> str | None:
     return None
 
 
+def _sentences(text: str) -> list[str]:
+    """Splits a post into sentence/clause-like chunks -- after a real sentence-ending mark
+    (. ? !) followed by whitespace. Handles LinkedIn's own common one-idea-per-line-break style
+    (each line already ends in its own punctuation) the same as a single-line multi-sentence
+    paragraph. A trailing hashtag/mention block with no terminal punctuation becomes its own
+    final, punctuation-less chunk -- it can never end in "?", so it's never mistaken for a
+    question. Pure regex split -- no keyword list, no scoring, no LLM."""
+    return [s.strip() for s in re.split(r"(?<=[.?!])\s+", text) if s.strip()]
+
+
+def _matched_clause_is_question(text: str, phrase: str) -> bool:
+    """Fixes the real bug found live in production signal 126: a genuine matching question
+    ("What's harder right now?") was rejected because the OLD check required the entire post to
+    end in "?", and something else (a closing remark, a hashtag block -- both extremely common on
+    LinkedIn) followed it. Determines whether the actual sentence/clause containing the matched
+    phrase itself is a real question, not whether the whole post happens to be. A post having real
+    commentary or hashtags after a genuine question no longer invalidates it -- but a phrase
+    appearing in a sentence that itself never ends in "?" (declarative, incidental, third-party
+    framing) still correctly fails here, exactly as before."""
+    for sentence in _sentences(text):
+        if phrase in sentence.lower() and sentence.endswith("?"):
+            return True
+    return False
+
+
 def interpret_linkedin_post_signal(signal: GtmSignal) -> InterpretedSignal | None:
     """Checked in priority order (strongest, most specific claim first): a post could plausibly
     match more than one pattern set, and a declared problem statement is a stronger claim than an
@@ -142,7 +169,7 @@ def interpret_linkedin_post_signal(signal: GtmSignal) -> InterpretedSignal | Non
         )
 
     matched = _matches_any(text_lower, QUESTION_LEAD_PHRASES)
-    if matched and text.strip().endswith("?"):
+    if matched and _matched_clause_is_question(text, matched):
         return _build(
             signal, event_type="solution_question", affected_function=affected_function,
             business_change=f"{who} appears to be asking how others address a {affected_function}-related challenge.",
