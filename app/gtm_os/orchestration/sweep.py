@@ -112,6 +112,7 @@ at ERROR level, so a fatal infrastructure issue is fully visible to any caller, 
 as structured failure data rather than a raised exception out of this function."""
 
 import logging
+import re
 from datetime import datetime
 
 from sqlalchemy import Column, DateTime, Integer, JSON, String
@@ -182,11 +183,53 @@ def start_gtm_intelligence_run(db: Session, tenant_id: int) -> GtmIntelligenceRu
     return run
 
 
+def _concise_error(error: str, max_len: int = 160) -> str:
+    """Best-effort SHORT excerpt of a raw error string, for a run's error_summary -- never
+    raises, always falls back to plain truncation. Real provider errors (e.g. Deepline's
+    theirstack_job_search failure) are often a multi-KB JSON blob; a human-readable "message"
+    field, when present, is far more useful here than the raw blob's own opening text."""
+    match = re.search(r'"message":\s*"((?:[^"\\]|\\.)*)"', error)
+    text = match.group(1) if match else error
+    text = " ".join(text.split())  # collapse embedded newlines/whitespace
+    return text if len(text) <= max_len else text[:max_len].rstrip() + "..."
+
+
+def _collect_failure_summaries(result: dict) -> list[str]:
+    """Real, human-readable one-liners for every genuine "failed" condition in a sweep result --
+    both top-level stage failures (result[stage].status == "failed", the original, unchanged
+    detection) AND nested per-source failures (result["sources"][name].status == "failed") --
+    e.g. sources.theirstack_job failing on a real Deepline credit error, which the original
+    top-level-only scan never saw at all.
+
+    Deliberately narrow: only ever looks at status == "failed". Every other real, non-error
+    state a stage or source can be in today -- "skipped", "blocked_by_budget",
+    "configuration_required", or a "succeeded" result with a zero/no-data count -- is left
+    completely alone; none of those are errors, and this never reclassifies them as one."""
+    summaries = []
+    for key, value in result.items():
+        if key == "sources" or not isinstance(value, dict):
+            continue
+        if value.get("status") == "failed":
+            label = key.replace("_", " ").capitalize()
+            error = value.get("error")
+            summaries.append(f"{label} failed: {_concise_error(error)}" if error else f"{label} failed")
+
+    sources = result.get("sources")
+    if isinstance(sources, dict):
+        for name, value in sources.items():
+            if isinstance(value, dict) and value.get("status") == "failed":
+                label = name.replace("_", " ").capitalize()
+                error = value.get("error")
+                summaries.append(f"{label} failed: {_concise_error(error)}" if error else f"{label} failed")
+
+    return summaries
+
+
 def finish_gtm_intelligence_run(db: Session, run: GtmIntelligenceRun, result: dict) -> GtmIntelligenceRun:
-    failed_stages = [k for k, v in result.items() if isinstance(v, dict) and v.get("status") == "failed"]
+    failure_summaries = _collect_failure_summaries(result)
     run.status = result.get("status", "completed")
     run.stage_results = result
-    run.error_summary = f"{len(failed_stages)} stage(s) failed: {', '.join(failed_stages)}" if failed_stages else None
+    run.error_summary = "; ".join(failure_summaries) if failure_summaries else None
     run.completed_at = datetime.utcnow()
     db.commit()
     return run

@@ -4116,9 +4116,12 @@ def list_gtm_intelligence_runs(limit: int = 20, db: Session = Depends(get_db)):
 
 @router.post("/gtm-os/intelligence-runs/trigger")
 def trigger_gtm_intelligence_run(dry_run: bool = False, db: Session = Depends(get_db)):
-    """Manual trigger for testing -- the scheduled cycle runs automatically every 60 minutes; this
-    lets a run be checked immediately instead of waiting for the next tick. Same persisted
-    run-record as the scheduled path (unless dry_run=True, which persists nothing, matching
+    """Manual trigger -- the scheduled cycle runs automatically once daily, at a fixed configurable
+    UTC time (control.py's get_intelligence_schedule_utc); this lets a run be checked immediately
+    instead of waiting for the next scheduled occurrence -- same exact path as the scheduled tick,
+    no separate "test run" implementation (see body below: identical run_gtm_intelligence_sweep()
+    call, identical concurrency/stale-run/control-plane guards). Same persisted run-record as the
+    scheduled path (unless dry_run=True, which persists nothing, matching
     run_gtm_intelligence_sweep's own dry_run contract).
 
     V2 CONTROL PLANE (Phase 0): dry_run is always allowed (introspection only, no writes/external
