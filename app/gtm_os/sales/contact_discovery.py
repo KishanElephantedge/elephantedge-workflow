@@ -15,10 +15,45 @@ from sqlalchemy.orm import Session
 
 from app.budget_guard import BudgetExceededError, BudgetGuard
 from app.db.models import Batch, Company, Contact
+from app.deepline_client import DeeplineError, get_credit_balance_usd
 from app.gtm_os.opportunity.opportunity import Opportunity
 from app.gtm_os.orchestration.control import ControlPlaneHalted, check_can_run, get_control_config
 from app.gtm_os.strategy.strategy import GtmStrategy
-from app.phases.decision_maker import MAX_CONTACTS_PER_COMPANY, find_decision_makers
+from app.phases.decision_maker import CANDIDATES_PER_SEARCH, MAX_CONTACTS_PER_COMPANY, find_decision_makers
+
+# Real, documented paid-fallback cost model (decision_maker.py's own comments -- not invented
+# here): search_contact bills $0.056/result, up to CANDIDATES_PER_SEARCH results in one billed
+# call, and find_decision_makers tries at most PAID_FALLBACK_MAX_TIERS such calls per company
+# (CEO/Founder tier, then sales-leader tier, only if the quota still isn't filled).
+PAID_FALLBACK_COST_PER_RESULT_USD = 0.056
+PAID_FALLBACK_MAX_TIERS = 2
+
+
+def _estimate_max_paid_fallback_cost_usd() -> float:
+    return PAID_FALLBACK_MAX_TIERS * CANDIDATES_PER_SEARCH * PAID_FALLBACK_COST_PER_RESULT_USD
+
+
+def _check_paid_fallback_budget(contact_budget_usd: float) -> tuple[bool, str | None]:
+    """Real PRE-FLIGHT check, run BEFORE find_decision_makers() is ever given
+    allow_paid_fallback=True -- unlike BudgetGuard's own guard.check() (only called AFTER a paid
+    call already happened; a post-hoc spend detector, not a pre-emptive block, and the real gap
+    this fix closes). Returns (allowed, reason). Never raises -- an unavailable OR negative real
+    balance fails CLOSED (blocked), same fail-safe discipline as every other budget guard in this
+    codebase. Does not replace BudgetGuard -- that stays as a second, defense-in-depth check on
+    the ACTUAL post-call spend, unchanged."""
+    estimated_cost = _estimate_max_paid_fallback_cost_usd()
+    if estimated_cost > contact_budget_usd:
+        return False, f"estimated max paid-fallback cost ${estimated_cost:.3f} exceeds configured limits.contact_discovery_daily_budget_usd ${contact_budget_usd:.2f}"
+
+    try:
+        balance = get_credit_balance_usd()
+    except DeeplineError as e:
+        return False, f"could not verify real Deepline balance before paid fallback: {e}"
+
+    if balance < estimated_cost:
+        return False, f"real Deepline balance ${balance:.4f} is insufficient for estimated max paid-fallback cost ${estimated_cost:.3f}"
+
+    return True, None
 
 
 def get_eligible_contacts(db: Session, company_id: int) -> list[Contact]:
@@ -116,10 +151,18 @@ def discover_contacts_for_opportunity(db: Session, tenant_id: int, opportunity: 
 
     existing_contacts = db.query(Contact).filter(Contact.company_id == company.id).all()
 
+    # Real, PRE-FLIGHT budget check -- runs BEFORE find_decision_makers() is ever allowed to
+    # attempt the paid Deepline fallback, closing the real gap where the free Jobo path always
+    # ran fine, but a paid attempt could fire before any budget/balance check happened at all
+    # (the old BudgetGuard.check() below only ever caught it AFTER the fact). The free path
+    # itself is never affected by this -- allow_paid_fallback=False still lets find_decision_makers
+    # run its free tier exactly as before, at $0 cost.
+    paid_allowed, paid_blocked_reason = _check_paid_fallback_budget(contact_budget_usd)
+
     guard = BudgetGuard(contact_budget_usd)
     try:
         new_contacts, used_paid = find_decision_makers(
-            company, db, tenant_id, allow_paid_fallback=True, max_contacts=MAX_CONTACTS_PER_COMPANY,
+            company, db, tenant_id, allow_paid_fallback=paid_allowed, max_contacts=MAX_CONTACTS_PER_COMPANY,
             existing_contacts=existing_contacts,
         )
     except BudgetExceededError:
@@ -128,9 +171,9 @@ def discover_contacts_for_opportunity(db: Session, tenant_id: int, opportunity: 
         return {"status": "failed", "opportunity_id": opportunity.id, "error": str(e)}
 
     if used_paid:
-        guard.check()  # raises BudgetExceededError to the caller if this call pushed spend over the cap
+        guard.check()  # still a second, defense-in-depth check on the ACTUAL post-call spend
 
-    return {
+    result = {
         "status": "succeeded",
         "opportunity_id": opportunity.id,
         "company_id": company.id,
@@ -138,6 +181,9 @@ def discover_contacts_for_opportunity(db: Session, tenant_id: int, opportunity: 
         "new_contact_ids": [c.id for c in new_contacts],
         "used_paid_fallback": used_paid,
     }
+    if not paid_allowed:
+        result["paid_fallback_blocked_reason"] = paid_blocked_reason
+    return result
 
 
 def run_v2_contact_discovery_sweep(db: Session, tenant_id: int, limit: int = 50) -> dict:

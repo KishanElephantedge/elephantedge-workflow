@@ -16,7 +16,10 @@ from datetime import datetime
 
 from sqlalchemy.orm import Session
 
-from app.gtm_os.intelligence.gap_identification import identify_investigation_gaps
+from app.gtm_os.intelligence.gap_identification import (
+    EVIDENCE_SOUGHT_ADDITIONAL_INDEPENDENT_EVIDENCE, EVIDENCE_SOUGHT_IDENTITY_RESOLUTION,
+    EVIDENCE_SOUGHT_OPENING_TIER, identify_investigation_gaps,
+)
 from app.gtm_os.intelligence.investigation_execution import execute_investigation_action
 from app.gtm_os.intelligence.investigation_feedback import process_investigation_feedback
 from app.gtm_os.intelligence.investigation_generation import generate_investigation_action
@@ -24,20 +27,62 @@ from app.gtm_os.intelligence.investigation_memory import InvestigationObjective,
 from app.gtm_os.intelligence.sensing_strategy import select_sensing_strategy
 from app.gtm_os.orchestration.control import get_control_config
 
+# Categorical closeness-to-Opportunity-eligibility, per gap_identification.py's own already-named
+# rules -- NOT a numeric/weighted score, just an ordering of the three real evidence_sought states
+# that already exist. ADDITIONAL_INDEPENDENT_EVIDENCE (Rule 4/opening-evidence-already-exists) is
+# genuinely one step from Opportunity eligibility; IDENTITY_RESOLUTION (Rule 3) already has
+# opening-tier Problem evidence, just blocked on a resolved company; OPENING_TIER (Rule 2) hasn't
+# established any Problem evidence for this company yet at all -- the furthest of the three.
+_EVIDENCE_SOUGHT_PROXIMITY_RANK = {
+    EVIDENCE_SOUGHT_ADDITIONAL_INDEPENDENT_EVIDENCE: 0,
+    EVIDENCE_SOUGHT_IDENTITY_RESOLUTION: 1,
+    EVIDENCE_SOUGHT_OPENING_TIER: 2,
+}
+_MIN_DATETIME = datetime.min
+
+
+def _objective_priority_key(objective: InvestigationObjective):
+    """Deterministic, real-field-only ordering -- every dimension here reads an already-real
+    column, never an invented/weighted score. Priority, highest first:
+      1. company-specific over company-agnostic (a real target_company_id only ever exists
+         because gap_identification.py already found a real ICPMatch for it -- Rules 2/3/4; a
+         company-agnostic objective (target_company_id=None) exists specifically because NO
+         ICPMatch exists yet at all -- Rule 1. So "company-specific" and "has a matched ICP" are
+         the same real fact here, not two separate signals to invent.
+      2. fewer attempts so far (a never-attempted objective is preferred over one already tried
+         and cooling down).
+      3. "freshest" eligibility -- next_eligible_at=None (never attempted, no cooldown standing
+         in the way at all) sorts as freshest; among cooldown-cleared objectives, the one whose
+         cooldown ended earliest (has been sitting ready longest) sorts next.
+      4. closest to Opportunity eligibility, via the real evidence_sought categories above.
+      5. id ascending -- the final, stable tie-break (unchanged from before)."""
+    is_company_agnostic = objective.target_company_id is None
+    proximity = _EVIDENCE_SOUGHT_PROXIMITY_RANK.get(objective.evidence_sought, 3)
+    return (
+        is_company_agnostic,
+        objective.attempts,
+        objective.next_eligible_at or _MIN_DATETIME,
+        proximity,
+        objective.id,
+    )
+
 
 def _select_bounded_objectives(db: Session, tenant_id: int, limit: int) -> list[InvestigationObjective]:
     """Eligible = not stopped AND (never attempted OR its cooldown has elapsed) -- reuses
-    is_eligible_for_attempt() (S1) row-by-row rather than re-deriving eligibility in SQL. Ordered
-    by id ascending (oldest-first) -- a stable tie-break, not a business priority score (no real
-    deterministic priority basis exists yet, per the approved architecture design)."""
+    is_eligible_for_attempt() (S1) row-by-row rather than re-deriving eligibility in SQL.
+
+    Ordered by _objective_priority_key() -- a real company-specific investigation (backed by an
+    actual ICPMatch) now genuinely outranks a company-agnostic one, rather than an arbitrary id
+    ordering always favoring whichever objective happened to be created first. Still a
+    deterministic tuple sort over existing real fields only -- no numeric/weighted score."""
     candidates = (
         db.query(InvestigationObjective)
         .filter(InvestigationObjective.tenant_id == tenant_id)
         .filter(InvestigationObjective.status != STATUS_STOPPED)
-        .order_by(InvestigationObjective.id.asc())
         .all()
     )
     eligible = [o for o in candidates if is_eligible_for_attempt(o)]
+    eligible.sort(key=_objective_priority_key)
     return eligible[:limit]
 
 
