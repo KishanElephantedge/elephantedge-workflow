@@ -70,6 +70,20 @@ def _objective_shape(db: Session, tenant_id: int, objective: InvestigationObject
     return SHAPE_GENERAL_PROBLEM
 
 
+def _evidence_capable(candidates: list[str]) -> list[str]:
+    """Filters to sources that can actually contribute to a Problem/Demand-evidence-seeking
+    objective through the EXISTING interpretation pipeline (SOURCE_CAPABILITIES'
+    interpreted_downstream, a real fact -- see that registry's own docstring for exactly how it's
+    derived). Execution capability alone (S5 being ABLE to run a source) is not the same question
+    as evidence suitability -- a source can be perfectly executable and still structurally
+    incapable of ever closing this kind of gap, because nothing downstream ever interprets its
+    signals into a ProblemHypothesis/DemandHypothesis. Applied to SHAPE_HIRING_TRIGGER and
+    SHAPE_GENERAL_PROBLEM only -- both seek opening-tier Problem/Demand evidence directly.
+    SHAPE_IDENTITY_RESOLUTION is a structurally different gap (resolving an ALREADY-opening-tier
+    Problem's company_id, not opening new evidence) and is untouched here."""
+    return [c for c in candidates if SOURCE_CAPABILITIES.get(c, {}).get("interpreted_downstream")]
+
+
 def _candidates_for_shape(db: Session, tenant_id: int, objective: InvestigationObjective, shape: str) -> list[str]:
     """Ordered by capability fit for the shape, per the principles in the module docstring --
     never by icp_id directly. See each shape's own comment for the real principle applied."""
@@ -77,10 +91,11 @@ def _candidates_for_shape(db: Session, tenant_id: int, objective: InvestigationO
         # "hiring-trigger evidence -> prefer a real hiring/job source" -- both are real structured
         # job sources; theirstack_job is wired into the hourly sweep AND budget-guarded today,
         # linkedin_job exists but has no approved search-criteria config yet (registry-recorded
-        # fact, not invented) so it's ranked second, not excluded.
-        base = ["theirstack_job", "linkedin_job"]
-        base.append("web_search")  # last-resort, per "broader web search only if cheaper sources inconclusive"
-        return base
+        # fact, not invented) so it's ranked second, not excluded. web_search is filtered out by
+        # _evidence_capable() below -- it's executable but never interpreted into Problem/Demand
+        # evidence, so offering it as a "last resort" would just spend real money for nothing.
+        base = ["theirstack_job", "linkedin_job", "web_search"]
+        return _evidence_capable(base)
 
     if shape == SHAPE_IDENTITY_RESOLUTION:
         # "company-specific unresolved evidence -> prefer a source capable of producing evidence
@@ -89,6 +104,10 @@ def _candidates_for_shape(db: Session, tenant_id: int, objective: InvestigationO
         # objective type needs. Deliberately NO generic fallback here: falling back to a
         # person-level or broad-web source for an identity-resolution gap would just produce
         # MORE unresolved-identity evidence, not resolve the one this objective already has.
+        # Deliberately NOT run through _evidence_capable() -- this shape's real job is resolving
+        # an EXISTING opening-tier Problem's company_id, not opening new Problem/Demand evidence
+        # from a fresh signal, so interpreted_downstream (which speaks to the latter) doesn't
+        # apply to it the same way; unchanged from before this fix.
         if not objective.target_company_id:
             return []
         company = db.get(Company, objective.target_company_id)
@@ -97,8 +116,9 @@ def _candidates_for_shape(db: Session, tenant_id: int, objective: InvestigationO
         return ["company_website"]
 
     # SHAPE_GENERAL_PROBLEM (default, covers Rule 1/2/4's company-agnostic and open-ended cases)
-    # "person-level problem evidence -> prefer person-level LinkedIn evidence"
-    return ["linkedin_post_search", "web_search"]
+    # "person-level problem evidence -> prefer person-level LinkedIn evidence". web_search filtered
+    # out by _evidence_capable() for the same reason as SHAPE_HIRING_TRIGGER above.
+    return _evidence_capable(["linkedin_post_search", "web_search"])
 
 
 def _currently_executable(db: Session, tenant_id: int, source: str) -> tuple[bool, str | None]:
@@ -132,14 +152,22 @@ def _currently_executable(db: Session, tenant_id: int, source: str) -> tuple[boo
     return True, None  # free or otherwise ungated (e.g. company_website) -- always executable
 
 
-def _deprioritize_just_attempted(candidates: list[str], objective: InvestigationObjective) -> list[str]:
-    """"Avoid selecting the same source repeatedly if it was just attempted... unless it's the
-    only viable option" -- moves objective.source_attempted to the back of the ordering rather
-    than excluding it outright, so an alternative wins when one exists (test 4) but the same
-    source can still be re-selected when it's genuinely the only candidate (test 5)."""
-    if not objective.source_attempted or objective.source_attempted not in candidates:
+def _rotate_by_attempts(candidates: list[str], objective: InvestigationObjective) -> list[str]:
+    """Deterministic round-robin starting point over the REAL, already-filtered candidate list,
+    using ONLY objective.attempts -- a column that already exists; no new "sources already
+    attempted" history/table is added for this. A single "last source tried" field (the previous
+    approach) can only ever avoid repeating the ONE most recent attempt -- with exactly 2 real
+    candidates, a 3rd attempt then silently repeats the 1st attempt's already-failed source. This
+    rotates the whole list by `attempts % len(candidates)` instead: with N real candidates and
+    attempts=0,1,2,..., every one gets a turn before any repeat -- e.g. 3 real candidates fully
+    cover a max_attempts=3 objective with ZERO repeats; 2 real candidates still repeat on the 3rd
+    (only 2 exist to rotate through -- not an invented score, just the honest ceiling of what's
+    actually available), but only after both have genuinely had a turn, never before. Never
+    reorders by anything except this rotation -- not a numeric score, a plain index shift."""
+    if not candidates:
         return candidates
-    return [c for c in candidates if c != objective.source_attempted] + [objective.source_attempted]
+    offset = objective.attempts % len(candidates)
+    return candidates[offset:] + candidates[:offset]
 
 
 def select_sensing_strategy(db: Session, tenant_id: int, objective: InvestigationObjective) -> dict:
@@ -159,7 +187,7 @@ def select_sensing_strategy(db: Session, tenant_id: int, objective: Investigatio
 
     shape = _objective_shape(db, tenant_id, objective)
     candidates = _candidates_for_shape(db, tenant_id, objective, shape)
-    candidates = _deprioritize_just_attempted(candidates, objective)
+    candidates = _rotate_by_attempts(candidates, objective)
 
     if not candidates:
         return _no_strategy(objective, f"no viable sensing source exists for objective shape {shape!r} given current state (e.g. no company domain on file) -- not inventing one")
@@ -191,9 +219,12 @@ def select_sensing_strategy(db: Session, tenant_id: int, objective: Investigatio
     capability = SOURCE_CAPABILITIES[chosen]
     reused_note = ""
     if objective.source_attempted and chosen == objective.source_attempted:
-        reused_note = f" (re-selected {chosen!r} despite a prior attempt -- no viable alternative exists for this objective shape, respecting attempt/cooldown limits already enforced above)"
+        if len(candidates) == 1:
+            reused_note = f" (re-selected {chosen!r} despite a prior attempt -- it's the only evidence-capable, currently-executable candidate for this objective shape)"
+        else:
+            reused_note = f" (re-selected {chosen!r} -- attempt #{objective.attempts + 1} has rotated back to it after trying every other real candidate; not repeating without having covered the alternatives first)"
     elif objective.source_attempted:
-        reused_note = f" (avoided repeating {objective.source_attempted!r}, just attempted)"
+        reused_note = f" (rotated to a different source than {objective.source_attempted!r}, its most recent attempt, per attempt #{objective.attempts + 1}'s round-robin position)"
 
     return {
         "source": chosen,

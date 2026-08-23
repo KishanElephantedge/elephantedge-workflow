@@ -14,7 +14,29 @@ could invoke them directly, same as any on-demand tool call already does elsewhe
 codebase), it just records honestly that today's automatic hourly cycle won't reach them itself.
 
 Cost categories are deliberately NOT invented for sources with no real documented cost --
-`cost_category="cost_unknown"` is used, never guessed. See COST section per source below."""
+`cost_category="cost_unknown"` is used, never guessed. See COST section per source below.
+
+`interpreted_downstream` -- a real, binary fact, not a guess: does ANY interpreter exist for
+this source's real GtmSignal rows in the existing pipeline at all (app/gtm_os/intelligence/
+interpretation.py's own _INTERPRETERS dispatch table, mirrored here the same way
+`wired_into_hourly_sweep` already mirrors sweep.py's SWEEPABLE_SOURCES -- a recorded fact, not a
+re-import, since source_capabilities.py sits upstream of sweep.py in the import graph). Each
+source's underlying GtmSignal.source value is confirmed directly against each sense_*() adapter
+in sensing.py: linkedin_post_search -> "linkedin_post", linkedin_job -> "linkedin_job",
+theirstack_job -> "theirstack_job", linkedin_reply -> "linkedin_reply" -- all four appear in
+sweep.py's ALL_INTERPRETED_SOURCES. web_search -> "web_search" and company_website ->
+"company_website" do NOT appear there -- confirmed, not assumed: no interpreter is registered for
+either, so a signal from them can never become a ProblemHypothesis/DemandHypothesis today,
+regardless of how good its raw content is. hackernews_story/rss_article feed an entirely
+separate branch (Content Intelligence -- topic_linking/candidate_extraction), never
+interpretation.py's dispatch table at all, so they're also False here -- true to what "opening-
+tier Problem/Demand evidence" actually requires, not a comment on their own real, separate value.
+
+This does NOT claim a source is GUARANTEED to reach opening tier (declared/implied_gap) -- tier
+classification depends on the signal's own content (problem_detection.classify_evidence_tier()),
+never on which source produced it. It only answers "can this source's evidence enter the
+Problem/Demand pipeline via an existing interpreter AT ALL" -- the honest, verifiable
+precondition, nothing more."""
 
 # apify_client.py: LINKEDIN_POST_COST_PER_POST_USD = 0.002 (confirmed real, pay-per-post)
 # apify_client.py: COST_PER_JOB_USD = 0.005, COST_PER_RUN_USD = 0.01 (confirmed real)
@@ -44,6 +66,7 @@ SOURCE_CAPABILITIES: dict[str, dict] = {
         "cost_category": COST_APIFY_PER_POST,
         "fallback_allowed": True,
         "wired_into_hourly_sweep": True,
+        "interpreted_downstream": True,  # GtmSignal.source="linkedin_post", in ALL_INTERPRETED_SOURCES
     },
     "linkedin_job": {
         "evidence_type": "structured job-posting title (company-published)",
@@ -53,6 +76,7 @@ SOURCE_CAPABILITIES: dict[str, dict] = {
         "cost_category": COST_APIFY_PER_JOB_PLUS_RUN,
         "fallback_allowed": True,
         "wired_into_hourly_sweep": False,  # confirmed: no approved search-criteria/profile-list config exists yet (sweep.py docstring)
+        "interpreted_downstream": True,  # GtmSignal.source="linkedin_job", in ALL_INTERPRETED_SOURCES
     },
     "theirstack_job": {
         "evidence_type": "structured job-posting (title + real firmographics: revenue/employee/funding)",
@@ -62,6 +86,7 @@ SOURCE_CAPABILITIES: dict[str, dict] = {
         "cost_category": COST_DEEPLINE_BUDGET_GUARDED,
         "fallback_allowed": True,
         "wired_into_hourly_sweep": True,
+        "interpreted_downstream": True,  # GtmSignal.source="theirstack_job", in ALL_INTERPRETED_SOURCES
     },
     "web_search": {
         "evidence_type": "broad open-web text (Google AI Overview) -- least targeted, most expensive",
@@ -71,6 +96,7 @@ SOURCE_CAPABILITIES: dict[str, dict] = {
         "cost_category": COST_APIFY_PER_QUERY,
         "fallback_allowed": True,  # explicitly the last-resort fallback per the approved design's own cheapest-first principle
         "wired_into_hourly_sweep": False,  # on-demand tool only, confirmed via sweep.py docstring
+        "interpreted_downstream": False,  # GtmSignal.source="web_search" -- confirmed NOT in ALL_INTERPRETED_SOURCES; no interpreter registered
     },
     "company_website": {
         "evidence_type": "company-published marketing/product text -- always tied to exactly one known company/domain",
@@ -80,6 +106,7 @@ SOURCE_CAPABILITIES: dict[str, dict] = {
         "cost_category": COST_FREE,
         "fallback_allowed": True,
         "wired_into_hourly_sweep": False,  # on-demand tool only, confirmed via sweep.py docstring
+        "interpreted_downstream": False,  # GtmSignal.source="company_website" -- confirmed NOT in ALL_INTERPRETED_SOURCES; no interpreter registered
     },
     "hackernews_story": {
         "evidence_type": "public tech-community discussion matching configured Content Intelligence topics",
@@ -89,6 +116,7 @@ SOURCE_CAPABILITIES: dict[str, dict] = {
         "cost_category": COST_FREE,
         "fallback_allowed": True,
         "wired_into_hourly_sweep": True,
+        "interpreted_downstream": False,  # feeds Content Intelligence (topic_linking/candidate_extraction), never interpretation.py's dispatch table
     },
     "rss_article": {
         "evidence_type": "published articles matching configured Content Intelligence topics",
@@ -98,6 +126,7 @@ SOURCE_CAPABILITIES: dict[str, dict] = {
         "cost_category": COST_FREE,
         "fallback_allowed": True,
         "wired_into_hourly_sweep": True,
+        "interpreted_downstream": False,  # feeds Content Intelligence (topic_linking/candidate_extraction), never interpretation.py's dispatch table
     },
     "linkedin_reply": {
         "evidence_type": "reply to an existing outreach message (already-known contact)",
@@ -107,6 +136,7 @@ SOURCE_CAPABILITIES: dict[str, dict] = {
         "cost_category": COST_APIFY_PER_POST,  # same underlying actor as linkedin_post_search
         "fallback_allowed": False,  # reactive-only; cannot be proactively selected as a fallback strategy
         "wired_into_hourly_sweep": True,
+        "interpreted_downstream": True,  # GtmSignal.source="linkedin_reply", in ALL_INTERPRETED_SOURCES (moot in practice -- fallback_allowed=False already excludes it as an S3 candidate)
     },
 }
 
