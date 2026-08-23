@@ -114,8 +114,9 @@ as structured failure data rather than a raised exception out of this function."
 import logging
 import re
 from datetime import datetime
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from sqlalchemy import Column, DateTime, Integer, JSON, String
+from sqlalchemy import Column, DateTime, Integer, JSON, String, func
 from sqlalchemy.orm import Session
 
 from app.db.models import Base, Parameter
@@ -136,10 +137,10 @@ from app.gtm_os.intelligence.sensing import (
     sense_linkedin_replies,
     sense_rss_articles,
 )
-from app.gtm_os.learning.message_draft import run_message_generation_sweep
+from app.gtm_os.learning.message_draft import MessageDraft, run_message_generation_sweep
 from app.gtm_os.learning.outcome import run_outcome_detection_sweep
 from app.gtm_os.opportunity.opportunity import run_opportunity_intelligence_sweep
-from app.gtm_os.orchestration.control import get_control_config
+from app.gtm_os.orchestration.control import ControlPlaneHalted, check_can_run, get_control_config
 from app.gtm_os.orchestration.discovery import run_v2_discovery_if_due
 from app.gtm_os.sales.contact_discovery import run_v2_contact_discovery_sweep
 from app.gtm_os.sales.outreach_sequencing import run_v2_outreach_sequencing_sweep
@@ -838,4 +839,143 @@ def run_gtm_intelligence_sweep(
         result["status"] = "failed"
     else:
         result["status"] = "completed"
+    return result
+
+
+def _flow_window_start(db: Session, tenant_id: int, now: datetime | None = None) -> datetime:
+    """Midnight of the current day, in the tenant's own configured business_hours.timezone (the
+    one real, already-existing tenant-timezone field in this codebase -- see control.py's
+    DEFAULT_GTM_OS_CONTROL_CONFIG) -- reused rather than introducing a second timezone concept.
+    Falls back to UTC on a missing/invalid zone string, same fail-safe pattern
+    is_within_business_hours() already uses. Returned as a naive UTC datetime (matching every
+    other timestamp column in this codebase, e.g. MessageDraft.created_at), for direct comparison
+    against DB-stored values."""
+    now = now or datetime.utcnow()
+    tz_name = (get_control_config(db, tenant_id).get("business_hours") or {}).get("timezone") or "UTC"
+    try:
+        zone = ZoneInfo(tz_name)
+    except ZoneInfoNotFoundError:
+        zone = ZoneInfo("UTC")
+    local_now = now.replace(tzinfo=ZoneInfo("UTC")).astimezone(zone)
+    local_midnight = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
+    return local_midnight.astimezone(ZoneInfo("UTC")).replace(tzinfo=None)
+
+
+def count_completed_flows_today(db: Session, tenant_id: int, now: datetime | None = None) -> int:
+    """A completed 'flow' = one distinct Opportunity that has at least one real, usable
+    MessageDraft (status 'ready_for_review' or 'approved' -- NOT 'draft', which failed the
+    quality gate, and NOT 'insufficient_context'), created since local midnight today. Reuses the
+    existing MessageDraft/Opportunity lineage exactly as verified before implementation:
+    Opportunity.demand_hypothesis_id carries a real DB-level UNIQUE index
+    (ix_opportunities_demand_hypothesis, app/db/session.py) guaranteeing one Opportunity per
+    independent Problem/Demand lineage, so COUNT(DISTINCT opportunity_id) here is exactly
+    COUNT(DISTINCT flow) -- no new Flow table, no new counter column. Multiple MessageDrafts for
+    the same Opportunity (one per contact, per V2 Phase 8) correctly count once."""
+    window_start = _flow_window_start(db, tenant_id, now)
+    return (
+        db.query(func.count(func.distinct(MessageDraft.opportunity_id)))
+        .filter(
+            MessageDraft.tenant_id == tenant_id,
+            MessageDraft.status.in_(("ready_for_review", "approved")),
+            MessageDraft.created_at >= window_start,
+        )
+        .scalar()
+        or 0
+    )
+
+
+def _no_eligible_work_remaining(result: dict) -> bool:
+    """True only when literally nothing new could have entered ANY flow's lineage this
+    iteration -- checked at the origin of the pipeline (sensing + investigation + interpretation),
+    never inferred from "zero new completed flows" (per the explicit zero-progress rule: a flow
+    can legitimately take several iterations to mature from Signal through to MessageDraft).
+
+    Reasoning: every downstream stage (opportunity/icp_matching/gtm_strategy/contact_discovery/
+    message_generation) is already a pure, idempotent full re-scan of EXISTING rows (see each
+    stage's own docstring -- "safe to run every cycle even with near-zero real data", never
+    duplicates on an unchanged rerun). Re-running them again against the exact same upstream data
+    they already saw cannot produce a new flow -- a new flow can only originate from either a
+    genuinely new sensed signal, a new investigation attempt, or a newly-created interpretation.
+    So checking only these three origin-level counts (not every individual downstream counter) is
+    sufficient and correct, without needing any of the six existing stage functions to be
+    modified or given a new rejection vocabulary."""
+    total_new_signals = sum(
+        source.get("signals_created", 0)
+        for source in (result.get("sources") or {}).values()
+        if isinstance(source, dict) and source.get("status") == "succeeded"
+    )
+    objectives_processed = (result.get("investigation_cycle") or {}).get("objectives_processed", 0)
+    interpretation_created = (result.get("interpretation") or {}).get("created", 0)
+    return total_new_signals == 0 and objectives_processed == 0 and interpretation_created == 0
+
+
+def run_gtm_daily_flow_cycle(db: Session, tenant_id: int) -> dict:
+    """Wraps the existing, UNMODIFIED run_gtm_intelligence_sweep() in an outer target-seeking
+    loop -- per the approved 2026-08-24 design, adds daily_flow_target/max_iterations_per_run
+    WITHOUT rewriting any of the five independent batch stages into a serial per-company/per-flow
+    loop. Each iteration is one full, ordinary call to run_gtm_intelligence_sweep(); the
+    controller only measures outcomes between iterations, it never selects candidates itself.
+
+    BACKWARD COMPATIBLE BY CONSTRUCTION: when flow_target.daily_flow_target or
+    flow_target.max_iterations_per_run is unconfigured (both None by default -- see control.py),
+    this runs run_gtm_intelligence_sweep() exactly ONCE and returns its result completely
+    unchanged, identical to calling it directly. Nothing changes for any tenant until both are
+    explicitly set -- same "None never means unlimited, and never changes default behavior"
+    discipline as every other cap in this config.
+
+    Every existing safety control composes unchanged: control-plane state is re-checked every
+    iteration (not just once at the start -- a pause mid-run stops the NEXT iteration from
+    starting), and every provider/spend budget (apify/discovery/contact-discovery) is enforced
+    exactly as it already is inside each call to run_gtm_intelligence_sweep()."""
+    config = get_control_config(db, tenant_id)
+    flow_target_config = config.get("flow_target") or {}
+    daily_flow_target = flow_target_config.get("daily_flow_target")
+    max_iterations_per_run = flow_target_config.get("max_iterations_per_run")
+
+    if not daily_flow_target or not max_iterations_per_run:
+        return run_gtm_intelligence_sweep(db, tenant_id)
+
+    now = datetime.utcnow()
+    count_at_run_start = count_completed_flows_today(db, tenant_id, now)
+
+    result: dict = {}
+    iterations_run = 0
+    stop_reason = None
+
+    while True:
+        try:
+            check_can_run(db, tenant_id)
+        except ControlPlaneHalted as e:
+            stop_reason = "control_plane_halted"
+            if iterations_run == 0:
+                result = {"status": "skipped", "reason": str(e)}
+            break
+
+        result = run_gtm_intelligence_sweep(db, tenant_id)
+        iterations_run += 1
+
+        # daily_flow_target is a DAY-cumulative total (count_at_run_start already includes any
+        # flows completed earlier today, e.g. from an earlier manual "Run Now") -- not "10 new
+        # flows produced by this particular invocation."
+        current_count = count_completed_flows_today(db, tenant_id)
+
+        if current_count >= daily_flow_target:
+            stop_reason = "target_reached"
+            break
+        if iterations_run >= max_iterations_per_run:
+            stop_reason = "iteration_ceiling_reached"
+            break
+        if _no_eligible_work_remaining(result):
+            stop_reason = "no_eligible_work_remaining"
+            break
+
+    final_count = count_completed_flows_today(db, tenant_id, now)
+    result["flow_target"] = {
+        "daily_flow_target": daily_flow_target,
+        "count_at_run_start": count_at_run_start,
+        "completed_flow_count_now": final_count,
+        "new_flows_this_run": final_count - count_at_run_start,
+        "iterations_run": iterations_run,
+        "stop_reason": stop_reason,
+    }
     return result

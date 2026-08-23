@@ -115,6 +115,23 @@ DEFAULT_GTM_OS_CONTROL_CONFIG: dict = {
         "daily_budget_usd": None,
         "monthly_budget_usd": None,
     },
+    # Daily flow target (2026-08-24 design) -- "a flow" = one Opportunity that has reached a
+    # real, usable MessageDraft (status "ready_for_review" or "approved" -- never "draft"/
+    # "insufficient_context"), per the approved definition. Wraps the existing, UNCHANGED
+    # run_gtm_intelligence_sweep() in an outer loop (see run_gtm_daily_flow_cycle in sweep.py)
+    # rather than rewriting any stage into a serial per-company loop. Both None (unconfigured)
+    # until an operator sets real numbers -- same "don't invent a business figure" discipline as
+    # every other cap in this config. Unconfigured means the daily cycle keeps running exactly
+    # one pass, exactly as it always has -- this block changes nothing until explicitly set.
+    "flow_target": {
+        "daily_flow_target": None,
+        # Bounds how many times the outer loop may re-invoke the existing sweep while chasing
+        # daily_flow_target -- a genuinely new safety ceiling (nothing existing bounds "how much
+        # candidate work happens while chasing an unmet target", per the approved design's own
+        # finding). Deliberately NOT given a seeded default the way retry.max_attempts is --
+        # this is a real business/cost decision, not a technical tuning constant.
+        "max_iterations_per_run": None,
+    },
 }
 
 
@@ -212,6 +229,12 @@ def _validate_control_config(config: dict) -> None:
     if not isinstance(sequencing, dict):
         raise ControlPlaneConfigError("'sequencing' must be an object")
     _validate_positive_int_or_none(sequencing.get("fallback_delay_hours"), "sequencing.fallback_delay_hours")
+
+    flow_target = config.get("flow_target")
+    if not isinstance(flow_target, dict):
+        raise ControlPlaneConfigError("'flow_target' must be an object")
+    _validate_positive_int_or_none(flow_target.get("daily_flow_target"), "flow_target.daily_flow_target")
+    _validate_positive_int_or_none(flow_target.get("max_iterations_per_run"), "flow_target.max_iterations_per_run")
 
 
 def get_control_config(db: Session, tenant_id: int) -> dict:

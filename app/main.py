@@ -15,7 +15,7 @@ from app.gtm_os.orchestration.sweep import (
     GtmIntelligenceRun,
     finish_gtm_intelligence_run,
     recover_stale_gtm_intelligence_runs,
-    run_gtm_intelligence_sweep,
+    run_gtm_daily_flow_cycle,
     start_gtm_intelligence_run,
 )
 from app.phases.autonomous_orchestrator import get_autonomous_schedule_utc, resume_pending_approvals, run_daily_autonomous_cycle
@@ -181,7 +181,7 @@ def _scheduled_gtm_intelligence_cycle():
             return
 
         run = start_gtm_intelligence_run(db, ELEPHANT_EDGE_TENANT_ID)
-        result = run_gtm_intelligence_sweep(db, tenant_id=ELEPHANT_EDGE_TENANT_ID)
+        result = run_gtm_daily_flow_cycle(db, tenant_id=ELEPHANT_EDGE_TENANT_ID)
         finish_gtm_intelligence_run(db, run, result)
         logging.getLogger(__name__).info("gtm_intelligence_cycle: %s", result)
     finally:
