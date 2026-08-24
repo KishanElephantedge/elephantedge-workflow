@@ -125,6 +125,12 @@ def run_investigation_cycle(db: Session, tenant_id: int) -> dict:
             results.append({
                 "objective_id": objective.id, "icp_id": objective.icp_id, "target_company_id": objective.target_company_id,
                 "strategy_source": strategy.get("source"), "exec_status": execution.get("status"), "feedback_result": feedback.get("result"),
+                # Real bug fix (2026-08-24): execute_investigation_action() already returns
+                # error_reason/raw_result_count on every outcome -- this just never persisted
+                # them, making a real provider_failed outcome undiagnosable afterward without an
+                # ad-hoc reproduction (confirmed live: run 94's two provider_failed objectives
+                # had no recoverable error text anywhere).
+                "error_reason": execution.get("error_reason"), "raw_result_count": execution.get("raw_result_count"),
             })
         except Exception as e:  # noqa: BLE001 -- one objective's failure must never block the others
             any_failed = True
