@@ -102,6 +102,14 @@ def sense_linkedin_jobs(
         # ever produced. org_linkedin_website/org_linkedin_headcount are real, already-present
         # fields captured here for the first time -- free byproducts of the same billed call,
         # not a new lookup -- kept in extracted_info for a future company-enrichment pass to use.
+        #
+        # 2026-08-24 addition: description_text (the REAL, full job description body) and several
+        # other AI-extracted/firmographic fields were confirmed present in the raw actor response
+        # but never captured anywhere -- also free byproducts of the same billed call. Captured
+        # here so a future JD-content classifier (distinguishing a genuine first-sales-hire/
+        # building-from-scratch gap from an ordinary scaling hire -- exactly the missing context
+        # problem_detection.py's own docstring names as the reason hiring_activity stays
+        # contextual-tier-only) has real text to work with instead of just a bare job title.
         signal = GtmSignal(
             tenant_id=tenant_id,
             source="linkedin_job",
@@ -115,6 +123,14 @@ def sense_linkedin_jobs(
                 "location": item.get("location"),
                 "organization_domain": item.get("org_linkedin_website"),
                 "organization_headcount": item.get("org_linkedin_headcount"),
+                "description_text": item.get("description_text"),
+                "seniority": item.get("seniority"),
+                "ai_experience_level": item.get("ai_experience_level"),
+                "ai_core_responsibilities": item.get("ai_core_responsibilities"),
+                "ai_requirements_summary": item.get("ai_requirements_summary"),
+                "organization_industry": item.get("org_linkedin_industry"),
+                "organization_founded_date": item.get("org_linkedin_founded_date"),
+                "organization_description": item.get("org_linkedin_description"),
             },
             dedup_key=_dedup_key("linkedin_job", source_ref),
         )

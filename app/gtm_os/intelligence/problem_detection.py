@@ -66,6 +66,16 @@ from app.gtm_os.orchestration.control import get_control_config
 # Deliberately left OUT of this map so it falls through to DEFAULT_EVIDENCE_TIER ("contextual"),
 # same conservative default hiring_activity already relies on -- listed here only so a future
 # reader doesn't miss that this event_type exists and is intentionally contextual, not forgotten.
+#
+# "first_sales_hire_signal" (2026-08-24 addition, linkedin_job_interpretation.py): NOT a blanket
+# promotion of hiring_activity -- this is a separate event_type that only ever gets created when
+# the REAL job description text itself (not the title, not company size) indicates the company is
+# hiring its first dedicated salesperson or building the sales function from scratch. That is
+# exactly the context this module's own docstring named as the thing missing that would otherwise
+# justify treating a hiring signal as more than contextual -- now that the JD text is actually
+# read, this is real, JD-grounded evidence, not an unstructured title guess. implied_gap, same
+# standing as solution_question/solution_evaluation_mention: strong enough to open a hypothesis,
+# not as direct as a declared first-person problem statement.
 EVENT_TYPE_TIERS: dict[str, str] = {
     "hiring_activity": "contextual",
     "problem_statement": "declared",
@@ -73,6 +83,7 @@ EVENT_TYPE_TIERS: dict[str, str] = {
     "solution_evaluation_mention": "implied_gap",
     "solution_adoption_mention": "contextual",
     "growth_hiring_mention": "contextual",
+    "first_sales_hire_signal": "implied_gap",
     # "market_pattern_observation" intentionally absent -- see comment above.
 }
 DEFAULT_EVIDENCE_TIER = "contextual"

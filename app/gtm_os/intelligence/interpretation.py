@@ -24,6 +24,7 @@ layers."""
 from sqlalchemy.orm import Session
 
 from app.gtm_os.intelligence.interpreted_signal import InterpretedSignal
+from app.gtm_os.intelligence.linkedin_job_interpretation import FIRST_HIRE_EVENT_TYPE, classify_job_description
 from app.gtm_os.intelligence.linkedin_post_interpretation import (
     interpret_linkedin_post_signal,
     interpret_linkedin_post_signals_grouped,
@@ -49,29 +50,55 @@ ROLE_LABEL = {
 }
 
 
-def _interpret_job_signal(signal: GtmSignal) -> InterpretedSignal | None:
+def _interpret_job_signal(signal: GtmSignal, db=None, tenant_id: int | None = None) -> InterpretedSignal | None:
     """Shared deterministic logic for both job-posting sources -- linkedin_job and
     theirstack_job both store the job title the same way in extracted_info["title"] (see
     app/gtm_os/intelligence/sensing.py), so one rule covers both.
 
     Returns None (creates nothing) if the title doesn't match a known sales/marketing role --
     a low-confidence guess isn't a better outcome than no interpretation at all, matching the
-    company_website precedent from the Step 4 design doc."""
+    company_website precedent from the Step 4 design doc.
+
+    2026-08-24 addition: for linkedin_job specifically (never theirstack_job, which has no JD
+    body captured), when db/tenant_id are supplied and a real job description is on file
+    (extracted_info["description_text"]), an additional semantic pass (see
+    linkedin_job_interpretation.classify_job_description) may promote the base "hiring_activity"
+    event to "first_sales_hire_signal" -- but only when the REAL JD text itself supports it. The
+    base title-matched result is unchanged either way; this only ever upgrades what event_type/
+    business_change/evidence gets attached to it."""
     title = (signal.extracted_info or {}).get("title")
     if not title:
         return None
     role = _classify_role(title)
     if role is None:
         return None
+
+    event_type = "hiring_activity"
+    business_change = f"{signal.company_name_raw or 'This company'} appears to be hiring for {ROLE_LABEL.get(role, role)} role."
+    evidence_excerpt = title
+    extraction_method = "deterministic:role_title_keyword_match"
+
+    if signal.source == "linkedin_job" and db is not None and tenant_id is not None:
+        description_text = (signal.extracted_info or {}).get("description_text")
+        promotion = classify_job_description(title, description_text, db, tenant_id) if description_text else None
+        if promotion is not None:
+            event_type = promotion["event_type"]
+            business_change = (
+                f"{signal.company_name_raw or 'This company'}'s job description for {ROLE_LABEL.get(role, role)} "
+                f"indicates this is a first sales hire / building the sales function from scratch."
+            )
+            evidence_excerpt = promotion["quote"]
+            extraction_method = "llm_semantic:first_sales_hire_signal"
+
     return InterpretedSignal(
         tenant_id=signal.tenant_id,
         source_signal_id=signal.id,
-        event_type="hiring_activity",
+        event_type=event_type,
         affected_function=ROLE_AFFECTED_FUNCTION.get(role, "unknown"),
-        business_change=f"{signal.company_name_raw or 'This company'} appears to be hiring for {ROLE_LABEL.get(role, role)} role.",
-        evidence_excerpt=title,
-        extraction_method="deterministic:role_title_keyword_match",
-        extraction_confidence="high",
+        business_change=business_change,
+        evidence_excerpt=evidence_excerpt,
+        extraction_method=extraction_method,
+        extraction_confidence="high" if event_type == "hiring_activity" else "medium",
         company_id=signal.company_id,
         company_name_raw=signal.company_name_raw,
         contact_id=signal.contact_id,
@@ -80,10 +107,10 @@ def _interpret_job_signal(signal: GtmSignal) -> InterpretedSignal | None:
     )
 
 
-def interpret_linkedin_job_signal(signal: GtmSignal) -> InterpretedSignal | None:
+def interpret_linkedin_job_signal(signal: GtmSignal, db=None, tenant_id: int | None = None) -> InterpretedSignal | None:
     if signal.source != "linkedin_job":
         raise ValueError(f"expected a linkedin_job signal, got {signal.source!r}")
-    return _interpret_job_signal(signal)
+    return _interpret_job_signal(signal, db=db, tenant_id=tenant_id)
 
 
 def interpret_theirstack_job_signal(signal: GtmSignal) -> InterpretedSignal | None:
@@ -158,7 +185,7 @@ def run_interpretation_sweep(
         interpreter = _INTERPRETERS.get(signal.source)
         if interpreter is None:
             continue
-        result = interpreter(signal)
+        result = interpreter(signal, db=db, tenant_id=tenant_id) if signal.source == "linkedin_job" else interpreter(signal)
         if result is not None:
             db.add(result)
             created.append(result)
