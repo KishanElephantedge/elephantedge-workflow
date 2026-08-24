@@ -941,6 +941,13 @@ def run_gtm_daily_flow_cycle(db: Session, tenant_id: int) -> dict:
     result: dict = {}
     iterations_run = 0
     stop_reason = None
+    # Real observability gap fix (2026-08-24, confirmed live -- run 96): result was overwritten
+    # each loop, so only the LAST iteration's investigation_cycle/opportunity/etc. counts were
+    # ever visible afterward -- earlier iterations' outcomes (e.g. what a since-exhausted
+    # objective's attempt actually returned) were unrecoverable without an ad-hoc reproduction.
+    # Keeps only the compact, diagnostically-useful subset per iteration, not the full result
+    # dict (which repeats large near-static blocks like icp_matching's 500-company scan).
+    iteration_history: list = []
 
     while True:
         try:
@@ -953,6 +960,14 @@ def run_gtm_daily_flow_cycle(db: Session, tenant_id: int) -> dict:
 
         result = run_gtm_intelligence_sweep(db, tenant_id)
         iterations_run += 1
+        iteration_history.append({
+            "iteration": iterations_run,
+            "investigation_cycle": result.get("investigation_cycle"),
+            "opportunity": result.get("opportunity"),
+            "gtm_strategy": result.get("gtm_strategy"),
+            "contact_discovery": result.get("contact_discovery"),
+            "message_generation": result.get("message_generation"),
+        })
 
         # daily_flow_target is a DAY-cumulative total (count_at_run_start already includes any
         # flows completed earlier today, e.g. from an earlier manual "Run Now") -- not "10 new
@@ -977,5 +992,6 @@ def run_gtm_daily_flow_cycle(db: Session, tenant_id: int) -> dict:
         "new_flows_this_run": final_count - count_at_run_start,
         "iterations_run": iterations_run,
         "stop_reason": stop_reason,
+        "iteration_history": iteration_history,
     }
     return result
