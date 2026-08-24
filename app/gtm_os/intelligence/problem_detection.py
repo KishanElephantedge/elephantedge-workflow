@@ -76,6 +76,12 @@ from app.gtm_os.orchestration.control import get_control_config
 # read, this is real, JD-grounded evidence, not an unstructured title guess. implied_gap, same
 # standing as solution_question/solution_evaluation_mention: strong enough to open a hypothesis,
 # not as direct as a declared first-person problem statement.
+#
+# "concurrent_hiring_surge" (2026-08-24 addition, interpretation.py's company-level job-signal
+# aggregation): 2+ distinct, real sales-role job postings open at the same company at once -- a
+# counted fact, not an inference from a single title. Real, active scaling pressure, same
+# implied_gap standing as first_sales_hire_signal -- an ordinary SINGLE hire stays "hiring_activity"
+# (contextual) exactly as before; only genuinely concurrent multi-role hiring is promoted.
 EVENT_TYPE_TIERS: dict[str, str] = {
     "hiring_activity": "contextual",
     "problem_statement": "declared",
@@ -84,6 +90,7 @@ EVENT_TYPE_TIERS: dict[str, str] = {
     "solution_adoption_mention": "contextual",
     "growth_hiring_mention": "contextual",
     "first_sales_hire_signal": "implied_gap",
+    "concurrent_hiring_surge": "implied_gap",
     # "market_pattern_observation" intentionally absent -- see comment above.
 }
 DEFAULT_EVIDENCE_TIER = "contextual"

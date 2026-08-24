@@ -43,11 +43,23 @@ from app.gtm_os.intelligence.signal import GtmSignal
 # solution_evaluation_mention, per the Step 11B spec's own instruction to represent these as a
 # stronger Demand tier rather than a new BuyingIntent object). "not_interested"/"timing_deferral"
 # are deliberately NOT registered here -- see linkedin_reply_interpretation.py's module docstring.
+#
+# 2026-08-24 additions (linkedin_job_interpretation.py / interpretation.py's concurrent-hiring
+# aggregation): "first_sales_hire_signal" (JD-content-verified: this is genuinely the company's
+# first dedicated sales hire / building the function from scratch) and "concurrent_hiring_surge"
+# (2+ distinct, real sales-role postings open at the same company at once -- a real, counted fact,
+# not an assumption) are both real, JD/count-grounded evidence of an actual gap, not just an
+# ordinary scaling hire (which stays "hiring_activity", still unlisted/non-qualifying here).
+# Tiered "demand" (the minimum qualifying bar, same as solution_question) -- explicitly NOT
+# "buying_intent_adjacent": a hiring decision, however strong, is not itself outward-looking
+# solution-seeking behavior the way evaluating a vendor or asking a pricing question is.
 DEMAND_EVENT_TYPE_TIERS: dict[str, str] = {
     "solution_question": "demand",  # general, non-vendor-specific ask -- Demand's own minimum bar
     "solution_evaluation_mention": "buying_intent_adjacent",  # actively evaluating a solution -- stronger, closer to (but not) buying intent
     "pricing_request": "buying_intent_adjacent",
     "demo_request": "buying_intent_adjacent",
+    "first_sales_hire_signal": "demand",
+    "concurrent_hiring_surge": "demand",
 }
 DEFAULT_DEMAND_TIER = "none"
 

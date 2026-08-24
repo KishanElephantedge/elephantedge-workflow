@@ -146,6 +146,40 @@ def _linkedin_post_group_key(signal: GtmSignal) -> tuple | None:
     return None
 
 
+def _promote_concurrent_hiring_signals(job_results: list[tuple[GtmSignal, InterpretedSignal]]) -> None:
+    """2026-08-24 addition, explicit instruction: a company with 2+ DISTINCT, real sales-role job
+    postings open at once is a stronger, genuinely counted signal than any one ordinary hire --
+    real scaling pressure, not an assumption. Groups this sweep's freshly-created linkedin_job
+    InterpretedSignal rows by company_name_raw (the real identity key for this source -- job
+    signals carry no profile URL); for any company with 2+ postings, every one of them that is
+    still plain "hiring_activity" (i.e. not already promoted to first_sales_hire_signal by the JD
+    classifier) is promoted to "concurrent_hiring_surge" -- implied_gap/demand-qualifying tier
+    (problem_detection.py/demand_detection.py), same standing as first_sales_hire_signal. A single
+    ordinary hire at a company with no other concurrent posting is left exactly as-is. Only counts
+    postings within THIS sweep's batch -- a company whose other concurrent postings were already
+    interpreted in an earlier sweep is not retroactively re-evaluated here (same documented scope
+    limitation as interpret_linkedin_post_signals_grouped)."""
+    by_company: dict[str, list[tuple[GtmSignal, InterpretedSignal]]] = {}
+    for signal, result in job_results:
+        if signal.company_name_raw:
+            by_company.setdefault(signal.company_name_raw, []).append((signal, result))
+
+    for company, items in by_company.items():
+        if len(items) < 2:
+            continue
+        titles = [(s.extracted_info or {}).get("title") or "unknown role" for s, _ in items]
+        for signal, result in items:
+            if result.event_type != "hiring_activity":
+                continue  # already promoted (first_sales_hire_signal) or otherwise -- leave as-is
+            result.event_type = "concurrent_hiring_surge"
+            result.business_change = (
+                f"{company} has {len(items)} distinct sales-role job postings open at once "
+                f"({', '.join(titles)}) -- a real concurrent hiring surge, not a single ordinary hire."
+            )
+            result.extraction_method = "deterministic:concurrent_hiring_count"
+            result.extraction_confidence = "medium"
+
+
 def run_interpretation_sweep(
     db: Session,
     tenant_id: int,
@@ -176,6 +210,7 @@ def run_interpretation_sweep(
     )
     created = []
     linkedin_post_signals = []
+    linkedin_job_results: list[tuple[GtmSignal, InterpretedSignal]] = []
     for signal in query:
         if signal.source == "linkedin_post":
             # Deferred to the grouped path below (2026-08-24 addition) instead of dispatched
@@ -189,6 +224,11 @@ def run_interpretation_sweep(
         if result is not None:
             db.add(result)
             created.append(result)
+            if signal.source == "linkedin_job":
+                linkedin_job_results.append((signal, result))
+
+    if linkedin_job_results:
+        _promote_concurrent_hiring_signals(linkedin_job_results)
 
     if linkedin_post_signals:
         groups: dict[tuple, list[GtmSignal]] = {}
