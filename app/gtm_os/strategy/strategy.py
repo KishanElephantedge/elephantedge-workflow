@@ -47,7 +47,8 @@ from app.gtm_os.content.trend_intelligence import evaluate_topic_trend
 from app.gtm_os.content.trend_config import get_trend_config
 from app.gtm_os.intelligence.demand_detection import DEMAND_QUALIFYING_TIERS
 from app.gtm_os.intelligence.demand_hypothesis import DemandHypothesis
-from app.gtm_os.intelligence.problem_hypothesis import ProblemHypothesis
+from app.gtm_os.intelligence.interpreted_signal import InterpretedSignal
+from app.gtm_os.intelligence.problem_hypothesis import ProblemHypothesis, ProblemHypothesisEvidence
 from app.gtm_os.icp.icp_offering_matching import match_offerings_for_opportunity
 from app.gtm_os.opportunity.opportunity import Opportunity
 
@@ -150,7 +151,40 @@ def market_context(db: Session, tenant_id: int) -> list[dict]:
     return context
 
 
-def _select_strategy_type(problem: ProblemHypothesis, demand: DemandHypothesis, opportunity: Opportunity, offering_fit_status: str) -> tuple[str, list[str]]:
+# 2026-08-25, explicit instruction: these three event types were built specifically so that a
+# JD-verified first sales hire, a genuinely counted concurrent multi-role hiring surge, or a real
+# head_of_sales-type hire, would each already BE the qualification work (real JD content read,
+# real postings counted, a real ICP-defining role type matched) -- not a raw, unverified signal
+# still awaiting confirmation the way a bare LinkedIn post inference is. Making the strategy layer
+# ask to "validate_problem" again for these specifically would just repeat verification already
+# done upstream. See linkedin_job_interpretation.py / interpretation.py's
+# _promote_concurrent_hiring_signals for where each of these is actually produced and verified.
+SELF_VERIFIED_HIRING_EVENT_TYPES = {"first_sales_hire_signal", "concurrent_hiring_surge", "leadership_hire_signal"}
+
+
+def _problem_has_self_verified_hiring_evidence(db: Session, problem: ProblemHypothesis) -> bool:
+    """True if ANY evidence linked to this ProblemHypothesis came from one of the
+    SELF_VERIFIED_HIRING_EVENT_TYPES above -- real, already-verified hiring evidence, not a raw
+    inference. Used only to skip the redundant validate_problem step/diagnostic strategy type for
+    that evidence specifically; every other evidence-tier gate (Opportunity eligibility, Demand
+    qualification, etc.) is completely untouched by this -- it only changes what the STRATEGY
+    layer recommends doing next, never what counts as real evidence."""
+    linked_signal_ids = [
+        row[0]
+        for row in db.query(ProblemHypothesisEvidence.interpreted_signal_id)
+        .filter(ProblemHypothesisEvidence.problem_hypothesis_id == problem.id)
+        .all()
+    ]
+    if not linked_signal_ids:
+        return False
+    event_types = {
+        row[0]
+        for row in db.query(InterpretedSignal.event_type).filter(InterpretedSignal.id.in_(linked_signal_ids)).all()
+    }
+    return bool(event_types & SELF_VERIFIED_HIRING_EVENT_TYPES)
+
+
+def _select_strategy_type(db: Session, problem: ProblemHypothesis, demand: DemandHypothesis, opportunity: Opportunity, offering_fit_status: str) -> tuple[str, list[str]]:
     """Pure, deterministic taxonomy selection -- reads ONLY Problem/Demand tiers, affected_function,
     and offering_fit_status. Never reads market/trend context (see module docstring)."""
     missing_information = []
@@ -160,6 +194,8 @@ def _select_strategy_type(problem: ProblemHypothesis, demand: DemandHypothesis, 
         return "insufficient_context", missing_information
 
     problem_tier = (problem.confidence or {}).get("best_evidence_tier")
+    if problem_tier == "implied_gap" and _problem_has_self_verified_hiring_evidence(db, problem):
+        problem_tier = "declared"  # already-verified hiring evidence -- treat as confirmed, same as a declared problem statement
     demand_tier = (demand.confidence or {}).get("best_evidence_tier")
 
     if problem_tier not in ("declared", "implied_gap") or demand_tier not in DEMAND_QUALIFYING_TIERS:
@@ -179,6 +215,7 @@ def _select_strategy_type(problem: ProblemHypothesis, demand: DemandHypothesis, 
 
 
 def _build_action_plan(
+    db: Session,
     problem: ProblemHypothesis,
     demand: DemandHypothesis,
     opportunity: Opportunity,
@@ -217,6 +254,9 @@ def _build_action_plan(
         return plan  # cannot safely recommend anything past this without a person to address
 
     problem_tier = (problem.confidence or {}).get("best_evidence_tier")
+    self_verified = problem_tier == "implied_gap" and _problem_has_self_verified_hiring_evidence(db, problem)
+    if self_verified:
+        problem_tier = "declared"  # already-verified hiring evidence -- see SELF_VERIFIED_HIRING_EVENT_TYPES
     if problem_tier != "declared":
         add("validate_problem", "Confirm the problem directly with the account rather than relying on implied evidence alone.", f"ProblemHypothesis evidence tier is {problem_tier!r}, not yet explicitly declared by the account.")
         return plan  # do not recommend demand/message/meeting steps ahead of confirming the problem itself
@@ -262,7 +302,7 @@ def generate_strategy_facts(db: Session, tenant_id: int, opportunity: Opportunit
         offering_fit_status = "insufficient_offering_context"
         matched_offering_name = None
 
-    strategy_type, missing_information = _select_strategy_type(problem, demand, opportunity, offering_fit_status)
+    strategy_type, missing_information = _select_strategy_type(db, problem, demand, opportunity, offering_fit_status)
 
     if offering_fit_status == "insufficient_offering_context":
         missing_information.append("offering definitions are not yet configured -- cannot confirm which offering fits (see app/gtm_os/opportunity/offering_config.py)")
@@ -279,6 +319,10 @@ def generate_strategy_facts(db: Session, tenant_id: int, opportunity: Opportunit
         # opportunity.py::Opportunity.icp_context). A soft signal for visibility only; nothing
         # in _select_strategy_type/_build_action_plan reads this -- ICP is not a strategy gate.
         "icp_context": opportunity.icp_context,
+        # 2026-08-25 -- transparency flag for auditability: True when this Problem's evidence
+        # already came from a JD-verified/counted hiring signal (SELF_VERIFIED_HIRING_EVENT_TYPES)
+        # -- explains why an "implied_gap" problem_tier still skipped validate_problem/diagnostic.
+        "problem_self_verified_via_hiring_evidence": _problem_has_self_verified_hiring_evidence(db, problem),
     }
 
     constraints: list[str] = []
@@ -305,7 +349,7 @@ def generate_strategy_facts(db: Session, tenant_id: int, opportunity: Opportunit
             "nurture": "Stay on radar -- evidence supports a real problem/demand, but no configured offering currently fits.",
         }.get(strategy_type)
         positioning_angle = f"Lead with the confirmed {opportunity.affected_function} problem" + (f", positioned around {matched_offering_name}" if matched_offering_name else "") + "."
-        action_plan = _build_action_plan(problem, demand, opportunity, offering_fit_status, decision_maker_known)
+        action_plan = _build_action_plan(db, problem, demand, opportunity, offering_fit_status, decision_maker_known)
 
     return {
         "strategy_type": strategy_type,
