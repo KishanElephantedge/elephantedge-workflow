@@ -158,9 +158,17 @@ def _matched_clause_is_question(text: str, phrase: str) -> bool:
 # Exact same category definitions the deterministic phrases above encode -- given to the LLM
 # fallback verbatim so semantic classification can never quietly redefine what these event types
 # mean. Order matches priority (strongest/most specific claim first).
+#
+# market_pattern_observation (2026-08-24 addition, explicit instruction): the real gap this closes
+# is a person clearly positioned/knowledgeable in the relevant space (per their own bio) describing
+# a recurring problem pattern -- real signal, but not a clean first-person "I/we have this problem"
+# claim, so it must NOT be treated as strong as problem_statement. It is intentionally left OUT of
+# problem_detection.py's EVENT_TYPE_TIERS map, which means it gets that map's own documented
+# default: "contextual" tier -- it can strengthen an already-open hypothesis, never open one alone.
+# This is the same conservative default hiring_activity already relies on, not a new mechanism.
 _EVENT_TYPE_DEFINITIONS = """- problem_statement: the person self-reports a genuine difficulty/challenge they are currently
-  experiencing (not a difficulty they're describing someone else having, not generic industry
-  commentary, not advice given TO others).
+  experiencing AT THEIR OWN COMPANY (not a difficulty they're describing someone else having, not
+  generic industry commentary, not advice given TO others).
 - solution_question: the person is asking, as a real question (not rhetorical, not third-party
   advice-giving), how others handle/solve/address a specific challenge.
 - solution_evaluation_mention: the person describes actively evaluating, comparing, testing, or
@@ -169,11 +177,18 @@ _EVENT_TYPE_DEFINITIONS = """- problem_statement: the person self-reports a genu
   -- already decided/done, not in-progress.
 - growth_hiring_mention: the person mentions team growth or hiring, with no explicit problem/
   question/evaluation attached.
-- none: nothing above applies confidently -- generic commentary, advice given to others,
-  storytelling, humor, industry takes with no first-person claim, etc."""
+- market_pattern_observation: the person's bio/headline shows they are clearly positioned or
+  knowledgeable in the relevant space (e.g. they run/lead a company in this domain, or their
+  headline is directly about this kind of work), AND they describe a recurring problem/failure
+  pattern they observe -- but it is NOT phrased as their own first-person "I/we have this problem
+  right now" claim (that would be problem_statement instead). Do NOT use this category for someone
+  with no relevant bio/positioning just giving generic advice or commentary -- bio relevance is
+  required, not optional, for this category specifically.
+- none: nothing above applies confidently -- generic commentary, advice given to others with no
+  relevant positioning, storytelling, humor, industry takes with no real claim, etc."""
 
 
-def _classify_text_semantic(text: str, db, tenant_id: int) -> dict | None:
+def _classify_text_semantic(text: str, db, tenant_id: int, headline: str | None = None, company_name_raw: str | None = None) -> dict | None:
     """Fallback for text the deterministic phrases above don't catch -- the same underlying claim
     expressed in different words. Reuses the existing Gemini-first/Claude-fallback generate_json()
     helper (app/llm_client.py, already used by investigation_generation.py for query formulation)
@@ -182,21 +197,39 @@ def _classify_text_semantic(text: str, db, tenant_id: int) -> dict | None:
     new event_type/tier meaning; it only decides which of the existing categories, if any, this
     text's actual (possibly differently-worded) claim belongs to.
 
+    headline/company_name_raw (2026-08-24 addition, explicit instruction to raise hit rate rather
+    than judging a post on its own): both are already captured on every linkedin_post GtmSignal at
+    sensing time (extracted_info["headline"], company_name_raw) but were previously never passed to
+    the classifier at all. Given here ONLY to help the LLM judge whether a post is a first-person
+    account of the author's own situation vs. third-party commentary/expertise-sharing -- explicitly
+    NOT for judging ICP/company-size fit, which stays a separate, later stage (ICP matching).
+
     Evidence integrity guard: the LLM must return an exact quoted sentence/clause from the source
     text. If that quote doesn't actually appear in the real text (hallucinated/paraphrased), the
     whole classification is discarded -- never trusted blind. This is the same discipline
     investigation_generation.py's _sanitize_formulations already applies to LLM output elsewhere
     in this codebase: verify against real data before trusting, don't take the model's word alone."""
+    context_lines = []
+    if headline:
+        context_lines.append(f"Author's LinkedIn headline/bio: {headline}")
+    if company_name_raw:
+        context_lines.append(f"Author's apparent company: {company_name_raw}")
+    context_block = ("\n" + "\n".join(context_lines) + "\n") if context_lines else ""
+
     prompt = f"""You are classifying a single LinkedIn post for a B2B sales-intelligence system.
 
 Category definitions (choose exactly one, "none" if nothing confidently applies):
 {_EVENT_TYPE_DEFINITIONS}
-
+{context_block}
 Post text:
 \"\"\"{text}\"\"\"
 
+Use the headline/company only to judge whether this is the author's OWN first-person situation vs.
+third-party commentary -- never to judge company size, industry fit, or whether they're a good
+prospect (that is decided elsewhere, not by you).
+
 Return JSON exactly:
-{{"event_type": "problem_statement" | "solution_question" | "solution_evaluation_mention" | "solution_adoption_mention" | "growth_hiring_mention" | "none", "quote": "<the exact sentence/clause from the post text above that supports this classification, verbatim, or empty string if event_type is none>", "affected_function": "sales" | "marketing" | "unknown"}}"""
+{{"event_type": "problem_statement" | "solution_question" | "solution_evaluation_mention" | "solution_adoption_mention" | "growth_hiring_mention" | "market_pattern_observation" | "none", "quote": "<the exact sentence/clause from the post text above that supports this classification, verbatim, or empty string if event_type is none>", "affected_function": "sales" | "marketing" | "unknown"}}"""
     try:
         response = generate_json(prompt, db, tenant_id, max_tokens=300)
     except Exception:
@@ -205,7 +238,7 @@ Return JSON exactly:
     event_type = response.get("event_type")
     valid_event_types = {
         "problem_statement", "solution_question", "solution_evaluation_mention",
-        "solution_adoption_mention", "growth_hiring_mention",
+        "solution_adoption_mention", "growth_hiring_mention", "market_pattern_observation",
     }
     if event_type not in valid_event_types:
         return None
@@ -224,6 +257,7 @@ Return JSON exactly:
         "solution_evaluation_mention": lambda who: f"{who} appears to be actively evaluating solutions related to {affected_function}.",
         "solution_adoption_mention": lambda who: f"{who} mentions having already adopted a solution related to {affected_function}.",
         "growth_hiring_mention": lambda who: f"{who} mentions team growth/hiring related to {affected_function}.",
+        "market_pattern_observation": lambda who: f"{who}, based on their apparent positioning in this space, describes a recurring {affected_function}-related problem pattern (not a first-person claim about their own company).",
     }
     return {
         "event_type": event_type, "affected_function": affected_function, "matched_phrase": quote,
@@ -232,7 +266,7 @@ Return JSON exactly:
     }
 
 
-def _classify_text(text: str, db=None, tenant_id: int | None = None) -> dict | None:
+def _classify_text(text: str, db=None, tenant_id: int | None = None, headline: str | None = None, company_name_raw: str | None = None) -> dict | None:
     """The classification decision, factored out of interpret_linkedin_post_signal so the same
     logic can run either against one post's text (the original behavior) or against several posts
     from the same person concatenated together (2026-08-24 addition, see
@@ -240,9 +274,11 @@ def _classify_text(text: str, db=None, tenant_id: int | None = None) -> dict | N
     never what the categories mean. Tries the deterministic phrase match first (free, instant);
     only falls back to the semantic LLM classifier (see _classify_text_semantic) when db/tenant_id
     are supplied AND no phrase matched -- callers that omit db/tenant_id get phrase-matching only,
-    same as this module's original behavior. Checked in priority order (strongest, most specific
-    claim first): text could plausibly match more than one pattern set, and a declared problem
-    statement is a stronger claim than an incidental growth mention in the same text."""
+    same as this module's original behavior. headline/company_name_raw are passed through to the
+    semantic fallback only (phrase-matching stays text-only, unchanged). Checked in priority order
+    (strongest, most specific claim first): text could plausibly match more than one pattern set,
+    and a declared problem statement is a stronger claim than an incidental growth mention in the
+    same text."""
     text_lower = text.lower()
     affected_function = _infer_affected_function(text_lower)
 
@@ -287,7 +323,7 @@ def _classify_text(text: str, db=None, tenant_id: int | None = None) -> dict | N
         }
 
     if db is not None and tenant_id is not None:
-        semantic = _classify_text_semantic(text, db, tenant_id)
+        semantic = _classify_text_semantic(text, db, tenant_id, headline=headline, company_name_raw=company_name_raw)
         if semantic is not None:
             return semantic
 
@@ -301,7 +337,10 @@ def interpret_linkedin_post_signal(signal: GtmSignal, db=None, tenant_id: int | 
     text = (signal.extracted_info or {}).get("text")
     if not text:
         return None
-    classification = _classify_text(text, db=db, tenant_id=tenant_id or signal.tenant_id)
+    headline = (signal.extracted_info or {}).get("headline")
+    classification = _classify_text(
+        text, db=db, tenant_id=tenant_id or signal.tenant_id, headline=headline, company_name_raw=signal.company_name_raw,
+    )
     if classification is None:
         return None
     who = signal.person_name_raw or signal.company_name_raw or "This person/company"
@@ -334,13 +373,23 @@ def interpret_linkedin_post_signals_grouped(signals: list[GtmSignal], db=None, t
 
     per_signal_text = {s.id: (s.extracted_info or {}).get("text") for s in signals}
     combined_text = "\n---\n".join(t for t in per_signal_text.values() if t)
-    group_classification = _classify_text(combined_text, db=db, tenant_id=tenant_id) if combined_text else None
+    # Same person across the whole group -- headline/company should agree; take the first non-null
+    # found so the group-combined classification also gets real bio/company context, not just each
+    # individual call.
+    group_headline = next(((s.extracted_info or {}).get("headline") for s in signals if (s.extracted_info or {}).get("headline")), None)
+    group_company = next((s.company_name_raw for s in signals if s.company_name_raw), None)
+    group_classification = (
+        _classify_text(combined_text, db=db, tenant_id=tenant_id, headline=group_headline, company_name_raw=group_company)
+        if combined_text else None
+    )
 
     for signal in signals:
         text = per_signal_text.get(signal.id)
         if not text:
             continue
-        individual_classification = _classify_text(text, db=db, tenant_id=tenant_id)
+        headline = (signal.extracted_info or {}).get("headline") or group_headline
+        company_name_raw = signal.company_name_raw or group_company
+        individual_classification = _classify_text(text, db=db, tenant_id=tenant_id, headline=headline, company_name_raw=company_name_raw)
         classification = individual_classification or group_classification
         if classification is None:
             continue

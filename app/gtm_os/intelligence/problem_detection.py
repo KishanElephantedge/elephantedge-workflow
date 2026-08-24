@@ -59,6 +59,13 @@ from app.gtm_os.orchestration.control import get_control_config
 # separate earlier problem statement, per Step 7's own worked example. "solution_adoption_mention"
 # keeps the ORIGINAL Step 6 reasoning (past-tense adoption can mean the need is already resolved,
 # possibly by a competitor) and stays contextual.
+#
+# "market_pattern_observation" (2026-08-24 addition, linkedin_post_interpretation.py): a person
+# clearly positioned/knowledgeable in the space describing a recurring problem pattern, but not
+# phrased as their own first-person claim -- real signal, but weaker than a declared problem.
+# Deliberately left OUT of this map so it falls through to DEFAULT_EVIDENCE_TIER ("contextual"),
+# same conservative default hiring_activity already relies on -- listed here only so a future
+# reader doesn't miss that this event_type exists and is intentionally contextual, not forgotten.
 EVENT_TYPE_TIERS: dict[str, str] = {
     "hiring_activity": "contextual",
     "problem_statement": "declared",
@@ -66,6 +73,7 @@ EVENT_TYPE_TIERS: dict[str, str] = {
     "solution_evaluation_mention": "implied_gap",
     "solution_adoption_mention": "contextual",
     "growth_hiring_mention": "contextual",
+    # "market_pattern_observation" intentionally absent -- see comment above.
 }
 DEFAULT_EVIDENCE_TIER = "contextual"
 
