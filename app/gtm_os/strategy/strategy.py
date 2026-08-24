@@ -46,7 +46,7 @@ from app.gtm_os.content.topic import ContentTopic
 from app.gtm_os.content.trend_intelligence import evaluate_topic_trend
 from app.gtm_os.content.trend_config import get_trend_config
 from app.gtm_os.intelligence.demand_detection import DEMAND_QUALIFYING_TIERS
-from app.gtm_os.intelligence.demand_hypothesis import DemandHypothesis
+from app.gtm_os.intelligence.demand_hypothesis import DemandHypothesis, DemandHypothesisEvidence
 from app.gtm_os.intelligence.interpreted_signal import InterpretedSignal
 from app.gtm_os.intelligence.problem_hypothesis import ProblemHypothesis, ProblemHypothesisEvidence
 from app.gtm_os.icp.icp_offering_matching import match_offerings_for_opportunity
@@ -184,6 +184,28 @@ def _problem_has_self_verified_hiring_evidence(db: Session, problem: ProblemHypo
     return bool(event_types & SELF_VERIFIED_HIRING_EVENT_TYPES)
 
 
+def _demand_has_self_verified_hiring_evidence(db: Session, demand: DemandHypothesis) -> bool:
+    """Same check as _problem_has_self_verified_hiring_evidence, applied to DemandHypothesis
+    evidence (2026-08-25, explicit instruction: extend the same self-verified logic to Demand).
+    A qualifying hiring signal (real JD content, a genuinely counted concurrent-hiring surge, or
+    a real head_of_sales-type hire) is treated as sufficient for Demand too, not just Problem --
+    same rationale: the qualification work already done upstream IS the verification, so asking
+    to "validate_demand" again for this specific evidence would just repeat it."""
+    linked_signal_ids = [
+        row[0]
+        for row in db.query(DemandHypothesisEvidence.interpreted_signal_id)
+        .filter(DemandHypothesisEvidence.demand_hypothesis_id == demand.id)
+        .all()
+    ]
+    if not linked_signal_ids:
+        return False
+    event_types = {
+        row[0]
+        for row in db.query(InterpretedSignal.event_type).filter(InterpretedSignal.id.in_(linked_signal_ids)).all()
+    }
+    return bool(event_types & SELF_VERIFIED_HIRING_EVENT_TYPES)
+
+
 def _select_strategy_type(db: Session, problem: ProblemHypothesis, demand: DemandHypothesis, opportunity: Opportunity, offering_fit_status: str) -> tuple[str, list[str]]:
     """Pure, deterministic taxonomy selection -- reads ONLY Problem/Demand tiers, affected_function,
     and offering_fit_status. Never reads market/trend context (see module docstring)."""
@@ -197,6 +219,8 @@ def _select_strategy_type(db: Session, problem: ProblemHypothesis, demand: Deman
     if problem_tier == "implied_gap" and _problem_has_self_verified_hiring_evidence(db, problem):
         problem_tier = "declared"  # already-verified hiring evidence -- treat as confirmed, same as a declared problem statement
     demand_tier = (demand.confidence or {}).get("best_evidence_tier")
+    if demand_tier == "demand" and _demand_has_self_verified_hiring_evidence(db, demand):
+        demand_tier = "buying_intent_adjacent"  # already-verified hiring evidence -- treat as confirmed buying intent
 
     if problem_tier not in ("declared", "implied_gap") or demand_tier not in DEMAND_QUALIFYING_TIERS:
         # Defensive fallback -- should not happen given Opportunity's own eligibility gate
@@ -262,6 +286,8 @@ def _build_action_plan(
         return plan  # do not recommend demand/message/meeting steps ahead of confirming the problem itself
 
     demand_tier = (demand.confidence or {}).get("best_evidence_tier")
+    if demand_tier == "demand" and _demand_has_self_verified_hiring_evidence(db, demand):
+        demand_tier = "buying_intent_adjacent"  # already-verified hiring evidence -- see SELF_VERIFIED_HIRING_EVENT_TYPES
     if demand_tier != "buying_intent_adjacent":
         add("validate_demand", "Confirm the account is genuinely evaluating solutions, not just discussing the problem.", f"DemandHypothesis evidence tier is {demand_tier!r}, weaker than buying-intent-adjacent.")
         return plan  # per Part J's own example: weak demand -> validate, don't request a meeting yet
@@ -323,6 +349,7 @@ def generate_strategy_facts(db: Session, tenant_id: int, opportunity: Opportunit
         # already came from a JD-verified/counted hiring signal (SELF_VERIFIED_HIRING_EVENT_TYPES)
         # -- explains why an "implied_gap" problem_tier still skipped validate_problem/diagnostic.
         "problem_self_verified_via_hiring_evidence": _problem_has_self_verified_hiring_evidence(db, problem),
+        "demand_self_verified_via_hiring_evidence": _demand_has_self_verified_hiring_evidence(db, demand),
     }
 
     constraints: list[str] = []
