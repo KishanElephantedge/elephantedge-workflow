@@ -76,9 +76,30 @@ LINKEDIN_POSTS_PER_SOURCE = 5
 # reproduce the exact failure mode this fix replaces).
 _LINKEDIN_POST_URL_PATTERN = re.compile(r"linkedin\.com/(posts|pulse)/")
 
+# Real bug fix (2026-08-24, confirmed live): search_linkedin_posts() does NOT actually retrieve
+# an individual post by its own permalink for a third-party post it didn't discover from that
+# profile's own feed -- confirmed empirically: a profile URL retrieval works and returns real
+# content, the SAME actor given a discovered /posts/ permalink for someone else's post silently
+# returns an empty list (no error). LinkedIn's own /posts/ URL format embeds the author's public
+# LinkedIn ID as the segment before the first underscore (e.g.
+# .../posts/sales-processes_founders-... -> "sales-processes") -- deriving and retrieving via
+# the profile URL instead is confirmed live to work. Retrieves the author's few most recent
+# posts rather than guaranteed to be the exact post Google found -- an accepted, honest
+# tradeoff given the actor's real, confirmed capability; still real, attributable evidence from
+# a real person on a related topic, never fabricated.
+_LINKEDIN_POST_AUTHOR_PATTERN = re.compile(r"linkedin\.com/posts/([a-zA-Z0-9-]+)_")
+LINKEDIN_POSTS_PER_AUTHOR = 3
+
 
 def _is_real_linkedin_post_url(url: str) -> bool:
     return bool(url) and bool(_LINKEDIN_POST_URL_PATTERN.search(url))
+
+
+def _derive_profile_url(post_url: str) -> str:
+    match = _LINKEDIN_POST_AUTHOR_PATTERN.search(post_url)
+    if match:
+        return f"https://www.linkedin.com/in/{match.group(1)}"
+    return post_url  # no extractable author (e.g. /pulse/) -- best effort, unchanged from before
 
 
 EXEC_RESULTS_RETURNED = "results_returned"
@@ -224,15 +245,24 @@ def execute_investigation_action(db: Session, tenant_id: int, action: dict) -> d
             discovered_urls = discovered_urls[:LINKEDIN_POSTS_PER_SOURCE]
 
             if discovered_urls:
+                # Retrieve via each discovered post's AUTHOR PROFILE, not the bare post
+                # permalink -- see _derive_profile_url's docstring. Deduplicated by profile (two
+                # discovered posts from the same real author only cost/retrieve once).
+                retrieval_urls: list[str] = []
+                for url in discovered_urls:
+                    profile_url = _derive_profile_url(url)
+                    if profile_url not in retrieval_urls:
+                        retrieval_urls.append(profile_url)
+
                 # Second, separate budget check -- sized to the REAL (bounded) retrieval volume
                 # just discovered, not a blind pre-flight guess. Mid-execution budget block is
                 # reported the same way a pre-flight block is (EXEC_BLOCKED_BY_BUDGET, no attempt
                 # recorded) -- retrieval was never actually attempted, so nothing to record.
-                retrieval_cost = len(discovered_urls) * LINKEDIN_POST_COST_PER_POST_USD
+                retrieval_cost = len(retrieval_urls) * LINKEDIN_POSTS_PER_AUTHOR * LINKEDIN_POST_COST_PER_POST_USD
                 retrieval_budget = check_apify_budget(db, tenant_id, retrieval_cost)
                 if retrieval_budget["status"] != APIFY_BUDGET_ALLOWED:
                     return _result(objective_id, source, action_type, EXEC_BLOCKED_BY_BUDGET, error_reason=retrieval_budget["reason"], started_at=started_at)
-                signals = sense_linkedin_posts(db, tenant_id, discovered_urls, limit_per_source=1)
+                signals = sense_linkedin_posts(db, tenant_id, retrieval_urls, limit_per_source=LINKEDIN_POSTS_PER_AUTHOR)
             else:
                 # No real post URLs discovered -- a genuine attempt was still made (the Google
                 # Search call(s) really happened and are billed), so this falls through to the
