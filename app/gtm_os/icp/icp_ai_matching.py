@@ -68,12 +68,22 @@ def _facts_block(facts: dict) -> str:
     return "\n".join(lines) if lines else "(no real facts available for this company)"
 
 
-def evaluate_icp_fit_holistic(db: Session, tenant_id: int, company: Company) -> dict:
-    """Real, LLM-assisted judgment of which ICP (if any) best fits this company, using ALL real
-    facts on file -- not a single rigid AND-gate on one field. Returns
+def evaluate_icp_fit_holistic(db: Session, tenant_id: int, company: Company, require_best_fit: bool = False) -> dict:
+    """Real, LLM-assisted judgment of which ICP best fits this company, using ALL real facts on
+    file -- not a single rigid AND-gate on one field. Returns
     {"icp_id": "icp_1"|"icp_2"|"icp_3"|None, "reasoning": str, "facts_cited": list[str]}.
     Fails closed (icp_id=None) on any LLM error, invalid icp_id, or a judgment that cites a fact
-    never actually given -- never a fabricated fit."""
+    never actually given -- never a fabricated fit.
+
+    require_best_fit=True (2026-08-25, explicit instruction): for a company that ALREADY has a
+    real, qualified Opportunity (JD-content-verified first-hire, a genuine concurrent-hiring
+    surge, or a real leadership hire -- see linkedin_job_interpretation.py/interpretation.py's
+    _promote_concurrent_hiring_signals) the qualification work is already done; ICP matching's
+    job here is only to place it into whichever of the 3 real ICPs is the CLOSEST fit, not to
+    re-litigate whether it's a real prospect. "none" is removed from the model's options in this
+    mode -- it must name the single best-fit icp_id and may lean on whatever real signal is
+    available (revenue if it looks reliable, otherwise employee_count/team size/industry), same
+    evidence-citation requirement either way."""
     icps = get_icp_config(db, tenant_id)
     valid_icp_ids = {icp["id"] for icp in icps}
     facts = _gather_company_facts(db, tenant_id, company)
@@ -84,24 +94,46 @@ def evaluate_icp_fit_holistic(db: Session, tenant_id: int, company: Company) -> 
         for icp in icps
     )
 
-    prompt = f"""You are judging which Ideal Customer Profile (ICP), if any, best fits a real company,
-for a B2B sales-intelligence system. Use holistic judgment across ALL the facts given -- do not
-require an exact match on any single field (e.g. the hiring role title doesn't have to be a
-perfect keyword match if other real evidence -- revenue, team size, the real opportunity evidence
--- clearly points to one ICP being the best fit).
+    if require_best_fit:
+        qualification_note = (
+            "This company has ALREADY been identified as a real, qualified sales opportunity for "
+            "us -- based on real hiring evidence (a verified first sales hire, a genuine "
+            "concurrent multi-role hiring surge, or a real leadership hire), it already passed "
+            "qualification. Your job here is ONLY to decide which of the 3 ICP segments below it "
+            "fits BEST -- do not say there is no fit, and do not require an exact match on any "
+            "single field (the hiring role title does not need to be a perfect keyword match; "
+            "revenue does not need to land precisely inside a band if it's the closest of the "
+            "three). If the revenue figure looks unreliable (e.g. an extremely wide range "
+            "spanning $100M+, likely a generic industry-wide answer, not this company's real "
+            "figure), say so and lean on employee_count/other real facts instead. You must name "
+            "exactly one of the 3 ICP ids -- \"none\" is not a valid answer here."
+        )
+        icp_id_options = '"icp_1" | "icp_2" | "icp_3"'
+    else:
+        qualification_note = (
+            "Use holistic judgment across ALL the facts given -- do not require an exact match on "
+            "any single field (e.g. the hiring role title doesn't have to be a perfect keyword "
+            "match if other real evidence clearly points to one ICP being the best fit). If a "
+            "revenue figure looks unreliable (e.g. an extremely wide range spanning $100M+, which "
+            "usually means a generic industry-wide answer rather than this specific company's "
+            "real revenue), say so explicitly and weigh it less, rather than treating it as "
+            "precise."
+        )
+        icp_id_options = '"icp_1" | "icp_2" | "icp_3" | "none"'
 
-The three real ICP definitions (pick exactly one id, or "none" if genuinely no reasonable fit):
+    prompt = f"""You are judging which Ideal Customer Profile (ICP) best fits a real company, for a
+B2B sales-intelligence system.
+
+{qualification_note}
+
+The three real ICP definitions:
 {icp_definitions}
 
 Real facts on file for this company:
 {facts_block}
 
-If a revenue figure looks unreliable (e.g. an extremely wide range spanning $100M+, which usually
-means a generic industry-wide answer rather than this specific company's real revenue), say so
-explicitly and weigh it less, rather than treating it as precise.
-
 Return JSON exactly:
-{{"icp_id": "icp_1" | "icp_2" | "icp_3" | "none", "reasoning": "<1-2 sentences, must explicitly reference at least one specific fact listed above by name and value>", "facts_cited": ["<fact key>", ...]}}"""
+{{"icp_id": {icp_id_options}, "reasoning": "<1-2 sentences, must explicitly reference at least one specific fact listed above by name and value>", "facts_cited": ["<fact key>", ...]}}"""
     try:
         response = generate_json(prompt, db, tenant_id, max_tokens=350)
     except Exception:
@@ -109,6 +141,8 @@ Return JSON exactly:
 
     icp_id = response.get("icp_id")
     if icp_id == "none":
+        if require_best_fit:
+            return {"icp_id": None, "reasoning": "model returned 'none' despite require_best_fit -- treated as no usable judgment", "facts_cited": []}
         return {"icp_id": None, "reasoning": response.get("reasoning") or "", "facts_cited": []}
     if icp_id not in valid_icp_ids:
         return {"icp_id": None, "reasoning": "invalid icp_id returned", "facts_cited": []}
@@ -120,13 +154,13 @@ Return JSON exactly:
     return {"icp_id": icp_id, "reasoning": response.get("reasoning") or "", "facts_cited": facts_cited}
 
 
-def evaluate_and_record_icp_fit_holistic(db: Session, tenant_id: int, company: Company) -> dict:
+def evaluate_and_record_icp_fit_holistic(db: Session, tenant_id: int, company: Company, require_best_fit: bool = False) -> dict:
     """Runs evaluate_icp_fit_holistic() and, if it found a real fit, records it via the EXISTING
     record_icp_match() (same ICPMatch table/persistence icp_matching.py already uses) -- tagged
     trigger_evidence.method="ai_holistic_judgment" so it is always distinguishable from a strict
     rule-based match. Returns the judgment dict plus the resulting ICPMatch id, or None if no fit
     was found."""
-    judgment = evaluate_icp_fit_holistic(db, tenant_id, company)
+    judgment = evaluate_icp_fit_holistic(db, tenant_id, company, require_best_fit=require_best_fit)
     if judgment["icp_id"] is None:
         return {**judgment, "icp_match_id": None}
 
