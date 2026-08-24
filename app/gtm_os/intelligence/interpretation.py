@@ -5,17 +5,21 @@ below, reusing the existing role-title keyword classification from app/phases/hi
 (ROLE_KEYWORDS / _classify_role) rather than building a second, unrelated classification system.
 
 linkedin_post (Step 6) is handled by app/gtm_os/intelligence/linkedin_post_interpretation.py --
-a separate module since free-text posts need narrow phrase-pattern matching, not title/keyword
-matching (see that module's own docstring for why). linkedin_reply (Step 11B) is handled by
+a separate module since free-text posts need phrase/semantic matching, not title/keyword matching
+(see that module's own docstring for why, and for its two-tier phrase-then-LLM-fallback design,
+2026-08-24). linkedin_reply (Step 11B) is handled by
 app/gtm_os/intelligence/linkedin_reply_interpretation.py, same phrase-matching philosophy, plus
 one context-dependent rule specific to conversation replies (see that module's own docstring).
 web_search and company_website remain explicitly out of scope.
 
-No LLM calls anywhere in this dispatch layer or the interpreters it calls.
+linkedin_job/theirstack_job/linkedin_reply interpretation below is purely deterministic, no LLM
+calls. linkedin_post interpretation (dispatched separately below, not through _INTERPRETERS) can
+make an LLM call as its second-tier fallback -- see linkedin_post_interpretation.py.
 
-Every interpreter here answers only "what does this single raw signal appear to say" -- never
-whether it constitutes demand, an opportunity, ICP fit, offering/playbook fit, urgency, or buying
-intent. Those are later, not-yet-built layers."""
+Every interpreter here answers only "what does this raw signal (or, for linkedin_post, this
+person's grouped signals) appear to say" -- never whether it constitutes demand, an opportunity,
+ICP fit, offering/playbook fit, urgency, or buying intent. Those are later, not-yet-built
+layers."""
 
 from sqlalchemy.orm import Session
 
@@ -168,7 +172,7 @@ def run_interpretation_sweep(
             else:
                 groups.setdefault(key, []).append(signal)
         for group_signals in groups.values():
-            for result in interpret_linkedin_post_signals_grouped(group_signals):
+            for result in interpret_linkedin_post_signals_grouped(group_signals, db=db, tenant_id=tenant_id):
                 db.add(result)
                 created.append(result)
 

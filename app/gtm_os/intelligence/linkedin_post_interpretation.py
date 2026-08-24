@@ -1,4 +1,4 @@
-"""Deterministic, observation-level interpretation for linkedin_post GtmSignals -- Step 6.
+"""Observation-level interpretation for linkedin_post GtmSignals -- Step 6.
 
 Extends what Step 4 deliberately left out. linkedin_job/theirstack_job interpretation
 (interpretation.py) works off a structured field (a job title) with an unambiguous keyword-role
@@ -6,31 +6,40 @@ mapping; a LinkedIn post is free text, where the actual failure mode is differen
 generic word ("sales", "pipeline", "growth", "AI", "outbound") tells you almost nothing about
 whether the post expresses a problem, a question, an announcement, or nothing relevant at all.
 
-So this module does NOT do keyword-presence matching. It matches narrow, explicit PHRASES that
-carry the actual claim (e.g. "struggling to", "how are other teams solving", "just hired") --
-the same "reuse existing keyword/category logic where appropriate, but do not reuse anything that
-makes a buying-signal judgment" instruction Step 6 was given, applied to phrases instead of single
-words specifically because single words overclaim here in a way they didn't for job titles.
+TWO-TIER matching, in this order (2026-08-24, explicit instruction -- semantic detection was
+always the intended design, not an afterthought bolted onto phrase-matching):
 
-If a post's text doesn't match one of these narrow, high-precision patterns, NO InterpretedSignal
-is created at all -- an unmatched post is not "no problem," it's "not confidently classifiable by
-a deterministic rule," and forcing a guess here would be exactly the overclaiming Step 6 asked to
-avoid. This is the same "don't force a low-value interpretation" precedent already used for
-company_website in Step 4.
+1. DETERMINISTIC PHRASE MATCH (free, instant, tried first): narrow, explicit PHRASES that carry
+   the actual claim (e.g. "struggling to", "how are other teams solving", "just hired"). Kept as
+   the first pass because it's a real, already-verified-precise pattern for the wording it does
+   catch -- no reason to spend an LLM call re-deriving what a fixed string match already answers
+   correctly.
+2. SEMANTIC LLM FALLBACK (only when step 1 finds nothing): the same underlying claim -- a real
+   problem, a real question, active evaluation, adoption, growth/hiring -- expressed in ANY
+   wording, not just the fixed phrase list. This is what step 1 alone could never do (its own
+   prior docstring named this exact gap: "detecting a genuine problem/question/solution-
+   evaluation statement that ISN'T phrased with one of the fixed trigger phrases... requires real
+   semantic understanding that phrase-matching cannot reliably provide"). The LLM is given the
+   SAME finite category definitions phrase-matching already encodes -- it classifies into the
+   identical event_type vocabulary (problem_statement / solution_question /
+   solution_evaluation_mention / solution_adoption_mention / growth_hiring_mention / none), never
+   a new one -- so every evidence-tier/eligibility rule downstream (problem_detection.py,
+   demand_detection.py) is completely untouched by this; only what text produces a match changed.
+   The LLM must return an exact quoted sentence/clause from the source text as its evidence --
+   verified programmatically against the real text before being trusted (see
+   _classify_text_semantic) -- a classification whose quote doesn't actually appear in the text is
+   discarded, never trusted blind.
 
-**Named, explicit LLM-assisted candidate, per Step 6's "STOP rather than force an unreliable
-rule" instruction**: detecting a genuine problem/question/solution-evaluation statement that
-ISN'T phrased with one of the fixed trigger phrases below (sarcasm, negation, humble-brag framing,
-implicit problem statements) requires real semantic understanding that phrase-matching cannot
-reliably provide. That is out of scope here and not silently approximated -- it's a real gap,
-left for an explicitly-scoped future LLM-assisted pass, not guessed at with weaker rules.
-
-No LLM calls in this module."""
+If NEITHER tier confidently matches, NO InterpretedSignal is created at all -- an unmatched post
+is not "no problem," it's "not confidently classifiable," and forcing a guess here would be
+exactly the overclaiming this module has always avoided (same "don't force a low-value
+interpretation" precedent as company_website in Step 4)."""
 
 import re
 
 from app.gtm_os.intelligence.interpreted_signal import InterpretedSignal
 from app.gtm_os.intelligence.signal import GtmSignal
+from app.llm_client import generate_json
 
 # Explicit, narrow phrases that carry a genuine self-reported difficulty -- not single keywords.
 # "we're struggling to generate qualified pipeline" matches; "our sales pipeline grew this
@@ -146,12 +155,92 @@ def _matched_clause_is_question(text: str, phrase: str) -> bool:
     return False
 
 
-def _classify_text(text: str) -> dict | None:
-    """The actual phrase-matching decision, factored out of interpret_linkedin_post_signal so the
-    same, UNCHANGED rules can run either against one post's text (the original behavior) or
-    against several posts from the same person concatenated together (2026-08-24 addition, see
-    interpret_linkedin_post_signals_grouped below) -- aggregation changes what text the rules see,
-    never what the rules themselves mean. Checked in priority order (strongest, most specific
+# Exact same category definitions the deterministic phrases above encode -- given to the LLM
+# fallback verbatim so semantic classification can never quietly redefine what these event types
+# mean. Order matches priority (strongest/most specific claim first).
+_EVENT_TYPE_DEFINITIONS = """- problem_statement: the person self-reports a genuine difficulty/challenge they are currently
+  experiencing (not a difficulty they're describing someone else having, not generic industry
+  commentary, not advice given TO others).
+- solution_question: the person is asking, as a real question (not rhetorical, not third-party
+  advice-giving), how others handle/solve/address a specific challenge.
+- solution_evaluation_mention: the person describes actively evaluating, comparing, testing, or
+  piloting a solution right now -- an unresolved, in-progress search for a fix.
+- solution_adoption_mention: the person mentions having already adopted/started using a solution
+  -- already decided/done, not in-progress.
+- growth_hiring_mention: the person mentions team growth or hiring, with no explicit problem/
+  question/evaluation attached.
+- none: nothing above applies confidently -- generic commentary, advice given to others,
+  storytelling, humor, industry takes with no first-person claim, etc."""
+
+
+def _classify_text_semantic(text: str, db, tenant_id: int) -> dict | None:
+    """Fallback for text the deterministic phrases above don't catch -- the same underlying claim
+    expressed in different words. Reuses the existing Gemini-first/Claude-fallback generate_json()
+    helper (app/llm_client.py, already used by investigation_generation.py for query formulation)
+    -- no new LLM plumbing invented. The LLM is given the EXACT SAME finite category set the
+    deterministic phrases already encode (see _EVENT_TYPE_DEFINITIONS) so it can never introduce a
+    new event_type/tier meaning; it only decides which of the existing categories, if any, this
+    text's actual (possibly differently-worded) claim belongs to.
+
+    Evidence integrity guard: the LLM must return an exact quoted sentence/clause from the source
+    text. If that quote doesn't actually appear in the real text (hallucinated/paraphrased), the
+    whole classification is discarded -- never trusted blind. This is the same discipline
+    investigation_generation.py's _sanitize_formulations already applies to LLM output elsewhere
+    in this codebase: verify against real data before trusting, don't take the model's word alone."""
+    prompt = f"""You are classifying a single LinkedIn post for a B2B sales-intelligence system.
+
+Category definitions (choose exactly one, "none" if nothing confidently applies):
+{_EVENT_TYPE_DEFINITIONS}
+
+Post text:
+\"\"\"{text}\"\"\"
+
+Return JSON exactly:
+{{"event_type": "problem_statement" | "solution_question" | "solution_evaluation_mention" | "solution_adoption_mention" | "growth_hiring_mention" | "none", "quote": "<the exact sentence/clause from the post text above that supports this classification, verbatim, or empty string if event_type is none>", "affected_function": "sales" | "marketing" | "unknown"}}"""
+    try:
+        response = generate_json(prompt, db, tenant_id, max_tokens=300)
+    except Exception:
+        return None  # LLM unavailable -- fail closed to "not classifiable", never a guess
+
+    event_type = response.get("event_type")
+    valid_event_types = {
+        "problem_statement", "solution_question", "solution_evaluation_mention",
+        "solution_adoption_mention", "growth_hiring_mention",
+    }
+    if event_type not in valid_event_types:
+        return None
+
+    quote = (response.get("quote") or "").strip()
+    if not quote or quote.lower() not in text.lower():
+        return None  # unverifiable/hallucinated evidence -- discarded, not trusted
+
+    affected_function = response.get("affected_function")
+    if affected_function not in ("sales", "marketing"):
+        affected_function = _infer_affected_function(text.lower())
+
+    business_change_by_type = {
+        "problem_statement": lambda who: f"{who} appears to describe a difficulty related to {affected_function}.",
+        "solution_question": lambda who: f"{who} appears to be asking how others address a {affected_function}-related challenge.",
+        "solution_evaluation_mention": lambda who: f"{who} appears to be actively evaluating solutions related to {affected_function}.",
+        "solution_adoption_mention": lambda who: f"{who} mentions having already adopted a solution related to {affected_function}.",
+        "growth_hiring_mention": lambda who: f"{who} mentions team growth/hiring related to {affected_function}.",
+    }
+    return {
+        "event_type": event_type, "affected_function": affected_function, "matched_phrase": quote,
+        "method": f"llm_semantic:{event_type}",
+        "business_change": business_change_by_type[event_type],
+    }
+
+
+def _classify_text(text: str, db=None, tenant_id: int | None = None) -> dict | None:
+    """The classification decision, factored out of interpret_linkedin_post_signal so the same
+    logic can run either against one post's text (the original behavior) or against several posts
+    from the same person concatenated together (2026-08-24 addition, see
+    interpret_linkedin_post_signals_grouped below) -- aggregation changes what text is classified,
+    never what the categories mean. Tries the deterministic phrase match first (free, instant);
+    only falls back to the semantic LLM classifier (see _classify_text_semantic) when db/tenant_id
+    are supplied AND no phrase matched -- callers that omit db/tenant_id get phrase-matching only,
+    same as this module's original behavior. Checked in priority order (strongest, most specific
     claim first): text could plausibly match more than one pattern set, and a declared problem
     statement is a stronger claim than an incidental growth mention in the same text."""
     text_lower = text.lower()
@@ -197,17 +286,22 @@ def _classify_text(text: str) -> dict | None:
             "business_change": lambda who: f"{who} mentions team growth/hiring related to {affected_function}.",
         }
 
-    return None  # no confident deterministic pattern matched -- not interpreted, not guessed at
+    if db is not None and tenant_id is not None:
+        semantic = _classify_text_semantic(text, db, tenant_id)
+        if semantic is not None:
+            return semantic
+
+    return None  # no confident pattern matched (deterministic or semantic) -- not guessed at
 
 
-def interpret_linkedin_post_signal(signal: GtmSignal) -> InterpretedSignal | None:
+def interpret_linkedin_post_signal(signal: GtmSignal, db=None, tenant_id: int | None = None) -> InterpretedSignal | None:
     if signal.source != "linkedin_post":
         raise ValueError(f"expected a linkedin_post signal, got {signal.source!r}")
 
     text = (signal.extracted_info or {}).get("text")
     if not text:
         return None
-    classification = _classify_text(text)
+    classification = _classify_text(text, db=db, tenant_id=tenant_id or signal.tenant_id)
     if classification is None:
         return None
     who = signal.person_name_raw or signal.company_name_raw or "This person/company"
@@ -218,35 +312,35 @@ def interpret_linkedin_post_signal(signal: GtmSignal) -> InterpretedSignal | Non
     )
 
 
-def interpret_linkedin_post_signals_grouped(signals: list[GtmSignal]) -> list[InterpretedSignal]:
+def interpret_linkedin_post_signals_grouped(signals: list[GtmSignal], db=None, tenant_id: int | None = None) -> list[InterpretedSignal]:
     """2026-08-24 addition: multiple posts from the SAME person, taken together, can carry a
     pattern no single one of them shows alone (real example: three separate posts about sales-hire
-    turnover, none individually phrase-matching, together an unmistakable repeated-failure theme) --
-    see this module's own docstring on why single-post phrase-matching alone can't already catch
-    this (it would require real semantic reasoning, explicitly out of scope for this deterministic
-    layer). This does NOT add that semantic reasoning. It does the one thing a deterministic layer
-    honestly can: if ANY post in the group phrase-matches on its own OR the group's combined text
-    phrase-matches, every post in the group becomes real evidence for that same event_type/tier --
-    today only the one matching post becomes evidence and the other, clearly-related posts from the
-    same person are silently discarded even though problem_detection.py's own multi-evidence
-    corroboration mechanism already exists to make use of them. Callers group signals by a caller-
-    determined identity key -- this function does not decide who counts as "the same person"."""
+    turnover, none individually matching, together an unmistakable repeated-failure theme) -- see
+    this module's own docstring on the two-tier (phrase then semantic) matching each individual
+    and combined text is run through. If ANY post in the group matches on its own OR the group's
+    combined text matches, every post in the group becomes real evidence for that same event_type/
+    tier -- today only the one matching post becomes evidence and the other, clearly-related posts
+    from the same person are silently discarded even though problem_detection.py's own multi-
+    evidence corroboration mechanism already exists to make use of them. Callers group signals by
+    a caller-determined identity key -- this function does not decide who counts as "the same
+    person"."""
     results = []
     if not signals:
         return results
+    tenant_id = tenant_id or signals[0].tenant_id
     if len(signals) == 1:
-        result = interpret_linkedin_post_signal(signals[0])
+        result = interpret_linkedin_post_signal(signals[0], db=db, tenant_id=tenant_id)
         return [result] if result else []
 
     per_signal_text = {s.id: (s.extracted_info or {}).get("text") for s in signals}
     combined_text = "\n---\n".join(t for t in per_signal_text.values() if t)
-    group_classification = _classify_text(combined_text) if combined_text else None
+    group_classification = _classify_text(combined_text, db=db, tenant_id=tenant_id) if combined_text else None
 
     for signal in signals:
         text = per_signal_text.get(signal.id)
         if not text:
             continue
-        individual_classification = _classify_text(text)
+        individual_classification = _classify_text(text, db=db, tenant_id=tenant_id)
         classification = individual_classification or group_classification
         if classification is None:
             continue
