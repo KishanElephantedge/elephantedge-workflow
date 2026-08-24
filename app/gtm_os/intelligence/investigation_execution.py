@@ -25,7 +25,11 @@ BUDGET RULE, per source cost_category:
       lagged) usage-so-far figures -- never a locally-accumulated estimate, never treating an
       unconfigured apify.daily_budget_usd/monthly_budget_usd as unlimited. Before Phase S8, both
       sources were unconditionally blocked here regardless of any configured number, because no
-      real guard existed at all -- that gap is now closed.
+      real guard existed at all -- that gap is now closed. linkedin_post_search specifically
+      (2026-08-24 fix) is now a TWO-PHASE spend: this pre-flight check only covers the discovery
+      phase (Google Search organicResults); a SECOND, separate check_apify_budget() call happens
+      inside the execution branch itself, sized to the real number of post URLs discovery
+      actually found, before the retrieval phase is allowed to proceed.
 
 RESULT RECORDING: reuses record_investigation_attempt() (S1) unchanged -- no second retry/logging
 system. Only genuine attempts (the provider was actually called) get recorded; a pre-flight block
@@ -38,14 +42,17 @@ successful execution that returns signals is recorded as S1's own `inconclusive`
 sensing attempt happened and produced N raw signals," not "evidence was found." That judgment
 belongs entirely to the existing, untouched interpretation/evidence-tier pipeline downstream."""
 
+import re
 from datetime import datetime
-from urllib.parse import quote
 
 from sqlalchemy.orm import Session
 
 from app.apify_budget_guard import STATUS_ALLOWED as APIFY_BUDGET_ALLOWED
 from app.apify_budget_guard import check_apify_budget
-from app.apify_client import GOOGLE_SEARCH_COST_PER_QUERY_USD, LINKEDIN_POST_COST_PER_POST_USD, ApifyError
+from app.apify_client import (
+    GOOGLE_SEARCH_COST_PER_QUERY_NO_AI_OVERVIEW_USD, GOOGLE_SEARCH_COST_PER_QUERY_USD,
+    LINKEDIN_POST_COST_PER_POST_USD, ApifyError, search_google_organic_results,
+)
 from app.apify_client import _get_api_key as _get_apify_api_key
 from app.budget_guard import BudgetExceededError, BudgetGuard
 from app.gtm_os.intelligence.investigation_memory import (
@@ -60,6 +67,19 @@ from app.gtm_os.orchestration.control import ControlPlaneHalted, check_can_run, 
 # exactly) -- used only to compute the real estimated cost passed to check_apify_budget(), never
 # to invent a different volume than what's really about to be called.
 LINKEDIN_POSTS_PER_SOURCE = 5
+
+# Confirmed live (2026-08-24): the broken keyword-search-URL approach was replaced with a real
+# discover-then-retrieve chain -- Google Search organicResults -> real individual LinkedIn post
+# URLs -> existing search_linkedin_posts() retrieval, unchanged. Only these two URL shapes count
+# as a genuine, individually-attributable post -- profile/company/search/generic LinkedIn pages
+# are explicitly excluded (a profile page isn't "a post," and retrying it as one would just
+# reproduce the exact failure mode this fix replaces).
+_LINKEDIN_POST_URL_PATTERN = re.compile(r"linkedin\.com/(posts|pulse)/")
+
+
+def _is_real_linkedin_post_url(url: str) -> bool:
+    return bool(url) and bool(_LINKEDIN_POST_URL_PATTERN.search(url))
+
 
 EXEC_RESULTS_RETURNED = "results_returned"
 EXEC_NO_RESULTS = "no_results"
@@ -92,10 +112,17 @@ def _result(objective_id, source, action_type, status, *, raw_result_count=None,
 def _estimate_apify_cost_usd(source: str, parameters: dict) -> float:
     """The REAL, bounded call S5 is about to make for this source -- matches the execution
     branch below exactly, never a different/larger volume. Uses only the real, already-
-    documented per-unit pricing from apify_client.py (never a guessed number)."""
+    documented per-unit pricing from apify_client.py (never a guessed number).
+
+    linkedin_post_search: this is now a TWO-PHASE cost (discovery, then retrieval) -- this
+    pre-flight estimate covers ONLY the discovery phase (one Google Search call per S4 query,
+    AI Overview disabled). The retrieval phase's cost depends on how many real post URLs
+    discovery actually finds, which isn't knowable before that call happens -- it gets its own,
+    separate check_apify_budget() call in the execution branch below, sized to the real
+    (bounded) count found, exactly per the approved two-phase design."""
     if source == "linkedin_post_search":
         query_count = len(parameters.get("queries", []))
-        return query_count * LINKEDIN_POSTS_PER_SOURCE * LINKEDIN_POST_COST_PER_POST_USD
+        return query_count * GOOGLE_SEARCH_COST_PER_QUERY_NO_AI_OVERVIEW_USD
     if source == "web_search":
         return GOOGLE_SEARCH_COST_PER_QUERY_USD  # only the first generated query is ever executed
     raise ValueError(f"no real cost estimation exists for source {source!r}")
@@ -179,13 +206,39 @@ def execute_investigation_action(db: Session, tenant_id: int, action: dict) -> d
 
     try:
         if source == "linkedin_post_search":
-            # One real Apify call, batching all (<=3) S4-generated formulations as one bounded
-            # request -- search_linkedin_posts() already accepts a list of URLs in one call.
-            search_urls = [
-                f"https://www.linkedin.com/search/results/content/?keywords={quote(q)}&datePosted=%22past-week%22&origin=FACETED_SEARCH"
-                for q in parameters.get("queries", [])
-            ]
-            signals = sense_linkedin_posts(db, tenant_id, search_urls, limit_per_source=5)
+            # Real discover-then-retrieve chain (2026-08-24 fix -- see module-level comment on
+            # _LINKEDIN_POST_URL_PATTERN for why the previous keyword-search-URL approach never
+            # worked at all): one Google Search call per S4-generated formulation, reading real
+            # organicResults, filtered to genuine individual LinkedIn post/pulse URLs and
+            # deduplicated, THEN retrieved via the existing, unmodified search_linkedin_posts()
+            # retrieval layer -- no second LinkedIn scraper, no new provider.
+            discovered_urls: list[str] = []
+            for q in parameters.get("queries", []):
+                organic_results = search_google_organic_results(_get_apify_api_key(db, tenant_id), q, max_pages=1)
+                for result in organic_results:
+                    url = result.get("url", "")
+                    if _is_real_linkedin_post_url(url) and url not in discovered_urls:
+                        discovered_urls.append(url)
+            # Bounded to the same real, documented volume this source has always been allowed
+            # to retrieve -- LINKEDIN_POSTS_PER_SOURCE, unchanged.
+            discovered_urls = discovered_urls[:LINKEDIN_POSTS_PER_SOURCE]
+
+            if discovered_urls:
+                # Second, separate budget check -- sized to the REAL (bounded) retrieval volume
+                # just discovered, not a blind pre-flight guess. Mid-execution budget block is
+                # reported the same way a pre-flight block is (EXEC_BLOCKED_BY_BUDGET, no attempt
+                # recorded) -- retrieval was never actually attempted, so nothing to record.
+                retrieval_cost = len(discovered_urls) * LINKEDIN_POST_COST_PER_POST_USD
+                retrieval_budget = check_apify_budget(db, tenant_id, retrieval_cost)
+                if retrieval_budget["status"] != APIFY_BUDGET_ALLOWED:
+                    return _result(objective_id, source, action_type, EXEC_BLOCKED_BY_BUDGET, error_reason=retrieval_budget["reason"], started_at=started_at)
+                signals = sense_linkedin_posts(db, tenant_id, discovered_urls, limit_per_source=1)
+            else:
+                # No real post URLs discovered -- a genuine attempt was still made (the Google
+                # Search call(s) really happened and are billed), so this falls through to the
+                # SAME existing "zero signals" handling below (raw_result_count=0 ->
+                # EXEC_NO_RESULTS -> RESULT_INCONCLUSIVE) rather than a new status/code path.
+                signals = []
         elif source == "web_search":
             # sense_web_search() takes exactly one query -- no batching support exists in this
             # adapter, so only the FIRST generated formulation is executed (one bounded call),

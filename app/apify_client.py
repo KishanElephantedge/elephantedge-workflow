@@ -137,6 +137,33 @@ def search_google_ai_overview(api_key: str, query: str) -> str | None:
     return overview.get("content") or None
 
 
+# Same actor/endpoint as search_google_ai_overview() above, but reads organicResults instead of
+# aiOverview -- confirmed live (2026-08-24) that this field is real and already present in every
+# response from this actor, just never read before. AI Overview is explicitly disabled here
+# (not needed for organic-result discovery), saving the $0.003/query AI Overview cost --
+# see GOOGLE_SEARCH_COST_PER_QUERY_NO_AI_OVERVIEW_USD below.
+GOOGLE_SEARCH_COST_PER_QUERY_NO_AI_OVERVIEW_USD = 0.0055  # $0.0045 page + $0.001 start (no AI Overview)
+
+
+def search_google_organic_results(api_key: str, query: str, max_pages: int = 1) -> list[dict]:
+    """Returns the real organicResults list for one query (each item carries at least url/title/
+    description, per this actor's own real response shape, confirmed live 2026-08-24) -- used for
+    genuine keyword-based content discovery, as opposed to search_google_ai_overview()'s single
+    summarized-text use case."""
+    response = _post(
+        f"{BASE_URL}/acts/{GOOGLE_SEARCH_ACTOR_ID}/run-sync-get-dataset-items",
+        params={"token": api_key},
+        json={"queries": query, "maxPagesPerQuery": max_pages, "aiOverview": {"enabled": False}},
+        timeout=60,
+    )
+    if response.status_code >= 300:
+        raise ApifyError(f"Google search failed ({response.status_code}): {response.text[:500]}")
+    items = response.json()
+    if not items:
+        return []
+    return items[0].get("organicResults") or []
+
+
 # memo23/linkedin-people-search -- searches LinkedIn's own data directly (not Google's index of
 # it), unlike a generic web search. Validated live (2026-08-08): a name+company search returned
 # the exact, cross-confirmed correct profile for one real person (Karan Talati, First
