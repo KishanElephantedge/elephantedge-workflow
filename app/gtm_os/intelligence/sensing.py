@@ -90,17 +90,26 @@ def sense_linkedin_jobs(
         source_ref = str(item.get("id") or item.get("jobUrl") or item.get("url") or "")
         if not source_ref:
             continue
+        # Real bug fix (2026-08-24, confirmed live): the raw actor response uses "organization"
+        # (and "org_linkedin_website"/"org_linkedin_headcount"/"date_posted"), never
+        # "organizationName"/"companyName"/"postedAt" -- those never matched anything real,
+        # meaning company_name_raw was silently None on every linkedin_job signal this source
+        # ever produced. org_linkedin_website/org_linkedin_headcount are real, already-present
+        # fields captured here for the first time -- free byproducts of the same billed call,
+        # not a new lookup -- kept in extracted_info for a future company-enrichment pass to use.
         signal = GtmSignal(
             tenant_id=tenant_id,
             source="linkedin_job",
             source_ref=source_ref,
             signal_type="job_posting",
-            observed_at=_parse_dt(item.get("postedAt") or item.get("datePosted")),
-            company_name_raw=item.get("organizationName") or item.get("companyName"),
+            observed_at=_parse_dt(item.get("date_posted") or item.get("postedAt") or item.get("datePosted")),
+            company_name_raw=item.get("organization") or item.get("organizationName") or item.get("companyName"),
             raw_evidence=item,
             extracted_info={
                 "title": item.get("title"),
                 "location": item.get("location"),
+                "organization_domain": item.get("org_linkedin_website"),
+                "organization_headcount": item.get("org_linkedin_headcount"),
             },
             dedup_key=_dedup_key("linkedin_job", source_ref),
         )
