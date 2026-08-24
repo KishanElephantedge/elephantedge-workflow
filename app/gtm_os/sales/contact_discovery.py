@@ -159,7 +159,22 @@ def discover_contacts_for_opportunity(db: Session, tenant_id: int, opportunity: 
     # run its free tier exactly as before, at $0 cost.
     paid_allowed, paid_blocked_reason = _check_paid_fallback_budget(contact_budget_usd)
 
-    guard = BudgetGuard(contact_budget_usd)
+    # Real bug fix (2026-08-25, confirmed live): BudgetGuard's constructor calls
+    # get_credit_balance_usd() itself, unguarded -- when paid_allowed is already False (e.g. a
+    # real Deepline outage/CLI issue, confirmed live), constructing this guard at all was an
+    # unnecessary second balance call that could crash the WHOLE sweep with an unhandled
+    # DeeplineError, even though the guard is only ever actually used below when used_paid is
+    # True -- which can never happen when paid_allowed is False (find_decision_makers only
+    # attempts the paid tier when allow_paid_fallback=True). Only constructed when actually
+    # needed now, same "one opportunity's failure must never crash the sweep" discipline this
+    # function already applies everywhere else.
+    guard = None
+    if paid_allowed:
+        try:
+            guard = BudgetGuard(contact_budget_usd)
+        except Exception as e:  # noqa: BLE001 -- a provider/balance-check failure must not crash the sweep
+            return {"status": "failed", "opportunity_id": opportunity.id, "error": f"could not initialize budget guard: {e}"}
+
     try:
         new_contacts, used_paid = find_decision_makers(
             company, db, tenant_id, allow_paid_fallback=paid_allowed, max_contacts=MAX_CONTACTS_PER_COMPANY,
@@ -170,7 +185,7 @@ def discover_contacts_for_opportunity(db: Session, tenant_id: int, opportunity: 
     except Exception as e:  # noqa: BLE001 -- a provider failure must not crash the sweep
         return {"status": "failed", "opportunity_id": opportunity.id, "error": str(e)}
 
-    if used_paid:
+    if used_paid and guard is not None:
         guard.check()  # still a second, defense-in-depth check on the ACTUAL post-call spend
 
     result = {
