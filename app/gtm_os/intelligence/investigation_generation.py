@@ -34,6 +34,13 @@ from app.llm_client import generate_json
 
 MAX_FORMULATIONS = 3  # a runtime safety bound, not a business rule -- see module docstring
 
+# V2-owned employee-headcount band for linkedin_job sensing (2026-08-24, explicit instruction).
+# Deliberately separate from V1's APIFY_EMPLOYEE_MIN/MAX (app/phases/apify_discovery.py, 25-50)
+# -- that band is intentional for V1's own fractional-leadership motion and must stay untouched.
+# V2 serves multiple offerings and can also fit somewhat larger companies.
+V2_LINKEDIN_JOB_EMPLOYEE_MIN = 25
+V2_LINKEDIN_JOB_EMPLOYEE_MAX = 100
+
 STATUS_OK = "ok"
 STATUS_GENERATION_FAILED = "generation_failed"
 STATUS_BLOCKED = "blocked"
@@ -186,17 +193,23 @@ def generate_investigation_action(db: Session, tenant_id: int, objective: Invest
     if source == "linkedin_job":
         # No LLM call -- structured filter parameters, not a keyword query, same discipline as
         # theirstack_job below. Real fix (2026-08-24): S5 previously had no execution path for
-        # this source at all; reuses V1's own real, live-validated search_linkedin_jobs()
-        # parameters verbatim (app/phases/apify_discovery.py's APIFY_TITLE_SEARCH/
-        # APIFY_INDUSTRY_FILTER/APIFY_EMPLOYEE_MIN/MAX) -- the exact same Apify LinkedIn Jobs
-        # Scraper call V1's own real production discovery already uses successfully, per the
-        # user's explicit "use the same as V1" instruction. Not re-derived or re-tuned here.
-        from app.phases.apify_discovery import APIFY_EMPLOYEE_MAX, APIFY_EMPLOYEE_MIN, APIFY_INDUSTRY_FILTER, APIFY_TITLE_SEARCH
+        # this source at all; reuses V1's own real, live-validated title_search/industry_filter
+        # verbatim (app/phases/apify_discovery.py's APIFY_TITLE_SEARCH/APIFY_INDUSTRY_FILTER).
+        #
+        # Employee band is DELIBERATELY a separate, V2-owned constant, NOT V1's shared
+        # APIFY_EMPLOYEE_MIN/MAX (2026-08-24 explicit instruction: V1's 25-50 band is
+        # intentional and must stay untouched for V1's own real daily discovery; V2 -- with
+        # multiple offerings, not just V1's fractional-leadership motion -- should also reach
+        # somewhat larger companies). No revenue filter exists here or ever will via this
+        # source: confirmed, neither Apify's LinkedIn Jobs actor nor the free Crustdata lookup
+        # expose a real revenue/funding number to filter on (see apify_discovery.py's own
+        # docstring) -- employee headcount is the only real, filterable proxy this source has.
+        from app.phases.apify_discovery import APIFY_INDUSTRY_FILTER, APIFY_TITLE_SEARCH
         return _result(
             objective.id, source, "linkedin_job",
             {
                 "title_search": APIFY_TITLE_SEARCH, "location_search": ["United States"],
-                "organization_employees_gte": APIFY_EMPLOYEE_MIN, "organization_employees_lte": APIFY_EMPLOYEE_MAX,
+                "organization_employees_gte": V2_LINKEDIN_JOB_EMPLOYEE_MIN, "organization_employees_lte": V2_LINKEDIN_JOB_EMPLOYEE_MAX,
                 "industry_filter": APIFY_INDUSTRY_FILTER, "time_range": "7d",
             },
             STATUS_OK,
