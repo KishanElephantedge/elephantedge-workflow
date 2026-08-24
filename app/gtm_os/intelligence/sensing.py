@@ -18,7 +18,11 @@ history on every call, unlike every other source's small-incremental-results sha
 sense_linkedin_posts() (2026-08-24) is a second, equally deliberate exception: it is called
 repeatedly over time against the same profile URLs, and the actor legitimately returns the same
 recent posts again on a later call -- an "already sensed by source_ref" guard is applied before
-insert, same pattern as linkedin_reply/hackernews_story/rss_article below."""
+insert, same pattern as linkedin_reply/hackernews_story/rss_article below.
+
+sense_linkedin_jobs() (2026-08-24) is a third such exception, same reasoning and same guard --
+confirmed live: the exact same Codeable job posting (same linkedin_id/url) was stored twice
+across overlapping search calls before this guard existed."""
 
 import hashlib
 from datetime import datetime
@@ -95,6 +99,20 @@ def sense_linkedin_jobs(
         source_ref = str(item.get("id") or item.get("jobUrl") or item.get("url") or "")
         if not source_ref:
             continue
+
+        # Real dedup bug fix (2026-08-24, confirmed live: the exact same Codeable BDR posting,
+        # same linkedin_id/url, stored 2x). Same missing "already sensed" guard already applied
+        # to sense_linkedin_posts() earlier today -- this adapter is also called repeatedly over
+        # time/across overlapping search queries, and the same real job can legitimately be
+        # returned again on a later call.
+        already_sensed = (
+            db.query(GtmSignal)
+            .filter(GtmSignal.tenant_id == tenant_id, GtmSignal.source == "linkedin_job", GtmSignal.source_ref == source_ref)
+            .first()
+        )
+        if already_sensed:
+            continue
+
         # Real bug fix (2026-08-24, confirmed live): the raw actor response uses "organization"
         # (and "org_linkedin_website"/"org_linkedin_headcount"/"date_posted"), never
         # "organizationName"/"companyName"/"postedAt" -- those never matched anything real,
