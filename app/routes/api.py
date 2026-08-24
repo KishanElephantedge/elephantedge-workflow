@@ -4371,3 +4371,64 @@ def get_inbound_visitors(limit: int = 50, resolved_only: bool = True, db: Sessio
         }
         for v in visitors
     ]
+
+
+# ---- CRM (V2) -- reads, edits, and deletes real HubSpot data directly (not V1's push-only
+# sync in app/phases/hubspot_sync.py, which this never touches). Curated property sets only --
+# see app/hubspot_client.py's own module comment for why. Every route here talks to HubSpot
+# live on every call; nothing is cached or mirrored locally.
+
+@router.get("/crm/companies")
+def list_crm_companies(limit: int = 25, after: str | None = None, search: str | None = None, db: Session = Depends(get_db)):
+    from app.hubspot_client import HubSpotError, list_companies
+    try:
+        return list_companies(db, ELEPHANT_EDGE_TENANT_ID, limit=limit, after=after, search=search)
+    except HubSpotError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+@router.get("/crm/contacts")
+def list_crm_contacts(limit: int = 25, after: str | None = None, search: str | None = None, db: Session = Depends(get_db)):
+    from app.hubspot_client import HubSpotError, list_contacts
+    try:
+        return list_contacts(db, ELEPHANT_EDGE_TENANT_ID, limit=limit, after=after, search=search)
+    except HubSpotError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+@router.patch("/crm/companies/{company_id}")
+def update_crm_company(company_id: str, body: dict = Body(...), db: Session = Depends(get_db)):
+    from app.hubspot_client import HubSpotError, update_company
+    try:
+        return update_company(company_id, body, db, ELEPHANT_EDGE_TENANT_ID)
+    except HubSpotError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+@router.patch("/crm/contacts/{contact_id}")
+def update_crm_contact(contact_id: str, body: dict = Body(...), db: Session = Depends(get_db)):
+    from app.hubspot_client import HubSpotError, update_contact
+    try:
+        return update_contact(contact_id, body, db, ELEPHANT_EDGE_TENANT_ID)
+    except HubSpotError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+@router.delete("/crm/companies/{company_id}")
+def delete_crm_company(company_id: str, db: Session = Depends(get_db)):
+    from app.hubspot_client import HubSpotError, delete_company
+    try:
+        delete_company(company_id, db, ELEPHANT_EDGE_TENANT_ID)
+    except HubSpotError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    return {"deleted": True}
+
+
+@router.delete("/crm/contacts/{contact_id}")
+def delete_crm_contact(contact_id: str, db: Session = Depends(get_db)):
+    from app.hubspot_client import HubSpotError, delete_contact
+    try:
+        delete_contact(contact_id, db, ELEPHANT_EDGE_TENANT_ID)
+    except HubSpotError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    return {"deleted": True}
