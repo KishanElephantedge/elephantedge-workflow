@@ -65,7 +65,17 @@ def _interpret_job_signal(signal: GtmSignal, db=None, tenant_id: int | None = No
     linkedin_job_interpretation.classify_job_description) may promote the base "hiring_activity"
     event to "first_sales_hire_signal" -- but only when the REAL JD text itself supports it. The
     base title-matched result is unchanged either way; this only ever upgrades what event_type/
-    business_change/evidence gets attached to it."""
+    business_change/evidence gets attached to it.
+
+    2026-08-24 second addition: a role classified as "head_of_sales" is itself a distinct, real
+    ICP-3 trigger (icp_config.py: icp_3 "Needs Fractional Leadership" triggers on exactly this
+    role type) -- a leadership/VP-level hire is not the same kind of ambiguous signal an ordinary
+    IC rep hire (sdr/ae) is, so it is promoted deterministically to "leadership_hire_signal"
+    (no LLM, reuses the role classification already computed above) UNLESS the JD-content pass
+    already promoted it further to first_sales_hire_signal. Ordinary sdr/ae/gtm/marketing roles
+    are NOT touched by this -- they stay plain hiring_activity, contextual tier, exactly as
+    before; this is deliberately narrow to the one role type that is itself a distinct, real
+    trigger, not a blanket promotion of every hire."""
     title = (signal.extracted_info or {}).get("title")
     if not title:
         return None
@@ -77,6 +87,14 @@ def _interpret_job_signal(signal: GtmSignal, db=None, tenant_id: int | None = No
     business_change = f"{signal.company_name_raw or 'This company'} appears to be hiring for {ROLE_LABEL.get(role, role)} role."
     evidence_excerpt = title
     extraction_method = "deterministic:role_title_keyword_match"
+
+    if role == "head_of_sales":
+        event_type = "leadership_hire_signal"
+        business_change = (
+            f"{signal.company_name_raw or 'This company'} is hiring for {ROLE_LABEL.get(role, role)} -- "
+            f"a leadership-level sales hire, not an ordinary rep hire."
+        )
+        extraction_method = "deterministic:head_of_sales_role_match"
 
     if signal.source == "linkedin_job" and db is not None and tenant_id is not None:
         description_text = (signal.extracted_info or {}).get("description_text")

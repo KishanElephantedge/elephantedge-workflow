@@ -91,6 +91,7 @@ EVENT_TYPE_TIERS: dict[str, str] = {
     "growth_hiring_mention": "contextual",
     "first_sales_hire_signal": "implied_gap",
     "concurrent_hiring_surge": "implied_gap",
+    "leadership_hire_signal": "implied_gap",
     # "market_pattern_observation" intentionally absent -- see comment above.
 }
 DEFAULT_EVIDENCE_TIER = "contextual"

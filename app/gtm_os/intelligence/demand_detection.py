@@ -60,6 +60,7 @@ DEMAND_EVENT_TYPE_TIERS: dict[str, str] = {
     "demo_request": "buying_intent_adjacent",
     "first_sales_hire_signal": "demand",
     "concurrent_hiring_surge": "demand",
+    "leadership_hire_signal": "demand",
 }
 DEFAULT_DEMAND_TIER = "none"
 
