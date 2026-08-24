@@ -105,20 +105,24 @@ def run_interpretation_sweep(
     kept deliberately simple for this first version (an open decision in the Step 4 design doc,
     not resolved with a schema change here since a small sweep can just query for it)."""
     sources = sources or list(_INTERPRETERS.keys())
-    already_interpreted = {
-        row[0]
-        for row in db.query(InterpretedSignal.source_signal_id).filter(InterpretedSignal.tenant_id == tenant_id).all()
-    }
+    # Real bug fix (2026-08-24, confirmed live): the previous query applied .limit(limit) BEFORE
+    # excluding already-interpreted signals, filtering them out only in Python afterward. Once
+    # the total signal backlog across these sources exceeded `limit` (confirmed live: 233 real
+    # signals vs limit=200), the oldest-N fetched were almost entirely already-interpreted, and
+    # genuinely NEW signals were never reached at all -- a real, silent starvation bug, not a
+    # capacity limit working as intended. Now excludes already-interpreted rows at the SQL level
+    # (a NOT IN subquery) before the limit is ever applied, so `limit` genuinely bounds "how many
+    # NEW signals to interpret this call," matching what every caller already assumes it does.
+    already_interpreted_subquery = db.query(InterpretedSignal.source_signal_id).filter(InterpretedSignal.tenant_id == tenant_id).subquery()
     query = (
         db.query(GtmSignal)
         .filter(GtmSignal.tenant_id == tenant_id, GtmSignal.source.in_(sources))
+        .filter(~GtmSignal.id.in_(db.query(already_interpreted_subquery.c.source_signal_id)))
         .order_by(GtmSignal.id)
         .limit(limit)
     )
     created = []
     for signal in query:
-        if signal.id in already_interpreted:
-            continue
         interpreter = _INTERPRETERS.get(signal.source)
         if interpreter is None:
             continue
