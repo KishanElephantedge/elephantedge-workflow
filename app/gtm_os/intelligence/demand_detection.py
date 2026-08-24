@@ -209,23 +209,25 @@ def run_demand_hypothesis_sweep(
     DemandHypothesis yet. Scoped to the sources Step 3/6 already sense: linkedin_post,
     linkedin_job, theirstack_job -- no new sensing/interpretation work needed, per Step 7's scope."""
     sources = sources or ["linkedin_post", "linkedin_job", "theirstack_job"]
-    already_linked_ids = {
-        row[0]
-        for row in db.query(DemandHypothesisEvidence.interpreted_signal_id)
+    # Real bug fix (2026-08-24, confirmed live -- same starvation bug found and fixed in
+    # interpretation.py and problem_detection.py the same day): .limit(limit) was applied BEFORE
+    # excluding already-linked signals (filtered in Python afterward), so once the backlog
+    # exceeded `limit`, genuinely NEW interpreted signals were never reached at all.
+    already_linked_subquery = (
+        db.query(DemandHypothesisEvidence.interpreted_signal_id)
         .filter(DemandHypothesisEvidence.tenant_id == tenant_id)
-        .all()
-    }
+        .subquery()
+    )
     query = (
         db.query(InterpretedSignal)
         .join(GtmSignal, InterpretedSignal.source_signal_id == GtmSignal.id)
         .filter(InterpretedSignal.tenant_id == tenant_id, GtmSignal.source.in_(sources))
+        .filter(~InterpretedSignal.id.in_(db.query(already_linked_subquery.c.interpreted_signal_id)))
         .order_by(InterpretedSignal.id)
         .limit(limit)
     )
     touched = []
     for signal in query:
-        if signal.id in already_linked_ids:
-            continue
         hypothesis = evaluate_interpreted_signal_for_demand(db, tenant_id, signal)
         if hypothesis is not None and hypothesis not in touched:
             touched.append(hypothesis)
