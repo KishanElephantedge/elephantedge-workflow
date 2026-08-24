@@ -119,6 +119,29 @@ def _list_or_search(object_type: str, properties: list[str], db: Session, tenant
     }
 
 
+def _get_object(object_type: str, object_id: str, properties: list[str], db: Session, tenant_id: int) -> dict:
+    """Single-object fetch, used by the V2 edit page so a direct URL / page refresh always has
+    real data to show instead of relying on state handed off from the list page."""
+    response = httpx.get(
+        f"{BASE_URL}/crm/v3/objects/{object_type}/{object_id}",
+        headers=_headers(db, tenant_id),
+        params={"properties": ",".join(properties)},
+        timeout=30,
+    )
+    if response.status_code != 200:
+        raise HubSpotError(f"{object_type} fetch failed ({response.status_code}): {response.text}")
+    result = response.json()
+    return {"id": result["id"], "properties": result.get("properties", {})}
+
+
+def get_company(company_id: str, db: Session, tenant_id: int) -> dict:
+    return _get_object("companies", company_id, COMPANY_PROPERTIES, db, tenant_id)
+
+
+def get_contact(contact_id: str, db: Session, tenant_id: int) -> dict:
+    return _get_object("contacts", contact_id, CONTACT_PROPERTIES, db, tenant_id)
+
+
 def list_companies(db: Session, tenant_id: int, limit: int = 25, after: str | None = None, search: str | None = None) -> dict:
     return _list_or_search("companies", COMPANY_PROPERTIES, db, tenant_id, limit, after, search)
 

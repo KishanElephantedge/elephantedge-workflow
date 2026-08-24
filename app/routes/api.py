@@ -4396,6 +4396,24 @@ def list_crm_contacts(limit: int = 25, after: str | None = None, search: str | N
         raise HTTPException(status_code=502, detail=str(e))
 
 
+@router.get("/crm/companies/{company_id}")
+def get_crm_company(company_id: str, db: Session = Depends(get_db)):
+    from app.hubspot_client import HubSpotError, get_company
+    try:
+        return get_company(company_id, db, ELEPHANT_EDGE_TENANT_ID)
+    except HubSpotError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+@router.get("/crm/contacts/{contact_id}")
+def get_crm_contact(contact_id: str, db: Session = Depends(get_db)):
+    from app.hubspot_client import HubSpotError, get_contact
+    try:
+        return get_contact(contact_id, db, ELEPHANT_EDGE_TENANT_ID)
+    except HubSpotError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
 @router.patch("/crm/companies/{company_id}")
 def update_crm_company(company_id: str, body: dict = Body(...), db: Session = Depends(get_db)):
     from app.hubspot_client import HubSpotError, update_company
