@@ -13,7 +13,12 @@ how to treat repeats without any evidence having been silently dropped.
 
 Step 11A's sense_linkedin_replies() is a deliberate, documented EXCEPTION to that "always insert"
 rule -- see its own docstring for why (SalesRobot's syncedMessages endpoint returns full thread
-history on every call, unlike every other source's small-incremental-results shape)."""
+history on every call, unlike every other source's small-incremental-results shape).
+
+sense_linkedin_posts() (2026-08-24) is a second, equally deliberate exception: it is called
+repeatedly over time against the same profile URLs, and the actor legitimately returns the same
+recent posts again on a later call -- an "already sensed by source_ref" guard is applied before
+insert, same pattern as linkedin_reply/hackernews_story/rss_article below."""
 
 import hashlib
 from datetime import datetime
@@ -155,6 +160,23 @@ def sense_linkedin_posts(
         source_ref = str(item.get("urn") or item.get("postUrl") or item.get("url") or "")
         if not source_ref:
             continue
+
+        # Real dedup bug fix (2026-08-24, confirmed live: the same post stored 3x for one
+        # person across separate objective attempts). This adapter is called repeatedly over
+        # time against the same profile URLs, and the actor legitimately returns the same
+        # recent posts again on a later call -- without this guard every repeat retrieval
+        # silently inserted another GtmSignal row for the identical post. Same pre-insert
+        # "already sensed" pattern already used below for linkedin_reply/hackernews_story/
+        # rss_article -- see this module's docstring for why those are exceptions to the
+        # default "always insert" rule; linkedin_post is now a second, equally deliberate one.
+        already_sensed = (
+            db.query(GtmSignal)
+            .filter(GtmSignal.tenant_id == tenant_id, GtmSignal.source == "linkedin_post", GtmSignal.source_ref == source_ref)
+            .first()
+        )
+        if already_sensed:
+            continue
+
         author = item.get("author") or {}
         headline = author.get("headline") or item.get("authorHeadline") or ""
         signal = GtmSignal(

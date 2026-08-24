@@ -146,61 +146,119 @@ def _matched_clause_is_question(text: str, phrase: str) -> bool:
     return False
 
 
+def _classify_text(text: str) -> dict | None:
+    """The actual phrase-matching decision, factored out of interpret_linkedin_post_signal so the
+    same, UNCHANGED rules can run either against one post's text (the original behavior) or
+    against several posts from the same person concatenated together (2026-08-24 addition, see
+    interpret_linkedin_post_signals_grouped below) -- aggregation changes what text the rules see,
+    never what the rules themselves mean. Checked in priority order (strongest, most specific
+    claim first): text could plausibly match more than one pattern set, and a declared problem
+    statement is a stronger claim than an incidental growth mention in the same text."""
+    text_lower = text.lower()
+    affected_function = _infer_affected_function(text_lower)
+
+    matched = _matches_any(text_lower, DECLARED_PROBLEM_PHRASES)
+    if matched:
+        return {
+            "event_type": "problem_statement", "affected_function": affected_function, "matched_phrase": matched,
+            "method": "deterministic:phrase_match:declared_problem",
+            "business_change": lambda who: f"{who} appears to describe a difficulty related to {affected_function}.",
+        }
+
+    matched = _matches_any(text_lower, QUESTION_LEAD_PHRASES)
+    if matched and _matched_clause_is_question(text, matched):
+        return {
+            "event_type": "solution_question", "affected_function": affected_function, "matched_phrase": matched,
+            "method": "deterministic:phrase_match:solution_question",
+            "business_change": lambda who: f"{who} appears to be asking how others address a {affected_function}-related challenge.",
+        }
+
+    matched = _matches_any(text_lower, ONGOING_SOLUTION_PHRASES)
+    if matched:
+        return {
+            "event_type": "solution_evaluation_mention", "affected_function": affected_function, "matched_phrase": matched,
+            "method": "deterministic:phrase_match:solution_evaluation",
+            "business_change": lambda who: f"{who} appears to be actively evaluating solutions related to {affected_function}.",
+        }
+
+    matched = _matches_any(text_lower, RESOLVED_SOLUTION_PHRASES)
+    if matched:
+        return {
+            "event_type": "solution_adoption_mention", "affected_function": affected_function, "matched_phrase": matched,
+            "method": "deterministic:phrase_match:solution_adoption",
+            "business_change": lambda who: f"{who} mentions having already adopted a solution related to {affected_function}.",
+        }
+
+    matched = _matches_any(text_lower, GROWTH_HIRING_PHRASES)
+    if matched:
+        return {
+            "event_type": "growth_hiring_mention", "affected_function": affected_function, "matched_phrase": matched,
+            "method": "deterministic:phrase_match:growth_hiring",
+            "business_change": lambda who: f"{who} mentions team growth/hiring related to {affected_function}.",
+        }
+
+    return None  # no confident deterministic pattern matched -- not interpreted, not guessed at
+
+
 def interpret_linkedin_post_signal(signal: GtmSignal) -> InterpretedSignal | None:
-    """Checked in priority order (strongest, most specific claim first): a post could plausibly
-    match more than one pattern set, and a declared problem statement is a stronger claim than an
-    incidental growth mention in the same post."""
     if signal.source != "linkedin_post":
         raise ValueError(f"expected a linkedin_post signal, got {signal.source!r}")
 
     text = (signal.extracted_info or {}).get("text")
     if not text:
         return None
-    text_lower = text.lower()
-    affected_function = _infer_affected_function(text_lower)
+    classification = _classify_text(text)
+    if classification is None:
+        return None
     who = signal.person_name_raw or signal.company_name_raw or "This person/company"
+    return _build(
+        signal, event_type=classification["event_type"], affected_function=classification["affected_function"],
+        business_change=classification["business_change"](who), matched_phrase=classification["matched_phrase"],
+        text=text, method=classification["method"],
+    )
 
-    matched = _matches_any(text_lower, DECLARED_PROBLEM_PHRASES)
-    if matched:
-        return _build(
-            signal, event_type="problem_statement", affected_function=affected_function,
-            business_change=f"{who} appears to describe a difficulty related to {affected_function}.",
-            matched_phrase=matched, text=text, method="deterministic:phrase_match:declared_problem",
-        )
 
-    matched = _matches_any(text_lower, QUESTION_LEAD_PHRASES)
-    if matched and _matched_clause_is_question(text, matched):
-        return _build(
-            signal, event_type="solution_question", affected_function=affected_function,
-            business_change=f"{who} appears to be asking how others address a {affected_function}-related challenge.",
-            matched_phrase=matched, text=text, method="deterministic:phrase_match:solution_question",
-        )
+def interpret_linkedin_post_signals_grouped(signals: list[GtmSignal]) -> list[InterpretedSignal]:
+    """2026-08-24 addition: multiple posts from the SAME person, taken together, can carry a
+    pattern no single one of them shows alone (real example: three separate posts about sales-hire
+    turnover, none individually phrase-matching, together an unmistakable repeated-failure theme) --
+    see this module's own docstring on why single-post phrase-matching alone can't already catch
+    this (it would require real semantic reasoning, explicitly out of scope for this deterministic
+    layer). This does NOT add that semantic reasoning. It does the one thing a deterministic layer
+    honestly can: if ANY post in the group phrase-matches on its own OR the group's combined text
+    phrase-matches, every post in the group becomes real evidence for that same event_type/tier --
+    today only the one matching post becomes evidence and the other, clearly-related posts from the
+    same person are silently discarded even though problem_detection.py's own multi-evidence
+    corroboration mechanism already exists to make use of them. Callers group signals by a caller-
+    determined identity key -- this function does not decide who counts as "the same person"."""
+    results = []
+    if not signals:
+        return results
+    if len(signals) == 1:
+        result = interpret_linkedin_post_signal(signals[0])
+        return [result] if result else []
 
-    matched = _matches_any(text_lower, ONGOING_SOLUTION_PHRASES)
-    if matched:
-        return _build(
-            signal, event_type="solution_evaluation_mention", affected_function=affected_function,
-            business_change=f"{who} appears to be actively evaluating solutions related to {affected_function}.",
-            matched_phrase=matched, text=text, method="deterministic:phrase_match:solution_evaluation",
-        )
+    per_signal_text = {s.id: (s.extracted_info or {}).get("text") for s in signals}
+    combined_text = "\n---\n".join(t for t in per_signal_text.values() if t)
+    group_classification = _classify_text(combined_text) if combined_text else None
 
-    matched = _matches_any(text_lower, RESOLVED_SOLUTION_PHRASES)
-    if matched:
-        return _build(
-            signal, event_type="solution_adoption_mention", affected_function=affected_function,
-            business_change=f"{who} mentions having already adopted a solution related to {affected_function}.",
-            matched_phrase=matched, text=text, method="deterministic:phrase_match:solution_adoption",
-        )
-
-    matched = _matches_any(text_lower, GROWTH_HIRING_PHRASES)
-    if matched:
-        return _build(
-            signal, event_type="growth_hiring_mention", affected_function=affected_function,
-            business_change=f"{who} mentions team growth/hiring related to {affected_function}.",
-            matched_phrase=matched, text=text, method="deterministic:phrase_match:growth_hiring",
-        )
-
-    return None  # no confident deterministic pattern matched -- not interpreted, not guessed at
+    for signal in signals:
+        text = per_signal_text.get(signal.id)
+        if not text:
+            continue
+        individual_classification = _classify_text(text)
+        classification = individual_classification or group_classification
+        if classification is None:
+            continue
+        who = signal.person_name_raw or signal.company_name_raw or "This person/company"
+        evidence_text = text if individual_classification else combined_text
+        method = classification["method"] if individual_classification else f"{classification['method']}:grouped_context"
+        results.append(_build(
+            signal, event_type=classification["event_type"], affected_function=classification["affected_function"],
+            business_change=classification["business_change"](who), matched_phrase=classification["matched_phrase"],
+            text=evidence_text, method=method,
+        ))
+    return results
 
 
 def _build(signal: GtmSignal, *, event_type: str, affected_function: str, business_change: str, matched_phrase: str, text: str, method: str) -> InterpretedSignal:

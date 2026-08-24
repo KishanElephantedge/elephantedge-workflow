@@ -20,7 +20,10 @@ intent. Those are later, not-yet-built layers."""
 from sqlalchemy.orm import Session
 
 from app.gtm_os.intelligence.interpreted_signal import InterpretedSignal
-from app.gtm_os.intelligence.linkedin_post_interpretation import interpret_linkedin_post_signal
+from app.gtm_os.intelligence.linkedin_post_interpretation import (
+    interpret_linkedin_post_signal,
+    interpret_linkedin_post_signals_grouped,
+)
 from app.gtm_os.intelligence.linkedin_reply_interpretation import interpret_linkedin_reply_signal
 from app.gtm_os.intelligence.signal import GtmSignal
 from app.phases.hiring_signal import _classify_role
@@ -93,6 +96,25 @@ _INTERPRETERS = {
 }
 
 
+def _linkedin_post_group_key(signal: GtmSignal) -> tuple | None:
+    """Real per-person identity key for grouping linkedin_post signals (2026-08-24 addition, see
+    interpret_linkedin_post_signals_grouped). Prefers the LinkedIn profile identifier already
+    captured in extracted_info (author_profile_url/author_urn/author_profile_id -- the same
+    stable fields company_resolution.py already treats as the trustworthy per-person key) over
+    person_name_raw, which is a raw, unnormalized string (e.g. "Sai S.", "Ramas Krishnan (RK)")
+    that risks silently merging different people who happen to render the same name, or failing
+    to merge the same person whose name renders differently across posts. Two signals only ever
+    group together when their non-null identifiers are identical -- a signal with no identifiable
+    person at all (key is None) is never grouped with anything."""
+    info = signal.extracted_info or {}
+    profile_id = info.get("author_profile_url") or info.get("author_urn") or info.get("author_profile_id")
+    if profile_id:
+        return ("profile", profile_id)
+    if signal.person_name_raw:
+        return ("name", signal.person_name_raw, signal.company_id or signal.company_name_raw)
+    return None
+
+
 def run_interpretation_sweep(
     db: Session,
     tenant_id: int,
@@ -122,7 +144,13 @@ def run_interpretation_sweep(
         .limit(limit)
     )
     created = []
+    linkedin_post_signals = []
     for signal in query:
+        if signal.source == "linkedin_post":
+            # Deferred to the grouped path below (2026-08-24 addition) instead of dispatched
+            # individually here -- see interpret_linkedin_post_signals_grouped's own docstring.
+            linkedin_post_signals.append(signal)
+            continue
         interpreter = _INTERPRETERS.get(signal.source)
         if interpreter is None:
             continue
@@ -130,5 +158,19 @@ def run_interpretation_sweep(
         if result is not None:
             db.add(result)
             created.append(result)
+
+    if linkedin_post_signals:
+        groups: dict[tuple, list[GtmSignal]] = {}
+        for signal in linkedin_post_signals:
+            key = _linkedin_post_group_key(signal)
+            if key is None:
+                groups.setdefault(("__ungrouped__", signal.id), []).append(signal)
+            else:
+                groups.setdefault(key, []).append(signal)
+        for group_signals in groups.values():
+            for result in interpret_linkedin_post_signals_grouped(group_signals):
+                db.add(result)
+                created.append(result)
+
     db.commit()
     return created
