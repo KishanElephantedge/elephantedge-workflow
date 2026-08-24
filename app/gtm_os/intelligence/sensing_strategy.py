@@ -37,13 +37,16 @@ from app.gtm_os.orchestration.control import ControlPlaneHalted, check_can_run, 
 # separate gap in S5 itself. Listed here, not silently worked around, so S3 stops proposing a
 # source that can never currently execute -- S5's own gating logic is left completely
 # untouched, still the final/only real safety authority.
-SOURCES_WITH_NO_EXECUTION_GUARD = {"linkedin_job"}
+#
+# Real fix (2026-08-24): linkedin_job now has a real S5 execution path (reuses V1's own proven
+# search_linkedin_jobs() adapter/parameters -- see investigation_execution.py/
+# investigation_generation.py) -- empty set, kept (not deleted) so a future source added without
+# an S5 execution branch has an obvious place to be recorded, same discipline as before.
+SOURCES_WITH_NO_EXECUTION_GUARD: set[str] = set()
 
 # Sources S5 apify-budget-gates today (investigation_execution.py's own literal condition:
-# `if source in ("linkedin_post_search", "web_search")`) -- mirrored exactly, not generalized to
-# every Apify-cost-category source (linkedin_job is Apify-costed too but NOT in that tuple; see
-# SOURCES_WITH_NO_EXECUTION_GUARD above for why it's handled separately).
-APIFY_BUDGET_GATED_SOURCES = {"linkedin_post_search", "web_search"}
+# `if source in ("linkedin_post_search", "web_search", "linkedin_job")`) -- mirrored exactly.
+APIFY_BUDGET_GATED_SOURCES = {"linkedin_post_search", "web_search", "linkedin_job"}
 
 SHAPE_HIRING_TRIGGER = "hiring_trigger"
 SHAPE_IDENTITY_RESOLUTION = "identity_resolution"
@@ -90,8 +93,9 @@ def _candidates_for_shape(db: Session, tenant_id: int, objective: InvestigationO
     if shape == SHAPE_HIRING_TRIGGER:
         # "hiring-trigger evidence -> prefer a real hiring/job source" -- both are real structured
         # job sources; theirstack_job is wired into the hourly sweep AND budget-guarded today,
-        # linkedin_job exists but has no approved search-criteria config yet (registry-recorded
-        # fact, not invented) so it's ranked second, not excluded. web_search is filtered out by
+        # linkedin_job now has a real S5 execution path too (2026-08-24 fix, reuses V1's own
+        # proven parameters) so it's ranked second, a real fallback rather than a dead end.
+        # web_search is filtered out by
         # _evidence_capable() below -- it's executable but never interpreted into Problem/Demand
         # evidence, so offering it as a "last resort" would just spend real money for nothing.
         base = ["theirstack_job", "linkedin_job", "web_search"]

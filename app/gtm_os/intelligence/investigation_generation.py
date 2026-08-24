@@ -183,6 +183,25 @@ def generate_investigation_action(db: Session, tenant_id: int, objective: Invest
             return _result(objective.id, source, "company_website", None, STATUS_GENERATION_FAILED, "no Company.domain on file for the target company")
         return _result(objective.id, source, "company_website", {"domain": company.domain, "company_id": company.id}, STATUS_OK)
 
+    if source == "linkedin_job":
+        # No LLM call -- structured filter parameters, not a keyword query, same discipline as
+        # theirstack_job below. Real fix (2026-08-24): S5 previously had no execution path for
+        # this source at all; reuses V1's own real, live-validated search_linkedin_jobs()
+        # parameters verbatim (app/phases/apify_discovery.py's APIFY_TITLE_SEARCH/
+        # APIFY_INDUSTRY_FILTER/APIFY_EMPLOYEE_MIN/MAX) -- the exact same Apify LinkedIn Jobs
+        # Scraper call V1's own real production discovery already uses successfully, per the
+        # user's explicit "use the same as V1" instruction. Not re-derived or re-tuned here.
+        from app.phases.apify_discovery import APIFY_EMPLOYEE_MAX, APIFY_EMPLOYEE_MIN, APIFY_INDUSTRY_FILTER, APIFY_TITLE_SEARCH
+        return _result(
+            objective.id, source, "linkedin_job",
+            {
+                "title_search": APIFY_TITLE_SEARCH, "location_search": ["United States"],
+                "organization_employees_gte": APIFY_EMPLOYEE_MIN, "organization_employees_lte": APIFY_EMPLOYEE_MAX,
+                "industry_filter": APIFY_INDUSTRY_FILTER, "time_range": "7d",
+            },
+            STATUS_OK,
+        )
+
     if source == "theirstack_job":
         # Real sense_theirstack_jobs(db, tenant_id, offset, limit, exclude_domains) signature --
         # its job-title/revenue/employee-count filters are fixed module constants in sensing.py,

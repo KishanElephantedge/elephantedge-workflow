@@ -51,7 +51,7 @@ from app.apify_budget_guard import STATUS_ALLOWED as APIFY_BUDGET_ALLOWED
 from app.apify_budget_guard import check_apify_budget
 from app.apify_client import (
     GOOGLE_SEARCH_COST_PER_QUERY_NO_AI_OVERVIEW_USD, GOOGLE_SEARCH_COST_PER_QUERY_USD,
-    LINKEDIN_POST_COST_PER_POST_USD, ApifyError, search_google_organic_results,
+    LINKEDIN_POST_COST_PER_POST_USD, ApifyError, estimate_cost_usd, search_google_organic_results,
 )
 from app.apify_client import _get_api_key as _get_apify_api_key
 from app.budget_guard import BudgetExceededError, BudgetGuard
@@ -59,7 +59,9 @@ from app.gtm_os.intelligence.investigation_memory import (
     RESULT_ERROR, RESULT_INCONCLUSIVE, STATUS_STOPPED, InvestigationObjective,
     is_eligible_for_attempt, record_investigation_attempt,
 )
-from app.gtm_os.intelligence.sensing import sense_company_website, sense_linkedin_posts, sense_theirstack_jobs, sense_web_search
+from app.gtm_os.intelligence.sensing import (
+    sense_company_website, sense_linkedin_jobs, sense_linkedin_posts, sense_theirstack_jobs, sense_web_search,
+)
 from app.gtm_os.intelligence.source_capabilities import COST_DEEPLINE_BUDGET_GUARDED, COST_FREE, SOURCE_CAPABILITIES
 from app.gtm_os.orchestration.control import ControlPlaneHalted, check_can_run, get_control_config
 
@@ -67,6 +69,14 @@ from app.gtm_os.orchestration.control import ControlPlaneHalted, check_can_run, 
 # exactly) -- used only to compute the real estimated cost passed to check_apify_budget(), never
 # to invent a different volume than what's really about to be called.
 LINKEDIN_POSTS_PER_SOURCE = 5
+
+# Real bug fix (2026-08-24): linkedin_job had NO execution path in S5 at all (confirmed live,
+# sensing_strategy.py's own SOURCES_WITH_NO_EXECUTION_GUARD) despite being a real, working,
+# already-proven adapter (sense_linkedin_jobs, the exact same Apify LinkedIn Jobs Scraper call
+# V1's own production discovery already uses successfully -- see app/phases/apify_discovery.py).
+# Bounded to a small real limit here (not V1's own up-to-150), since this is one investigation
+# attempt for one objective, not a full daily discovery batch.
+LINKEDIN_JOBS_PER_INVESTIGATION_ATTEMPT = 20
 
 # Confirmed live (2026-08-24): the broken keyword-search-URL approach was replaced with a real
 # discover-then-retrieve chain -- Google Search organicResults -> real individual LinkedIn post
@@ -113,7 +123,7 @@ EXEC_BLOCKED_BY_UNSUPPORTED_SOURCE = "blocked_by_unsupported_source"
 EXEC_BLOCKED_BY_MISSING_CREDENTIALS = "blocked_by_missing_credentials"
 
 # Only these 4 -- exactly the ones S3/S4 can actually produce, per the explicit task scope.
-SUPPORTED_SOURCES = {"linkedin_post_search", "web_search", "theirstack_job", "company_website"}
+SUPPORTED_SOURCES = {"linkedin_post_search", "web_search", "theirstack_job", "company_website", "linkedin_job"}
 
 
 def _result(objective_id, source, action_type, status, *, raw_result_count=None, error_reason=None, started_at=None, investigation_attempt=None):
@@ -146,6 +156,8 @@ def _estimate_apify_cost_usd(source: str, parameters: dict) -> float:
         return query_count * GOOGLE_SEARCH_COST_PER_QUERY_NO_AI_OVERVIEW_USD
     if source == "web_search":
         return GOOGLE_SEARCH_COST_PER_QUERY_USD  # only the first generated query is ever executed
+    if source == "linkedin_job":
+        return estimate_cost_usd(LINKEDIN_JOBS_PER_INVESTIGATION_ATTEMPT)  # real per-job + flat run-fee pricing, same function V1's own discovery uses
     raise ValueError(f"no real cost estimation exists for source {source!r}")
 
 
@@ -168,7 +180,7 @@ def _budget_check(db: Session, tenant_id: int, source: str, parameters: dict) ->
             return f"Deepline budget check failed: {e}"
         return None
 
-    if source in ("linkedin_post_search", "web_search"):
+    if source in ("linkedin_post_search", "web_search", "linkedin_job"):
         estimated_cost = _estimate_apify_cost_usd(source, parameters)
         result = check_apify_budget(db, tenant_id, estimated_cost)
         if result["status"] == APIFY_BUDGET_ALLOWED:
@@ -214,7 +226,7 @@ def execute_investigation_action(db: Session, tenant_id: int, action: dict) -> d
     if source not in SOURCE_CAPABILITIES or source not in SUPPORTED_SOURCES:
         return _result(objective_id, source, action_type, EXEC_BLOCKED_BY_UNSUPPORTED_SOURCE, error_reason=f"{source!r} is not a source S5 executes", started_at=started_at)
 
-    if source in ("linkedin_post_search", "web_search"):
+    if source in ("linkedin_post_search", "web_search", "linkedin_job"):
         try:
             _get_apify_api_key(db, tenant_id)
         except ApifyError as e:
@@ -278,6 +290,18 @@ def execute_investigation_action(db: Session, tenant_id: int, action: dict) -> d
             signals = sense_web_search(db, tenant_id, queries[0]) if queries else []
         elif source == "theirstack_job":
             signals = sense_theirstack_jobs(db, tenant_id, offset=parameters.get("offset", 0), limit=parameters.get("limit", 25), exclude_domains=parameters.get("exclude_domains") or None)
+        elif source == "linkedin_job":
+            # Real fix (2026-08-24) -- reuses V1's own proven sense_linkedin_jobs() adapter and
+            # S4's deterministic parameters (see investigation_generation.py), bounded to
+            # LINKEDIN_JOBS_PER_INVESTIGATION_ATTEMPT for this one investigation attempt.
+            signals = sense_linkedin_jobs(
+                db, tenant_id,
+                title_search=parameters["title_search"], location_search=parameters["location_search"],
+                organization_employees_gte=parameters["organization_employees_gte"],
+                organization_employees_lte=parameters["organization_employees_lte"],
+                industry_filter=parameters["industry_filter"], time_range=parameters.get("time_range", "7d"),
+                limit=LINKEDIN_JOBS_PER_INVESTIGATION_ATTEMPT,
+            )
         elif source == "company_website":
             signals = sense_company_website(db, tenant_id, parameters["domain"], company_id=parameters.get("company_id"))
         else:
