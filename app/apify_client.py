@@ -189,7 +189,15 @@ LINKEDIN_POST_COST_PER_POST_USD = 0.002
 def search_linkedin_posts(api_key: str, profile_urls: list[str], scrape_until: str | None = None, limit_per_source: int = 5) -> list[dict]:
     """Returns recent posts for each given LinkedIn profile/company/post URL. scrape_until
     (ISO date string) filters to posts newer than that date -- pass the last time this profile
-    was checked to avoid re-billing for posts already seen."""
+    was checked to avoid re-billing for posts already seen.
+
+    Real bug fix (2026-08-24, confirmed live -- run 94/95): the previous 120s client timeout was
+    too short for this actor's real synchronous run time when scraping real LinkedIn post pages
+    -- confirmed via a real production error, "The read operation timed out," on a call that
+    only requested 1 post. run-sync-get-dataset-items blocks until the actor run itself
+    completes server-side; a client-side timeout shorter than that just gives up on a run that
+    was still genuinely in progress, wasting the spend with nothing to show for it. Raised to
+    240s -- still bounded, just realistic for this actor's real observed latency."""
     payload = {"urls": profile_urls, "limitPerSource": limit_per_source, "deepScrape": False}
     if scrape_until:
         payload["scrapeUntil"] = scrape_until
@@ -197,7 +205,7 @@ def search_linkedin_posts(api_key: str, profile_urls: list[str], scrape_until: s
         f"{BASE_URL}/acts/{LINKEDIN_POST_ACTOR_ID}/run-sync-get-dataset-items",
         params={"token": api_key},
         json=payload,
-        timeout=120,
+        timeout=240,
     )
     if response.status_code >= 300:
         raise ApifyError(f"LinkedIn post search failed ({response.status_code}): {response.text[:500]}")
