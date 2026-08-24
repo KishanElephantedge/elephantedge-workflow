@@ -309,9 +309,18 @@ def run_problem_hypothesis_sweep(
     limit: int = 200,
 ) -> list[ProblemHypothesis]:
     """Evaluates InterpretedSignal rows for this tenant that haven't been linked into any
-    ProblemHypothesis yet. Only linkedin_job and theirstack_job are in scope for this version,
-    matching Step 4's current coverage."""
-    sources = sources or ["linkedin_job", "theirstack_job"]
+    ProblemHypothesis yet.
+
+    Real bug fix (2026-08-24, confirmed live): the default `sources` was still
+    ["linkedin_job", "theirstack_job"] only -- a stale restriction left over from Step 4, before
+    linkedin_post interpretation (Step 6) existed. This silently meant every post-based signal,
+    including declared-tier problem_statement (the STRONGEST possible evidence), was never
+    evaluated by this sweep at all when called with its default sources -- confirmed live: Dale
+    Zwizinski's real declared problem_statement had zero ProblemHypothesis link despite being
+    interpreted, because the sweep never even looked at linkedin_post signals. Now matches
+    demand_detection.run_demand_hypothesis_sweep's own (already-correct) default, plus
+    linkedin_reply (Step 11B, also never added here)."""
+    sources = sources or ["linkedin_job", "theirstack_job", "linkedin_post", "linkedin_reply"]
     # Real bug fix (2026-08-24, confirmed live -- same starvation bug found and fixed in
     # interpretation.run_interpretation_sweep the same day): .limit(limit) was applied BEFORE
     # excluding already-linked signals (filtered in Python afterward), so once the backlog
