@@ -132,6 +132,18 @@ DEFAULT_GTM_OS_CONTROL_CONFIG: dict = {
         # this is a real business/cost decision, not a technical tuning constant.
         "max_iterations_per_run": None,
     },
+    # Company resolution (2026-08-24) -- makes company_resolution.py's allow_paid_enrichment a
+    # real config toggle instead of a hardcoded Python default (confirmed live: the previous
+    # hardcoded False meant nothing set anywhere could ever turn it on). Defaults False, same
+    # opt-in discipline as every other paid-enrichment gate in this config -- an operator must
+    # explicitly enable it. Enabling it activates ALL resolution tiers gated on
+    # allow_paid_enrichment (the Deepline-free Apify-based profile lookup, the Deepline
+    # search_contact profile lookup, and the existing Deepline name-guess fallback) -- each tier
+    # still fails safe and reports its own real reason (including a real Deepline balance block)
+    # rather than crashing or silently skipping.
+    "company_resolution": {
+        "allow_paid_enrichment": False,
+    },
 }
 
 
@@ -235,6 +247,12 @@ def _validate_control_config(config: dict) -> None:
         raise ControlPlaneConfigError("'flow_target' must be an object")
     _validate_positive_int_or_none(flow_target.get("daily_flow_target"), "flow_target.daily_flow_target")
     _validate_positive_int_or_none(flow_target.get("max_iterations_per_run"), "flow_target.max_iterations_per_run")
+
+    company_resolution = config.get("company_resolution")
+    if not isinstance(company_resolution, dict):
+        raise ControlPlaneConfigError("'company_resolution' must be an object")
+    if not isinstance(company_resolution.get("allow_paid_enrichment"), bool):
+        raise ControlPlaneConfigError("'company_resolution.allow_paid_enrichment' must be a boolean")
 
 
 def get_control_config(db: Session, tenant_id: int) -> dict:

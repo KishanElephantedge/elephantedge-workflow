@@ -22,8 +22,16 @@ RESOLUTION ORDER (cheapest/safest first, per the approved task):
    company_name_raw (the existing free-text "Title at Company" guess
    reverse_discovery._guess_company_name() already produces in sensing.py -- reused unmodified,
    never re-derived). Pure DB read, no provider cost. Exactly one match -> resolved. Zero
-   matches -> falls through to step 3/4 only if explicitly enabled (see allow_paid_enrichment).
+   matches -> falls through to step 2.5/3/4 only if explicitly enabled (see allow_paid_enrichment,
+   now a real config toggle -- control.company_resolution.allow_paid_enrichment, added 2026-08-24;
+   was a hardcoded-False Python default before that date, meaning nothing set anywhere could ever
+   turn it on).
    Two or more matches -> ambiguous, resolution stops there -- no fuzzy scoring, no guessing.
+2.5. Bounded, OPT-IN-ONLY, DEEPLINE-FREE profile-based enrichment (added 2026-08-24) -- reuses
+   the Google Search actor + organic-results reading confirmed live the same day for LinkedIn
+   content discovery. Tried FIRST among the paid tiers specifically because it does not share
+   Deepline's single point of failure (the real account balance has been negative all session).
+   See _try_apify_profile_enrichment.
 3. Bounded, OPT-IN-ONLY profile-based enrichment (added 2026-08-23, real gap: signals like the
    Daniel Clarke case have NO company_name_raw at all -- the headline never mentions an employer
    -- so step 2 is a structural no-op for them regardless of ordering, and step 4 below needs a
@@ -206,6 +214,68 @@ def _try_paid_enrichment(db: Session, tenant_id: int, company_name_raw: str) -> 
     }
 
 
+def _try_apify_profile_enrichment(db: Session, tenant_id: int, profile_url: str) -> dict:
+    """Deepline-free company resolution, added 2026-08-24 -- a real fallback for when Deepline's
+    balance is negative (confirmed live all session), reusing the SAME Google Search actor and
+    organic-results-reading capability confirmed live and already proven for LinkedIn content
+    discovery (investigation_execution.py's linkedin_post_search fix, same day). Tried FIRST,
+    before the two Deepline-dependent tiers below, precisely because it doesn't share their
+    single point of failure. Budget-guarded via the real Apify guard (app.apify_budget_guard),
+    never Deepline's BudgetGuard -- a genuinely separate spend/failure path. Same Option A
+    discipline as every other tier here: resolves to an EXISTING Company only, never fabricates
+    one from a single social-post mention."""
+    from app.apify_budget_guard import STATUS_ALLOWED as APIFY_BUDGET_ALLOWED
+    from app.apify_budget_guard import check_apify_budget
+    from app.apify_client import GOOGLE_SEARCH_COST_PER_QUERY_NO_AI_OVERVIEW_USD, ApifyError
+    from app.apify_client import _get_api_key as _get_apify_api_key
+    from app.apify_client import search_google_organic_results
+
+    try:
+        api_key = _get_apify_api_key(db, tenant_id)
+    except ApifyError as e:
+        return {"status": "unresolved", "method": None, "reason": f"apify_credential_unavailable: {e}"}
+
+    budget = check_apify_budget(db, tenant_id, GOOGLE_SEARCH_COST_PER_QUERY_NO_AI_OVERVIEW_USD)
+    if budget["status"] != APIFY_BUDGET_ALLOWED:
+        return {"status": "unresolved", "method": None, "reason": f"apify_budget_blocked: {budget['reason']}"}
+
+    try:
+        organic_results = search_google_organic_results(api_key, f"{profile_url} current company employer", max_pages=1)
+    except ApifyError as e:
+        return {"status": "unresolved", "method": None, "reason": f"google_search_provider_error: {e}"}
+
+    if not organic_results:
+        return {"status": "unresolved", "method": None, "reason": "no_organic_results_for_profile_query"}
+
+    import re
+
+    # Same full-hostname pattern _try_paid_enrichment uses -- see that function's own comment
+    # for why a naive single-label match is unsafe (silently matches an unrelated shorter domain).
+    # Deliberately scans ONLY title/description text, never the result `url` field itself --
+    # confirmed live in testing: a search-result URL's own host (e.g. a generic short domain
+    # from an unrelated result) can itself look like a valid domain and get falsely matched
+    # instead of the real company mentioned in the actual text.
+    domain_pattern = re.compile(r"\b((?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+(?:com|io|co|net|org|ai))\b")
+    combined_text = " ".join(f"{r.get('title', '')} {r.get('description', '')}" for r in organic_results[:5]).lower()
+    domain_match = domain_pattern.search(combined_text)
+    if not domain_match:
+        return {"status": "unresolved", "method": None, "reason": "no_domain_pattern_found_in_organic_results"}
+    guessed_domain = domain_match.group(1)
+
+    existing = db.query(Company).filter(func.lower(Company.domain) == guessed_domain).first()
+    if existing:
+        return {"status": "resolved", "method": "apify_profile_enrichment", "reason": None, "company_id": existing.id}
+
+    return {
+        "status": "unresolved",
+        "method": None,
+        "reason": (
+            f"apify_profile_enrichment_guessed_domain={guessed_domain!r} but no existing Company matches it -- "
+            "creating one from a single social-post mention is out of scope (see module docstring, Option A over Option B)"
+        ),
+    }
+
+
 def _try_profile_enrichment(db: Session, tenant_id: int, profile_url: str) -> dict:
     """Only called when no exact company-name match was found AND the caller explicitly opted
     into paid enrichment AND the signal actually captured a real author profile URL (never
@@ -307,9 +377,23 @@ def resolve_company_for_signal(
                 "company_id": None,
             }
 
-        # Step 3 (profile-based enrichment) -- tried whenever exact-name matching didn't already
-        # resolve/disambiguate it, since it needs no company_name_raw at all (unlike step 4).
+        # Step 2.5 (Deepline-FREE profile-based enrichment, added 2026-08-24) -- tried FIRST among
+        # the paid tiers, precisely because it does not share Deepline's single point of failure
+        # (the real, confirmed-negative Deepline balance blocks steps 3/4 below every time).
         profile_attempt_reason = None
+        if result is None and allow_paid_enrichment:
+            profile_url = (signal.extracted_info or {}).get("author_profile_url")
+            if profile_url:
+                apify_result = _try_apify_profile_enrichment(db, tenant_id, profile_url)
+                if apify_result["status"] == "resolved":
+                    result = apify_result
+                else:
+                    profile_attempt_reason = f"apify_profile_enrichment: {apify_result.get('reason')}"
+            else:
+                profile_attempt_reason = "no_profile_url_captured_on_signal"
+
+        # Step 3 (Deepline profile-based enrichment) -- tried whenever exact-name matching AND
+        # the Deepline-free tier above didn't already resolve/disambiguate it.
         if result is None and allow_paid_enrichment:
             profile_url = (signal.extracted_info or {}).get("author_profile_url")
             if profile_url:
@@ -317,9 +401,7 @@ def resolve_company_for_signal(
                 if profile_result["status"] == "resolved":
                     result = profile_result
                 else:
-                    profile_attempt_reason = profile_result.get("reason")
-            else:
-                profile_attempt_reason = "no_profile_url_captured_on_signal"
+                    profile_attempt_reason = f"{profile_attempt_reason}; deepline_profile_enrichment: {profile_result.get('reason')}"
 
         # Step 4 (existing name-guessing paid fallback) -- only makes sense when a company name
         # actually exists to guess a domain from.

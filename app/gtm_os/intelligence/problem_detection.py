@@ -32,6 +32,7 @@ from app.gtm_os.intelligence.company_resolution import ensure_company_resolved_i
 from app.gtm_os.intelligence.interpreted_signal import InterpretedSignal
 from app.gtm_os.intelligence.problem_hypothesis import ProblemHypothesis, ProblemHypothesisEvidence
 from app.gtm_os.intelligence.signal import GtmSignal
+from app.gtm_os.orchestration.control import get_control_config
 
 # event_type -> evidence tier. Anything not listed here defaults to "contextual" (the safe,
 # under-claiming default -- see EVIDENCE_TIER_RANK for why that's conservative, not arbitrary).
@@ -196,7 +197,12 @@ def evaluate_interpreted_signal(
     evidence with no existing hypothesis to attach to -- the intended, conservative outcome for
     every current hiring_activity interpretation until a declared/implied_gap source exists)."""
     tier = classify_evidence_tier(interpreted_signal)
-    ensure_company_resolved_if_needed(db, tenant_id, interpreted_signal, opening_tier=tier in OPENING_TIERS)
+    # Real config toggle (2026-08-24) -- was a hardcoded False default before, meaning nothing
+    # set anywhere could ever turn paid company-resolution enrichment on. Now reads
+    # control.company_resolution.allow_paid_enrichment, same opt-in-by-config discipline as
+    # every other paid-enrichment gate in this codebase.
+    allow_paid_enrichment = get_control_config(db, tenant_id).get("company_resolution", {}).get("allow_paid_enrichment", False)
+    ensure_company_resolved_if_needed(db, tenant_id, interpreted_signal, opening_tier=tier in OPENING_TIERS, allow_paid_enrichment=allow_paid_enrichment)
     dedup_key = _dedup_key_for(db, interpreted_signal)
     affected_function = interpreted_signal.affected_function or "unknown"
 
