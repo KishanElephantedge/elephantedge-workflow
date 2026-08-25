@@ -316,11 +316,15 @@ def generate_message_draft(db: Session, tenant_id: int, opportunity: Opportunity
     prep = prepare_message(db, tenant_id, opportunity, strategy, research, decision_maker)
     primary_channel = prep.get("channel")
 
-    existing = _existing_draft_for_contact(db, tenant_id, opportunity.id, strategy.id, contact_id, channel=primary_channel)
-    if existing is not None:
-        return existing
-
-    primary_draft = _draft_message_for_channel(db, tenant_id, opportunity, strategy, contact_id, prep, primary_channel)
+    # Real bug fix (2026-08-25, confirmed live): this used to return immediately when the
+    # PRIMARY channel's draft already existed, which meant the extra-channel loop below never
+    # even ran for an opportunity whose LinkedIn draft was generated before the email-drafting
+    # feature existed -- confirmed live, re-running this for all 4 real opportunities produced
+    # zero new email drafts because every primary (LinkedIn) draft already existed. Now only
+    # SKIPS re-generating the primary when it already exists (still zero LLM calls on that path);
+    # it always still checks/generates any other available channel.
+    existing_primary = _existing_draft_for_contact(db, tenant_id, opportunity.id, strategy.id, contact_id, channel=primary_channel)
+    primary_draft = existing_primary if existing_primary is not None else _draft_message_for_channel(db, tenant_id, opportunity, strategy, contact_id, prep, primary_channel)
 
     # Best-effort additional channel(s) -- V1 parity (see docstring). Never affects the returned
     # value or raises: a failure drafting the email must never look like a failure of the whole
