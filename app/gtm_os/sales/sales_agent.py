@@ -239,19 +239,19 @@ def prepare_message(db, tenant_id: int, opportunity: Opportunity, strategy: GtmS
 
     if strategy.strategy_type == "insufficient_context":
         missing_information.append("strategy is insufficient_context -- no approach has been determined yet")
-        return {"status": "insufficient_context", "channel": None, "objective": None, "target_role": None,
+        return {"status": "insufficient_context", "channel": None, "available_channels": [], "objective": None, "target_role": None,
                 "target_name": None, "positioning_angle": None, "evidence_basis": strategy.evidence_basis,
                 "personalization_inputs": [], "missing_information": missing_information}
 
     if decision_maker["status"] != "known":
         missing_information.append("no known decision-maker contact -- cannot target a message")
-        return {"status": "insufficient_context", "channel": None, "objective": None, "target_role": None,
+        return {"status": "insufficient_context", "channel": None, "available_channels": [], "objective": None, "target_role": None,
                 "target_name": None, "positioning_angle": strategy.positioning_angle, "evidence_basis": strategy.evidence_basis,
                 "personalization_inputs": [], "missing_information": missing_information}
 
     if strategy.offering_fit_status != "candidate_match":
         missing_information.append(f"offering_fit_status is {strategy.offering_fit_status!r} -- cannot credibly position a message without a confirmed offering")
-        return {"status": "insufficient_context", "channel": None, "objective": None,
+        return {"status": "insufficient_context", "channel": None, "available_channels": [], "objective": None,
                 "target_role": decision_maker["contacts"][0]["title"], "target_name": decision_maker["contacts"][0].get("name"),
                 "positioning_angle": strategy.positioning_angle,
                 "evidence_basis": strategy.evidence_basis, "personalization_inputs": [], "missing_information": missing_information}
@@ -259,13 +259,24 @@ def prepare_message(db, tenant_id: int, opportunity: Opportunity, strategy: GtmS
     next_action_types = [a["action_type"] for a in (strategy.action_plan or [])]
     if "prepare_message" not in next_action_types:
         missing_information.append("action plan has not yet reached prepare_message -- earlier prerequisites still open")
-        return {"status": "insufficient_context", "channel": None, "objective": None,
+        return {"status": "insufficient_context", "channel": None, "available_channels": [], "objective": None,
                 "target_role": decision_maker["contacts"][0]["title"], "target_name": decision_maker["contacts"][0].get("name"),
                 "positioning_angle": strategy.positioning_angle,
                 "evidence_basis": strategy.evidence_basis, "personalization_inputs": [], "missing_information": missing_information}
 
     contact = decision_maker["contacts"][0]
-    channel = "linkedin" if contact.get("linkedin_url") else ("email" if contact.get("has_email") else None)
+    # 2026-08-25, explicit instruction: matching V1's real behavior (personalized_outreach.py's
+    # generate_personalized_message() drafts BOTH a LinkedIn message and an email for the same
+    # contact whenever they have an email on file -- confirmed by reading that code -- it is
+    # never "pick one channel"). available_channels lists every channel this contact genuinely
+    # supports; `channel` (singular) is kept as the first/primary one only for callers that
+    # still expect a single value.
+    available_channels = []
+    if contact.get("linkedin_url"):
+        available_channels.append("linkedin")
+    if contact.get("has_email"):
+        available_channels.append("email")
+    channel = available_channels[0] if available_channels else None
     if channel is None:
         missing_information.append("known contact has neither a LinkedIn URL nor an email -- no channel to prepare a message for")
 
@@ -280,6 +291,7 @@ def prepare_message(db, tenant_id: int, opportunity: Opportunity, strategy: GtmS
     return {
         "status": "ready" if channel else "insufficient_context",
         "channel": channel,
+        "available_channels": available_channels,
         "objective": next((a["objective"] for a in strategy.action_plan if a["action_type"] == "prepare_message"), None),
         "target_role": contact.get("title"),
         # 2026-08-25 real bug fix: the contact's real name was already available on `contact`

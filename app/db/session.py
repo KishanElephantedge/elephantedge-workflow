@@ -481,13 +481,22 @@ def ensure_indexes():
         # single index is dropped first -- it would otherwise block the second contact's draft
         # outright.
         conn.execute(text("DROP INDEX IF EXISTS ix_message_drafts_opportunity_strategy"))
+        # 2026-08-25 real schema fix: widened to include `channel` -- a real contact with BOTH a
+        # LinkedIn URL and an email now gets a draft PER channel (V1 parity, see
+        # message_draft.py's generate_message_draft() docstring). The old (opportunity, strategy,
+        # contact)-only index would have rejected the second channel's row for the same contact
+        # outright. Safe/additive: only widens what's allowed, never invalidates any existing row
+        # (every row created before this change has exactly one (opportunity, strategy, contact)
+        # combination, which trivially still satisfies the new, more permissive index too).
+        conn.execute(text("DROP INDEX IF EXISTS ix_message_drafts_opp_strategy_no_contact"))
+        conn.execute(text("DROP INDEX IF EXISTS ix_message_drafts_opp_strategy_contact"))
         conn.execute(text(
-            "CREATE UNIQUE INDEX IF NOT EXISTS ix_message_drafts_opp_strategy_no_contact "
-            "ON message_drafts (opportunity_id, gtm_strategy_id) WHERE contact_id IS NULL"
+            "CREATE UNIQUE INDEX IF NOT EXISTS ix_message_drafts_opp_strategy_channel_no_contact "
+            "ON message_drafts (opportunity_id, gtm_strategy_id, channel) WHERE contact_id IS NULL"
         ))
         conn.execute(text(
-            "CREATE UNIQUE INDEX IF NOT EXISTS ix_message_drafts_opp_strategy_contact "
-            "ON message_drafts (opportunity_id, gtm_strategy_id, contact_id) WHERE contact_id IS NOT NULL"
+            "CREATE UNIQUE INDEX IF NOT EXISTS ix_message_drafts_opp_strategy_contact_channel "
+            "ON message_drafts (opportunity_id, gtm_strategy_id, contact_id, channel) WHERE contact_id IS NOT NULL"
         ))
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_message_drafts_tenant_status ON message_drafts (tenant_id, status)"))
         # Phase 7 (V2 human review) -- generalized review fields alongside the existing

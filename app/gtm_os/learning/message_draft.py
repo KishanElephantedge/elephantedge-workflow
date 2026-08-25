@@ -156,13 +156,21 @@ def _existing_draft(db: Session, tenant_id: int, opportunity_id: int, gtm_strate
     )
 
 
-def _existing_draft_for_contact(db: Session, tenant_id: int, opportunity_id: int, gtm_strategy_id: int, contact_id: int | None) -> MessageDraft | None:
+def _existing_draft_for_contact(db: Session, tenant_id: int, opportunity_id: int, gtm_strategy_id: int, contact_id: int | None, channel: str | None = None) -> MessageDraft | None:
     """V2 Phase 8 -- the real idempotency check generate_message_draft() itself uses: is there
-    ALREADY a draft for this exact (opportunity, strategy, contact) combination? Distinguishes
-    contact_id IS NULL (the insufficient_context/no-contact-yet case, still capped at one draft
-    per strategy version -- see the partial unique index in ensure_indexes()) from a specific
-    contact (one draft per contact, once contact discovery/sequencing has a real person to
-    target)."""
+    ALREADY a draft for this exact (opportunity, strategy, contact, channel) combination?
+    Distinguishes contact_id IS NULL (the insufficient_context/no-contact-yet case, still capped
+    at one draft per strategy version -- see the partial unique index in ensure_indexes()) from a
+    specific contact (one draft per contact, once contact discovery/sequencing has a real person
+    to target).
+
+    channel (2026-08-25, explicit instruction): a real contact with BOTH a LinkedIn URL and an
+    email now gets a draft PER channel (matching V1's own dual-channel behavior, see
+    generate_message_draft()'s own docstring) -- so the idempotency check must also be scoped to
+    channel, or generating the email draft would incorrectly be treated as "already exists"
+    because the LinkedIn draft for this same contact already does. channel=None preserves the
+    original (opportunity, strategy, contact)-only lookup for callers that don't care which
+    channel (e.g. _existing_draft's own "any draft at all" use case)."""
     query = db.query(MessageDraft).filter(
         MessageDraft.tenant_id == tenant_id, MessageDraft.opportunity_id == opportunity_id, MessageDraft.gtm_strategy_id == gtm_strategy_id
     )
@@ -170,6 +178,8 @@ def _existing_draft_for_contact(db: Session, tenant_id: int, opportunity_id: int
         query = query.filter(MessageDraft.contact_id.is_(None))
     else:
         query = query.filter(MessageDraft.contact_id == contact_id)
+    if channel is not None:
+        query = query.filter(MessageDraft.channel == channel)
     return query.first()
 
 
@@ -199,35 +209,17 @@ def _run_quality_gate(opportunity: Opportunity, strategy: GtmStrategy, contact_i
     return reasons
 
 
-def generate_message_draft(db: Session, tenant_id: int, opportunity: Opportunity, strategy: GtmStrategy, exclude_contact_ids=None) -> MessageDraft:
-    """The only function that calls the LLM. Idempotent: an existing draft for this exact
-    (opportunity, strategy version, TARGET CONTACT) is reused/skipped -- never regenerated, and
-    NEVER overwritten once approved (Part N/K).
-
-    exclude_contact_ids (V2 Phase 8, optional, default None -- every pre-Phase-8 caller passes
-    nothing and resolves the exact same primary contact as before): threaded straight into
-    evaluate_decision_maker(), so contacts[0] of what's left after exclusion becomes the target
-    -- this is how outreach_sequencing.py gets a real draft for "the next fallback contact"
-    without any separate contact-selection logic living here or there.
-
-    The target contact must be resolved BEFORE the idempotency check now (existence depends on
-    WHICH contact, not just the opportunity+strategy pair) -- this costs one extra read
-    (evaluate_decision_maker's own Contact query) on the steady-state "draft already exists"
-    path, compared to before Phase 8; still zero LLM/paid calls on that path."""
-    decision_maker = evaluate_decision_maker(db, tenant_id, opportunity.company_id, opportunity.affected_function, exclude_contact_ids=exclude_contact_ids)
-    contact_id = decision_maker["contacts"][0]["id"] if decision_maker["status"] == "known" and decision_maker["contacts"] else None
-
-    existing = _existing_draft_for_contact(db, tenant_id, opportunity.id, strategy.id, contact_id)
-    if existing is not None:
-        return existing
-
-    research = gather_account_research(db, tenant_id, opportunity)
-    prep = prepare_message(db, tenant_id, opportunity, strategy, research, decision_maker)
-
+def _draft_message_for_channel(db: Session, tenant_id: int, opportunity: Opportunity, strategy: GtmStrategy, contact_id: int | None, prep: dict, channel: str | None) -> MessageDraft:
+    """Generates and persists ONE MessageDraft for ONE specific channel, reusing the SAME shared
+    `prep` (objective/target_role/target_name/positioning_angle/personalization_inputs/
+    evidence_basis are identical across channels for the same contact -- only the channel itself,
+    and therefore the drafted text, differs). Extracted 2026-08-25 so generate_message_draft()
+    can call this once per available channel (V1 parity -- see that function's own docstring)
+    instead of being hardcoded to exactly one channel."""
     if prep["status"] != "ready":
         draft = MessageDraft(
             tenant_id=tenant_id, opportunity_id=opportunity.id, gtm_strategy_id=strategy.id, contact_id=contact_id,
-            channel=prep["channel"], objective=prep["objective"], target_role=prep["target_role"],
+            channel=channel, objective=prep["objective"], target_role=prep["target_role"],
             positioning_angle=prep["positioning_angle"], evidence_basis=prep["evidence_basis"],
             personalization_inputs=prep["personalization_inputs"], message_text=None,
             generation_method="deterministic:insufficient_context", missing_information=prep["missing_information"],
@@ -238,7 +230,7 @@ def generate_message_draft(db: Session, tenant_id: int, opportunity: Opportunity
         return draft
 
     prompt = MESSAGE_GENERATION_PROMPT.format(
-        objective=prep["objective"], channel=prep["channel"], target_role=prep["target_role"] or "unknown",
+        objective=prep["objective"], channel=channel, target_role=prep["target_role"] or "unknown",
         target_name=prep.get("target_name") or "unknown",
         positioning_angle=prep["positioning_angle"] or "none provided",
         personalization_inputs="; ".join(prep["personalization_inputs"]) or "none",
@@ -249,7 +241,7 @@ def generate_message_draft(db: Session, tenant_id: int, opportunity: Opportunity
     except Exception as e:  # noqa: BLE001 -- an LLM outage must never crash the caller
         draft = MessageDraft(
             tenant_id=tenant_id, opportunity_id=opportunity.id, gtm_strategy_id=strategy.id, contact_id=contact_id,
-            channel=prep["channel"], objective=prep["objective"], target_role=prep["target_role"],
+            channel=channel, objective=prep["objective"], target_role=prep["target_role"],
             positioning_angle=prep["positioning_angle"], evidence_basis=prep["evidence_basis"],
             personalization_inputs=prep["personalization_inputs"], message_text=None,
             generation_method="llm:generate_json", missing_information=[f"llm_call_failed: {e}"],
@@ -265,7 +257,7 @@ def generate_message_draft(db: Session, tenant_id: int, opportunity: Opportunity
     if not message_text or not isinstance(message_text, str):
         draft = MessageDraft(
             tenant_id=tenant_id, opportunity_id=opportunity.id, gtm_strategy_id=strategy.id, contact_id=contact_id,
-            channel=prep["channel"], objective=prep["objective"], target_role=prep["target_role"],
+            channel=channel, objective=prep["objective"], target_role=prep["target_role"],
             positioning_angle=prep["positioning_angle"], evidence_basis=prep["evidence_basis"],
             personalization_inputs=prep["personalization_inputs"], subject=None, message_text=None,
             generation_method="llm:generate_json",
@@ -281,7 +273,7 @@ def generate_message_draft(db: Session, tenant_id: int, opportunity: Opportunity
 
     draft = MessageDraft(
         tenant_id=tenant_id, opportunity_id=opportunity.id, gtm_strategy_id=strategy.id, contact_id=contact_id,
-        channel=prep["channel"], objective=prep["objective"], target_role=prep["target_role"],
+        channel=channel, objective=prep["objective"], target_role=prep["target_role"],
         positioning_angle=prep["positioning_angle"], evidence_basis=prep["evidence_basis"],
         personalization_inputs=prep["personalization_inputs"], subject=subject, message_text=message_text,
         generation_method="llm:generate_json", missing_information=prep["missing_information"],
@@ -290,6 +282,57 @@ def generate_message_draft(db: Session, tenant_id: int, opportunity: Opportunity
     db.add(draft)
     db.commit()
     return draft
+
+
+def generate_message_draft(db: Session, tenant_id: int, opportunity: Opportunity, strategy: GtmStrategy, exclude_contact_ids=None) -> MessageDraft:
+    """The only function that calls the LLM. Idempotent: an existing draft for this exact
+    (opportunity, strategy version, TARGET CONTACT, CHANNEL) is reused/skipped -- never
+    regenerated, and NEVER overwritten once approved (Part N/K).
+
+    2026-08-25, explicit instruction -- V1 parity: a contact with BOTH a LinkedIn URL and an
+    email gets a draft for EACH channel (matching personalized_outreach.py's real
+    generate_personalized_message(), which always attempts LinkedIn and additionally drafts an
+    email whenever contact.email is populated -- confirmed by reading that code). This function's
+    RETURN CONTRACT is unchanged (still returns exactly one MessageDraft, the primary/first
+    available channel) so every existing caller (recover_message_draft_if_unblocked,
+    run_message_generation_sweep, regenerate_message_draft) keeps working exactly as before;
+    any additional channel is generated as a best-effort side effect, same "a failure here must
+    never wipe out the primary message" discipline V1's own email-generation branch already uses.
+
+    exclude_contact_ids (V2 Phase 8, optional, default None -- every pre-Phase-8 caller passes
+    nothing and resolves the exact same primary contact as before): threaded straight into
+    evaluate_decision_maker(), so contacts[0] of what's left after exclusion becomes the target
+    -- this is how outreach_sequencing.py gets a real draft for "the next fallback contact"
+    without any separate contact-selection logic living here or there.
+
+    The target contact must be resolved BEFORE the idempotency check now (existence depends on
+    WHICH contact, not just the opportunity+strategy pair) -- this costs one extra read
+    (evaluate_decision_maker's own Contact query) on the steady-state "draft already exists"
+    path, compared to before Phase 8; still zero LLM/paid calls on that path."""
+    decision_maker = evaluate_decision_maker(db, tenant_id, opportunity.company_id, opportunity.affected_function, exclude_contact_ids=exclude_contact_ids)
+    contact_id = decision_maker["contacts"][0]["id"] if decision_maker["status"] == "known" and decision_maker["contacts"] else None
+
+    research = gather_account_research(db, tenant_id, opportunity)
+    prep = prepare_message(db, tenant_id, opportunity, strategy, research, decision_maker)
+    primary_channel = prep.get("channel")
+
+    existing = _existing_draft_for_contact(db, tenant_id, opportunity.id, strategy.id, contact_id, channel=primary_channel)
+    if existing is not None:
+        return existing
+
+    primary_draft = _draft_message_for_channel(db, tenant_id, opportunity, strategy, contact_id, prep, primary_channel)
+
+    # Best-effort additional channel(s) -- V1 parity (see docstring). Never affects the returned
+    # value or raises: a failure drafting the email must never look like a failure of the whole
+    # (already-succeeded) primary draft.
+    for extra_channel in (prep.get("available_channels") or [])[1:]:
+        try:
+            if _existing_draft_for_contact(db, tenant_id, opportunity.id, strategy.id, contact_id, channel=extra_channel) is None:
+                _draft_message_for_channel(db, tenant_id, opportunity, strategy, contact_id, prep, extra_channel)
+        except Exception:  # noqa: BLE001 -- see docstring, must never affect the primary draft
+            pass
+
+    return primary_draft
 
 
 def recover_message_draft_if_unblocked(
