@@ -70,14 +70,23 @@ def _is_company_qualified(company: Company) -> bool:
 # own, per its own finding (absorbed into Discovery's query filters and Phase 6's thread_role).
 
 @router.post("/batches")
-def create_batch(name: str, source: str = "deepline", db: Session = Depends(get_db)):
+def create_batch(name: str, source: str = "deepline", offering_name: str | None = None, campaign_label: str | None = None, db: Session = Depends(get_db)):
+    """offering_name/campaign_label (2026-08-25, explicit instruction): tag a batch as belonging
+    to a specific named outbound campaign (e.g. one of the 4 real campaigns launched this
+    session) so run_campaign_execution() stamps every real CampaignPush it produces with the
+    same tags -- the real, previously-missing link for tracing a push back to which offering/
+    campaign it came from. Both optional/nullable -- a real ICP-discovery batch (not a named
+    outbound campaign) is created exactly as before, with neither set."""
     if source not in ("deepline", "jobo"):
         raise HTTPException(status_code=400, detail="source must be 'deepline' or 'jobo'")
-    batch = Batch(tenant_id=ELEPHANT_EDGE_TENANT_ID, name=name, source=source)
+    batch = Batch(tenant_id=ELEPHANT_EDGE_TENANT_ID, name=name, source=source, offering_name=offering_name, campaign_label=campaign_label)
     db.add(batch)
     db.commit()
     db.refresh(batch)
-    return {"id": batch.id, "name": batch.name, "source": batch.source, "status": batch.status}
+    return {
+        "id": batch.id, "name": batch.name, "source": batch.source, "status": batch.status,
+        "offering_name": batch.offering_name, "campaign_label": batch.campaign_label,
+    }
 
 
 def _normalize_company_source(raw: str | None) -> str:

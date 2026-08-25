@@ -43,6 +43,18 @@ class Batch(Base):
     # so the dashboard can show them in fully independent tabs.
     source = Column(String, default="deepline", nullable=False)
 
+    # 2026-08-25, explicit instruction -- the real, missing link for "which offering/campaign did
+    # this batch of prospects belong to." A manually-created outbound campaign (e.g. the 4 real
+    # ones launched this session: Playbook/Dubai, Sales Cohort/India, Fractional VP Sales/India,
+    # Sales OS/US) is created as its own Batch and tagged here at creation time, so
+    # run_campaign_execution() can stamp every CampaignPush it writes with the real offering --
+    # without this, CampaignPush had no way to trace a push back to which offering/campaign it
+    # belonged to at all (confirmed, no join key existed anywhere). Both nullable -- every
+    # existing batch (real ICP-discovery batches, not a named outbound campaign) stays untagged,
+    # exactly as before.
+    offering_name = Column(String, nullable=True)
+    campaign_label = Column(String, nullable=True)
+
     companies = relationship("Company", back_populates="batch", cascade="all, delete-orphan")
 
 
@@ -236,6 +248,15 @@ class CampaignPush(Base):
     status = Column(String, default="pending")
     error_message = Column(Text, nullable=True)
     pushed_at = Column(DateTime, nullable=True)
+
+    # 2026-08-25, explicit instruction -- stamped from the pushed contact's own Batch
+    # (Batch.offering_name/campaign_label, see that model's own comment) at push time, so a
+    # CampaignPush row can finally be traced back to which offering/campaign it belonged to --
+    # previously impossible, this table had no join key to offering/ICP/campaign at all. Both
+    # nullable -- every existing row (and any push from an untagged, non-campaign batch) stays
+    # exactly as before.
+    offering_name = Column(String, nullable=True)
+    campaign_label = Column(String, nullable=True)
 
     contact = relationship("Contact", back_populates="campaign_pushes")
 

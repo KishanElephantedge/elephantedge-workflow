@@ -66,6 +66,12 @@ def get_db():
 def ensure_indexes():
     with engine.begin() as conn:
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_campaign_events_contact_id ON campaign_events (contact_id)"))
+        # 2026-08-25 -- real offering/campaign tracking link (Batch.offering_name/campaign_label,
+        # CampaignPush.offering_name/campaign_label; see those models' own comments for why).
+        conn.execute(text("ALTER TABLE batches ADD COLUMN IF NOT EXISTS offering_name VARCHAR"))
+        conn.execute(text("ALTER TABLE batches ADD COLUMN IF NOT EXISTS campaign_label VARCHAR"))
+        conn.execute(text("ALTER TABLE campaign_pushes ADD COLUMN IF NOT EXISTS offering_name VARCHAR"))
+        conn.execute(text("ALTER TABLE campaign_pushes ADD COLUMN IF NOT EXISTS campaign_label VARCHAR"))
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS calendar_bookings (
                 id SERIAL PRIMARY KEY,

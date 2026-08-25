@@ -19,12 +19,22 @@ from datetime import datetime
 
 from sqlalchemy.orm import Session
 
-from app.db.models import CampaignPush, Company, Contact
+from app.db.models import Batch, CampaignPush, Company, Contact
 from app.outreach.base import OutreachChannel
 
 
 def run_campaign_execution(batch_id: int, db: Session, channel: OutreachChannel) -> dict:
     contacts = db.query(Contact).join(Company).filter(Company.batch_id == batch_id).all()
+
+    # 2026-08-25, explicit instruction -- the real offering/campaign tracking link. A batch
+    # tagged at creation time (Batch.offering_name/campaign_label, e.g. one of the 4 real
+    # outbound campaigns launched this session) has every CampaignPush it produces stamped with
+    # the same tags, so a push can finally be traced back to which offering/campaign it belonged
+    # to -- previously impossible, this table had no such join key at all. An untagged batch
+    # (real ICP-discovery batches, not a named outbound campaign) stamps None, exactly as before.
+    batch = db.get(Batch, batch_id)
+    offering_name = batch.offering_name if batch else None
+    campaign_label = batch.campaign_label if batch else None
 
     already_pushed_ids = {
         p.contact_id
@@ -48,6 +58,8 @@ def run_campaign_execution(batch_id: int, db: Session, channel: OutreachChannel)
                 status="skipped",
                 error_message="Excluded from push via dashboard",
                 pushed_at=None,
+                offering_name=offering_name,
+                campaign_label=campaign_label,
             ))
             db.commit()
             continue
@@ -70,6 +82,8 @@ def run_campaign_execution(batch_id: int, db: Session, channel: OutreachChannel)
             status=result["status"],
             error_message=result.get("error_message"),
             pushed_at=datetime.utcnow() if result["status"] == "pushed" else None,
+            offering_name=offering_name,
+            campaign_label=campaign_label,
         ))
         db.commit()
 
