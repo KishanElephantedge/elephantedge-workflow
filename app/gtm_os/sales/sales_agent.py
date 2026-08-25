@@ -240,26 +240,28 @@ def prepare_message(db, tenant_id: int, opportunity: Opportunity, strategy: GtmS
     if strategy.strategy_type == "insufficient_context":
         missing_information.append("strategy is insufficient_context -- no approach has been determined yet")
         return {"status": "insufficient_context", "channel": None, "objective": None, "target_role": None,
-                "positioning_angle": None, "evidence_basis": strategy.evidence_basis, "personalization_inputs": [],
-                "missing_information": missing_information}
+                "target_name": None, "positioning_angle": None, "evidence_basis": strategy.evidence_basis,
+                "personalization_inputs": [], "missing_information": missing_information}
 
     if decision_maker["status"] != "known":
         missing_information.append("no known decision-maker contact -- cannot target a message")
         return {"status": "insufficient_context", "channel": None, "objective": None, "target_role": None,
-                "positioning_angle": strategy.positioning_angle, "evidence_basis": strategy.evidence_basis,
+                "target_name": None, "positioning_angle": strategy.positioning_angle, "evidence_basis": strategy.evidence_basis,
                 "personalization_inputs": [], "missing_information": missing_information}
 
     if strategy.offering_fit_status != "candidate_match":
         missing_information.append(f"offering_fit_status is {strategy.offering_fit_status!r} -- cannot credibly position a message without a confirmed offering")
         return {"status": "insufficient_context", "channel": None, "objective": None,
-                "target_role": decision_maker["contacts"][0]["title"], "positioning_angle": strategy.positioning_angle,
+                "target_role": decision_maker["contacts"][0]["title"], "target_name": decision_maker["contacts"][0].get("name"),
+                "positioning_angle": strategy.positioning_angle,
                 "evidence_basis": strategy.evidence_basis, "personalization_inputs": [], "missing_information": missing_information}
 
     next_action_types = [a["action_type"] for a in (strategy.action_plan or [])]
     if "prepare_message" not in next_action_types:
         missing_information.append("action plan has not yet reached prepare_message -- earlier prerequisites still open")
         return {"status": "insufficient_context", "channel": None, "objective": None,
-                "target_role": decision_maker["contacts"][0]["title"], "positioning_angle": strategy.positioning_angle,
+                "target_role": decision_maker["contacts"][0]["title"], "target_name": decision_maker["contacts"][0].get("name"),
+                "positioning_angle": strategy.positioning_angle,
                 "evidence_basis": strategy.evidence_basis, "personalization_inputs": [], "missing_information": missing_information}
 
     contact = decision_maker["contacts"][0]
@@ -280,6 +282,11 @@ def prepare_message(db, tenant_id: int, opportunity: Opportunity, strategy: GtmS
         "channel": channel,
         "objective": next((a["objective"] for a in strategy.action_plan if a["action_type"] == "prepare_message"), None),
         "target_role": contact.get("title"),
+        # 2026-08-25 real bug fix: the contact's real name was already available on `contact`
+        # (evaluate_decision_maker already computes it) but was never surfaced here or passed to
+        # the LLM prompt -- confirmed live, a message greeted the COMPANY name ("Hi Cara")
+        # instead of the actual contact, because the model had no real person name to work with.
+        "target_name": contact.get("name"),
         "positioning_angle": strategy.positioning_angle,
         "evidence_basis": strategy.evidence_basis,
         "personalization_inputs": personalization_inputs,

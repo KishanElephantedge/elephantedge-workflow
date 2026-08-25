@@ -70,6 +70,7 @@ message on behalf of a B2B GTM team, using ONLY the structured information provi
 
 Objective: {objective}
 Channel: {channel}
+Target contact's real name: {target_name}
 Target role: {target_role}
 Positioning angle: {positioning_angle}
 Known, real facts you may reference (nothing else): {personalization_inputs}
@@ -78,6 +79,14 @@ STRICT RULES -- you must not violate any of these:
 - Do NOT invent or assume any company fact, contact fact, pain point, budget, timeline, \
 initiative, metric, customer story, or product capability that is not explicitly listed above.
 - Do NOT reference specific numbers, dates, or claims unless they appear above.
+- If a real target contact name is given above, greet THAT PERSON by their first name only. \
+NEVER greet or address a company name as if it were a person (the personalization facts above \
+may mention a company name -- that is never who you are writing to).
+- If no real target contact name is given above (it says "unknown"), use a generic greeting \
+("Hi," or "Hi there,") -- do not invent a name.
+- Do NOT include any closing signature, sign-off line, or placeholder (no "Best,", no \
+"[Your Name]", no "Regards," followed by a blank/bracketed name) -- no real sender identity is \
+available to you, so end the message with its final substantive sentence instead.
 - If the information above is not enough to write a genuinely grounded, specific message, return \
 null for both subject and message_text rather than writing something generic or invented.
 - Keep the message short (3-5 sentences), professional, and directly grounded in the facts above.
@@ -230,6 +239,7 @@ def generate_message_draft(db: Session, tenant_id: int, opportunity: Opportunity
 
     prompt = MESSAGE_GENERATION_PROMPT.format(
         objective=prep["objective"], channel=prep["channel"], target_role=prep["target_role"] or "unknown",
+        target_name=prep.get("target_name") or "unknown",
         positioning_angle=prep["positioning_angle"] or "none provided",
         personalization_inputs="; ".join(prep["personalization_inputs"]) or "none",
     )
