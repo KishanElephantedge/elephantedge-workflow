@@ -12,7 +12,7 @@ from sqlalchemy import func, or_
 
 from app.cache import active_keys, bump_batch_version, cache_get, cache_set, get_batch_version, mark_active
 from app.claude_client import ClaudeError, call_claude_messages
-from app.db.models import AutonomousRun, Batch, CalendarBooking, CampaignEvent, CampaignPush, ChatConversation, ChatMessage, Company, Contact, Credential, DailyReview, LinkedinMonitorProfile, LinkedinMonitorSignal, Notification, Parameter, PartnerCompanyRecommendation, PartnerRecommendationMessage, PersonalizedMessage, ReverseDiscoveryCandidate, ReviewComment, Score
+from app.db.models import AutonomousRun, Batch, CalendarBooking, CampaignEvent, CampaignPush, ChatConversation, ChatMessage, Company, Contact, Credential, DailyReview, LinkedinMonitorProfile, LinkedinMonitorSignal, Notification, Parameter, PartnerCompanyRecommendation, PartnerRecommendationMessage, PersonalizedMessage, Proposal, ReverseDiscoveryCandidate, ReviewComment, Score
 from app.notifications import delete_expired_notifications
 from app.google_calendar_client import GoogleCalendarError
 from app.phases.hiring_signal import has_qualifying_hiring_signal
@@ -4501,4 +4501,98 @@ def delete_crm_contact(contact_id: str, db: Session = Depends(get_db)):
         delete_contact(contact_id, db, ELEPHANT_EDGE_TENANT_ID)
     except HubSpotError as e:
         raise HTTPException(status_code=502, detail=str(e))
+    return {"deleted": True}
+
+
+# ---- Proposals (2025 backlog + future) -- see Proposal's own docstring in app/db/models.py.
+# Manual CRUD only for now: the imported backlog isn't auto-validated (Deepline credits), so the
+# user reviews/edits/removes rows here directly instead. No re-engagement/cadence/send logic
+# yet -- this is purely the browse-and-clean-up surface for the imported data.
+
+PROPOSAL_EDITABLE_FIELDS = [
+    "company_name", "linkedin_url", "contact_name", "what_they_asked_for", "why_not_closed",
+    "icp_fit", "monthly_value", "status", "sent_period",
+]
+
+
+def _serialize_proposal(p, include_document=False):
+    data = {
+        "id": p.id,
+        "company_id": p.company_id,
+        "contact_id": p.contact_id,
+        "company_name": p.company_name,
+        "linkedin_url": p.linkedin_url,
+        "contact_name": p.contact_name,
+        "what_they_asked_for": p.what_they_asked_for,
+        "why_not_closed": p.why_not_closed,
+        "icp_fit": p.icp_fit,
+        "monthly_value": p.monthly_value,
+        "status": p.status,
+        "sent_period": p.sent_period,
+        "proposal_document_filename": p.proposal_document_filename,
+        "has_document": bool(p.proposal_document_text),
+        "source": p.source,
+        "validated_at": p.validated_at,
+        "last_touch_at": p.last_touch_at,
+        "created_at": p.created_at,
+    }
+    if include_document:
+        data["proposal_document_text"] = p.proposal_document_text
+    return data
+
+
+@router.get("/proposals")
+def list_proposals(page: int = 1, page_size: int = 25, search: str = "", status: str = "", db: Session = Depends(get_db)):
+    query = db.query(Proposal).filter(Proposal.tenant_id == ELEPHANT_EDGE_TENANT_ID)
+    if search.strip():
+        query = query.filter(Proposal.company_name.ilike(f"%{search.strip()}%"))
+    if status.strip():
+        query = query.filter(Proposal.status == status.strip())
+
+    total = query.count()
+    page = max(page, 1)
+    page_size = max(1, min(page_size, 100))
+    rows = (
+        query
+        .order_by(Proposal.id.asc())
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+        .all()
+    )
+    return {
+        "page": page,
+        "page_size": page_size,
+        "total": total,
+        "total_pages": (total + page_size - 1) // page_size if total else 0,
+        "proposals": [_serialize_proposal(p) for p in rows],
+    }
+
+
+@router.get("/proposals/{proposal_id}")
+def get_proposal(proposal_id: int, db: Session = Depends(get_db)):
+    p = db.query(Proposal).filter(Proposal.id == proposal_id, Proposal.tenant_id == ELEPHANT_EDGE_TENANT_ID).first()
+    if not p:
+        raise HTTPException(status_code=404, detail="Proposal not found")
+    return _serialize_proposal(p, include_document=True)
+
+
+@router.patch("/proposals/{proposal_id}")
+def update_proposal(proposal_id: int, body: dict = Body(...), db: Session = Depends(get_db)):
+    p = db.query(Proposal).filter(Proposal.id == proposal_id, Proposal.tenant_id == ELEPHANT_EDGE_TENANT_ID).first()
+    if not p:
+        raise HTTPException(status_code=404, detail="Proposal not found")
+    for field in PROPOSAL_EDITABLE_FIELDS:
+        if field in body:
+            setattr(p, field, body[field])
+    db.commit()
+    return _serialize_proposal(p, include_document=True)
+
+
+@router.delete("/proposals/{proposal_id}")
+def delete_proposal(proposal_id: int, db: Session = Depends(get_db)):
+    p = db.query(Proposal).filter(Proposal.id == proposal_id, Proposal.tenant_id == ELEPHANT_EDGE_TENANT_ID).first()
+    if not p:
+        raise HTTPException(status_code=404, detail="Proposal not found")
+    db.delete(p)
+    db.commit()
     return {"deleted": True}

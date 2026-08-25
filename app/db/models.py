@@ -261,6 +261,51 @@ class CampaignPush(Base):
     contact = relationship("Contact", back_populates="campaign_pushes")
 
 
+class Proposal(Base):
+    """A real client proposal Elephant Edge sent -- past (manually done, imported from Drive/
+    the Sales Progress sheet) or future (whichever system eventually produces one). Deliberately
+    does NOT require a Company/Batch link -- company_id/contact_id are optional, filled in only
+    once/if an account is matched and validated as still current (a separate, paced step, not
+    done at import time). This keeps the imported 2025 backlog isolated from the outbound
+    discovery/scoring pipeline that runs against `companies`, per explicit instruction not to
+    let the daily autonomous cycle re-process these as fresh cold leads.
+
+    The re-engagement sweep (not yet built) is meant to query `status` here directly rather than
+    a separate list -- any account that reaches a stalled proposal, past or future, becomes
+    eligible the same way, so this table (not a one-off import) is the durable home for both."""
+
+    __tablename__ = "proposals"
+
+    id = Column(Integer, primary_key=True)
+    tenant_id = Column(Integer, nullable=False)
+
+    company_id = Column(Integer, ForeignKey("companies.id"), nullable=True)
+    contact_id = Column(Integer, ForeignKey("contacts.id"), nullable=True)
+
+    company_name = Column(String, nullable=False)
+    linkedin_url = Column(String, nullable=True)  # company or contact LinkedIn, as captured in the source sheet
+    contact_name = Column(String, nullable=True)
+
+    what_they_asked_for = Column(Text, nullable=True)
+    why_not_closed = Column(Text, nullable=True)
+    icp_fit = Column(String, nullable=True)  # yes | no | unknown -- as originally assessed, not re-derived
+    monthly_value = Column(Float, nullable=True)  # as recorded in the sheet; unit not confirmed (looks like INR lakhs)
+
+    status = Column(String, nullable=False, default="unknown")  # sent | in_pipeline | accepted | rejected | stalled | unknown
+    sent_period = Column(String, nullable=True)  # free-text month bucket from the sheet, e.g. "January-February 2025" -- exact date unknown
+
+    proposal_document_filename = Column(String, nullable=True)
+    proposal_document_text = Column(Text, nullable=True)  # full extracted text of the actual doc sent, when we have it -- real reference material for re-engagement message generation
+
+    source = Column(String, nullable=False, default="2025_backlog")  # 2025_backlog | system
+    validated_at = Column(DateTime, nullable=True)  # set once someone confirms the contact is still current at this company (paced manually, not automatic)
+    last_touch_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    company = relationship("Company")
+    contact = relationship("Contact")
+
+
 class CampaignEvent(Base):
     """Outcome tracking, received via SalesRobot's own outbound webhook (confirmed live --
     SalesRobot pushes events to us, there is no pull/status API). contact_id is nullable
