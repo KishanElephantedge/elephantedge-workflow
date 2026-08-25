@@ -56,6 +56,35 @@ def _check_paid_fallback_budget(contact_budget_usd: float) -> tuple[bool, str | 
     return True, None
 
 
+def update_contact_email(db: Session, tenant_id: int, contact_id: int, email: str) -> Contact:
+    """2026-08-25, explicit instruction: a human reviewing a message draft can add/correct a
+    contact's email directly (e.g. the contact has none on file, or the pattern-guessed one is
+    wrong) rather than being blocked from an email draft entirely. Real tenant-scoping check via
+    the same Company -> Batch -> tenant_id chain every other Company/Contact query in this
+    codebase already uses (Contact has no direct tenant_id column). Sets email_source="manual" --
+    a human-provided email is real, verified-by-a-person data, a strictly higher confidence tier
+    than "pattern_guess" (see Contact.email_source's own column comment), never conflated with it."""
+    contact = db.get(Contact, contact_id)
+    if contact is None:
+        raise ValueError(f"no Contact {contact_id}")
+
+    owns_contact = (
+        db.query(Contact.id)
+        .join(Company, Contact.company_id == Company.id)
+        .join(Batch, Company.batch_id == Batch.id)
+        .filter(Contact.id == contact_id, Batch.tenant_id == tenant_id)
+        .first()
+        is not None
+    )
+    if not owns_contact:
+        raise ValueError(f"Contact {contact_id} does not belong to tenant {tenant_id}")
+
+    contact.email = email
+    contact.email_source = "manual"
+    db.commit()
+    return contact
+
+
 def get_eligible_contacts(db: Session, company_id: int) -> list[Contact]:
     """Real Contact rows for this company that are NOT suppressed -- Contact.excluded_from_push,
     the exact same field run_campaign_execution already respects, reused as-is (no new field).

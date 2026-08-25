@@ -3783,6 +3783,49 @@ def get_gtm_os_pipeline_item(opportunity_id: int, db: Session = Depends(get_db))
     return item
 
 
+@router.patch("/gtm-os/messages/{message_draft_id}")
+def patch_gtm_os_message(message_draft_id: int, payload: dict = Body(...), db: Session = Depends(get_db)):
+    """2026-08-25, explicit instruction -- real human editing of AI-generated content before
+    approval. Thin dispatch over update_message_draft_content() (message_draft.py); no editing
+    logic lives in this route. Rejects editing an already-approved draft with 400 (same
+    immutability rule the review route's own approve action already enforces)."""
+    from app.gtm_os.learning.message_draft import update_message_draft_content
+
+    subject = payload.get("subject")
+    message_text = payload.get("message_text")
+    if subject is None and message_text is None:
+        raise HTTPException(status_code=400, detail="at least one of subject/message_text must be provided")
+
+    try:
+        draft = update_message_draft_content(db, ELEPHANT_EDGE_TENANT_ID, message_draft_id, subject=subject, message_text=message_text)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    return {
+        "id": draft.id, "subject": draft.subject, "message_text": draft.message_text,
+        "status": draft.status, "last_updated_at": draft.last_updated_at,
+    }
+
+
+@router.patch("/gtm-os/contacts/{contact_id}/email")
+def patch_gtm_os_contact_email(contact_id: int, payload: dict = Body(...), db: Session = Depends(get_db)):
+    """2026-08-25, explicit instruction -- lets a human add/correct a contact's email directly
+    from the Message Workspace (e.g. the contact has none on file yet, blocking an email draft).
+    Thin dispatch over update_contact_email() (contact_discovery.py); no editing logic here."""
+    from app.gtm_os.sales.contact_discovery import update_contact_email
+
+    email = payload.get("email")
+    if not isinstance(email, str) or not email.strip():
+        raise HTTPException(status_code=400, detail="email is required")
+
+    try:
+        contact = update_contact_email(db, ELEPHANT_EDGE_TENANT_ID, contact_id, email.strip())
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    return {"id": contact.id, "email": contact.email, "email_source": contact.email_source}
+
+
 @router.post("/gtm-os/messages/{message_draft_id}/review")
 def post_gtm_os_message_review(message_draft_id: int, payload: dict = Body(...), db: Session = Depends(get_db)):
     """V2 human approval boundary (Phase 7, Part 8-10) -- the ONLY write route this phase adds.

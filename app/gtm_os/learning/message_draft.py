@@ -435,6 +435,29 @@ def regenerate_message_draft(db: Session, tenant_id: int, draft_id: int, contact
     return generate_message_draft(db, tenant_id, opportunity, strategy, exclude_contact_ids=exclude_contact_ids)
 
 
+def update_message_draft_content(db: Session, tenant_id: int, message_draft_id: int, subject: str | None = None, message_text: str | None = None) -> MessageDraft:
+    """2026-08-25, explicit instruction -- real human editing of AI-generated content: the
+    system drafts subject/message_text, a human can then directly correct it (not just
+    request-changes-and-regenerate) before approval. Never touches an already-approved draft --
+    same immutability rule approve_message_draft() itself establishes (Part N/K); once approved,
+    the record is a fact about what was actually sent/is being sent, not a draft to keep editing.
+    Only updates the field(s) actually passed (None means "leave unchanged"), so a caller editing
+    just the body doesn't have to also resend the subject."""
+    draft = db.get(MessageDraft, message_draft_id)
+    if draft is None or draft.tenant_id != tenant_id:
+        raise ValueError(f"no MessageDraft {message_draft_id} for tenant {tenant_id}")
+    if draft.status == "approved":
+        raise ValueError("cannot edit an already-approved draft")
+
+    if subject is not None:
+        draft.subject = subject
+    if message_text is not None:
+        draft.message_text = message_text
+    draft.last_updated_at = datetime.utcnow()
+    db.commit()
+    return draft
+
+
 def approve_message_draft(db: Session, tenant_id: int, message_draft_id: int, approved_by: str) -> MessageDraft:
     """The ONLY function that ever sets status='approved'. Requires the draft to already be
     ready_for_review -- cannot approve a draft/insufficient_context message (forces the
