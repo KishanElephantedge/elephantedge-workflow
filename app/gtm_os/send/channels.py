@@ -13,11 +13,12 @@ only meaningful on a "failed" result -- False means this exact failure cannot su
 failure (network/timeout/5xx) worth the configured retry attempts."""
 from sqlalchemy.orm import Session
 
-from app.db.models import Contact, Parameter
+from app.db.models import Contact, Credential, Parameter
 from app.gtm_os.learning.message_draft import MessageDraft
 from app.gtm_os.opportunity.opportunity import Opportunity
 from app.salesrobot_client import SalesRobotError, send_connection_request
 from app.smartlead_client import SmartleadError, add_lead
+from app.smtp_client import SmtpError, send_email
 
 
 def _get_smartlead_campaign_id(db: Session, tenant_id: int) -> int:
@@ -68,6 +69,47 @@ def send_via_smartlead(db: Session, tenant_id: int, draft: MessageDraft, contact
     # the campaign; Smartlead's own async sequence engine is what actually sends the email,
     # on its own schedule, which this call has no visibility into.
     return {"status": "enrolled", "provider_ref": f"campaign:{campaign_id}", "error_message": None, "retryable": None}
+
+
+def _get_smtp_credential(db: Session, tenant_id: int, name: str) -> str | None:
+    cred = db.query(Credential).filter(Credential.tenant_id == tenant_id, Credential.name == name).first()
+    return cred.value if cred and cred.value else None
+
+
+def send_via_smtp(db: Session, tenant_id: int, draft: MessageDraft, contact: Contact, opportunity: Opportunity) -> dict:
+    """Real email sending, 2026-08-25 explicit instruction -- replaces send_via_smartlead for the
+    "email" channel entirely (Smartlead is not used for email sends; this bypasses it). Sends
+    directly via a fixed, real Gmail mailbox (smtp_email/smtp_app_password Credentials, same
+    Credential model/CRUD every other provider credential here already uses -- no new storage
+    mechanism). opportunity is unused here (kept for the shared adapter signature, same as
+    send_via_salesrobot's own note on this)."""
+    if not contact.email:
+        return {"status": "failed", "provider_ref": None, "error_message": "contact has no email address", "retryable": False}
+    if not draft.message_text:
+        return {"status": "failed", "provider_ref": None, "error_message": "draft has no message_text", "retryable": False}
+    if not draft.subject:
+        # Same discipline as send_via_smartlead's own subject check -- the send layer must never
+        # invent content, including a subject line; a draft missing one is a real, permanent gap.
+        return {"status": "failed", "provider_ref": None, "error_message": "draft has no subject", "retryable": False}
+
+    sender_email = _get_smtp_credential(db, tenant_id, "smtp_email")
+    app_password = _get_smtp_credential(db, tenant_id, "smtp_app_password")
+    if not sender_email or not app_password:
+        return {"status": "failed", "provider_ref": None, "error_message": "smtp_email/smtp_app_password credentials not configured", "retryable": False}
+
+    to_name = f"{contact.first_name or ''} {contact.last_name or ''}".strip() or None
+    try:
+        send_email(sender_email, app_password, contact.email, draft.subject, draft.message_text, to_name=to_name)
+    except SmtpError as e:
+        # An auth failure (wrong/expired app password) will not fix itself on retry; anything
+        # else (connection/transient) is worth the configured retry attempts.
+        retryable = "authentication failed" not in str(e).lower()
+        return {"status": "failed", "provider_ref": None, "error_message": str(e), "retryable": retryable}
+
+    # "sent", not "enrolled" -- unlike Smartlead's async campaign engine, this call IS the actual
+    # delivery attempt to the mailbox's SMTP server; a successful return here means the email was
+    # actually handed off for delivery, not just accepted into a queue.
+    return {"status": "sent", "provider_ref": f"smtp:{sender_email}", "error_message": None, "retryable": None}
 
 
 def send_via_salesrobot(db: Session, tenant_id: int, draft: MessageDraft, contact: Contact, opportunity: Opportunity) -> dict:

@@ -13,7 +13,7 @@ from app.db.models import Contact
 from app.gtm_os.learning.message_draft import MessageDraft
 from app.gtm_os.opportunity.opportunity import Opportunity
 from app.gtm_os.orchestration.control import ControlPlaneHalted, check_can_run, get_control_config, is_within_business_hours
-from app.gtm_os.send.channels import send_via_salesrobot, send_via_smartlead
+from app.gtm_os.send.channels import send_via_salesrobot, send_via_smtp
 from app.gtm_os.send.send_state import (
     MessageSendAttempt,
     count_successful_sends_since,
@@ -23,7 +23,14 @@ from app.gtm_os.send.send_state import (
     last_attempt_permanently_failed,
 )
 
-CHANNEL_PROVIDERS = {"email": "smartlead", "linkedin": "salesrobot"}
+# "email" -> "smtp" (2026-08-25, explicit instruction): email sends bypass Smartlead entirely and
+# go via real SMTP from a specific, fixed mailbox (see app/smtp_client.py, app/gtm_os/send/
+# channels.py's send_via_smtp). Smartlead is no longer used for any channel here.
+CHANNEL_PROVIDERS = {"email": "smtp", "linkedin": "salesrobot"}
+
+# smtp needs two credentials (a mailbox address + its app password), not the single
+# "{provider}_api_key" shape every other provider here uses -- checked separately below.
+PROVIDER_CREDENTIAL_NAMES = {"smtp": ("smtp_email", "smtp_app_password")}
 
 # Every one of these must be explicitly configured (not None) before ANY send proceeds -- per
 # explicit instruction, an unconfigured send limit must never be silently interpreted as
@@ -123,15 +130,16 @@ def send_message_draft(db: Session, tenant_id: int, draft: MessageDraft) -> dict
     if provider is None:
         return {"status": "skipped", "reason": f"unsupported or missing channel {draft.channel!r}"}
 
-    credential_name = f"{provider}_api_key"
-    if not _has_credential(db, tenant_id, credential_name):
-        return {"status": "skipped", "reason": f"{credential_name} credential not configured"}
+    required_credential_names = PROVIDER_CREDENTIAL_NAMES.get(provider, (f"{provider}_api_key",))
+    missing_credentials = [name for name in required_credential_names if not _has_credential(db, tenant_id, name)]
+    if missing_credentials:
+        return {"status": "skipped", "reason": f"{', '.join(missing_credentials)} credential(s) not configured"}
 
     opportunity = db.get(Opportunity, draft.opportunity_id)
 
     # THE PROVIDER CALL -- the final side effect. Everything above is a pure read/skip check.
-    if provider == "smartlead":
-        result = send_via_smartlead(db, tenant_id, draft, contact, opportunity)
+    if provider == "smtp":
+        result = send_via_smtp(db, tenant_id, draft, contact, opportunity)
     else:
         result = send_via_salesrobot(db, tenant_id, draft, contact, opportunity)
 
