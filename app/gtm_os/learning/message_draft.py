@@ -34,7 +34,7 @@ from datetime import datetime
 from sqlalchemy import Column, DateTime, ForeignKey, Integer, JSON, String, Text
 from sqlalchemy.orm import Session
 
-from app.db.models import Base
+from app.db.models import Base, Contact
 from app.gtm_os.opportunity.opportunity import Opportunity
 from app.gtm_os.sales.contact_discovery import get_eligible_contacts
 from app.gtm_os.sales.sales_agent import evaluate_decision_maker, evaluate_sales_readiness, gather_account_research, prepare_message
@@ -567,12 +567,32 @@ def list_messages_for_company(db: Session, tenant_id: int, company_id: int) -> l
         )
         latest_strategy_id_by_opportunity = dict(latest_rows)
 
+    # 2026-08-25, real Message Workspace UI need: the frontend must show WHO a draft is actually
+    # addressed to (real name + email), not just an opaque contact_id. One bulk query for every
+    # distinct contact_id in this result set -- same "bulk fetch, never per-row" discipline
+    # already used above for latest_strategy_id_by_opportunity.
+    contact_ids = list({d.contact_id for d in rows if d.contact_id is not None})
+    contact_by_id: dict[int, Contact] = {}
+    if contact_ids:
+        contact_by_id = {c.id: c for c in db.query(Contact).filter(Contact.id.in_(contact_ids)).all()}
+
+    def _contact_fields(contact_id):
+        contact = contact_by_id.get(contact_id) if contact_id is not None else None
+        if contact is None:
+            return {"contact_name": None, "contact_email": None, "contact_title": None}
+        return {
+            "contact_name": f"{contact.first_name or ''} {contact.last_name or ''}".strip() or None,
+            "contact_email": contact.email,
+            "contact_title": contact.title,
+        }
+
     return [
         {
             "id": d.id,
             "opportunity_id": d.opportunity_id,
             "gtm_strategy_id": d.gtm_strategy_id,
             "contact_id": d.contact_id,
+            **_contact_fields(d.contact_id),
             "channel": d.channel,
             "objective": d.objective,
             "target_role": d.target_role,
