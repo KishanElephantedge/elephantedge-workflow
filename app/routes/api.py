@@ -4002,6 +4002,21 @@ def get_gtm_os_learning_readout(db: Session = Depends(get_db)):
     return evaluate_learning_readout(db, ELEPHANT_EDGE_TENANT_ID)
 
 
+@router.get("/gtm-os/offering-performance")
+def get_gtm_os_offering_performance(db: Session = Depends(get_db)):
+    """2026-08-26, explicit instruction -- "the system should keep on track and learning...
+    which is getting better reply, better conversations, which is getting better sold and which
+    is not... and suggest for us what to do." Read-only wrapper over
+    get_offering_performance()/generate_offering_suggestions() (app/gtm_os/learning/
+    offering_performance.py) -- same "real counts only, no LLM narrative" discipline as
+    learning-readout above; suggestions are plain rule-based sentences templated from those real
+    counts, not a generated recommendation."""
+    from app.gtm_os.learning.offering_performance import generate_offering_suggestions, get_offering_performance
+
+    performance = get_offering_performance(db, ELEPHANT_EDGE_TENANT_ID)
+    return {**performance, "suggestions": generate_offering_suggestions(performance)}
+
+
 @router.get("/gtm-os/jobs-to-be-done")
 def get_gtm_os_jobs_to_be_done(db: Session = Depends(get_db)):
     """V2 Jobs to Be Done -- read-only composition of four existing, unmodified backend readers:
