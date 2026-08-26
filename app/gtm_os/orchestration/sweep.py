@@ -770,7 +770,20 @@ def run_gtm_intelligence_sweep(
     if not outbound_due:
         contact_discovery_result = {"status": "skipped", "reason": outbound_reason}
     else:
-        contact_discovery_result = run_v2_contact_discovery_sweep(db, tenant_id, limit=50)
+        try:
+            contact_discovery_result = run_v2_contact_discovery_sweep(db, tenant_id, limit=50)
+        except Exception as e:  # noqa: BLE001 -- real bug fix (2026-08-26, confirmed live): this
+            # was the ONE stage call in this whole function missing the try/except every other
+            # stage here has -- confirmed live, a real sqlalchemy.exc.PendingRollbackError
+            # (itself caused by a separate now-fixed bug in contact_discovery.py) propagated all
+            # the way out of run_gtm_intelligence_sweep and killed the ENTIRE remaining sweep
+            # (message_generation, send, outreach_sequencing never even attempted), directly
+            # violating this module's own "never raises for an individual source/stage failure"
+            # docstring promise. rollback() first since an uncaught DB-level exception can leave
+            # this shared session invalid for every stage still to come.
+            db.rollback()
+            contact_discovery_result = {"status": "failed", "error": str(e)}
+            logger.error("gtm_intelligence_sweep: contact_discovery raised unexpectedly -- %s", e)
     result["contact_discovery"] = contact_discovery_result
     if contact_discovery_result.get("status") == "succeeded":
         any_succeeded = True

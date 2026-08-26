@@ -9,6 +9,7 @@ V2 stage -> shared/proven capability -> result returns directly into V2 -> V2 co
 
 Runs ONLY for Opportunities that genuinely need contacts -- never for every Company. See
 is_contact_discovery_eligible() for the exact real, non-invented conditions."""
+import logging
 from datetime import datetime
 
 from sqlalchemy.orm import Session
@@ -20,6 +21,8 @@ from app.gtm_os.opportunity.opportunity import Opportunity
 from app.gtm_os.orchestration.control import ControlPlaneHalted, check_can_run, get_control_config
 from app.gtm_os.strategy.strategy import GtmStrategy
 from app.phases.decision_maker import CANDIDATES_PER_SEARCH, MAX_CONTACTS_PER_COMPANY, find_decision_makers
+
+logger = logging.getLogger(__name__)
 
 # Real, documented paid-fallback cost model (decision_maker.py's own comments -- not invented
 # here): search_contact bills $0.056/result, up to CANDIDATES_PER_SEARCH results in one billed
@@ -202,6 +205,15 @@ def discover_contacts_for_opportunity(db: Session, tenant_id: int, opportunity: 
         try:
             guard = BudgetGuard(contact_budget_usd)
         except Exception as e:  # noqa: BLE001 -- a provider/balance-check failure must not crash the sweep
+            # Real bug fix (2026-08-26, confirmed live): a raw DB-level exception caught here
+            # (as opposed to a provider/network error) leaves this SHARED session's transaction
+            # "invalid" until rolled back -- confirmed live, the very next opportunity's
+            # `db.get(Opportunity, ...)` in run_v2_contact_discovery_sweep's loop crashed the
+            # WHOLE sweep with sqlalchemy.exc.PendingRollbackError, because nothing here ever
+            # rolled the poisoned transaction back before returning "failed" and moving on.
+            # rollback() is always safe to call even when the real cause was a non-DB error
+            # (a no-op on a still-valid transaction), so this isn't gated on the exception type.
+            db.rollback()
             return {"status": "failed", "opportunity_id": opportunity.id, "error": f"could not initialize budget guard: {e}"}
 
     try:
@@ -212,6 +224,9 @@ def discover_contacts_for_opportunity(db: Session, tenant_id: int, opportunity: 
     except BudgetExceededError:
         raise
     except Exception as e:  # noqa: BLE001 -- a provider failure must not crash the sweep
+        # Same real fix as above -- this is the exact except block whose swallowed DB-level
+        # exception caused the live PendingRollbackError crash.
+        db.rollback()
         return {"status": "failed", "opportunity_id": opportunity.id, "error": str(e)}
 
     if used_paid and guard is not None:
@@ -261,6 +276,16 @@ def run_v2_contact_discovery_sweep(db: Session, tenant_id: int, limit: int = 50)
     ]
 
     for opp_id in opportunity_ids:
+        # Real bug fix (2026-08-26, confirmed live) -- belt-and-suspenders alongside the
+        # rollback() fixes inside discover_contacts_for_opportunity itself: db.get() is the exact
+        # call that crashed the whole sweep live with PendingRollbackError, because a PRIOR
+        # iteration's swallowed DB-level exception had left this shared session's transaction
+        # invalid. A stray, still-invalid transaction from anywhere else this session touched
+        # would hit the identical failure here; rolling back defensively before every iteration's
+        # own DB.get() costs nothing on a healthy session (a no-op) and keeps this loop's own
+        # "per-opportunity failures are isolated" promise true even if some other bug elsewhere
+        # leaves the session dirty.
+        db.rollback()
         opportunity = db.get(Opportunity, opp_id)
         if opportunity is None or opportunity.tenant_id != tenant_id:
             continue
@@ -270,6 +295,11 @@ def run_v2_contact_discovery_sweep(db: Session, tenant_id: int, limit: int = 50)
         except BudgetExceededError:
             counts["budget_stopped_early"] = True
             break
+        except Exception as e:  # noqa: BLE001 -- see module docstring: one opportunity's failure must never crash the sweep
+            db.rollback()
+            counts["failed"] += 1
+            logger.error("run_v2_contact_discovery_sweep: opportunity %s failed unexpectedly -- %s", opp_id, e)
+            continue
 
         if result["status"] == "succeeded":
             counts["eligible"] += 1
