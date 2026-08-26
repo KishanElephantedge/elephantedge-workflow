@@ -4611,3 +4611,15 @@ def delete_proposal(proposal_id: int, db: Session = Depends(get_db)):
     db.delete(p)
     db.commit()
     return {"deleted": True}
+
+
+# ---- TEMPORARY diagnostic route, re-added 2026-08-26 to check whether the freshly-updated
+# DEEPLINE_API_KEY actually resolved the earlier 401. Remove once confirmed either way.
+@router.get("/_debug/deepline-ip-lookup")
+def debug_deepline_ip_lookup(ip: str = "103.171.98.78"):
+    from app.deepline_client import DeeplineError, execute_tool
+    try:
+        result = execute_tool("deepline_ip_to_company_find_company_by_ip", {"ip": ip})
+        return {"ok": True, "result": result}
+    except DeeplineError as e:
+        return {"ok": False, "error": str(e)}
