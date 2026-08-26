@@ -99,6 +99,17 @@ class Company(Base):
     marketing_headcount_percent = Column(Float, nullable=True)
     geography_tier = Column(String, nullable=True)  # "tier_1" | "tier_2"
     industry_classification = Column(String, nullable=True)  # "tech" | "non_tech"
+
+    # 2026-08-26, real fix -- run_icp_matching_sweep() used to re-evaluate the same fixed batch
+    # of companies (ordered by id) from scratch on EVERY run, confirmed live: 1,461 of 1,500 real
+    # checks in one run came back "insufficient_information", not a real match/no-match verdict,
+    # because most companies simply lack revenue/sales-headcount data -- re-checking them without
+    # new data can never produce a different answer. These two columns let the sweep skip a
+    # company once it has a real, COMPLETE (no missing_information) verdict -- nothing about it
+    # can change through this sweep alone -- while still retrying any company whose last check
+    # was incomplete (it may have been enriched since) or that has never been checked at all.
+    icp_last_evaluated_at = Column(DateTime, nullable=True)
+    icp_last_evaluation_had_missing_information = Column(Boolean, nullable=True)
     active_job_title = Column(String, nullable=True)  # title of the matched posting, if any
     hiring_signal_role = Column(String, nullable=True)  # head_of_sales | sdr | ae | marketing | gtm
     hiring_signal_hire_type = Column(String, nullable=True)  # first_hire | multiple_hire

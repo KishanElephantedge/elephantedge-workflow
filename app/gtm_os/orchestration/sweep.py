@@ -126,6 +126,7 @@ from app.gtm_os.content.promotion import run_candidate_promotion_sweep
 from app.gtm_os.content.topic_linking import run_content_topic_linking_sweep
 from app.gtm_os.content.trend_intelligence import run_trend_intelligence_sweep
 from app.gtm_os.icp.icp_matching import run_icp_matching_sweep
+from app.gtm_os.icp.revenue_estimation import run_revenue_backfill_sweep
 from app.gtm_os.intelligence.demand_detection import run_demand_hypothesis_sweep
 from app.gtm_os.intelligence.interpretation import run_interpretation_sweep
 from app.gtm_os.intelligence.investigation_cycle import run_investigation_cycle
@@ -323,6 +324,13 @@ CONTENT_INTELLIGENCE_STAGES: list[tuple[str, callable]] = [
 # real data (each stage safely returns all-zero counts rather than fabricating output).
 ACCOUNT_STRATEGY_STAGES_PRE_CONTACT: list[tuple[str, callable]] = [
     ("opportunity", lambda db, tenant_id: run_opportunity_intelligence_sweep(db, tenant_id)),
+    # 2026-08-26, real fix -- confirmed live: 1,461 of 1,500 real ICP checks in one run came back
+    # "insufficient_information", overwhelmingly because revenue is null on the company, not
+    # because it was genuinely evaluated and disqualified. Runs BEFORE icp_matching, in the SAME
+    # cycle, so a company this backfills gets a real chance at a real ICP verdict immediately
+    # rather than waiting for a future run. See revenue_estimation.py's own docstring for the
+    # bounded/budget-gated real cost model.
+    ("revenue_backfill", lambda db, tenant_id: run_revenue_backfill_sweep(db, tenant_id, limit=30)),
     # ICP matching (icp_matching.py) -- until this GTM-OS wiring pass, run_icp_matching_sweep()
     # had ZERO callers anywhere in the app (confirmed by full-repo grep): not the scheduler, not
     # any API route, not this orchestrator. The real ICPMatch table (read by the Demand Grid,
@@ -579,6 +587,7 @@ def run_gtm_intelligence_sweep(
         "candidate_promotion": {},
         "trend_intelligence": {},
         "opportunity": {},
+        "revenue_backfill": {},
         "icp_matching": {},
         "gtm_strategy": {},
         "contact_discovery": {},
@@ -665,6 +674,7 @@ def run_gtm_intelligence_sweep(
             result["sources"][name] = {"status": "skipped", "reason": str(e)}
             logger.info("gtm_intelligence_sweep: sensing %s skipped (budget) -- %s", name, e)
         except Exception as e:  # noqa: BLE001 -- one source's failure must never block the others; see module docstring
+            db.rollback()  # 2026-08-26, real fix -- see the try/except above this function's ACCOUNT_STRATEGY_STAGES loop for the full explanation
             result["sources"][name] = {"status": "failed", "error": str(e)}
             any_failed = True
             logger.error("gtm_intelligence_sweep: sensing %s failed -- %s", name, e)
@@ -684,6 +694,7 @@ def run_gtm_intelligence_sweep(
             any_failed = True
         logger.info("gtm_intelligence_sweep: investigation_cycle %s", investigation_result.get("status"))
     except Exception as e:  # noqa: BLE001 -- see module docstring
+        db.rollback()  # 2026-08-26, real fix -- see the ACCOUNT_STRATEGY_STAGES loop's own comment for the full explanation
         result["investigation_cycle"] = {"status": "failed", "error": str(e)}
         any_failed = True
         logger.error("gtm_intelligence_sweep: investigation_cycle failed -- %s", e)
@@ -694,6 +705,7 @@ def run_gtm_intelligence_sweep(
         any_succeeded = True
         logger.info("gtm_intelligence_sweep: interpretation succeeded (%d created)", len(interpreted))
     except Exception as e:  # noqa: BLE001 -- see module docstring
+        db.rollback()  # 2026-08-26, real fix -- see the ACCOUNT_STRATEGY_STAGES loop's own comment for the full explanation
         result["interpretation"] = {"status": "failed", "error": str(e)}
         any_failed = True
         logger.error("gtm_intelligence_sweep: interpretation failed -- %s", e)
@@ -704,6 +716,7 @@ def run_gtm_intelligence_sweep(
         any_succeeded = True
         logger.info("gtm_intelligence_sweep: problem detection succeeded (%d hypotheses touched)", len(problems))
     except Exception as e:  # noqa: BLE001 -- see module docstring
+        db.rollback()  # 2026-08-26, real fix -- see the ACCOUNT_STRATEGY_STAGES loop's own comment for the full explanation
         result["problem_detection"] = {"status": "failed", "error": str(e)}
         any_failed = True
         logger.error("gtm_intelligence_sweep: problem detection failed -- %s", e)
@@ -714,6 +727,7 @@ def run_gtm_intelligence_sweep(
         any_succeeded = True
         logger.info("gtm_intelligence_sweep: demand detection succeeded (%d hypotheses touched)", len(demands))
     except Exception as e:  # noqa: BLE001 -- see module docstring
+        db.rollback()  # 2026-08-26, real fix -- see the ACCOUNT_STRATEGY_STAGES loop's own comment for the full explanation
         result["demand_detection"] = {"status": "failed", "error": str(e)}
         any_failed = True
         logger.error("gtm_intelligence_sweep: demand detection failed -- %s", e)
@@ -731,6 +745,10 @@ def run_gtm_intelligence_sweep(
             any_succeeded = True
             logger.info("gtm_intelligence_sweep: %s succeeded -- %s", stage_key, stage_result)
         except Exception as e:  # noqa: BLE001 -- one stage's failure must never block the others; see module docstring
+            # 2026-08-26, real fix (same class of bug as the contact_discovery.py crash fixed
+            # earlier -- confirmed live): an uncaught DB-level exception here leaves the shared
+            # session's transaction invalid for every stage still to come in this same sweep.
+            db.rollback()
             result[stage_key] = {"status": "failed", "error": str(e)}
             any_failed = True
             logger.error("gtm_intelligence_sweep: %s failed -- %s", stage_key, e)
@@ -759,6 +777,10 @@ def run_gtm_intelligence_sweep(
             any_succeeded = True
             logger.info("gtm_intelligence_sweep: %s succeeded -- %s", stage_key, stage_result)
         except Exception as e:  # noqa: BLE001 -- one stage's failure must never block the others; see module docstring
+            # 2026-08-26, real fix (same class of bug as the contact_discovery.py crash fixed
+            # earlier -- confirmed live): an uncaught DB-level exception here leaves the shared
+            # session's transaction invalid for every stage still to come in this same sweep.
+            db.rollback()
             result[stage_key] = {"status": "failed", "error": str(e)}
             any_failed = True
             logger.error("gtm_intelligence_sweep: %s failed -- %s", stage_key, e)
@@ -801,6 +823,10 @@ def run_gtm_intelligence_sweep(
             any_succeeded = True
             logger.info("gtm_intelligence_sweep: %s succeeded -- %s", stage_key, stage_result)
         except Exception as e:  # noqa: BLE001 -- one stage's failure must never block the others; see module docstring
+            # 2026-08-26, real fix (same class of bug as the contact_discovery.py crash fixed
+            # earlier -- confirmed live): an uncaught DB-level exception here leaves the shared
+            # session's transaction invalid for every stage still to come in this same sweep.
+            db.rollback()
             result[stage_key] = {"status": "failed", "error": str(e)}
             any_failed = True
             logger.error("gtm_intelligence_sweep: %s failed -- %s", stage_key, e)
@@ -826,6 +852,10 @@ def run_gtm_intelligence_sweep(
             any_succeeded = True
             logger.info("gtm_intelligence_sweep: %s succeeded -- %s", stage_key, stage_result)
         except Exception as e:  # noqa: BLE001 -- one stage's failure must never block the others; see module docstring
+            # 2026-08-26, real fix (same class of bug as the contact_discovery.py crash fixed
+            # earlier -- confirmed live): an uncaught DB-level exception here leaves the shared
+            # session's transaction invalid for every stage still to come in this same sweep.
+            db.rollback()
             result[stage_key] = {"status": "failed", "error": str(e)}
             any_failed = True
             logger.error("gtm_intelligence_sweep: %s failed -- %s", stage_key, e)

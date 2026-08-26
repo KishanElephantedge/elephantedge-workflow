@@ -194,6 +194,10 @@ def ensure_indexes():
         conn.execute(text("ALTER TABLE companies ADD COLUMN IF NOT EXISTS tofu_keyword_found BOOLEAN"))
         conn.execute(text("ALTER TABLE companies ADD COLUMN IF NOT EXISTS hot_lead BOOLEAN"))
         conn.execute(text("ALTER TABLE companies ADD COLUMN IF NOT EXISTS hot_lead_reasoning TEXT"))
+        # 2026-08-26, real fix -- see Company.icp_last_evaluated_at's own comment in models.py:
+        # lets run_icp_matching_sweep() skip companies whose last check was already complete.
+        conn.execute(text("ALTER TABLE companies ADD COLUMN IF NOT EXISTS icp_last_evaluated_at TIMESTAMP"))
+        conn.execute(text("ALTER TABLE companies ADD COLUMN IF NOT EXISTS icp_last_evaluation_had_missing_information BOOLEAN"))
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS reverse_discovery_candidates (
                 id SERIAL PRIMARY KEY,

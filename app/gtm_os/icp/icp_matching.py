@@ -220,7 +220,19 @@ def get_icp_context_for_company(db: Session, tenant_id: int, company_id: int | N
 def run_icp_matching_sweep(db: Session, tenant_id: int, limit: int = 200, dry_run: bool = False) -> dict:
     """Evaluates up to `limit` companies (tenant-scoped via Batch.tenant_id) against the tenant's
     configured ICPs. `dry_run=True` computes everything but writes nothing. One company's failure
-    never aborts the sweep."""
+    never aborts the sweep.
+
+    2026-08-26, real fix -- confirmed live: this used to re-evaluate the same fixed batch of
+    companies (ordered by id) from scratch on EVERY run, forever, even for a company that already
+    got a real, COMPLETE verdict (a genuine match or a genuine no_match with no missing
+    information) -- nothing about that verdict can change without new data, so re-checking it
+    wastes the run's own `limit` budget on companies that will never move. Candidates are now
+    companies that have EITHER never been checked (icp_last_evaluated_at IS NULL) OR whose last
+    check was incomplete (icp_last_evaluation_had_missing_information -- it may have been enriched
+    since, e.g. by a revenue backfill run just before this stage). A company with a complete prior
+    verdict is skipped entirely. Ordered never-checked-first, then longest-since-checked, so the
+    same `limit` now makes real forward progress through the whole company pool instead of being
+    stuck on the same first N companies by id every time."""
     counts = {
         "companies_evaluated": 0,
         "icp_checks_performed": 0,
@@ -239,7 +251,8 @@ def run_icp_matching_sweep(db: Session, tenant_id: int, limit: int = 200, dry_ru
         for row in db.query(Company.id)
         .join(Batch, Company.batch_id == Batch.id)
         .filter(Batch.tenant_id == tenant_id)
-        .order_by(Company.id)
+        .filter((Company.icp_last_evaluated_at.is_(None)) | (Company.icp_last_evaluation_had_missing_information.is_(True)))
+        .order_by(Company.icp_last_evaluated_at.is_(None).desc(), Company.icp_last_evaluated_at.asc())
         .limit(limit)
         .all()
     ]
@@ -252,10 +265,12 @@ def run_icp_matching_sweep(db: Session, tenant_id: int, limit: int = 200, dry_ru
             counts["companies_evaluated"] += 1
 
             results = evaluate_icp_matches_for_company(company, icp_config)
+            had_missing_information = False
             for result in results:
                 counts["icp_checks_performed"] += 1
                 if result["missing_information"]:
                     counts["insufficient_information"] += 1
+                    had_missing_information = True
                     continue
                 if not result["matched"]:
                     counts["no_match"] += 1
@@ -269,7 +284,13 @@ def run_icp_matching_sweep(db: Session, tenant_id: int, limit: int = 200, dry_ru
                 else:
                     counts["matches_recorded"] += 1
 
+            if not dry_run:
+                company.icp_last_evaluated_at = datetime.utcnow()
+                company.icp_last_evaluation_had_missing_information = had_missing_information
+                db.commit()
+
         except Exception:  # noqa: BLE001 -- one company's failure must never block the others
+            db.rollback()  # 2026-08-26, same real fix as contact_discovery.py: never leave the shared session invalid for the next company
             counts["failed"] += 1
 
     return counts

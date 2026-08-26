@@ -28,6 +28,7 @@ source text a revenue figure came from; a quote that doesn't verifiably appear i
 result is discarded, never trusted blind. No revenue number is ever invented from a bare company
 name/domain alone."""
 
+import logging
 import re
 
 from sqlalchemy.orm import Session
@@ -37,9 +38,11 @@ from app.apify_budget_guard import check_apify_budget
 from app.apify_client import GOOGLE_SEARCH_COST_PER_QUERY_USD, ApifyError
 from app.apify_client import _get_api_key as _get_apify_api_key
 from app.apify_client import search_google_ai_overview
-from app.db.models import Company
+from app.db.models import Batch, Company
 from app.deepline_client import execute_tool
 from app.llm_client import generate_json
+
+logger = logging.getLogger(__name__)
 
 
 def _extract_revenue_from_text(text: str, db: Session, tenant_id: int) -> dict | None:
@@ -179,3 +182,51 @@ def estimate_company_revenue(db: Session, tenant_id: int, company: Company) -> d
         return {"status": "resolved", "source": "deepline_crustdata_identify", "lower_usd": deepline_result["lower_usd"], "higher_usd": deepline_result["higher_usd"], "attempts": attempts}
 
     return {"status": "not_found", "attempts": attempts}
+
+
+def run_revenue_backfill_sweep(db: Session, tenant_id: int, limit: int = 30) -> dict:
+    """2026-08-26, real fix -- confirmed live: 1,461 of 1,500 real ICP checks in one run came back
+    "insufficient_information", overwhelmingly because revenue is null, not because a company was
+    genuinely evaluated and disqualified. estimate_company_revenue() existed but had no automatic
+    caller anywhere -- it only ever ran when invoked by hand. This sweep runs it, bounded, for
+    companies genuinely missing revenue, BEFORE icp_matching's own sweep in the same cycle (see
+    orchestration/sweep.py), so a company enriched here gets a real chance at a real ICP verdict
+    in the SAME run instead of waiting for a future one.
+
+    Bounded at limit=30 by default (not the icp_matching-sized 500): unlike ICP matching (free,
+    local computation), each company here can trigger a real, budget-gated Apify call -- a small
+    default keeps this sweep's real cost predictable per run rather than trying to enrich the
+    whole backlog at once. One company's failure never aborts the sweep."""
+    counts = {"evaluated": 0, "resolved": 0, "not_found": 0, "unavailable": 0, "failed": 0}
+
+    company_ids = [
+        row[0]
+        for row in db.query(Company.id)
+        .join(Batch, Company.batch_id == Batch.id)
+        .filter(Batch.tenant_id == tenant_id)
+        .filter(Company.estimated_revenue_lower_usd.is_(None), Company.estimated_revenue_higher_usd.is_(None))
+        .order_by(Company.icp_last_evaluated_at.is_(None).desc(), Company.icp_last_evaluated_at.asc())
+        .limit(limit)
+        .all()
+    ]
+
+    for company_id in company_ids:
+        try:
+            company = db.get(Company, company_id)
+            if company is None:
+                continue
+            counts["evaluated"] += 1
+            result = estimate_company_revenue(db, tenant_id, company)
+            status = result["status"]
+            if status in ("resolved", "already_had_revenue"):
+                counts["resolved"] += 1
+            elif status == "not_found":
+                counts["not_found"] += 1
+            else:
+                counts["unavailable"] += 1
+        except Exception as e:  # noqa: BLE001 -- one company's failure must never block the others
+            db.rollback()  # same real fix as contact_discovery.py/icp_matching.py -- never leave the shared session invalid for the next company
+            counts["failed"] += 1
+            logger.error("run_revenue_backfill_sweep: company %s failed unexpectedly -- %s", company_id, e)
+
+    return counts
