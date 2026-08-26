@@ -35,6 +35,7 @@ from sqlalchemy import Column, DateTime, ForeignKey, Integer, JSON, String, Text
 from sqlalchemy.orm import Session
 
 from app.db.models import Base, Contact
+from app.gtm_os.opportunity.offering_config import get_offering_messaging_reference
 from app.gtm_os.opportunity.opportunity import Opportunity
 from app.gtm_os.sales.contact_discovery import get_eligible_contacts
 from app.gtm_os.sales.sales_agent import evaluate_decision_maker, evaluate_sales_readiness, gather_account_research, prepare_message
@@ -75,6 +76,8 @@ Target role: {target_role}
 Positioning angle: {positioning_angle}
 Known, real facts you may reference (nothing else): {personalization_inputs}
 
+{messaging_reference_section}
+
 STRICT RULES -- you must not violate any of these:
 - Do NOT invent or assume any company fact, contact fact, pain point, budget, timeline, \
 initiative, metric, customer story, or product capability that is not explicitly listed above.
@@ -97,6 +100,47 @@ is not email, it just won't be used for sending.
 Return JSON exactly:
 {{"subject": "<the email subject line, or null>", "message_text": "<the drafted message, or null>", "reason": "<one sentence explaining your decision>"}}"""
 
+# 2026-08-26, explicit instruction -- "feed all of them into the system and the system should
+# generate based on that pattern and tone, either those might be exact or similar." Reused by
+# both the primary-message and follow-up prompts below -- same reference material, same
+# instruction not to fabricate around it. Returns "" when the matched offering has no real
+# historical examples on file (e.g. Sales OS today), so the prompt section simply doesn't appear
+# rather than inventing placeholder guidance.
+def _messaging_reference_section(messaging_reference: dict) -> str:
+    examples = messaging_reference.get("proven_message_examples") or []
+    note = messaging_reference.get("messaging_pattern_note")
+    if not examples and not note:
+        return ""
+    lines = ["Real historical messages for this offering, with what's known about how they performed — use these to match the TONE and PATTERN (warm, personal, specific beats stats/scarcity/credentials-first, per the note below), not as a script to copy verbatim; your version may be exact or similar, but must stay grounded in the real facts given above, never in facts only these examples mention:"]
+    for example in examples:
+        lines.append(f"- \"{example}\"")
+    if note:
+        lines.append(f"Pattern note: {note}")
+    return "\n".join(lines)
+
+
+FOLLOWUP_GENERATION_PROMPT = """You are drafting a SHORT follow-up message, to be sent only if \
+the person did not reply to an earlier outbound message. Using ONLY the structured information \
+provided below.
+
+Channel: {channel}
+Target contact's real name: {target_name}
+The earlier message this is following up on: {primary_message_text}
+
+{messaging_reference_section}
+
+STRICT RULES -- you must not violate any of these:
+- This is a brief, low-pressure check-in, NOT a second full pitch -- real historical top follow-ups \
+in this system are one short sentence (e.g. "Did you get a chance to check this out?"). Do not \
+repeat the full pitch from the earlier message.
+- Do NOT invent or assume any fact not present in the earlier message or the reference examples above.
+- If a real target contact name is given above, address THAT PERSON by their first name only.
+- Do NOT include any closing signature, sign-off line, or placeholder.
+- Keep it to 1-2 short sentences.
+
+Return JSON exactly:
+{{"message_text": "<the short follow-up message, or null if a genuine follow-up cannot be written from the given information>", "reason": "<one sentence explaining your decision>"}}"""
+
 
 class MessageDraft(Base):
     __tablename__ = "message_drafts"
@@ -109,6 +153,14 @@ class MessageDraft(Base):
     contact_id = Column(Integer, ForeignKey("contacts.id"), nullable=True)
 
     channel = Column(String, nullable=True)
+    # 2026-08-26, explicit instruction -- SalesRobot campaigns created this session have a real
+    # Step 3 ("did they reply? no -> send a follow-up") that needs its OWN generated content,
+    # distinct from the primary pitch (see FOLLOWUP_GENERATION_PROMPT below) -- "primary" for
+    # every draft created before this column existed and every ordinary draft since (backward
+    # compatible default), "followup" for the new second row generate_message_draft() now also
+    # creates per contact/channel. Widened the (opportunity, strategy, contact, channel) unique
+    # indexes in ensure_indexes() to include this, so a primary and a followup row can coexist.
+    message_role = Column(String, nullable=False, default="primary")
     objective = Column(Text, nullable=True)
     target_role = Column(String, nullable=True)
     positioning_angle = Column(Text, nullable=True)
@@ -156,7 +208,7 @@ def _existing_draft(db: Session, tenant_id: int, opportunity_id: int, gtm_strate
     )
 
 
-def _existing_draft_for_contact(db: Session, tenant_id: int, opportunity_id: int, gtm_strategy_id: int, contact_id: int | None, channel: str | None = None) -> MessageDraft | None:
+def _existing_draft_for_contact(db: Session, tenant_id: int, opportunity_id: int, gtm_strategy_id: int, contact_id: int | None, channel: str | None = None, message_role: str = "primary") -> MessageDraft | None:
     """V2 Phase 8 -- the real idempotency check generate_message_draft() itself uses: is there
     ALREADY a draft for this exact (opportunity, strategy, contact, channel) combination?
     Distinguishes contact_id IS NULL (the insufficient_context/no-contact-yet case, still capped
@@ -172,7 +224,8 @@ def _existing_draft_for_contact(db: Session, tenant_id: int, opportunity_id: int
     original (opportunity, strategy, contact)-only lookup for callers that don't care which
     channel (e.g. _existing_draft's own "any draft at all" use case)."""
     query = db.query(MessageDraft).filter(
-        MessageDraft.tenant_id == tenant_id, MessageDraft.opportunity_id == opportunity_id, MessageDraft.gtm_strategy_id == gtm_strategy_id
+        MessageDraft.tenant_id == tenant_id, MessageDraft.opportunity_id == opportunity_id, MessageDraft.gtm_strategy_id == gtm_strategy_id,
+        MessageDraft.message_role == message_role,
     )
     if contact_id is None:
         query = query.filter(MessageDraft.contact_id.is_(None))
@@ -219,7 +272,7 @@ def _draft_message_for_channel(db: Session, tenant_id: int, opportunity: Opportu
     if prep["status"] != "ready":
         draft = MessageDraft(
             tenant_id=tenant_id, opportunity_id=opportunity.id, gtm_strategy_id=strategy.id, contact_id=contact_id,
-            channel=channel, objective=prep["objective"], target_role=prep["target_role"],
+            channel=channel, message_role="primary", objective=prep["objective"], target_role=prep["target_role"],
             positioning_angle=prep["positioning_angle"], evidence_basis=prep["evidence_basis"],
             personalization_inputs=prep["personalization_inputs"], message_text=None,
             generation_method="deterministic:insufficient_context", missing_information=prep["missing_information"],
@@ -229,11 +282,13 @@ def _draft_message_for_channel(db: Session, tenant_id: int, opportunity: Opportu
         db.commit()
         return draft
 
+    messaging_reference = get_offering_messaging_reference(db, tenant_id, strategy.matched_offering_name)
     prompt = MESSAGE_GENERATION_PROMPT.format(
         objective=prep["objective"], channel=channel, target_role=prep["target_role"] or "unknown",
         target_name=prep.get("target_name") or "unknown",
         positioning_angle=prep["positioning_angle"] or "none provided",
         personalization_inputs="; ".join(prep["personalization_inputs"]) or "none",
+        messaging_reference_section=_messaging_reference_section(messaging_reference),
     )
 
     try:
@@ -241,7 +296,7 @@ def _draft_message_for_channel(db: Session, tenant_id: int, opportunity: Opportu
     except Exception as e:  # noqa: BLE001 -- an LLM outage must never crash the caller
         draft = MessageDraft(
             tenant_id=tenant_id, opportunity_id=opportunity.id, gtm_strategy_id=strategy.id, contact_id=contact_id,
-            channel=channel, objective=prep["objective"], target_role=prep["target_role"],
+            channel=channel, message_role="primary", objective=prep["objective"], target_role=prep["target_role"],
             positioning_angle=prep["positioning_angle"], evidence_basis=prep["evidence_basis"],
             personalization_inputs=prep["personalization_inputs"], message_text=None,
             generation_method="llm:generate_json", missing_information=[f"llm_call_failed: {e}"],
@@ -257,7 +312,7 @@ def _draft_message_for_channel(db: Session, tenant_id: int, opportunity: Opportu
     if not message_text or not isinstance(message_text, str):
         draft = MessageDraft(
             tenant_id=tenant_id, opportunity_id=opportunity.id, gtm_strategy_id=strategy.id, contact_id=contact_id,
-            channel=channel, objective=prep["objective"], target_role=prep["target_role"],
+            channel=channel, message_role="primary", objective=prep["objective"], target_role=prep["target_role"],
             positioning_angle=prep["positioning_angle"], evidence_basis=prep["evidence_basis"],
             personalization_inputs=prep["personalization_inputs"], subject=None, message_text=None,
             generation_method="llm:generate_json",
@@ -273,12 +328,59 @@ def _draft_message_for_channel(db: Session, tenant_id: int, opportunity: Opportu
 
     draft = MessageDraft(
         tenant_id=tenant_id, opportunity_id=opportunity.id, gtm_strategy_id=strategy.id, contact_id=contact_id,
-        channel=channel, objective=prep["objective"], target_role=prep["target_role"],
+        channel=channel, message_role="primary", objective=prep["objective"], target_role=prep["target_role"],
         positioning_angle=prep["positioning_angle"], evidence_basis=prep["evidence_basis"],
         personalization_inputs=prep["personalization_inputs"], subject=subject, message_text=message_text,
         generation_method="llm:generate_json", missing_information=prep["missing_information"],
         status=status, quality_gate_reasons=quality_gate_reasons or None,
     )
+    db.add(draft)
+    db.commit()
+    return draft
+
+
+def _draft_followup_message(db: Session, tenant_id: int, opportunity: Opportunity, strategy: GtmStrategy, contact_id: int | None, prep: dict, channel: str | None, primary_message_text: str) -> MessageDraft:
+    """The real Step-3 ("no reply yet") content the SalesRobot campaigns created 2026-08-26
+    expect (see FOLLOWUP_GENERATION_PROMPT) -- a second, short, low-pressure MessageDraft row
+    (message_role="followup") distinct from the primary pitch. Only called once a primary draft
+    with real message_text exists (see generate_message_draft()) -- there is nothing to follow up
+    on otherwise."""
+    messaging_reference = get_offering_messaging_reference(db, tenant_id, strategy.matched_offering_name)
+    prompt = FOLLOWUP_GENERATION_PROMPT.format(
+        channel=channel, target_name=prep.get("target_name") or "unknown",
+        primary_message_text=primary_message_text,
+        messaging_reference_section=_messaging_reference_section(messaging_reference),
+    )
+
+    common_fields = dict(
+        tenant_id=tenant_id, opportunity_id=opportunity.id, gtm_strategy_id=strategy.id, contact_id=contact_id,
+        channel=channel, message_role="followup", objective=prep["objective"], target_role=prep["target_role"],
+        positioning_angle=prep["positioning_angle"], evidence_basis=prep["evidence_basis"],
+        personalization_inputs=prep["personalization_inputs"],
+    )
+
+    try:
+        result = generate_json(prompt, db, tenant_id, max_tokens=150)
+    except Exception as e:  # noqa: BLE001 -- an LLM outage must never crash the caller
+        draft = MessageDraft(**common_fields, message_text=None, generation_method="llm:generate_json",
+                              missing_information=[f"llm_call_failed: {e}"], status="insufficient_context", quality_gate_reasons=None)
+        db.add(draft)
+        db.commit()
+        return draft
+
+    message_text = result.get("message_text") if isinstance(result, dict) else None
+    if not message_text or not isinstance(message_text, str):
+        draft = MessageDraft(**common_fields, message_text=None, generation_method="llm:generate_json",
+                              missing_information=[f"LLM declined to generate: {result.get('reason', 'no reason given') if isinstance(result, dict) else 'malformed output'}"],
+                              status="insufficient_context", quality_gate_reasons=None)
+        db.add(draft)
+        db.commit()
+        return draft
+
+    quality_gate_reasons = _run_quality_gate(opportunity, strategy, contact_id, prep, message_text)
+    draft = MessageDraft(**common_fields, message_text=message_text, generation_method="llm:generate_json",
+                          missing_information=None, status="draft" if quality_gate_reasons else "ready_for_review",
+                          quality_gate_reasons=quality_gate_reasons or None)
     db.add(draft)
     db.commit()
     return draft
@@ -333,6 +435,17 @@ def generate_message_draft(db: Session, tenant_id: int, opportunity: Opportunity
         try:
             if _existing_draft_for_contact(db, tenant_id, opportunity.id, strategy.id, contact_id, channel=extra_channel) is None:
                 _draft_message_for_channel(db, tenant_id, opportunity, strategy, contact_id, prep, extra_channel)
+        except Exception:  # noqa: BLE001 -- see docstring, must never affect the primary draft
+            pass
+
+    # 2026-08-26, explicit instruction -- a real Step-3 follow-up (see FOLLOWUP_GENERATION_PROMPT),
+    # only for the primary channel (SalesRobot's own campaign sequence is what "step 3" belongs
+    # to; email has no equivalent concept here). Only when the primary draft actually has content
+    # to follow up on -- best-effort, same "never affects the primary draft" discipline as above.
+    if primary_draft.message_text:
+        try:
+            if _existing_draft_for_contact(db, tenant_id, opportunity.id, strategy.id, contact_id, channel=primary_channel, message_role="followup") is None:
+                _draft_followup_message(db, tenant_id, opportunity, strategy, contact_id, prep, primary_channel, primary_draft.message_text)
         except Exception:  # noqa: BLE001 -- see docstring, must never affect the primary draft
             pass
 
@@ -550,6 +663,12 @@ def list_messages_for_company(db: Session, tenant_id: int, company_id: int) -> l
             MessageDraft.tenant_id == tenant_id,
             Opportunity.tenant_id == tenant_id,
             Opportunity.company_id == company_id,
+            # 2026-08-26 -- the new message_role="followup" row (see MessageDraft.message_role)
+            # is a real, distinct draft, but the V2 Messages tab/Message Workspace UI has no
+            # concept of it yet and would render it as an unexplained duplicate card next to its
+            # primary. Scoped out here rather than changing this API's shape; revisit if/when the
+            # UI is built to show a follow-up alongside its primary message.
+            MessageDraft.message_role == "primary",
         )
         .order_by(MessageDraft.id.desc())
         .all()

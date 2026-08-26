@@ -1,6 +1,7 @@
 from sqlalchemy.orm import Session
 
 from app.db.models import Contact, Parameter
+from app.gtm_os.opportunity.offering_config import get_offering_campaign_id
 from app.outreach.base import OutreachChannel
 from app.outreach.smartlead import push_email
 from app.salesrobot_client import SalesRobotError, add_single_prospect
@@ -28,12 +29,20 @@ class SalesRobotChannel(OutreachChannel):
         value = param.value
         return value.get("value") if isinstance(value, dict) else value
 
-    def push_lead(self, contact: Contact) -> dict:
+    def _resolve_campaign_uuid(self, offering_name: str | None) -> str:
+        if offering_name:
+            configured = get_offering_campaign_id(self.db, self.tenant_id, offering_name, "salesrobot")
+            if not configured:
+                raise SalesRobotError(f"No SalesRobot campaign configured for offering {offering_name!r}")
+            return configured
+        return self._get_param("salesrobot_campaign_uuid")
+
+    def push_lead(self, contact: Contact, offering_name: str | None = None) -> dict:
         if not contact.linkedin_url:
             return {"status": "skipped", "error_message": "no linkedin_url", "channel_ref": None}
 
         try:
-            campaign_uuid = self._get_param("salesrobot_campaign_uuid")
+            campaign_uuid = self._resolve_campaign_uuid(offering_name)
             linkedin_account_uuid = self._get_param("salesrobot_linkedin_account_uuid")
         except SalesRobotError as e:
             return {"status": "failed", "error_message": str(e), "channel_ref": None}

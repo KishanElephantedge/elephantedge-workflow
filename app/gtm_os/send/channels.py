@@ -15,8 +15,10 @@ from sqlalchemy.orm import Session
 
 from app.db.models import Contact, Credential, Parameter
 from app.gtm_os.learning.message_draft import MessageDraft
+from app.gtm_os.opportunity.offering_config import get_offering_campaign_id
 from app.gtm_os.opportunity.opportunity import Opportunity
-from app.salesrobot_client import SalesRobotError, send_connection_request
+from app.gtm_os.strategy.strategy import GtmStrategy
+from app.salesrobot_client import SalesRobotError, add_single_prospect
 from app.smartlead_client import SmartleadError, add_lead
 from app.smtp_client import SmtpError, send_email
 
@@ -112,14 +114,46 @@ def send_via_smtp(db: Session, tenant_id: int, draft: MessageDraft, contact: Con
     return {"status": "sent", "provider_ref": f"smtp:{sender_email}", "error_message": None, "retryable": None}
 
 
+def _get_followup_message_text(db: Session, tenant_id: int, draft: MessageDraft) -> str | None:
+    followup = (
+        db.query(MessageDraft)
+        .filter(
+            MessageDraft.tenant_id == tenant_id,
+            MessageDraft.opportunity_id == draft.opportunity_id,
+            MessageDraft.gtm_strategy_id == draft.gtm_strategy_id,
+            MessageDraft.contact_id == draft.contact_id,
+            MessageDraft.channel == draft.channel,
+            MessageDraft.message_role == "followup",
+        )
+        .first()
+    )
+    return followup.message_text if followup else None
+
+
 def send_via_salesrobot(db: Session, tenant_id: int, draft: MessageDraft, contact: Contact, opportunity: Opportunity) -> dict:
-    # opportunity is unused here (SalesRobot's connection request has no subject line to
-    # derive) -- kept in the signature so both adapters share one uniform call shape for the
-    # orchestrator (send.py) to call through without per-channel branching there.
+    """2026-08-26, explicit instruction -- rewritten from a one-shot send_connection_request()
+    call to real SalesRobot Campaign enrollment (add_single_prospect), because the real
+    campaigns created this session (Playbook, Sales OS, Execution, Workshop) each have their own
+    Step 1 (connect) / Step 2 (message) / Step 3 (follow-up) sequence that only fires when the
+    contact is actually added to that campaign -- a raw connection request has no way to trigger
+    Step 2/3 at all. Routed per the Opportunity's matched offering (GtmStrategy.
+    matched_offering_name), never one tenant-wide default -- a Fractional-VP-Sales-matched
+    contact must never land in the Sales OS campaign just because that happened to be configured
+    first (see get_offering_campaign_id's own docstring)."""
     if not contact.linkedin_url:
         return {"status": "failed", "provider_ref": None, "error_message": "contact has no linkedin_url", "retryable": False}
     if not draft.message_text:
         return {"status": "failed", "provider_ref": None, "error_message": "draft has no message_text", "retryable": False}
+
+    strategy = db.get(GtmStrategy, draft.gtm_strategy_id)
+    offering_name = strategy.matched_offering_name if strategy else None
+    campaign_uuid = get_offering_campaign_id(db, tenant_id, offering_name, "salesrobot") if offering_name else None
+    if not campaign_uuid:
+        return {
+            "status": "failed", "provider_ref": None,
+            "error_message": f"no SalesRobot campaign configured for offering {offering_name!r}",
+            "retryable": False,
+        }
 
     param = (
         db.query(Parameter)
@@ -131,29 +165,31 @@ def send_via_salesrobot(db: Session, tenant_id: int, draft: MessageDraft, contac
         return {"status": "failed", "provider_ref": None, "error_message": "salesrobot_linkedin_account_uuid parameter is not set", "retryable": False}
     linkedin_account_uuid = param.value.get("value") if isinstance(param.value, dict) else param.value
 
+    # customMap keys match the merge tags configured in these specific SalesRobot campaigns'
+    # Step 2/Step 3 templates ({personalisedmessage}/{followup}, all-lowercase -- confirmed
+    # directly against the real campaign editor, not our own naming convention). No
+    # connectionNote: these campaigns' Step 1 doesn't reference one.
+    prospect = {"profileUrl": contact.linkedin_url}
+    if contact.first_name:
+        prospect["firstName"] = contact.first_name
+    if contact.last_name:
+        prospect["lastName"] = contact.last_name
+    if contact.title:
+        prospect["jobTitle"] = contact.title
+    if contact.company and contact.company.name:
+        prospect["companyName"] = contact.company.name
+    custom_map = {"personalisedmessage": draft.message_text}
+    followup_text = _get_followup_message_text(db, tenant_id, draft)
+    if followup_text:
+        custom_map["followup"] = followup_text
+    prospect["customMap"] = custom_map
+
     try:
-        result = send_connection_request(contact.linkedin_url, linkedin_account_uuid, draft.message_text, db, tenant_id)
+        add_single_prospect(campaign_uuid, linkedin_account_uuid, prospect, db, tenant_id)
     except SalesRobotError as e:
-        return {"status": "failed", "provider_ref": None, "error_message": str(e), "retryable": True}
+        return {"status": "failed", "provider_ref": campaign_uuid, "error_message": str(e), "retryable": True}
 
-    data = result.get("data") or {}
-    if not result.get("success"):
-        # A clean, well-formed API response that itself reports failure (invalid profile,
-        # already connected, etc.) -- the request was submitted and rejected, not a
-        # network/transient issue, so not retryable.
-        return {
-            "status": "failed",
-            "provider_ref": data.get("invitationId"),
-            "error_message": data.get("failureReason") or result.get("message") or "connection request rejected",
-            "retryable": False,
-        }
-
-    # "request_submitted", never "sent"/"delivered" -- this confirms the connection request was
-    # SUBMITTED, not that it was accepted or that any conversation resulted. See this module's
-    # own docstring and send_connection_request()'s docstring for why that distinction matters.
-    return {
-        "status": "request_submitted",
-        "provider_ref": data.get("invitationId"),
-        "error_message": data.get("failureReason"),
-        "retryable": None,
-    }
+    # "enrolled", not "sent"/"request_submitted" -- this confirms the contact was added to the
+    # campaign; SalesRobot's own sequence engine is what actually sends Step 1/2/3, on its own
+    # schedule, same "enrolled" semantics send_via_smartlead already uses in this module.
+    return {"status": "enrolled", "provider_ref": campaign_uuid, "error_message": None, "retryable": None}

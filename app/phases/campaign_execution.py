@@ -65,7 +65,7 @@ def run_campaign_execution(batch_id: int, db: Session, channel: OutreachChannel)
             continue
 
         try:
-            result = channel.push_lead(contact)
+            result = channel.push_lead(contact, offering_name=offering_name)
         except Exception as e:
             result = {"status": "failed", "error_message": f"unexpected error: {e}", "channel_ref": None}
 

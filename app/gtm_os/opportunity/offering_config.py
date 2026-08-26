@@ -81,6 +81,39 @@ _OFFERING_DETAILS: dict[str, dict] = {
     },
 }
 
+# 2026-08-26, explicit instruction -- real historical LinkedIn message performance data (the
+# "LinkedIn Message Copies" PDF, 2020-2026), fed into MESSAGE_GENERATION_PROMPT/
+# FOLLOWUP_GENERATION_PROMPT as style/tone reference for the LLM (see message_draft.py) -- NOT a
+# fixed template to copy verbatim. Each offering's messaging_pattern_note is the PDF's own
+# real, data-backed observation for that offering (never a generic "be warm" instruction
+# invented here). "Sales OS" has none of its own real historical data in the PDF (it's V1's
+# newer framing, not covered by the source document) -- deliberately left empty rather than
+# fabricated; message generation for that offering falls back to having no reference examples,
+# same as before this change.
+_PROVEN_MESSAGING: dict[str, dict] = {
+    "Digital Playbook": {
+        "proven_message_examples": [
+            "how's it going? I've designed and launched a sales system to guide founders from zero to 100+ paying customers. I tested it with my close network of founders, business owners, and sales professionals, all of whom experienced surprising growth in sales. Would love to invite you to check it out. The editable version is now available for only $10. Love to hear your thoughts! https://www.elephantedge.co/l/salesplaybook -Majji",
+            "I have put together a proven and easy-to-implement playbook that makes founders' jobs easier. https://www.elephantedge.co/l/b2bSales Love to have a chat if this resonates with your SaaS business goals. -Venkatesh",
+        ],
+        "messaging_pattern_note": "Warm, personal, specific copy consistently outperforms stats/scarcity/credentials-led framing (real reply rates: 37.3%/44.4% for personal-note style vs 5.2% for a bare resource link, 0% for a Dubai-relocation pitch).",
+    },
+    "Workshop": {
+        "proven_message_examples": [
+            "how are you? I stumbled upon your profile and found it quite intriguing. After a successful exit, I'm now working on Elephant Edge, where we're building a Sales Academy for B2B/Tech sales training in India & US. We've had some fantastic results with our cohorts and online courses. I'm new to growth marketing and would love to have a quick chat with you to gain some insights and explore potential collaboration opportunities. If you have a moment for a brief call, would love to speak. - Venkatesh",
+            "Hi {{firstName}} - How's it going? I wanted to personally share something with you that I'm launching. For sales professionals who are targeting India/US market, I'm hosting a B2B Sales cohort with primary focus to drive the first $1M in revenue and key accounts, a strategy that has been well-tested by early-stage tech founders and their first hires. Would you be interested in joining us for this 1-day cohort. Love to know your thoughts, {{firstName}}. Venkatesh",
+        ],
+        "messaging_pattern_note": "Your two best performers (52.2% and 33.8% reply) are both simple, personal notes from your earliest cohort era. Your highest-volume recent templates, which lead with credentials/exits before the ask, are your weakest (18-20%) -- warmth and specificity beat scale and credential-leading.",
+    },
+    "Execution": {
+        "proven_message_examples": [
+            "Venkatesh here. I'm a new member at GTM Partners and recently joined to accelerate my fractional VP Sales practice. Great connecting with you, and I'd love to learn more about your work in the coming weeks. — Venkatesh",
+            "I'm a 2x founder now working as a Fractional VP Sales, helping companies build AI-powered revenue systems to get to $1M without the traditional sales team overhead. Would love to connect.",
+        ],
+        "messaging_pattern_note": "Your top two performers (69.7% and 38.7% reply) are simple, warm, community-anchored intros with no pitch and no credentials-first framing -- just 'I'm a member here, let's connect.' Your weakest (0-12%) lead with a value prop or ask upfront. Even your most original idea (the 'digital twin of the consultant' pitch) only pulled 21%, likely because it opens with a paragraph of positioning before the ask.",
+    },
+}
+
 DEFAULT_OFFERING_CONFIG: list[dict] = [
     {
         "name": name,
@@ -94,6 +127,14 @@ DEFAULT_OFFERING_CONFIG: list[dict] = [
         "typical_objections": [],
         "delivery_constraints": None,
         "positioning_messaging": _OFFERING_DETAILS[name]["positioning_messaging"],
+        # 2026-08-26, explicit instruction -- real per-offering outbound campaigns (Playbook,
+        # Workshop/"Cohort", Execution/Fractional VP Sales, Sales OS) each need their own
+        # SalesRobot/HeyReach campaign, not one tenant-wide default (see app/outreach/*.py --
+        # "we should not hardcode that"). {channel_name: campaign_id}, empty until a real
+        # campaign is created and its id is supplied -- see set_offering_campaign_id().
+        "campaign_ids": {},
+        "proven_message_examples": _PROVEN_MESSAGING.get(name, {}).get("proven_message_examples", []),
+        "messaging_pattern_note": _PROVEN_MESSAGING.get(name, {}).get("messaging_pattern_note"),
     }
     for name in ["Consulting", "Execution", "Workshop", "Sales OS", "Sales Products", "Digital Playbook"]
 ]
@@ -128,6 +169,15 @@ def _validate_offering_config(offerings: list[dict]) -> None:
             value = offering.get(list_field, [])
             if not isinstance(value, list) or any(not isinstance(v, str) for v in value):
                 raise OfferingConfigError(f"offering {name!r} field {list_field!r} must be a list of strings")
+        campaign_ids = offering.get("campaign_ids", {})
+        if not isinstance(campaign_ids, dict) or any(not isinstance(k, str) or not isinstance(v, str) for k, v in campaign_ids.items()):
+            raise OfferingConfigError(f"offering {name!r} field 'campaign_ids' must be a dict of channel name -> campaign id string")
+        examples = offering.get("proven_message_examples", [])
+        if not isinstance(examples, list) or any(not isinstance(v, str) for v in examples):
+            raise OfferingConfigError(f"offering {name!r} field 'proven_message_examples' must be a list of strings")
+        pattern_note = offering.get("messaging_pattern_note")
+        if pattern_note is not None and not isinstance(pattern_note, str):
+            raise OfferingConfigError(f"offering {name!r} field 'messaging_pattern_note' must be a string or null")
 
 
 def get_offering_config(db: Session, tenant_id: int) -> list[dict]:
@@ -140,6 +190,53 @@ def get_offering_config(db: Session, tenant_id: int) -> list[dict]:
     if param and isinstance(param.value, list):
         return param.value
     return DEFAULT_OFFERING_CONFIG
+
+
+def get_offering_campaign_id(db: Session, tenant_id: int, offering_name: str, channel: str) -> str | None:
+    """Real per-offering routing target for app/outreach/*.py. Returns None if this offering has
+    no campaign configured yet for this channel -- callers must NOT fall back to a different
+    campaign in that case (see module docstring): a named offering with nothing configured means
+    "not ready yet", not "use the tenant default", since that would silently misroute a
+    Fractional-VP-Sales-matched prospect into whatever the Sales OS campaign happens to be, etc."""
+    for offering in get_offering_config(db, tenant_id):
+        if offering.get("name") == offering_name:
+            return (offering.get("campaign_ids") or {}).get(channel)
+    return None
+
+
+def get_offering_messaging_reference(db: Session, tenant_id: int, offering_name: str | None) -> dict:
+    """Real historical proven_message_examples/messaging_pattern_note for the given offering, for
+    message_draft.py's generation prompts to use as style/tone reference (never a template to
+    copy verbatim -- see module docstring). Returns {"proven_message_examples": [], "messaging_pattern_note": None}
+    when offering_name is None or that offering has none configured (e.g. Sales OS today)."""
+    if offering_name:
+        for offering in get_offering_config(db, tenant_id):
+            if offering.get("name") == offering_name:
+                return {
+                    "proven_message_examples": offering.get("proven_message_examples") or [],
+                    "messaging_pattern_note": offering.get("messaging_pattern_note"),
+                }
+    return {"proven_message_examples": [], "messaging_pattern_note": None}
+
+
+def set_offering_campaign_id(db: Session, tenant_id: int, offering_name: str, channel: str, campaign_id: str) -> None:
+    """Sets just one offering's campaign id for one channel, leaving the rest of the config
+    untouched -- the real update path once a campaign is created in SalesRobot/HeyReach and its
+    id is supplied, so this never requires resending the whole offering config by hand."""
+    offerings = get_offering_config(db, tenant_id)
+    updated = []
+    found = False
+    for offering in offerings:
+        offering = dict(offering)
+        if offering.get("name") == offering_name:
+            campaign_ids = dict(offering.get("campaign_ids") or {})
+            campaign_ids[channel] = campaign_id
+            offering["campaign_ids"] = campaign_ids
+            found = True
+        updated.append(offering)
+    if not found:
+        raise OfferingConfigError(f"no offering named {offering_name!r} configured")
+    set_offering_config(db, tenant_id, updated)
 
 
 def set_offering_config(db: Session, tenant_id: int, offerings: list[dict]) -> None:

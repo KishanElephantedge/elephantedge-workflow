@@ -496,13 +496,22 @@ def ensure_indexes():
         # combination, which trivially still satisfies the new, more permissive index too).
         conn.execute(text("DROP INDEX IF EXISTS ix_message_drafts_opp_strategy_no_contact"))
         conn.execute(text("DROP INDEX IF EXISTS ix_message_drafts_opp_strategy_contact"))
+        # 2026-08-26, explicit instruction -- real SalesRobot campaigns now have their own Step 3
+        # ("no reply yet") that needs its OWN generated MessageDraft (message_role="followup"),
+        # distinct from the primary pitch (message_role="primary", the default -- see
+        # message_draft.py's MessageDraft.message_role). Widened AGAIN to include message_role, so
+        # a primary and a followup row can coexist for the same (opportunity, strategy, contact,
+        # channel) -- the old channel-only index would have rejected the followup row outright.
+        conn.execute(text("DROP INDEX IF EXISTS ix_message_drafts_opp_strategy_channel_no_contact"))
+        conn.execute(text("DROP INDEX IF EXISTS ix_message_drafts_opp_strategy_contact_channel"))
+        conn.execute(text("ALTER TABLE message_drafts ADD COLUMN IF NOT EXISTS message_role VARCHAR NOT NULL DEFAULT 'primary'"))
         conn.execute(text(
-            "CREATE UNIQUE INDEX IF NOT EXISTS ix_message_drafts_opp_strategy_channel_no_contact "
-            "ON message_drafts (opportunity_id, gtm_strategy_id, channel) WHERE contact_id IS NULL"
+            "CREATE UNIQUE INDEX IF NOT EXISTS ix_message_drafts_opp_strategy_channel_role_no_contact "
+            "ON message_drafts (opportunity_id, gtm_strategy_id, channel, message_role) WHERE contact_id IS NULL"
         ))
         conn.execute(text(
-            "CREATE UNIQUE INDEX IF NOT EXISTS ix_message_drafts_opp_strategy_contact_channel "
-            "ON message_drafts (opportunity_id, gtm_strategy_id, contact_id, channel) WHERE contact_id IS NOT NULL"
+            "CREATE UNIQUE INDEX IF NOT EXISTS ix_message_drafts_opp_strategy_contact_channel_role "
+            "ON message_drafts (opportunity_id, gtm_strategy_id, contact_id, channel, message_role) WHERE contact_id IS NOT NULL"
         ))
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_message_drafts_tenant_status ON message_drafts (tenant_id, status)"))
         # Phase 7 (V2 human review) -- generalized review fields alongside the existing
