@@ -132,7 +132,12 @@ def generate_campaign_intelligence(db: Session, tenant_id: int, tracking: dict) 
     prompt = CAMPAIGN_INTELLIGENCE_PROMPT.format(campaigns_block=campaigns_block)
 
     try:
-        response = generate_json(prompt, db, tenant_id, max_tokens=400)
+        # 2026-08-27, real bug fix (confirmed live): 400 was sized for a small handful of
+        # campaigns; with the tenant's real 9 live campaigns to cite/reason about, the response
+        # was cut off mid-JSON ("Unterminated string...") and discarded as unparseable. Scaled to
+        # the real number of campaigns being reasoned about, with real headroom for the citation
+        # list plus the diagnosis/recommendation text.
+        response = generate_json(prompt, db, tenant_id, max_tokens=max(600, 150 * len(campaigns)))
     except Exception as e:  # noqa: BLE001 -- an LLM outage must never crash the caller
         return {"status": "llm_unavailable", "error": str(e), "diagnosis": None, "priority_recommendation": None}
 
