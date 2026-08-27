@@ -4017,6 +4017,23 @@ def get_gtm_os_offering_performance(db: Session = Depends(get_db)):
     return {**performance, "suggestions": generate_offering_suggestions(performance)}
 
 
+@router.get("/gtm-os/campaign-intelligence")
+def get_gtm_os_campaign_intelligence(db: Session = Depends(get_db)):
+    """2026-08-27, explicit instruction -- "let's track all these campaigns from the app," and
+    "the agent should think... but our end goal is again the revenue, conversions, meetings."
+    Real, live per-campaign numbers (app/gtm_os/learning/campaign_intelligence.py's
+    get_campaign_tracking(), pulled directly from SalesRobot's own API -- the exact same real
+    numbers V1's own Campaign tab already shows), PLUS a grounded LLM reasoning layer
+    (generate_campaign_intelligence()) that compares campaigns and prioritizes toward revenue/
+    conversions/meetings -- every claim it makes is checked against the real numbers actually
+    given to it; a claim citing a campaign never provided is discarded, never trusted blind."""
+    from app.gtm_os.learning.campaign_intelligence import generate_campaign_intelligence, get_campaign_tracking
+
+    tracking = get_campaign_tracking(db, ELEPHANT_EDGE_TENANT_ID)
+    intelligence = generate_campaign_intelligence(db, ELEPHANT_EDGE_TENANT_ID, tracking)
+    return {**tracking, "intelligence": intelligence}
+
+
 @router.get("/gtm-os/jobs-to-be-done")
 def get_gtm_os_jobs_to_be_done(db: Session = Depends(get_db)):
     """V2 Jobs to Be Done -- read-only composition of four existing, unmodified backend readers:
