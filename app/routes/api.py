@@ -1650,6 +1650,7 @@ def patch_calendar_booking_outcome(booking_id: int, body: dict = Body(...), db: 
             notes=body.get("notes"),
             recorded_by=body.get("recorded_by"),
             opportunity_id=body.get("opportunity_id"),
+            channel=body.get("channel"),
         )
     except LookupError as e:
         raise HTTPException(status_code=404, detail=str(e))
@@ -1668,10 +1669,23 @@ def patch_calendar_booking_outcome(booking_id: int, body: dict = Body(...), db: 
         "outcome_amount_usd": booking.outcome_amount_usd,
         "outcome_reason": booking.outcome_reason,
         "outcome_notes": booking.outcome_notes,
+        "outcome_channel": booking.outcome_channel,
         "outcome_icp_snapshot": booking.outcome_icp_snapshot,
         "outcome_recorded_at": booking.outcome_recorded_at,
         "outcome_recorded_by": booking.outcome_recorded_by,
     }
+
+
+@router.get("/gtm-os/companies/{company_id}/detected-outbound-activity")
+def get_gtm_os_detected_outbound_activity(company_id: int, db: Session = Depends(get_db)):
+    """2026-08-27, explicit instruction -- real "Channels Intelligence" support: when a human is
+    about to record a meeting outcome's channel, this tells them whether a real outbound send
+    (SalesRobot/HeyReach push or a real V2 MessageSendAttempt) actually reached this company --
+    a suggestion to pre-fill outcome_channel="outbound" with, never a silent auto-set. See
+    detect_real_outbound_activity()'s own docstring."""
+    from app.gtm_os.revenue.revenue_pace import detect_real_outbound_activity
+
+    return {"company_id": company_id, "detected_outbound_activity": detect_real_outbound_activity(db, ELEPHANT_EDGE_TENANT_ID, company_id)}
 
 
 @router.get("/gtm-os/revenue-pace")

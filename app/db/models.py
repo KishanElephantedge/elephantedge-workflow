@@ -366,6 +366,13 @@ class CalendarBooking(Base):
     outcome_reason = Column(Text, nullable=True)  # only meaningful when outcome_status == "lost"
     outcome_notes = Column(Text, nullable=True)  # free-form summary, usable regardless of status
     outcome_icp_snapshot = Column(JSON, nullable=True)  # system-captured at record time, never user-entered
+    # 2026-08-27, explicit instruction -- real revenue-by-channel attribution ("Channels
+    # Intelligence"). Human-recorded at the same time as won/lost, same as outcome_reason/
+    # outcome_notes -- there is no automatic way to detect "this came from personal network" or
+    # "from Majji's own LinkedIn content" the way outbound can be (see
+    # detect_real_outbound_activity() in revenue_pace.py), so this stays a real, honest
+    # self-report rather than a guess. One of OUTCOME_CHANNELS in revenue_pace.py, or null.
+    outcome_channel = Column(String, nullable=True)
     outcome_recorded_at = Column(DateTime, nullable=True)
     outcome_recorded_by = Column(String, nullable=True)  # the logged-in user's email, frontend-supplied
 

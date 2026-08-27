@@ -20,14 +20,64 @@ from datetime import datetime
 
 from sqlalchemy.orm import Session
 
-from app.db.models import Batch, CalendarBooking, Company
+from app.db.models import Batch, CalendarBooking, CampaignPush, Company, Contact
 from app.gtm_os.context.business_context import get_business_context
 from app.gtm_os.icp.icp_config import get_icp_config
 from app.gtm_os.icp.icp_matching import ICPMatch
+from app.gtm_os.learning.message_draft import MessageDraft
 from app.gtm_os.opportunity.offering_config import get_offering_config
 from app.gtm_os.opportunity.opportunity import Opportunity
+from app.gtm_os.send.send_state import MessageSendAttempt
 
 VALID_OUTCOME_STATUSES = {"won", "lost", None}
+
+# 2026-08-27, explicit instruction -- real revenue-by-channel attribution ("Channels
+# Intelligence"). Only "outbound" has a real, automatic detection path (see
+# detect_real_outbound_activity() below) -- every other value here is a human self-report,
+# recorded the same honest way outcome_reason/outcome_notes already are, because no real
+# mechanism exists anywhere in this system to auto-detect a personal-network referral, an
+# inbound-website-visit-turned-deal, LinkedIn-content engagement, or a webinar signup (confirmed
+# by direct investigation -- see this module's own git history/PR description).
+OUTCOME_CHANNELS = {"personal_network", "linkedin_content", "inbound", "webinar", "outbound", "other", None}
+
+# The real, already-existing "a send actually happened" status values across BOTH of this
+# system's real outbound mechanisms -- CampaignPush (V1's/manually-tagged-batch pathway) and
+# MessageSendAttempt (V2's real automated send path, app/gtm_os/send/send_state.py). Reused
+# verbatim, not re-derived: CampaignPush's real values are set in campaign_execution.py;
+# MessageSendAttempt's real "sent" value was a confirmed live bug fix (send_state.py's own
+# SUCCESS_STATUSES constant is stale/missing it) -- this uses the REAL observed value set, same
+# fix already applied in campaign_intelligence.py's REAL_SEND_SUCCESS_STATUSES.
+_REAL_CAMPAIGN_PUSH_SUCCESS_STATUSES = {"pushed"}
+_REAL_MESSAGE_SEND_SUCCESS_STATUSES = {"enrolled", "sent", "request_submitted"}
+
+
+def detect_real_outbound_activity(db: Session, tenant_id: int, company_id: int) -> bool:
+    """True only if a real outbound send actually reached a real Contact at this Company, via
+    either real send mechanism. A suggestion for the human recording an outcome, never a silent
+    auto-set -- the human still confirms/overrides via outcome_channel, same discipline as
+    opportunity_id's own "human-supplied, never inferred" rule above."""
+    contact_ids = [c.id for c in db.query(Contact.id).filter(Contact.company_id == company_id).all()]
+    if not contact_ids:
+        return False
+
+    has_campaign_push = (
+        db.query(CampaignPush.id)
+        .filter(CampaignPush.contact_id.in_(contact_ids), CampaignPush.status.in_(_REAL_CAMPAIGN_PUSH_SUCCESS_STATUSES))
+        .first()
+        is not None
+    )
+    if has_campaign_push:
+        return True
+
+    has_message_send = (
+        db.query(MessageSendAttempt.id)
+        .join(MessageDraft, MessageSendAttempt.message_draft_id == MessageDraft.id)
+        .filter(MessageDraft.tenant_id == tenant_id, MessageSendAttempt.contact_id.in_(contact_ids))
+        .filter(MessageSendAttempt.status.in_(_REAL_MESSAGE_SEND_SUCCESS_STATUSES))
+        .first()
+        is not None
+    )
+    return has_message_send
 
 
 def record_meeting_outcome(
@@ -42,6 +92,7 @@ def record_meeting_outcome(
     notes: str | None,
     recorded_by: str | None,
     opportunity_id: int | None = None,
+    channel: str | None = None,
 ) -> CalendarBooking:
     booking = db.get(CalendarBooking, booking_id)
     if booking is None:
@@ -49,6 +100,9 @@ def record_meeting_outcome(
 
     if status not in VALID_OUTCOME_STATUSES:
         raise ValueError(f"status must be 'won', 'lost', or null, got {status!r}")
+
+    if channel not in OUTCOME_CHANNELS:
+        raise ValueError(f"channel must be one of {sorted(c for c in OUTCOME_CHANNELS if c)}, or null, got {channel!r}")
 
     company = None
     if company_id is not None:
@@ -83,6 +137,7 @@ def record_meeting_outcome(
     booking.outcome_amount_usd = amount_usd if status == "won" else None
     booking.outcome_reason = reason if status == "lost" else None
     booking.outcome_notes = notes
+    booking.outcome_channel = channel
 
     if status is None:
         # Reset -- clears everything derived from a prior recording, same as un-setting it.
@@ -90,6 +145,7 @@ def record_meeting_outcome(
         booking.outcome_icp_snapshot = None
         booking.outcome_recorded_at = None
         booking.outcome_recorded_by = None
+        booking.outcome_channel = None
     else:
         icp_snapshot = []
         if company is not None:

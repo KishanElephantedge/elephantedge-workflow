@@ -580,6 +580,8 @@ def ensure_indexes():
         conn.execute(text("ALTER TABLE calendar_bookings ADD COLUMN IF NOT EXISTS outcome_reason TEXT"))
         conn.execute(text("ALTER TABLE calendar_bookings ADD COLUMN IF NOT EXISTS outcome_notes TEXT"))
         conn.execute(text("ALTER TABLE calendar_bookings ADD COLUMN IF NOT EXISTS outcome_icp_snapshot JSON"))
+        # 2026-08-27, real fix -- see CalendarBooking.outcome_channel's own comment in models.py.
+        conn.execute(text("ALTER TABLE calendar_bookings ADD COLUMN IF NOT EXISTS outcome_channel VARCHAR"))
         conn.execute(text("ALTER TABLE calendar_bookings ADD COLUMN IF NOT EXISTS outcome_recorded_at TIMESTAMP"))
         conn.execute(text("ALTER TABLE calendar_bookings ADD COLUMN IF NOT EXISTS outcome_recorded_by VARCHAR"))
         # V2 Overrides & Evals -- meeting -> Opportunity attribution link, optional, human-supplied.
