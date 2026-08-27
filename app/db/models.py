@@ -447,6 +447,10 @@ class ChatConversation(Base):
     id = Column(Integer, primary_key=True)
     tenant_id = Column(Integer, nullable=False)
     title = Column(String, nullable=True)
+    # None = V1's legacy funnel-scoped chat (every conversation before this column existed, and
+    # every new one from that same widget) -- "v2" = the GTM-OS V2 assistant
+    # (app/gtm_os/chat/v2_chat_tools.py), a separate tool list/system prompt/history.
+    scope = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 

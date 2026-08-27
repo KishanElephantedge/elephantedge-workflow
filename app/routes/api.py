@@ -2529,7 +2529,11 @@ CHAT_HISTORY_WINDOW = 20  # prior turns fed back to Claude as context -- not unb
 CHAT_MAX_TOOL_ITERATIONS = 6
 
 
-def _run_chat_turn(conversation_id: int, user_text: str, db: Session) -> dict:
+def _run_chat_turn(conversation_id: int, user_text: str, db: Session, scope: str = "v1") -> dict:
+    """`scope` selects the system prompt/tool list/dispatcher -- "v1" (default, unchanged
+    behavior) is V1's legacy funnel-scoped chat; "v2" is the GTM-OS V2 assistant
+    (app/gtm_os/chat/v2_chat_tools.py), with a much broader real read/write tool set. Both share
+    the exact same tool-calling loop mechanism below -- only the prompt/tools/dispatch differ."""
     prior = (
         db.query(ChatMessage)
         .filter(ChatMessage.conversation_id == conversation_id)
@@ -2545,13 +2549,19 @@ def _run_chat_turn(conversation_id: int, user_text: str, db: Session) -> dict:
     messages = [{"role": m.role, "content": m.content} for m in prior]
     messages.append({"role": "user", "content": user_text})
 
-    system = CHAT_SYSTEM_PROMPT_TEMPLATE.format(today=datetime.utcnow().strftime("%Y-%m-%d"))
+    if scope == "v2":
+        from app.gtm_os.chat.v2_chat_tools import V2_CHAT_SYSTEM_PROMPT, V2_CHAT_TOOLS, execute_v2_chat_tool
+        system = V2_CHAT_SYSTEM_PROMPT.format(today=datetime.utcnow().strftime("%Y-%m-%d"))
+        tools = V2_CHAT_TOOLS
+    else:
+        system = CHAT_SYSTEM_PROMPT_TEMPLATE.format(today=datetime.utcnow().strftime("%Y-%m-%d"))
+        tools = CHAT_TOOLS
     tools_used: list[str] = []
     csv_attachment = None
 
     for _ in range(CHAT_MAX_TOOL_ITERATIONS):
         try:
-            response = call_claude_messages(messages, db, ELEPHANT_EDGE_TENANT_ID, system=system, tools=CHAT_TOOLS)
+            response = call_claude_messages(messages, db, ELEPHANT_EDGE_TENANT_ID, system=system, tools=tools)
         except ClaudeError as e:
             reply = f"I hit an error talking to Claude: {e}"
             db.add(ChatMessage(conversation_id=conversation_id, role="assistant", content=reply, tools_used=tools_used))
@@ -2578,7 +2588,10 @@ def _run_chat_turn(conversation_id: int, user_text: str, db: Session) -> dict:
             tool_name = block["name"]
             tools_used.append(tool_name)
             try:
-                result = _execute_chat_tool(tool_name, block.get("input", {}), db)
+                if scope == "v2":
+                    result = execute_v2_chat_tool(tool_name, block.get("input", {}), db, ELEPHANT_EDGE_TENANT_ID)
+                else:
+                    result = _execute_chat_tool(tool_name, block.get("input", {}), db)
             except Exception as e:
                 result = {"error": str(e)}
 
@@ -2599,16 +2612,15 @@ def _run_chat_turn(conversation_id: int, user_text: str, db: Session) -> dict:
     return {"reply": reply, "tools_used": tools_used, "csv": csv_attachment}
 
 
-def _get_or_create_latest_conversation(db: Session) -> ChatConversation:
-    conv = (
-        db.query(ChatConversation)
-        .filter(ChatConversation.tenant_id == ELEPHANT_EDGE_TENANT_ID)
-        .order_by(ChatConversation.updated_at.desc())
-        .first()
-    )
+def _get_or_create_latest_conversation(db: Session, scope: str = "v1") -> ChatConversation:
+    # scope filter: "v1" also matches legacy rows with scope=None (every conversation created
+    # before this column existed) -- never silently orphans pre-existing V1 chat history.
+    query = db.query(ChatConversation).filter(ChatConversation.tenant_id == ELEPHANT_EDGE_TENANT_ID)
+    query = query.filter(ChatConversation.scope.is_(None)) if scope == "v1" else query.filter(ChatConversation.scope == scope)
+    conv = query.order_by(ChatConversation.updated_at.desc()).first()
     if conv:
         return conv
-    conv = ChatConversation(tenant_id=ELEPHANT_EDGE_TENANT_ID)
+    conv = ChatConversation(tenant_id=ELEPHANT_EDGE_TENANT_ID, scope=None if scope == "v1" else scope)
     db.add(conv)
     db.commit()
     db.refresh(conv)
@@ -2616,8 +2628,8 @@ def _get_or_create_latest_conversation(db: Session) -> ChatConversation:
 
 
 @router.get("/chat/latest")
-def get_latest_chat_conversation(db: Session = Depends(get_db)):
-    conv = _get_or_create_latest_conversation(db)
+def get_latest_chat_conversation(scope: str = "v1", db: Session = Depends(get_db)):
+    conv = _get_or_create_latest_conversation(db, scope=scope)
     messages = (
         db.query(ChatMessage)
         .filter(ChatMessage.conversation_id == conv.id)
@@ -2631,8 +2643,8 @@ def get_latest_chat_conversation(db: Session = Depends(get_db)):
 
 
 @router.post("/chat/new")
-def start_new_chat_conversation(db: Session = Depends(get_db)):
-    conv = ChatConversation(tenant_id=ELEPHANT_EDGE_TENANT_ID)
+def start_new_chat_conversation(scope: str = "v1", db: Session = Depends(get_db)):
+    conv = ChatConversation(tenant_id=ELEPHANT_EDGE_TENANT_ID, scope=None if scope == "v1" else scope)
     db.add(conv)
     db.commit()
     db.refresh(conv)
@@ -2641,6 +2653,7 @@ def start_new_chat_conversation(db: Session = Depends(get_db)):
 
 class ChatMessageIn(BaseModel):
     message: str
+    scope: str = "v1"
 
 
 @router.post("/chat/conversations/{conversation_id}/messages")
@@ -2656,7 +2669,7 @@ def send_chat_message(conversation_id: int, body: ChatMessageIn, db: Session = D
     if not body.message.strip():
         raise HTTPException(status_code=400, detail="message cannot be empty")
 
-    result = _run_chat_turn(conversation_id, body.message.strip(), db)
+    result = _run_chat_turn(conversation_id, body.message.strip(), db, scope=body.scope)
     csv_payload = None
     if result["csv"]:
         csv_payload = {

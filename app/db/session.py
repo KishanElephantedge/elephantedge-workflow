@@ -119,6 +119,7 @@ def ensure_indexes():
                 created_at TIMESTAMP
             )
         """))
+        conn.execute(text("ALTER TABLE chat_conversations ADD COLUMN IF NOT EXISTS scope VARCHAR"))
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_chat_conversations_tenant_updated ON chat_conversations (tenant_id, updated_at DESC)"))
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_chat_messages_conversation_created ON chat_messages (conversation_id, created_at)"))
         conn.execute(text("""
