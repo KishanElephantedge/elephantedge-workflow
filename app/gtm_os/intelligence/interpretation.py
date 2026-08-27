@@ -137,11 +137,43 @@ def interpret_theirstack_job_signal(signal: GtmSignal) -> InterpretedSignal | No
     return _interpret_job_signal(signal)
 
 
+def interpret_website_visitor_signal(signal: GtmSignal) -> InterpretedSignal | None:
+    """Channels Intelligence step 4 -- purely deterministic, no LLM call, no role/keyword
+    classification to run (a page visit carries no title/text to classify). event_type
+    "website_visit" is deliberately absent from problem_detection.py's EVENT_TYPE_TIERS so it
+    falls to the DEFAULT_EVIDENCE_TIER ("contextual") -- see sense_website_visitors()'s own
+    docstring for why that's the correct, intended tier, not an oversight."""
+    if signal.source != "website_visitor":
+        raise ValueError(f"expected a website_visitor signal, got {signal.source!r}")
+
+    info = signal.extracted_info or {}
+    company = signal.company_name_raw or "An unidentified company"
+    page = info.get("page_path")
+    business_change = f"{company} visited the website" + (f" (page: {page})" if page else "") + "."
+
+    return InterpretedSignal(
+        tenant_id=signal.tenant_id,
+        source_signal_id=signal.id,
+        event_type="website_visit",
+        affected_function="unknown",
+        business_change=business_change,
+        evidence_excerpt=page or "(page not captured)",
+        extraction_method="deterministic:ip_identified_website_visit",
+        extraction_confidence="low",
+        company_id=signal.company_id,
+        company_name_raw=signal.company_name_raw,
+        contact_id=signal.contact_id,
+        person_name_raw=signal.person_name_raw,
+        observed_at=signal.observed_at,
+    )
+
+
 _INTERPRETERS = {
     "linkedin_job": interpret_linkedin_job_signal,
     "theirstack_job": interpret_theirstack_job_signal,
     "linkedin_post": interpret_linkedin_post_signal,
     "linkedin_reply": interpret_linkedin_reply_signal,
+    "website_visitor": interpret_website_visitor_signal,
 }
 
 

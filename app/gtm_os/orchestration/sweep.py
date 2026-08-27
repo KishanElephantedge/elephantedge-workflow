@@ -137,6 +137,7 @@ from app.gtm_os.intelligence.sensing import (
     sense_linkedin_post_search,
     sense_linkedin_replies,
     sense_rss_articles,
+    sense_website_visitors,
 )
 from app.gtm_os.learning.message_draft import MessageDraft, run_message_generation_sweep
 from app.gtm_os.learning.outcome import run_outcome_detection_sweep
@@ -386,7 +387,7 @@ ACCOUNT_STRATEGY_STAGES: list[tuple[str, callable]] = (
 # The complete, CURRENT set of sources the interpretation/detection layers know how to handle
 # (interpretation.py::_INTERPRETERS, kept in sync manually -- see module docstring for why this
 # exists instead of trusting either sweep function's own default).
-ALL_INTERPRETED_SOURCES = ["linkedin_job", "theirstack_job", "linkedin_post", "linkedin_reply"]
+ALL_INTERPRETED_SOURCES = ["linkedin_job", "theirstack_job", "linkedin_post", "linkedin_reply", "website_visitor"]
 
 
 class MissingSourceConfiguration(Exception):
@@ -520,6 +521,15 @@ def _run_linkedin_post_search(db: Session, tenant_id: int):
     return sense_linkedin_post_search(db, tenant_id)
 
 
+def _run_website_visitors(db: Session, tenant_id: int):
+    # No MissingSourceConfiguration needed -- sense_website_visitors() already senses nothing if
+    # zero resolved WebsiteVisitor rows exist for this tenant yet, a valid state (the tracking
+    # snippet may simply not have captured a resolved visit since the last sweep), not an error.
+    # Free (no external paid call -- WebsiteVisitor rows are already resolved at write time by
+    # app/website_visitor_tracking.py, this only reads them).
+    return sense_website_visitors(db, tenant_id)
+
+
 # Source registration -- (name, runner(db, tenant_id) -> list[GtmSignal]). A future source
 # (Reddit/X/YouTube/etc., none added in this step) means adding one entry here; the sweep loop
 # below never branches on source name (Step 13 design doc §14). hackernews_story/rss_article
@@ -528,13 +538,16 @@ def _run_linkedin_post_search(db: Session, tenant_id: int):
 # have nothing real to process without them. linkedin_post_search added in the GTM-OS end-to-end
 # wiring pass -- the one source capable of OPENING a new ProblemHypothesis (see
 # problem_detection.py's own tier map); explicitly NOT the Network/LinkedIn-monitor watch-list,
-# see sense_linkedin_post_search()'s own docstring.
+# see sense_linkedin_post_search()'s own docstring. website_visitor added in Channels Intelligence
+# step 4 -- deliberately contextual-tier only (see sense_website_visitors()'s own docstring for
+# why it can never open a hypothesis alone).
 SWEEPABLE_SOURCES: list[tuple[str, callable]] = [
     ("linkedin_job", _run_linkedin_jobs),
     ("linkedin_reply", _run_linkedin_replies),
     ("hackernews_story", _run_hackernews),
     ("rss_article", _run_rss),
     ("linkedin_post_search", _run_linkedin_post_search),
+    ("website_visitor", _run_website_visitors),
 ]
 
 

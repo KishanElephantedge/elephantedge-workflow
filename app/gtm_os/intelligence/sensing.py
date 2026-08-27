@@ -767,3 +767,108 @@ def sense_rss_articles(db: Session, tenant_id: int, limit_per_feed: int = 20) ->
 
     db.commit()
     return signals
+
+
+def sense_website_visitors(db: Session, tenant_id: int, limit: int = 50) -> list[GtmSignal]:
+    """Channels Intelligence step 4 (2026-08-27) -- feeds the already-built, already-running
+    IP-identified website-visitor tracking (app/website_visitor_tracking.py's WebsiteVisitor
+    table, populated independently by the marketing site's tracking snippet) into the main GTM-OS
+    sensing pipeline as a real signal source. Same shared GtmSignal architecture as every other
+    adapter in this file.
+
+    ONLY company-resolved visits are sensed (company_lookup_status == "resolved") -- an
+    unresolved IP carries no attributable company, nothing to sense. Deliberately does NOT filter
+    by is_fuzzy_match: even a probabilistic company match is still real, better-than-nothing
+    evidence that some real company visited -- but see the evidence-tier note below for why that
+    uncertainty is handled downstream, not by dropping the row here.
+
+    DELIBERATELY WEAK EVIDENCE, BY DESIGN: a single page visit says "someone at this company
+    looked at our site," not "this company has a real problem/demand" -- nowhere near as strong
+    as a job posting or a declared problem statement. event_type "website_visit" is deliberately
+    left OUT of problem_detection.py's EVENT_TYPE_TIERS, so it falls through to
+    DEFAULT_EVIDENCE_TIER ("contextual") -- the same treatment hiring_activity and
+    market_pattern_observation already get. Per OPENING_TIERS, contextual evidence can never open
+    a new hypothesis by itself; it can only support/boost one that already exists from stronger
+    evidence. This is the intended behavior, not a gap -- a company visiting the site should
+    realistically raise confidence on an existing signal, never single-handedly manufacture an
+    Opportunity.
+
+    COMPANY RESOLUTION: unlike every other source here (which only ever sets company_name_raw and
+    lets resolve_company_for_signal()'s name-matching run later), this sensor does its own
+    domain-based match against Company.domain (tenant-scoped via Batch, the same join pattern
+    used throughout this codebase) at sense time, when the visitor's own resolved company_domain
+    exactly matches an existing Company. An exact domain match is a materially stronger identity
+    signal than name matching (company names collide; registered domains essentially don't), so
+    reusing the same fuzzy name-matching machinery here would be a real downgrade, not a reuse of
+    a good pattern. Setting company_id directly makes resolve_company_for_signal() take its own
+    documented "already explicitly resolved" fast path -- no new resolution capability invented,
+    just an earlier, more reliable way of populating the field it already knows how to trust.
+
+    DEDUPLICATION: source_ref is the WebsiteVisitor row's own id -- each page-view beacon is a
+    genuinely distinct, one-time event (not a recurring feed item that might update), so, unlike
+    the HN/RSS sources above, this dedup check is scoped by source_ref alone within this tenant's
+    own visitor rows -- there is no cross-tenant sharing concern here since WebsiteVisitor rows
+    are already tenant-scoped at write time (app/website_visitor_tracking.py's record_visit)."""
+    from app.db.models import Batch, Company, WebsiteVisitor
+
+    visitors = (
+        db.query(WebsiteVisitor)
+        .filter(WebsiteVisitor.tenant_id == tenant_id, WebsiteVisitor.company_lookup_status == "resolved")
+        .order_by(WebsiteVisitor.created_at.desc())
+        .limit(limit)
+        .all()
+    )
+
+    signals = []
+    for visitor in visitors:
+        source_ref = str(visitor.id)
+        already_sensed = (
+            db.query(GtmSignal)
+            .filter(GtmSignal.tenant_id == tenant_id, GtmSignal.source == "website_visitor", GtmSignal.source_ref == source_ref)
+            .first()
+        )
+        if already_sensed:
+            continue
+
+        company_id = None
+        if visitor.company_domain:
+            match = (
+                db.query(Company)
+                .join(Batch, Company.batch_id == Batch.id)
+                .filter(Batch.tenant_id == tenant_id, Company.domain.ilike(visitor.company_domain))
+                .first()
+            )
+            if match:
+                company_id = match.id
+
+        signal = GtmSignal(
+            tenant_id=tenant_id,
+            source="website_visitor",
+            source_ref=source_ref,
+            signal_type="page_visit",
+            observed_at=visitor.created_at,
+            company_id=company_id,
+            company_name_raw=visitor.company_name,
+            raw_evidence={
+                "ip_address": visitor.ip_address,
+                "page_path": visitor.page_path,
+                "referrer": visitor.referrer,
+                "user_agent": visitor.user_agent,
+                "is_fuzzy_match": visitor.is_fuzzy_match,
+            },
+            extracted_info={
+                "page_path": visitor.page_path,
+                "referrer": visitor.referrer,
+                "company_domain": visitor.company_domain,
+                "company_website": visitor.company_website,
+                "company_industry": visitor.company_industry,
+                "company_employee_range": visitor.company_employee_range,
+                "is_fuzzy_match": visitor.is_fuzzy_match,
+            },
+            dedup_key=_dedup_key("website_visitor", source_ref),
+        )
+        db.add(signal)
+        signals.append(signal)
+
+    db.commit()
+    return signals
