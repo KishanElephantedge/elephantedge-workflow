@@ -4048,6 +4048,20 @@ def get_gtm_os_campaign_intelligence(db: Session = Depends(get_db)):
     return {**tracking, "intelligence": intelligence}
 
 
+@router.get("/gtm-os/channel-intelligence")
+def get_gtm_os_channel_intelligence(db: Session = Depends(get_db)):
+    """2026-08-27, Channels Intelligence step 3 -- real, human-recorded revenue outcomes
+    aggregated by outcome_channel (app/gtm_os/learning/channel_intelligence.py's
+    get_channel_performance()), PLUS a grounded LLM reasoning layer (generate_channel_intelligence())
+    that compares channels and prioritizes toward revenue -- same fabrication-guard discipline as
+    campaign-intelligence above: any channel cited that wasn't actually given is discarded."""
+    from app.gtm_os.learning.channel_intelligence import generate_channel_intelligence, get_channel_performance
+
+    performance = get_channel_performance(db, ELEPHANT_EDGE_TENANT_ID)
+    intelligence = generate_channel_intelligence(db, ELEPHANT_EDGE_TENANT_ID, performance)
+    return {**performance, "intelligence": intelligence}
+
+
 @router.get("/gtm-os/jobs-to-be-done")
 def get_gtm_os_jobs_to_be_done(db: Session = Depends(get_db)):
     """V2 Jobs to Be Done -- read-only composition of four existing, unmodified backend readers:
