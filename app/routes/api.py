@@ -4097,6 +4097,20 @@ def post_gtm_os_own_linkedin_content_sync(db: Session = Depends(get_db)):
     return sync_own_linkedin_posts(db, ELEPHANT_EDGE_TENANT_ID)
 
 
+@router.put("/gtm-os/own-linkedin-content/profile-url")
+def put_gtm_os_own_linkedin_content_profile_url(body: dict = Body(...), db: Session = Depends(get_db)):
+    """Configures which real LinkedIn profile own-content tracking watches -- a plain string
+    Parameter, not the generic POST /parameters route (that one stores `value: dict`, which
+    would break get_own_linkedin_profile_url()'s own str check)."""
+    from app.gtm_os.learning.own_linkedin_content import set_own_linkedin_profile_url
+
+    try:
+        set_own_linkedin_profile_url(db, ELEPHANT_EDGE_TENANT_ID, body.get("profile_url"))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"profile_url": body.get("profile_url")}
+
+
 @router.get("/gtm-os/jobs-to-be-done")
 def get_gtm_os_jobs_to_be_done(db: Session = Depends(get_db)):
     """V2 Jobs to Be Done -- read-only composition of four existing, unmodified backend readers:
