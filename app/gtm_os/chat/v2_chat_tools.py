@@ -12,11 +12,12 @@ lead explicitly asked for it after being told the standard, safer default exclud
 send_message_draft tool's own description, which is written to make an LLM treat it with real
 weight, not as a routine action.
 
-ONE DELIBERATE EXCLUSION, flagged rather than silently made either way: HubSpot CRM record
-DELETION (delete_crm_company/delete_crm_contact) is NOT exposed here. That's an external SaaS
-system's real data, and a misheard voice command destructively deleting a real CRM record is a
-materially different risk than every other write here (all of which touch this app's own,
-recoverable rows). CRM record UPDATE is included; deletion is not.
+HubSpot CRM record deletion (delete_crm_company/delete_crm_contact) IS included, per explicit
+instruction (2026-08-27) after this exclusion was raised and the lead confirmed they want it
+anyway. Flagged here for the record: this is real, external SaaS data, and a misheard voice
+command destructively deleting a real CRM record is a materially different risk than every other
+write in this module (all of which touch this app's own, recoverable rows) -- the tool
+descriptions below are written to make that weight explicit to the model, not soften it.
 
 LEARNING (2026-08-27 explicit instruction: "if we tell that something it has to learn from that
 as well") -- remember_knowledge auto-confirms via HumanKnowledge's own confirm_human_knowledge()
@@ -51,6 +52,12 @@ request or email) -- it still passes through this system's own safety gates (rat
 cooldowns, business hours, credentials), but it is not reversible once it succeeds. Only call it \
 when the human has clearly asked for a message to actually be sent, not merely reviewed or \
 approved.
+
+delete_crm_company and delete_crm_contact PERMANENTLY delete a real record from HubSpot CRM, with \
+no undo. Only call one of these when the human has explicitly and unambiguously named the exact \
+record to delete -- never as a guess, never as a side effect of a different request, and never \
+when more than one record could plausibly match what they said. If there's any doubt which real \
+record they mean, ask before deleting.
 
 Be concise and direct. Use real numbers and names from tool results, never estimates."""
 
@@ -250,6 +257,16 @@ V2_CHAT_TOOLS = [
         "description": "Trigger a real, on-demand check for new posts on the tracked LinkedIn content profile.",
         "input_schema": {"type": "object", "properties": {}},
     },
+    {
+        "name": "delete_crm_company",
+        "description": "PERMANENTLY DELETE a real company record from HubSpot CRM. Not reversible. Only call this when the human has explicitly and unambiguously asked for this specific record to be deleted -- never as a side effect of another request, and never if there is any doubt about which record they mean.",
+        "input_schema": {"type": "object", "properties": {"company_id": {"type": "string"}}, "required": ["company_id"]},
+    },
+    {
+        "name": "delete_crm_contact",
+        "description": "PERMANENTLY DELETE a real contact record from HubSpot CRM. Not reversible. Only call this when the human has explicitly and unambiguously asked for this specific record to be deleted -- never as a side effect of another request, and never if there is any doubt about which record they mean.",
+        "input_schema": {"type": "object", "properties": {"contact_id": {"type": "string"}}, "required": ["contact_id"]},
+    },
 ]
 
 
@@ -447,5 +464,15 @@ def execute_v2_chat_tool(name: str, tool_input: dict, db: Session, tenant_id: in
     if name == "sync_own_linkedin_content":
         from app.gtm_os.learning.own_linkedin_content import sync_own_linkedin_posts
         return sync_own_linkedin_posts(db, tenant_id)
+
+    if name == "delete_crm_company":
+        from app.hubspot_client import delete_company
+        delete_company(tool_input["company_id"], db, tenant_id)
+        return {"deleted": True, "company_id": tool_input["company_id"]}
+
+    if name == "delete_crm_contact":
+        from app.hubspot_client import delete_contact
+        delete_contact(tool_input["contact_id"], db, tenant_id)
+        return {"deleted": True, "contact_id": tool_input["contact_id"]}
 
     return {"error": f"unknown tool {name!r}"}
