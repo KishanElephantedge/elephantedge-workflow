@@ -4063,6 +4063,40 @@ def get_gtm_os_channel_intelligence(db: Session = Depends(get_db)):
     return {**performance, "intelligence": intelligence}
 
 
+@router.get("/gtm-os/own-linkedin-content")
+def get_gtm_os_own_linkedin_content(db: Session = Depends(get_db)):
+    """Channels Intelligence step 7 -- read-only: the configured profile URL (if any) plus
+    whatever real posts have already been synced. Never triggers a real Apify call itself --
+    see the POST .../sync route below for that. See app/gtm_os/learning/own_linkedin_content.py's
+    own docstring for why this is a separate, purpose-built module, not a reuse of
+    LinkedinMonitorProfile/LinkedinMonitorSignal."""
+    from app.gtm_os.learning.own_linkedin_content import get_own_linkedin_profile_url, get_recent_own_posts
+
+    posts = get_recent_own_posts(db, ELEPHANT_EDGE_TENANT_ID)
+    return {
+        "profile_url": get_own_linkedin_profile_url(db, ELEPHANT_EDGE_TENANT_ID),
+        "posts": [
+            {
+                "id": p.id,
+                "post_url": p.post_url,
+                "post_text": p.post_text,
+                "posted_at": p.posted_at,
+                "created_at": p.created_at,
+            }
+            for p in posts
+        ],
+    }
+
+
+@router.post("/gtm-os/own-linkedin-content/sync")
+def post_gtm_os_own_linkedin_content_sync(db: Session = Depends(get_db)):
+    """Real, on-demand Apify call (~$0.002/post scraped) -- deliberately not on any recurring
+    schedule. See sync_own_linkedin_posts()'s own docstring."""
+    from app.gtm_os.learning.own_linkedin_content import sync_own_linkedin_posts
+
+    return sync_own_linkedin_posts(db, ELEPHANT_EDGE_TENANT_ID)
+
+
 @router.get("/gtm-os/jobs-to-be-done")
 def get_gtm_os_jobs_to_be_done(db: Session = Depends(get_db)):
     """V2 Jobs to Be Done -- read-only composition of four existing, unmodified backend readers:

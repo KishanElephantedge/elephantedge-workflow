@@ -694,6 +694,35 @@ class LinkedinMonitorSignal(Base):
     profile = relationship("LinkedinMonitorProfile")
 
 
+class OwnLinkedinPost(Base):
+    """Channels Intelligence step 7 (2026-08-27) -- Majji's OWN LinkedIn posts (configured via
+    the `own_linkedin_profile_url` Parameter), fetched with the exact same Apify actor
+    (search_linkedin_posts) as LinkedinMonitorProfile/LinkedinMonitorSignal above, but
+    deliberately NOT stored in those tables: this is visibility into Elephant Edge's own content
+    output for the "LinkedIn content" channel, not ecosystem/competitor watching -- running it
+    through that table's keyword taxonomy, AI-SDR relevance classifier, GTM partner
+    classification, and self-alerting Slack message would all be nonsensical here (see
+    app/gtm_os/learning/own_linkedin_content.py's own docstring for the fuller reasoning).
+
+    No engagement (likes/comments/reactions) data is captured -- LinkedIn's officially-grantable
+    API products don't cover personal-profile post analytics, and no Apify actor for scraping
+    real per-post engager identities has been evaluated or confirmed to exist in this codebase.
+    raw_evidence stores the actor's full untouched response so any real engagement fields it
+    happens to include are preserved for a future, deliberately-verified integration -- never
+    parsed into a named column without first confirming what the actor's real schema is via a
+    live call, which would cost real money to verify and hasn't been authorized."""
+    __tablename__ = "own_linkedin_posts"
+
+    id = Column(Integer, primary_key=True)
+    tenant_id = Column(Integer, nullable=False)
+    post_urn = Column(String, nullable=False)
+    post_url = Column(String, nullable=True)
+    post_text = Column(Text, nullable=True)
+    posted_at = Column(DateTime, nullable=True)
+    raw_evidence = Column(JSON, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
 class ReverseDiscoveryCandidate(Base):
     """Mode B from the hot-leads research (app/phases/reverse_discovery.py) -- a person found
     via a broad LinkedIn keyword search (not a known watch-list) publicly discussing/exploring

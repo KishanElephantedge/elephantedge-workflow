@@ -190,6 +190,19 @@ def ensure_indexes():
         conn.execute(text("ALTER TABLE linkedin_monitor_signals ADD COLUMN IF NOT EXISTS relevance_score INTEGER"))
         conn.execute(text("ALTER TABLE linkedin_monitor_signals ADD COLUMN IF NOT EXISTS recommended_action VARCHAR"))
         conn.execute(text("ALTER TABLE linkedin_monitor_signals ADD COLUMN IF NOT EXISTS classifier_reason TEXT"))
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS own_linkedin_posts (
+                id SERIAL PRIMARY KEY,
+                tenant_id INTEGER NOT NULL,
+                post_urn VARCHAR NOT NULL,
+                post_url VARCHAR,
+                post_text TEXT,
+                posted_at TIMESTAMP,
+                raw_evidence JSON,
+                created_at TIMESTAMP
+            )
+        """))
+        conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ix_own_linkedin_posts_tenant_urn ON own_linkedin_posts (tenant_id, post_urn)"))
         conn.execute(text("ALTER TABLE companies ADD COLUMN IF NOT EXISTS hiring_signal_posting_count INTEGER"))
         conn.execute(text("ALTER TABLE companies ADD COLUMN IF NOT EXISTS tofu_keyword_found BOOLEAN"))
         conn.execute(text("ALTER TABLE companies ADD COLUMN IF NOT EXISTS hot_lead BOOLEAN"))
