@@ -3562,6 +3562,21 @@ def get_gtm_os_account_brief(company_id: int, db: Session = Depends(get_db)):
     return build_account_brief(db, ELEPHANT_EDGE_TENANT_ID, company_id)
 
 
+@router.get("/gtm-os/accounts/{company_id}/timeline")
+def get_gtm_os_account_timeline(company_id: int, db: Session = Depends(get_db)):
+    """Account Event Timeline -- read-only wrapper over get_account_event_timeline()
+    (app/gtm_os/execution/account_timeline.py). Composes only real, already-existing,
+    append-only tables; never re-derives or fabricates an event. Same 404 pattern as the
+    account brief route above."""
+    from app.gtm_os.execution.account_timeline import get_account_event_timeline
+
+    company = db.get(Company, company_id)
+    if company is None or company.batch.tenant_id != ELEPHANT_EDGE_TENANT_ID:
+        raise HTTPException(status_code=404, detail="Company not found")
+
+    return get_account_event_timeline(db, ELEPHANT_EDGE_TENANT_ID, company_id)
+
+
 @router.get("/gtm-os/accounts/{company_id}/messages")
 def get_gtm_os_account_messages(company_id: int, db: Session = Depends(get_db)):
     """V2 Account 360 Messages tab (Phase 3, Part 6) -- read-only wrapper over
