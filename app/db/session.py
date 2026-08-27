@@ -203,6 +203,20 @@ def ensure_indexes():
             )
         """))
         conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ix_own_linkedin_posts_tenant_urn ON own_linkedin_posts (tenant_id, post_urn)"))
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS job_dismissals (
+                id SERIAL PRIMARY KEY,
+                tenant_id INTEGER NOT NULL,
+                category VARCHAR NOT NULL,
+                subcategory VARCHAR,
+                source_type VARCHAR NOT NULL,
+                source_id INTEGER NOT NULL,
+                reason TEXT,
+                dismissed_by VARCHAR,
+                dismissed_at TIMESTAMP
+            )
+        """))
+        conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ix_job_dismissals_identity ON job_dismissals (tenant_id, category, source_type, source_id)"))
         conn.execute(text("ALTER TABLE companies ADD COLUMN IF NOT EXISTS hiring_signal_posting_count INTEGER"))
         conn.execute(text("ALTER TABLE companies ADD COLUMN IF NOT EXISTS tofu_keyword_found BOOLEAN"))
         conn.execute(text("ALTER TABLE companies ADD COLUMN IF NOT EXISTS hot_lead BOOLEAN"))

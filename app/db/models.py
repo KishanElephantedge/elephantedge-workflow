@@ -723,6 +723,35 @@ class OwnLinkedinPost(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
+class JobDismissal(Base):
+    """Escalation / Manual Research Capture (2026-08-27) -- the one genuinely missing piece for
+    Jobs to Be Done's contacts_to_find category (see app/gtm_os/jobs/jobs_to_be_done.py's own
+    module docstring: nothing is persisted there by design, every call re-derives the queue).
+    That's correct for the queue itself, but means there was never any way to say "I looked,
+    there's nothing more to find here, stop asking" -- an item just reappears forever until the
+    underlying condition changes. This table is that one real, human decision, scoped to exactly
+    the (category, source_type, source_id) triple jobs_to_be_done.py already uses to identify an
+    item, so filtering it back out is a single join, not a new identity scheme.
+
+    Deliberately NOT a general-purpose Contact.phone field or a phone-specific escalation flow
+    the way the reference deck's example describes -- this system's real contacts_to_find
+    subcategories are `no_contact_found` (no phone field exists or is needed; the real capture
+    mechanism is POST /companies/{id}/contacts/import, already built) and `missing_email` (the
+    real capture mechanism is PATCH /gtm-os/contacts/{id}/email, already built). This table only
+    adds the "skip it" half neither of those routes could ever provide."""
+    __tablename__ = "job_dismissals"
+
+    id = Column(Integer, primary_key=True)
+    tenant_id = Column(Integer, nullable=False)
+    category = Column(String, nullable=False)  # e.g. "contacts_to_find" -- matches jobs_to_be_done.py's own category key
+    subcategory = Column(String, nullable=True)  # e.g. "no_contact_found" | "missing_email" -- presentational only, not part of the identity key
+    source_type = Column(String, nullable=False)  # "company" | "contact" -- matches the item's own source_type
+    source_id = Column(Integer, nullable=False)  # matches the item's own source_id
+    reason = Column(Text, nullable=True)
+    dismissed_by = Column(String, nullable=True)
+    dismissed_at = Column(DateTime, default=datetime.utcnow)
+
+
 class ReverseDiscoveryCandidate(Base):
     """Mode B from the hot-leads research (app/phases/reverse_discovery.py) -- a person found
     via a broad LinkedIn keyword search (not a known watch-list) publicly discussing/exploring

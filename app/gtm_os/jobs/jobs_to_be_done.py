@@ -23,6 +23,7 @@ from app.db.models import Company, Contact
 from app.gtm_os.execution.execution_readiness import get_next_execution_action
 from app.gtm_os.intelligence.interpreted_signal import InterpretedSignal
 from app.gtm_os.intelligence.signal import GtmSignal
+from app.gtm_os.jobs.escalation import get_dismissed_keys
 from app.gtm_os.opportunity.opportunity import Opportunity
 
 # Human-readable labels for execution_readiness.py's own EXECUTION_STATUSES vocabulary -- purely
@@ -99,6 +100,11 @@ def _hot_leads_to_review(db: Session, tenant_id: int) -> list[dict]:
 
 
 def _contacts_to_find(db: Session, tenant_id: int) -> list[dict]:
+    # A real, human "I looked, there's nothing more to find here" decision (JobDismissal) --
+    # see escalation.py's own docstring. Filtered here, not persisted here: the queue itself
+    # stays fully re-derived every call, per this module's own top-level discipline.
+    dismissed = get_dismissed_keys(db, tenant_id, "contacts_to_find")
+
     companies = (
         db.query(Company)
         .join(Company.batch)
@@ -108,6 +114,8 @@ def _contacts_to_find(db: Session, tenant_id: int) -> list[dict]:
     )
     items = []
     for c in companies:
+        if ("company", c.id) in dismissed:
+            continue
         contacts = db.query(Contact).filter(Contact.company_id == c.id).all()
         if not contacts:
             items.append({
@@ -134,6 +142,8 @@ def _contacts_to_find(db: Session, tenant_id: int) -> list[dict]:
         # has no confirmed email (email_source is null). This is NOT the same as "no contact
         # found" and is labeled separately.
         for contact in contacts:
+            if ("contact", contact.id) in dismissed:
+                continue
             if not contact.email_source:
                 name = f"{contact.first_name or ''} {contact.last_name or ''}".strip() or "Unnamed contact"
                 items.append({

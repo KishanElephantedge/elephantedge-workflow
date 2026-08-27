@@ -3865,6 +3865,68 @@ def patch_gtm_os_contact_email(contact_id: int, payload: dict = Body(...), db: S
     return {"id": contact.id, "email": contact.email, "email_source": contact.email_source}
 
 
+@router.get("/gtm-os/jobs/contacts-to-find/dismissals")
+def get_gtm_os_contacts_to_find_dismissals(company_id: int, db: Session = Depends(get_db)):
+    """Real dismissal state for one account -- both the company-level dismissal (no_contact_found)
+    and any of its contacts' dismissals (missing_email), so AccountDetail's Contacts tab can show
+    "Skipped" instead of re-prompting an escalation the human already resolved."""
+    from app.db.models import JobDismissal
+
+    contact_ids = [c.id for c in db.query(Contact.id).filter(Contact.company_id == company_id)]
+    rows = (
+        db.query(JobDismissal)
+        .filter(JobDismissal.tenant_id == ELEPHANT_EDGE_TENANT_ID, JobDismissal.category == "contacts_to_find")
+        .filter(
+            (JobDismissal.source_type == "company") & (JobDismissal.source_id == company_id)
+            | (JobDismissal.source_type == "contact") & (JobDismissal.source_id.in_(contact_ids or [-1]))
+        )
+        .all()
+    )
+    return {
+        "dismissals": [
+            {"source_type": r.source_type, "source_id": r.source_id, "reason": r.reason, "dismissed_by": r.dismissed_by, "dismissed_at": r.dismissed_at}
+            for r in rows
+        ]
+    }
+
+
+@router.post("/gtm-os/jobs/contacts-to-find/dismiss")
+def post_gtm_os_dismiss_contacts_to_find(payload: dict = Body(...), db: Session = Depends(get_db)):
+    """Escalation / Manual Research Capture -- "I looked, skip this account/contact." See
+    JobDismissal's own docstring (app/db/models.py) for why this is the one genuinely missing
+    piece; the "found it" paths already have real routes (contact import, email patch)."""
+    from app.gtm_os.jobs.escalation import dismiss_job_item
+
+    try:
+        dismissal = dismiss_job_item(
+            db, ELEPHANT_EDGE_TENANT_ID,
+            category="contacts_to_find",
+            source_type=payload.get("source_type"),
+            source_id=payload.get("source_id"),
+            subcategory=payload.get("subcategory"),
+            reason=payload.get("reason"),
+            dismissed_by=payload.get("dismissed_by"),
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    return {"id": dismissal.id, "source_type": dismissal.source_type, "source_id": dismissal.source_id, "dismissed_at": dismissal.dismissed_at}
+
+
+@router.post("/gtm-os/jobs/contacts-to-find/undo-dismiss")
+def post_gtm_os_undo_dismiss_contacts_to_find(payload: dict = Body(...), db: Session = Depends(get_db)):
+    """Reverses a dismissal made in error -- see dismiss route above."""
+    from app.gtm_os.jobs.escalation import undo_job_dismissal
+
+    undone = undo_job_dismissal(
+        db, ELEPHANT_EDGE_TENANT_ID,
+        category="contacts_to_find",
+        source_type=payload.get("source_type"),
+        source_id=payload.get("source_id"),
+    )
+    return {"undone": undone}
+
+
 @router.post("/gtm-os/messages/{message_draft_id}/review")
 def post_gtm_os_message_review(message_draft_id: int, payload: dict = Body(...), db: Session = Depends(get_db)):
     """V2 human approval boundary (Phase 7, Part 8-10) -- the ONLY write route this phase adds.
