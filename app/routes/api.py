@@ -3663,6 +3663,109 @@ def put_gtm_os_content_topics(body: dict = Body(...), db: Session = Depends(get_
     return {"topics": get_content_topics(db, ELEPHANT_EDGE_TENANT_ID)}
 
 
+@router.get("/gtm-os/content-competitors")
+def get_gtm_os_content_competitors(db: Session = Depends(get_db)):
+    """Content Intelligence competitor configuration (competitors.py, 2026-08-28) -- same
+    "no override -> real default" contract as get_content_topics() above."""
+    from app.gtm_os.content.competitors import get_content_competitors
+
+    return {"competitors": get_content_competitors(db, ELEPHANT_EDGE_TENANT_ID)}
+
+
+@router.put("/gtm-os/content-competitors")
+def put_gtm_os_content_competitors(body: dict = Body(...), db: Session = Depends(get_db)):
+    from app.gtm_os.content.competitors import CompetitorConfigError, get_content_competitors, set_content_competitors
+
+    competitors = body.get("competitors")
+    if not isinstance(competitors, list):
+        raise HTTPException(status_code=400, detail="body must be an object with a 'competitors' list")
+    try:
+        set_content_competitors(db, ELEPHANT_EDGE_TENANT_ID, competitors)
+    except CompetitorConfigError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"competitors": get_content_competitors(db, ELEPHANT_EDGE_TENANT_ID)}
+
+
+@router.get("/gtm-os/content-opportunities")
+def list_gtm_os_content_opportunities(status: str | None = None, db: Session = Depends(get_db)):
+    """Real content opportunities (content_opportunity.py, 2026-08-28), joined with their real
+    topic name so the frontend never needs a second lookup. `status` optionally filters
+    (candidate/approved/rejected/changes_requested); defaults to every status."""
+    from app.gtm_os.content.content_opportunity import ContentOpportunity
+    from app.gtm_os.content.topic import ContentTopic
+
+    query = db.query(ContentOpportunity).filter(ContentOpportunity.tenant_id == ELEPHANT_EDGE_TENANT_ID)
+    if status:
+        query = query.filter(ContentOpportunity.status == status)
+    opportunities = query.order_by(ContentOpportunity.created_at.desc()).all()
+
+    topic_ids = {o.content_topic_id for o in opportunities}
+    topics_by_id = {t.id: t for t in db.query(ContentTopic).filter(ContentTopic.id.in_(topic_ids)).all()} if topic_ids else {}
+
+    return {
+        "opportunities": [
+            {
+                "id": o.id,
+                "content_topic_id": o.content_topic_id,
+                "topic_name": topics_by_id[o.content_topic_id].canonical_name if o.content_topic_id in topics_by_id else None,
+                "origin": o.origin,
+                "trend_state": o.trend_state,
+                "why_now": o.why_now,
+                "suggested_angle": o.suggested_angle,
+                "cited_urls": o.cited_urls,
+                "status": o.status,
+                "reviewed_at": o.reviewed_at,
+                "reviewed_by": o.reviewed_by,
+                "review_note": o.review_note,
+                "draft_text": o.draft_text,
+                "draft_generated_at": o.draft_generated_at,
+                "created_at": o.created_at,
+            }
+            for o in opportunities
+        ]
+    }
+
+
+@router.post("/gtm-os/content-opportunities/{content_opportunity_id}/review")
+def post_gtm_os_content_opportunity_review(content_opportunity_id: int, payload: dict = Body(...), db: Session = Depends(get_db)):
+    """Approve/reject/request changes on one content opportunity -- mirrors
+    POST /gtm-os/messages/{id}/review's exact dispatch shape (Phase 7's human approval boundary)."""
+    from app.gtm_os.content.content_opportunity import (
+        approve_content_opportunity, reject_content_opportunity, request_content_opportunity_changes,
+    )
+
+    action = payload.get("action")
+    reviewed_by = payload.get("reviewed_by")
+    note = payload.get("note")
+
+    try:
+        if action == "approve":
+            opportunity = approve_content_opportunity(db, ELEPHANT_EDGE_TENANT_ID, content_opportunity_id, reviewed_by)
+        elif action == "reject":
+            opportunity = reject_content_opportunity(db, ELEPHANT_EDGE_TENANT_ID, content_opportunity_id, reviewed_by, note)
+        elif action == "request_changes":
+            if not note:
+                raise HTTPException(status_code=400, detail="note is required for request_changes")
+            opportunity = request_content_opportunity_changes(db, ELEPHANT_EDGE_TENANT_ID, content_opportunity_id, reviewed_by, note)
+        else:
+            raise HTTPException(status_code=400, detail="action must be one of 'approve', 'reject', 'request_changes'")
+    except LookupError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    return {"id": opportunity.id, "status": opportunity.status}
+
+
+@router.post("/gtm-os/content-opportunities/{content_opportunity_id}/generate-draft")
+def post_gtm_os_content_opportunity_generate_draft(content_opportunity_id: int, db: Session = Depends(get_db)):
+    """The deck's "write this specific topic" mode -- real, on-demand LLM call, only on an
+    already-approved opportunity. See generate_content_draft()'s own docstring."""
+    from app.gtm_os.content.content_opportunity import generate_content_draft
+
+    return generate_content_draft(db, ELEPHANT_EDGE_TENANT_ID, content_opportunity_id)
+
+
 @router.get("/gtm-os/debug/signal-texts")
 def get_gtm_os_debug_signal_texts(limit: int = 500, db: Session = Depends(get_db)):
     """TEMPORARY read-only diagnostic (2026-08-19) -- dumps the exact text topic_linking.py's

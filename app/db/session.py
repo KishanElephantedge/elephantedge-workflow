@@ -405,6 +405,26 @@ def ensure_indexes():
         conn.execute(text("ALTER TABLE topic_candidates ADD COLUMN IF NOT EXISTS normalization_method VARCHAR"))
         conn.execute(text("ALTER TABLE topic_candidates ADD COLUMN IF NOT EXISTS normalization_reason TEXT"))
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_topic_candidates_tenant_cluster ON topic_candidates (tenant_id, cluster_key)"))
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS content_opportunities (
+                id SERIAL PRIMARY KEY,
+                tenant_id INTEGER NOT NULL,
+                content_topic_id INTEGER NOT NULL REFERENCES content_topics(id),
+                origin VARCHAR NOT NULL,
+                trend_state VARCHAR NOT NULL,
+                why_now TEXT NOT NULL,
+                suggested_angle TEXT NOT NULL,
+                cited_urls JSON NOT NULL,
+                status VARCHAR NOT NULL DEFAULT 'candidate',
+                reviewed_at TIMESTAMP,
+                reviewed_by VARCHAR,
+                review_note TEXT,
+                draft_text TEXT,
+                draft_generated_at TIMESTAMP,
+                created_at TIMESTAMP
+            )
+        """))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_content_opportunities_tenant_topic ON content_opportunities (tenant_id, content_topic_id)"))
         # Batch 4 -- Opportunity Engine (see app/gtm_os/opportunity/opportunity.py). One
         # Opportunity per DemandHypothesis -- unique index enforces this at the DB level too, not
         # just at the application check-before-insert layer.

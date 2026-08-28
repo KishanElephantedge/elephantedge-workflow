@@ -122,6 +122,7 @@ from sqlalchemy.orm import Session
 from app.db.models import Base, Parameter
 from app.gtm_os.content.candidate_extraction import run_candidate_extraction_sweep
 from app.gtm_os.content.candidate_normalization import run_candidate_normalization_sweep
+from app.gtm_os.content.content_opportunity import run_content_opportunity_generation_sweep
 from app.gtm_os.content.promotion import run_candidate_promotion_sweep
 from app.gtm_os.content.topic_linking import run_content_topic_linking_sweep
 from app.gtm_os.content.trend_intelligence import run_trend_intelligence_sweep
@@ -316,6 +317,7 @@ CONTENT_INTELLIGENCE_STAGES: list[tuple[str, callable]] = [
     ("candidate_normalization", lambda db, tenant_id: run_candidate_normalization_sweep(db, tenant_id)),
     ("candidate_promotion", lambda db, tenant_id: run_candidate_promotion_sweep(db, tenant_id)),
     ("trend_intelligence", lambda db, tenant_id: run_trend_intelligence_sweep(db, tenant_id)),
+    ("content_opportunity_generation", lambda db, tenant_id: run_content_opportunity_generation_sweep(db, tenant_id)),
 ]
 
 # Account/Strategy/Sales branch (Batch 6 Part L) -- runs AFTER problem_detection/demand_detection
@@ -638,6 +640,7 @@ def run_gtm_intelligence_sweep(
         "candidate_normalization": {},
         "candidate_promotion": {},
         "trend_intelligence": {},
+        "content_opportunity_generation": {},
         "opportunity": {},
         "revenue_backfill": {},
         "icp_matching": {},
