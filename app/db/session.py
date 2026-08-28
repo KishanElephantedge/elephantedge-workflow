@@ -419,12 +419,17 @@ def ensure_indexes():
                 reviewed_at TIMESTAMP,
                 reviewed_by VARCHAR,
                 review_note TEXT,
-                draft_text TEXT,
                 draft_generated_at TIMESTAMP,
                 created_at TIMESTAMP
             )
         """))
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_content_opportunities_tenant_topic ON content_opportunities (tenant_id, content_topic_id)"))
+        # 2026-08-28 -- draft_text (one generic draft) replaced with drafts (JSON, one per real
+        # platform: blog/linkedin/twitter). No real production drafts existed at migration time
+        # (confirmed: draft_text was null on every real row), so this is a clean replacement, not
+        # a backwards-compat shim.
+        conn.execute(text("ALTER TABLE content_opportunities DROP COLUMN IF EXISTS draft_text"))
+        conn.execute(text("ALTER TABLE content_opportunities ADD COLUMN IF NOT EXISTS drafts JSON"))
         # Batch 4 -- Opportunity Engine (see app/gtm_os/opportunity/opportunity.py). One
         # Opportunity per DemandHypothesis -- unique index enforces this at the DB level too, not
         # just at the application check-before-insert layer.

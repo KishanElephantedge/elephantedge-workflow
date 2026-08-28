@@ -69,7 +69,12 @@ class ContentOpportunity(Base):
     reviewed_by = Column(String, nullable=True)
     review_note = Column(Text, nullable=True)
 
-    draft_text = Column(Text, nullable=True)
+    # {"blog": "<text>", "linkedin": "<text>", ...} -- one draft per real platform requested, not
+    # a single generic draft (2026-08-28 explicit instruction: different platforms need different
+    # length/voice, e.g. LinkedIn short and direct, a blog post longer and structured). Latest
+    # generation per platform wins, same "no version history" simplicity as this codebase's other
+    # single-draft fields where no separate review lifecycle exists for the draft text itself.
+    drafts = Column(JSON, nullable=True)
     draft_generated_at = Column(DateTime, nullable=True)
 
     created_at = Column(DateTime, default=datetime.utcnow)
@@ -261,7 +266,18 @@ def request_content_opportunity_changes(db: Session, tenant_id: int, content_opp
     return opportunity
 
 
-DRAFT_PROMPT = """Write a real, publishable LinkedIn/blog post for Elephant Edge on the topic \
+VALID_PLATFORMS = {"blog", "linkedin", "twitter"}
+
+# Real, distinct voice/length per platform -- never the same generic draft reused everywhere
+# (2026-08-28 explicit instruction). Grounded in how these platforms actually differ, not
+# invented style rules.
+PLATFORM_BRIEF = {
+    "blog": "A blog post (500-700 words): structured with a clear opening hook, 2-3 body sections, and a real conclusion. Can go deeper into the evidence and reasoning than a social post would.",
+    "linkedin": "A LinkedIn post (120-200 words): short paragraphs or line breaks, a direct hook in the first line, no headers, conversational but substantive -- written to be read on a phone in a feed, not a formal article.",
+    "twitter": "An X/Twitter thread (4-7 short posts, each under 280 characters, numbered): the first post is the hook, each following post makes one real point building on the evidence, the last post lands the angle.",
+}
+
+DRAFT_PROMPT = """Write a real, publishable {platform_label} for Elephant Edge on the topic \
 below, grounded ONLY in the real evidence and angle already established -- never invent a \
 statistic, quote, or claim not present below.
 
@@ -272,17 +288,21 @@ Angle: {suggested_angle}
 Real evidence this is grounded in:
 {evidence_block}
 
-Write a genuine draft (250-400 words), in Elephant Edge's real voice: direct, no fluff, grounded \
-in real evidence, consistent with their "build vs. rent" positioning. Return JSON exactly:
-{{"draft_text": "<the full draft>"}}"""
+Format for this platform specifically: {platform_brief}
+
+Write in Elephant Edge's real voice: direct, no fluff, grounded in real evidence, consistent \
+with their "build vs. rent" positioning. Return JSON exactly:
+{{"draft_text": "<the full draft, formatted for this exact platform>"}}"""
 
 
-def generate_content_draft(db: Session, tenant_id: int, content_opportunity_id: int) -> dict:
+def generate_content_draft(db: Session, tenant_id: int, content_opportunity_id: int, platform: str = "blog") -> dict:
     """The deck's "write this specific topic" mode -- only callable on an approved opportunity.
     Never auto-triggered by approve_content_opportunity(); a human always explicitly asks for
-    this. Regenerating overwrites the previous draft_text (same "latest wins, no version history"
-    simplicity as this codebase's other single-draft fields where no separate review lifecycle
-    exists for the draft text itself)."""
+    this, one real platform at a time. Regenerating a platform overwrites only that platform's
+    entry in `drafts` -- other platforms' drafts are untouched."""
+    if platform not in VALID_PLATFORMS:
+        return {"status": "invalid_platform", "reason": f"platform must be one of {sorted(VALID_PLATFORMS)}, got {platform!r}"}
+
     opportunity = _get_owned_opportunity(db, tenant_id, content_opportunity_id)
     if opportunity.status != "approved":
         return {"status": "not_approved", "reason": f"opportunity status is {opportunity.status!r}, must be 'approved'"}
@@ -290,7 +310,11 @@ def generate_content_draft(db: Session, tenant_id: int, content_opportunity_id: 
     topic = db.get(ContentTopic, opportunity.content_topic_id)
     evidence = _gather_evidence(db, tenant_id, opportunity.content_topic_id)
     evidence_block = "\n".join(f"- {e['title'] or '(no title)'} -- {e['summary'] or '(no summary)'} ({e['url']})" for e in evidence)
-    prompt = DRAFT_PROMPT.format(topic_name=topic.canonical_name, why_now=opportunity.why_now, suggested_angle=opportunity.suggested_angle, evidence_block=evidence_block)
+    prompt = DRAFT_PROMPT.format(
+        platform_label={"blog": "blog post", "linkedin": "LinkedIn post", "twitter": "X/Twitter thread"}[platform],
+        topic_name=topic.canonical_name, why_now=opportunity.why_now, suggested_angle=opportunity.suggested_angle,
+        evidence_block=evidence_block, platform_brief=PLATFORM_BRIEF[platform],
+    )
 
     try:
         response = generate_json(prompt, db, tenant_id, max_tokens=900)
@@ -301,7 +325,9 @@ def generate_content_draft(db: Session, tenant_id: int, content_opportunity_id: 
     if not draft_text:
         return {"status": "discarded", "reason": "no draft_text returned"}
 
-    opportunity.draft_text = draft_text
+    drafts = dict(opportunity.drafts or {})
+    drafts[platform] = draft_text
+    opportunity.drafts = drafts
     opportunity.draft_generated_at = datetime.utcnow()
     db.commit()
-    return {"status": "ok", "draft_text": draft_text}
+    return {"status": "ok", "platform": platform, "draft_text": draft_text}

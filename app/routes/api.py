@@ -2550,9 +2550,13 @@ def _run_chat_turn(conversation_id: int, user_text: str, db: Session, scope: str
     messages.append({"role": "user", "content": user_text})
 
     if scope == "v2":
-        from app.gtm_os.chat.v2_chat_tools import V2_CHAT_SYSTEM_PROMPT, V2_CHAT_TOOLS, execute_v2_chat_tool
+        from app.gtm_os.chat.v2_chat_tools import V2_CHAT_SYSTEM_PROMPT, V2_CHAT_TOOLS
         system = V2_CHAT_SYSTEM_PROMPT.format(today=datetime.utcnow().strftime("%Y-%m-%d"))
         tools = V2_CHAT_TOOLS
+    elif scope == "content":
+        from app.gtm_os.chat.content_chat_tools import CONTENT_CHAT_SYSTEM_PROMPT, CONTENT_CHAT_TOOLS
+        system = CONTENT_CHAT_SYSTEM_PROMPT.format(today=datetime.utcnow().strftime("%Y-%m-%d"))
+        tools = CONTENT_CHAT_TOOLS
     else:
         system = CHAT_SYSTEM_PROMPT_TEMPLATE.format(today=datetime.utcnow().strftime("%Y-%m-%d"))
         tools = CHAT_TOOLS
@@ -2589,7 +2593,11 @@ def _run_chat_turn(conversation_id: int, user_text: str, db: Session, scope: str
             tools_used.append(tool_name)
             try:
                 if scope == "v2":
+                    from app.gtm_os.chat.v2_chat_tools import execute_v2_chat_tool
                     result = execute_v2_chat_tool(tool_name, block.get("input", {}), db, ELEPHANT_EDGE_TENANT_ID)
+                elif scope == "content":
+                    from app.gtm_os.chat.content_chat_tools import execute_content_chat_tool
+                    result = execute_content_chat_tool(tool_name, block.get("input", {}), db, ELEPHANT_EDGE_TENANT_ID)
                 else:
                     result = _execute_chat_tool(tool_name, block.get("input", {}), db)
             except Exception as e:
@@ -3717,7 +3725,7 @@ def list_gtm_os_content_opportunities(status: str | None = None, db: Session = D
                 "reviewed_at": o.reviewed_at,
                 "reviewed_by": o.reviewed_by,
                 "review_note": o.review_note,
-                "draft_text": o.draft_text,
+                "drafts": o.drafts or {},
                 "draft_generated_at": o.draft_generated_at,
                 "created_at": o.created_at,
             }
@@ -3758,12 +3766,14 @@ def post_gtm_os_content_opportunity_review(content_opportunity_id: int, payload:
 
 
 @router.post("/gtm-os/content-opportunities/{content_opportunity_id}/generate-draft")
-def post_gtm_os_content_opportunity_generate_draft(content_opportunity_id: int, db: Session = Depends(get_db)):
+def post_gtm_os_content_opportunity_generate_draft(content_opportunity_id: int, payload: dict = Body(default={}), db: Session = Depends(get_db)):
     """The deck's "write this specific topic" mode -- real, on-demand LLM call, only on an
-    already-approved opportunity. See generate_content_draft()'s own docstring."""
+    already-approved opportunity, one real platform (blog/linkedin/twitter) at a time. See
+    generate_content_draft()'s own docstring."""
     from app.gtm_os.content.content_opportunity import generate_content_draft
 
-    return generate_content_draft(db, ELEPHANT_EDGE_TENANT_ID, content_opportunity_id)
+    platform = payload.get("platform", "blog")
+    return generate_content_draft(db, ELEPHANT_EDGE_TENANT_ID, content_opportunity_id, platform=platform)
 
 
 @router.get("/gtm-os/debug/signal-texts")
