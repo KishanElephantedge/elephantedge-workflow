@@ -43,6 +43,16 @@ outcome, approve a message, even send an approved message), actually call the to
 applies to (e.g. which company, which contact, which message), ask a brief clarifying question \
 rather than guessing which real row to act on.
 
+CRITICAL -- GROUNDING FOLLOW-UP REQUESTS: only the plain text of your own past replies is kept as \
+conversation history, not the tool results that produced them. So when a follow-up refers back to \
+something you just listed ("their emails," "those accounts," "opportunity 7"), you must resolve \
+EXACTLY those same real records again -- by their name, id, or opportunity number as stated in \
+your own prior reply (use get_opportunity for an opportunity number, get_account_brief/ \
+search_accounts for a company) -- never by re-running a broader query (e.g. get_jobs_to_be_done \
+again) and picking whichever result set looks topically related. Picking a different-but-similar \
+set of real records instead of the exact ones already named is a serious grounding failure, not a \
+minor imprecision.
+
 You can also be explicitly told to remember something ("remember that...", "learn that...", "for \
 future reference..."). When that happens, call remember_knowledge with the fact verbatim -- this \
 persists it as real, confirmed knowledge the rest of the system can read.
@@ -97,6 +107,11 @@ V2_CHAT_TOOLS = [
         "name": "get_pipeline",
         "description": "Real opportunity pipeline: for each opportunity, its strategy, readiness, and next required action.",
         "input_schema": {"type": "object", "properties": {"page": {"type": "integer"}, "page_size": {"type": "integer", "description": "default 25, max 100"}}},
+    },
+    {
+        "name": "get_opportunity",
+        "description": "Full detail for ONE specific opportunity by its id (e.g. resolving 'Opportunity 7' from an earlier answer back to its exact real company/strategy/contacts) -- always use this to re-resolve a specific opportunity number mentioned earlier, rather than re-listing the whole pipeline.",
+        "input_schema": {"type": "object", "properties": {"opportunity_id": {"type": "integer"}}, "required": ["opportunity_id"]},
     },
     {
         "name": "get_revenue_pace",
@@ -309,6 +324,11 @@ def execute_v2_chat_tool(name: str, tool_input: dict, db: Session, tenant_id: in
     if name == "get_pipeline":
         from app.gtm_os.execution.execution_readiness import list_pipeline_items
         return list_pipeline_items(db, tenant_id, page=tool_input.get("page", 1), page_size=min(tool_input.get("page_size", 25), 100))
+
+    if name == "get_opportunity":
+        from app.gtm_os.execution.execution_readiness import get_pipeline_item
+        item = get_pipeline_item(db, tenant_id, tool_input["opportunity_id"])
+        return item if item is not None else {"error": "opportunity not found"}
 
     if name == "get_revenue_pace":
         from app.gtm_os.revenue.revenue_pace import get_revenue_pace
