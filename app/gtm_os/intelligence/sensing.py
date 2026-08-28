@@ -31,7 +31,7 @@ from urllib.parse import quote
 from sqlalchemy.orm import Session
 
 from app.apify_client import _get_api_key as _get_apify_api_key
-from app.apify_client import search_google_ai_overview, search_linkedin_jobs, search_linkedin_posts
+from app.apify_client import ApifyError, search_google_ai_overview, search_google_organic_results, search_linkedin_jobs, search_linkedin_posts
 from app.deepline_client import execute_tool
 from app.gtm_os.intelligence.signal import GtmSignal
 from app.phases.discovery import EMPLOYEE_COUNT_MIN, REVENUE_MIN_USD
@@ -50,6 +50,7 @@ from app.salesrobot_client import SalesRobotError, get_campaign_prospects, get_s
 from app.hackernews_client import get_item, get_top_story_ids
 from app.gtm_os.content.topics import get_enabled_content_topics, match_topic
 from app.gtm_os.content.feeds import get_enabled_content_feeds
+from app.gtm_os.content.competitors import get_enabled_content_competitors
 from app.rss_client import fetch_feed_entries
 
 
@@ -869,6 +870,155 @@ def sense_website_visitors(db: Session, tenant_id: int, limit: int = 50) -> list
         )
         db.add(signal)
         signals.append(signal)
+
+    db.commit()
+    return signals
+
+
+def sense_web_search_trends(db: Session, tenant_id: int, limit: int = 20) -> list[GtmSignal]:
+    """Content Intelligence -- the "trend" leg (targeting the real ~60% of the content mix,
+    2026-08-28 explicit instruction). No Reddit/X/Perplexity API integration exists in this
+    codebase (confirmed by direct search) -- a real, already-working Google Search integration
+    (search_google_organic_results, the same Apify actor free_decision_maker.py/
+    reverse_discovery.py already use) stands in for those platforms until real API keys for them
+    exist. Same shared GtmSignal architecture as every other adapter in this file -- feeds
+    directly into the EXISTING, unmodified topic_linking.py -> candidate_extraction.py ->
+    promotion.py -> trend_intelligence.py pipeline (that pipeline is already source-agnostic, see
+    topic_linking.py's own module docstring, so it needed zero changes for this).
+
+    ONE real query per enabled topic (get_enabled_content_topics, the same config HN/RSS sensing
+    already reads) -- real cost $0.0055/query (GOOGLE_SEARCH_COST_PER_QUERY_NO_AI_OVERVIEW_USD).
+    `limit` bounds the number of topics processed per call, same "no runaway cost as config grows"
+    discipline as every budget-bounded sensing function in this codebase.
+
+    DEDUPLICATION: scoped by (tenant_id, source, source_ref) together, source_ref is the result's
+    own URL -- same reasoning as sense_hackernews_stories()'s own docstring: a real article/page
+    can legitimately be relevant to more than one of this tenant's topics, but the SAME topic
+    searching the SAME query and getting the SAME URL again should never re-create a signal.
+
+    NO observed_at: this actor's organicResults items carry no reliable publish-date field (only
+    url/title/description, confirmed live) -- left null rather than inventing one, same
+    discipline as every other source's own time parser in this file."""
+    topics = get_enabled_content_topics(db, tenant_id)[:limit]
+    if not topics:
+        return []
+
+    api_key = _get_apify_api_key(db, tenant_id)
+    signals = []
+    for topic in topics:
+        query = topic["name"]
+        try:
+            results = search_google_organic_results(api_key, query, max_pages=1)
+        except ApifyError:
+            continue  # this topic's query failed -- picked up again next sweep, other topics unaffected
+
+        for result in results:
+            url = result.get("url")
+            if not url:
+                continue
+            source_ref = url
+            already_sensed = (
+                db.query(GtmSignal)
+                .filter(GtmSignal.tenant_id == tenant_id, GtmSignal.source == "web_search_trend", GtmSignal.source_ref == source_ref)
+                .first()
+            )
+            if already_sensed:
+                continue
+
+            signal = GtmSignal(
+                tenant_id=tenant_id,
+                source="web_search_trend",
+                source_ref=source_ref,
+                signal_type="search_result",
+                observed_at=None,
+                raw_evidence=result,
+                extracted_info={
+                    "title": result.get("title"),
+                    "summary": result.get("description"),
+                    "url": url,
+                    "matched_keyword": query,
+                },
+                dedup_key=_dedup_key("web_search_trend", source_ref),
+            )
+            db.add(signal)
+            signals.append(signal)
+
+    db.commit()
+    return signals
+
+
+def sense_competitor_content(db: Session, tenant_id: int, limit: int = 30) -> list[GtmSignal]:
+    """Content Intelligence -- the "competitor" leg (targeting the real ~40% of the content mix,
+    2026-08-28 explicit instruction). Same Google Search mechanism as sense_web_search_trends()
+    above, but each query is scoped to one real, named competitor's own domain via a `site:`
+    search operator, so results are actually that competitor's own content, not just anything
+    mentioning them. Competitor list is app/gtm_os/content/competitors.py's own config (separate
+    from topics.py, same reasoning feeds.py's own separation documents).
+
+    `limit` bounds the total number of real (topic, competitor) query pairs made per call --
+    real cost $0.0055/query, and the full cross product (topics x competitors) can legitimately
+    exceed a sensible per-run budget as either list grows. Iterates topic-major (topic 1 against
+    every competitor, then topic 2, ...) -- if capped, later topics simply aren't covered this
+    run and are picked up on a subsequent one; this does NOT guarantee even coverage across
+    topics when capped, which is an accepted tradeoff, not a silent gap (documented here rather
+    than hidden).
+
+    Every other property (dedup by (tenant_id, source, source_ref), extracted_info shape, no
+    invented observed_at, per-query error isolation) is identical to sense_web_search_trends()
+    above -- see that function's own docstring."""
+    topics = get_enabled_content_topics(db, tenant_id)
+    competitors = get_enabled_content_competitors(db, tenant_id)
+    if not topics or not competitors:
+        return []
+
+    api_key = _get_apify_api_key(db, tenant_id)
+    signals = []
+    queries_made = 0
+    for topic in topics:
+        for competitor in competitors:
+            if queries_made >= limit:
+                return signals  # real per-run budget reached -- see docstring's coverage tradeoff note
+            queries_made += 1
+
+            query = f"site:{competitor['domain']} {topic['name']}"
+            try:
+                results = search_google_organic_results(api_key, query, max_pages=1)
+            except ApifyError:
+                continue
+
+            for result in results:
+                url = result.get("url")
+                if not url:
+                    continue
+                source_ref = url
+                already_sensed = (
+                    db.query(GtmSignal)
+                    .filter(GtmSignal.tenant_id == tenant_id, GtmSignal.source == "competitor_content", GtmSignal.source_ref == source_ref)
+                    .first()
+                )
+                if already_sensed:
+                    continue
+
+                signal = GtmSignal(
+                    tenant_id=tenant_id,
+                    source="competitor_content",
+                    source_ref=source_ref,
+                    signal_type="search_result",
+                    observed_at=None,
+                    company_name_raw=competitor["name"],
+                    raw_evidence=result,
+                    extracted_info={
+                        "title": result.get("title"),
+                        "summary": result.get("description"),
+                        "url": url,
+                        "matched_keyword": topic["name"],
+                        "competitor_name": competitor["name"],
+                        "competitor_domain": competitor["domain"],
+                    },
+                    dedup_key=_dedup_key("competitor_content", source_ref),
+                )
+                db.add(signal)
+                signals.append(signal)
 
     db.commit()
     return signals

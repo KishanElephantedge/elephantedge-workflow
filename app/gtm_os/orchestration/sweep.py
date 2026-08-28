@@ -132,11 +132,13 @@ from app.gtm_os.intelligence.interpretation import run_interpretation_sweep
 from app.gtm_os.intelligence.investigation_cycle import run_investigation_cycle
 from app.gtm_os.intelligence.problem_detection import run_problem_hypothesis_sweep
 from app.gtm_os.intelligence.sensing import (
+    sense_competitor_content,
     sense_hackernews_stories,
     sense_linkedin_jobs,
     sense_linkedin_post_search,
     sense_linkedin_replies,
     sense_rss_articles,
+    sense_web_search_trends,
     sense_website_visitors,
 )
 from app.gtm_os.learning.message_draft import MessageDraft, run_message_generation_sweep
@@ -530,6 +532,37 @@ def _run_website_visitors(db: Session, tenant_id: int):
     return sense_website_visitors(db, tenant_id)
 
 
+def _run_web_search_trends(db: Session, tenant_id: int):
+    """Content Intelligence trend leg (2026-08-28) -- real paid Apify calls (Google Search), so,
+    same as _run_linkedin_jobs, this checks apify_budget_guard itself before calling. No
+    MissingSourceConfiguration needed -- sense_web_search_trends() already senses nothing if zero
+    enabled content topics are configured, a valid state, not a misconfiguration."""
+    from app.apify_client import GOOGLE_SEARCH_COST_PER_QUERY_NO_AI_OVERVIEW_USD
+    from app.apify_budget_guard import STATUS_ALLOWED, check_apify_budget
+
+    limit = 20
+    budget_result = check_apify_budget(db, tenant_id, limit * GOOGLE_SEARCH_COST_PER_QUERY_NO_AI_OVERVIEW_USD)
+    if budget_result["status"] != STATUS_ALLOWED:
+        raise SourceBudgetBlocked(budget_result["reason"])
+
+    return sense_web_search_trends(db, tenant_id, limit=limit)
+
+
+def _run_competitor_content(db: Session, tenant_id: int):
+    """Content Intelligence competitor leg (2026-08-28) -- same real-paid-call budget check as
+    _run_web_search_trends above. No MissingSourceConfiguration needed -- sense_competitor_content()
+    already senses nothing if zero enabled topics or zero enabled competitors are configured."""
+    from app.apify_client import GOOGLE_SEARCH_COST_PER_QUERY_NO_AI_OVERVIEW_USD
+    from app.apify_budget_guard import STATUS_ALLOWED, check_apify_budget
+
+    limit = 30
+    budget_result = check_apify_budget(db, tenant_id, limit * GOOGLE_SEARCH_COST_PER_QUERY_NO_AI_OVERVIEW_USD)
+    if budget_result["status"] != STATUS_ALLOWED:
+        raise SourceBudgetBlocked(budget_result["reason"])
+
+    return sense_competitor_content(db, tenant_id, limit=limit)
+
+
 # Source registration -- (name, runner(db, tenant_id) -> list[GtmSignal]). A future source
 # (Reddit/X/YouTube/etc., none added in this step) means adding one entry here; the sweep loop
 # below never branches on source name (Step 13 design doc §14). hackernews_story/rss_article
@@ -540,7 +573,11 @@ def _run_website_visitors(db: Session, tenant_id: int):
 # problem_detection.py's own tier map); explicitly NOT the Network/LinkedIn-monitor watch-list,
 # see sense_linkedin_post_search()'s own docstring. website_visitor added in Channels Intelligence
 # step 4 -- deliberately contextual-tier only (see sense_website_visitors()'s own docstring for
-# why it can never open a hypothesis alone).
+# why it can never open a hypothesis alone). web_search_trend/competitor_content added for
+# Content Intelligence's 60/40 trend/competitor content mix (2026-08-28) -- neither is meant to
+# open an outbound Problem/Demand hypothesis (deliberately absent from ALL_INTERPRETED_SOURCES
+# below), only to feed CONTENT_INTELLIGENCE_STAGES' already source-agnostic topic-linking
+# pipeline (see sense_web_search_trends()'s own docstring).
 SWEEPABLE_SOURCES: list[tuple[str, callable]] = [
     ("linkedin_job", _run_linkedin_jobs),
     ("linkedin_reply", _run_linkedin_replies),
@@ -548,6 +585,8 @@ SWEEPABLE_SOURCES: list[tuple[str, callable]] = [
     ("rss_article", _run_rss),
     ("linkedin_post_search", _run_linkedin_post_search),
     ("website_visitor", _run_website_visitors),
+    ("web_search_trend", _run_web_search_trends),
+    ("competitor_content", _run_competitor_content),
 ]
 
 
