@@ -734,6 +734,19 @@ def run_gtm_intelligence_sweep(
             any_failed = True
             logger.error("gtm_intelligence_sweep: sensing %s failed -- %s", name, e)
 
+    # 2026-08-29, real fix: this whole function shares ONE db session across every stage below
+    # (sensing, investigation, interpretation, problem/demand, Content Intelligence, account
+    # strategy, outreach). SQLAlchemy's session keeps every row it has ever loaded cached in its
+    # identity map for the session's entire lifetime -- on a 512MB container, a sensing pass that
+    # pulls real Apify/LinkedIn/TheirStack payloads accumulating alongside everything the rest of
+    # this mega-function loads was confirmed (via Render's own suspend header + a crash-timed
+    # deploy log showing a burst of LLM calls immediately preceding a container restart) to push
+    # memory over the limit. expire_all() only clears the in-memory cache -- every stage already
+    # re-queries via tenant_id rather than relying on a prior stage's Python objects, and each
+    # stage commits its own work (see the per-stage rollback-on-failure comments below), so this
+    # never discards anything durable.
+    db.expire_all()
+
     # Autonomous Sensing Phase S7 (app/gtm_os/intelligence/investigation_cycle.py) -- runs BEFORE
     # interpretation/problem/demand below so any GtmSignal rows S5 execution created this same
     # tick get picked up by the SAME existing interpretation pass, not a following one. Bounded
@@ -808,6 +821,8 @@ def run_gtm_intelligence_sweep(
             any_failed = True
             logger.error("gtm_intelligence_sweep: %s failed -- %s", stage_key, e)
 
+    db.expire_all()  # 2026-08-29, see the identity-map comment above the S7 sensing block
+
     # Account/Strategy/Sales branch (Batch 6) -- reads DemandHypothesis (produced above), but its
     # own failure never touches Problem/Demand or Content Intelligence, and vice versa. Each
     # stage is a pure/idempotent read-or-additive-insert sweep with zero LLM/external/CRM calls
@@ -868,6 +883,8 @@ def run_gtm_intelligence_sweep(
         any_failed = True
         logger.error("gtm_intelligence_sweep: contact_discovery failed -- %s", contact_discovery_result.get("error"))
 
+    db.expire_all()  # 2026-08-29, see the identity-map comment above the S7 sensing block
+
     for stage_key, runner in ACCOUNT_STRATEGY_STAGES_CONTACT_TO_MESSAGE:
         if not outbound_due:
             result[stage_key] = {"status": "skipped", "reason": outbound_reason}
@@ -899,6 +916,8 @@ def run_gtm_intelligence_sweep(
     elif send_result.get("status") == "failed":
         any_failed = True
         logger.error("gtm_intelligence_sweep: send failed -- %s", send_result.get("error"))
+
+    db.expire_all()  # 2026-08-29, see the identity-map comment above the S7 sensing block
 
     for stage_key, runner in ACCOUNT_STRATEGY_STAGES_POST_SEND:
         try:
