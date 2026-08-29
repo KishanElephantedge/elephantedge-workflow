@@ -30,10 +30,4 @@ COPY app/ ./app/
 # service's first deploy, since it was the first build to pull past that version.
 
 EXPOSE 8000
-# maxmemory caps Redis at 64MB (it only ever holds small cached JSON blobs and one sorted
-# set, per app/cache.py) with allkeys-lru eviction -- on the free tier's 512MB total RAM,
-# an unbounded Redis competing with uvicorn/httpx/LLM-call memory is what was pushing the
-# container over the limit and getting OOM-killed (seen as repeated "new open port 6379"
-# log lines followed by a full container restart, which Render surfaces as "Suspended"
-# for the few minutes it takes to recover).
-CMD ["sh", "-c", "redis-server --daemonize yes --save '' --maxmemory 64mb --maxmemory-policy allkeys-lru && uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
+CMD ["sh", "-c", "redis-server --daemonize yes --save '' && uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
