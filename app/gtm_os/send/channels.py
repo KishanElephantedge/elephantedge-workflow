@@ -142,8 +142,9 @@ def send_via_salesrobot(db: Session, tenant_id: int, draft: MessageDraft, contac
     first (see get_offering_campaign_id's own docstring)."""
     if not contact.linkedin_url:
         return {"status": "failed", "provider_ref": None, "error_message": "contact has no linkedin_url", "retryable": False}
-    if not draft.message_text:
-        return {"status": "failed", "provider_ref": None, "error_message": "draft has no message_text", "retryable": False}
+    # message_text is deliberately NOT required here: the CAMPAIGN template is what gets sent
+    # on this channel, so an empty draft body is no reason to refuse to enrol a real contact.
+    # (The SMTP/Smartlead paths above still require it -- those genuinely send our text.)
 
     strategy = db.get(GtmStrategy, draft.gtm_strategy_id)
     offering_name = strategy.matched_offering_name if strategy else None
@@ -165,10 +166,15 @@ def send_via_salesrobot(db: Session, tenant_id: int, draft: MessageDraft, contac
         return {"status": "failed", "provider_ref": None, "error_message": "salesrobot_linkedin_account_uuid parameter is not set", "retryable": False}
     linkedin_account_uuid = param.value.get("value") if isinstance(param.value, dict) else param.value
 
-    # customMap keys match the merge tags configured in these specific SalesRobot campaigns'
-    # Step 2/Step 3 templates ({personalisedmessage}/{followup}, all-lowercase -- confirmed
-    # directly against the real campaign editor, not our own naming convention). No
-    # connectionNote: these campaigns' Step 1 doesn't reference one.
+    # NO customMap (2026-08-31, corrected against the real campaign editor): these campaigns'
+    # Step 2/Step 3 templates are COMPLETE messages using {{firstName}}, not placeholders
+    # referencing {personalisedmessage}/{followup}. The generated draft text was being passed as
+    # merge-tag values nothing in the template consumed, so it never reached anyone.
+    #
+    # The campaign owns the message. We only enrol the contact; SalesRobot's sequence engine
+    # sends Step 1/2/3 from its own templates on its own schedule. Passing anything beyond what
+    # identifies the prospect is at best ignored, at worst overrides a human-authored template
+    # with machine text nobody approved for that campaign.
     prospect = {"profileUrl": contact.linkedin_url}
     if contact.first_name:
         prospect["firstName"] = contact.first_name
@@ -178,11 +184,6 @@ def send_via_salesrobot(db: Session, tenant_id: int, draft: MessageDraft, contac
         prospect["jobTitle"] = contact.title
     if contact.company and contact.company.name:
         prospect["companyName"] = contact.company.name
-    custom_map = {"personalisedmessage": draft.message_text}
-    followup_text = _get_followup_message_text(db, tenant_id, draft)
-    if followup_text:
-        custom_map["followup"] = followup_text
-    prospect["customMap"] = custom_map
 
     try:
         add_single_prospect(campaign_uuid, linkedin_account_uuid, prospect, db, tenant_id)
