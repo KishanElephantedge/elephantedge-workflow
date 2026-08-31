@@ -29,24 +29,48 @@ def _parse_event_time(time_obj: dict | None) -> datetime | None:
         return None
 
 
+def _name_from_booking_description(description: str | None, booker_email: str) -> str | None:
+    """Real Appointment Schedule bookings carry a Google-generated description shaped like
+    "Booked by\n<Name>\n<email>" -- confirmed live (2026-08-31) against a real booking. Google
+    never populates attendees[].displayName at all (also confirmed live), so this description
+    is the only place the booker's actual name exists; without parsing it, every real booking
+    would show as a bare email. Matches the email back to the identified booker to avoid ever
+    attributing a name from an unrelated line in a description that mentions other people."""
+    if not description:
+        return None
+    lines = [line.strip() for line in description.splitlines() if line.strip()]
+    for i, line in enumerate(lines):
+        if "booked by" in line.lower() and i + 2 < len(lines):
+            name, email_line = lines[i + 1], lines[i + 2]
+            if email_line.lower() == booker_email.lower():
+                return name
+    return None
+
+
 def _extract_booker(event: dict) -> tuple[str | None, str | None]:
     """The booker is a real attendee who is neither the account owner (Google marks the
     owner's own attendee entry `self: true`, regardless of what the organizer field says) nor
     the organizer. Falls back to the event creator only when there are no attendees at all.
     Returns (None, None) when no genuine external party can be identified -- the caller treats
-    that as "not a real booking", not as "booking with an unknown person"."""
+    that as "not a real booking", not as "booking with an unknown person". The name itself never
+    comes from attendees[].displayName (Google doesn't populate it) -- see
+    _name_from_booking_description for the real source, when there is one."""
     organizer_email = (event.get("organizer") or {}).get("email")
+    booker_email = None
     for attendee in event.get("attendees", []):
         if attendee.get("self"):
             continue
         if attendee.get("email") == organizer_email:
             continue
-        return attendee.get("displayName"), attendee.get("email")
-    if not event.get("attendees"):
+        booker_email = attendee.get("email")
+        break
+    if not booker_email and not event.get("attendees"):
         creator = event.get("creator", {})
         if creator.get("email") and creator.get("email") != organizer_email:
-            return creator.get("displayName"), creator.get("email")
-    return None, None
+            booker_email = creator.get("email")
+    if not booker_email:
+        return None, None
+    return _name_from_booking_description(event.get("description"), booker_email), booker_email
 
 
 def sync_calendar_bookings(db: Session, tenant_id: int, days_ahead: int = 30, days_back: int = 1) -> dict:
