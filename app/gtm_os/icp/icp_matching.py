@@ -47,6 +47,12 @@ class ICPMatch(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
+# Empirical, not invented: the median revenue-per-employee across the 562 companies in THIS
+# tenant's own data that carry both a real revenue figure and a real headcount (p25 $50,000,
+# p75 $125,000). Used only as a last-resort proxy -- see _estimated_revenue below.
+REVENUE_PER_EMPLOYEE_USD = 79_545
+
+
 def _estimated_revenue(company: Company) -> tuple[int | None, str | None]:
     lower, higher = company.estimated_revenue_lower_usd, company.estimated_revenue_higher_usd
     if lower is not None and higher is not None:
@@ -55,6 +61,25 @@ def _estimated_revenue(company: Company) -> tuple[int | None, str | None]:
         return lower, f"estimated_revenue_lower_usd={lower} (higher bound not available)"
     if higher is not None:
         return higher, f"estimated_revenue_higher_usd={higher} (lower bound not available)"
+
+    # Headcount proxy (2026-08-31). Reported revenue simply does not exist for most privately
+    # held early-stage companies -- confirmed the hard way on a real account: Deepline's company
+    # record carries no revenue field at all, and the Google fallback answered a name-only query
+    # with a $4.035B figure belonging to a completely different company of the same name. Without
+    # a proxy those companies can never match ANY ICP no matter how strong their buying signal,
+    # which is what left 1,486 of 1,500 real ICP checks at "insufficient_information".
+    #
+    # The evidence string says plainly that this is derived from headcount and is NOT a reported
+    # revenue figure, so nothing downstream (or any human reading the match) can mistake it for
+    # one. The real spread is wide (p25-p75 is $50k-$125k per employee, ~2.5x), so a company
+    # sitting near an ICP band boundary can land either side -- acceptable for a candidate match
+    # that a human reviews, never good enough to present as fact.
+    if company.employee_count is not None and company.employee_count > 0:
+        derived = company.employee_count * REVENUE_PER_EMPLOYEE_USD
+        return derived, (
+            f"DERIVED from employee_count={company.employee_count} x ${REVENUE_PER_EMPLOYEE_USD:,}/employee "
+            f"(tenant-median) = ${derived:,} -- no reported revenue on file, this is a headcount proxy, not a revenue figure"
+        )
     return None, None
 
 
