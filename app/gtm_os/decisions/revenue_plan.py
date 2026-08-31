@@ -34,6 +34,7 @@ from datetime import datetime
 
 from sqlalchemy.orm import Session
 
+from app.gtm_os.decisions.external_research import research_constraints
 from app.gtm_os.learning.channel_intelligence import get_channel_performance
 from app.gtm_os.learning.offering_performance import get_offering_performance
 from app.gtm_os.revenue.revenue_pace import get_revenue_pace
@@ -108,20 +109,53 @@ def build_revenue_diagnosis(db: Session, tenant_id: int, now: datetime | None = 
 
     constraints: list[dict] = []
 
-    # The single most important one: with no closed-won amount anywhere, revenue is unmeasurable,
-    # so NO plan below it can be evaluated. Stated first for that reason, not for drama.
+    # $0 revenue has TWO completely different meanings and they must never be conflated:
+    #
+    #   (a) meetings happened and nobody logged the result  -> a data-entry gap. Go record it.
+    #   (b) no meetings happened at all                     -> nothing has been EARNED. This is
+    #       not a measurement problem, it is the business problem, and treating it as "waiting
+    #       for data" is how a system stays busy while going nowhere.
+    #
+    # Distinguished by whether any meeting exists at all, so the plan responds to the situation
+    # that is actually true rather than to a missing field.
+    meetings_exist = bool(pace.get("meetings_this_month") or pace.get("won_count") or pace.get("lost_count") or pace.get("pending_count"))
     if not pace.get("ytd_actual_usd"):
-        constraints.append({
-            "constraint": "no_revenue_recorded",
-            "evidence": f"ytd_actual_usd={pace.get('ytd_actual_usd')}, won_count={pace.get('won_count')}",
-            "why_it_matters": "Revenue only enters the system when a meeting is marked won/lost with an amount. Until one is, every downstream number here is throughput, not revenue, and progress toward the target cannot be measured at all.",
-        })
+        if meetings_exist:
+            constraints.append({
+                "constraint": "revenue_not_recorded",
+                "severity": "blocking_measurement",
+                "evidence": f"meetings exist (this_month={pace.get('meetings_this_month')}, pending={pace.get('pending_count')}) but ytd_actual_usd={pace.get('ytd_actual_usd')}",
+                "why_it_matters": "Meetings have happened and none carries a recorded outcome, so real revenue may exist and be invisible. Record won/lost + amount before concluding anything about pace.",
+            })
+        else:
+            constraints.append({
+                "constraint": "no_revenue_earned",
+                "severity": "critical",
+                "evidence": (
+                    f"ZERO revenue earned: won_count={pace.get('won_count')}, meetings booked={pace.get('meetings_this_month')}, "
+                    f"ytd_actual_usd={pace.get('ytd_actual_usd')} against a {pace.get('annual_target_usd')} target with "
+                    f"{days_remaining} days left -- the ENTIRE gap of {gap} is unaddressed"
+                ),
+                "why_it_matters": (
+                    "This is not a reporting gap -- nothing has been sold. No meeting has ever been booked, so no deal can "
+                    "have closed. Every day that passes raises the run-rate required from the remaining days. The whole "
+                    "target is still ahead and the funnel has not yet produced its first meeting."
+                ),
+            })
 
-    if not outcomes.get("meeting_requested") and not pace.get("meetings_this_month"):
+    if not pace.get("meetings_this_month"):
         constraints.append({
             "constraint": "no_meetings_booked",
-            "evidence": f"meetings_this_month={pace.get('meetings_this_month')}, meeting_requested_outcomes={outcomes.get('meeting_requested', 0)}",
-            "why_it_matters": "Revenue requires meetings. The funnel currently converts outreach into replies but not into booked meetings.",
+            "severity": "critical",
+            "evidence": (
+                f"meetings_this_month={pace.get('meetings_this_month')}, meeting_requested_outcomes={outcomes.get('meeting_requested', 0)}, "
+                f"replies={sum(v for k, v in outcomes.items() if k in ('reply', 'positive_reply', 'meeting_requested'))}"
+            ),
+            "why_it_matters": (
+                "A meeting is the ONLY route to revenue in this model, and none has been booked. Replies are being produced "
+                "but none is converting to a booked meeting -- so the bottleneck is between reply and meeting, not at the top "
+                "of the funnel."
+            ),
         })
 
     if funnel["sends_succeeded"] < 10:
@@ -173,13 +207,21 @@ def build_revenue_diagnosis(db: Session, tenant_id: int, now: datetime | None = 
     }
 
 
-PLAN_PROMPT = """You are the operating brain of a B2B GTM system with ONE goal: close the revenue \
-gap below within the days remaining.
+PLAN_PROMPT = """You are the operating brain of a B2B GTM system with ONE goal: close the revenue gap below \
+within the days remaining. Treat it as a deadline you are accountable for, not a report you are \
+writing.
+
+If revenue is zero, that means nothing has been SOLD -- it is not a data problem to wait out. Say \
+what has to change now, and what the remaining days demand.
 
 You are given a DIAGNOSIS computed from the company's real database. Every number in it is real.
 
 DIAGNOSIS:
 {diagnosis}
+
+EXTERNAL RESEARCH (real practices extracted from web sources, each with the URL it came from --
+these are NOT from your own knowledge, and every one is attributable):
+{research}
 
 Produce a prioritised action plan. Rules you must follow:
 - Use ONLY facts present in the diagnosis. Never introduce a metric, rate, or number that is not \
@@ -191,12 +233,14 @@ like "improve messaging".
 - If the evidence is too thin to justify an action, say so rather than inventing a recommendation. \
 evidence_strength tells you how much weight the data can bear.
 - Distinguish what the SYSTEM can do automatically from what needs a HUMAN.
+- Where an external practice applies to a constraint, use it and cite its source_url in `source`. Where none applies, leave `source` null -- never attribute an idea to a source that does not support it.
 
 Return JSON exactly:
 {{"assessment": "<2-3 sentences: where we stand against the target and why>",
   "actions": [{{"action": "<specific action>", "owner": "system" | "human",
                 "addresses": "<constraint name or evidence quoted from the diagnosis>",
                 "expected_effect": "<what changes if done>",
+                "source": "<source_url of the external practice this draws on, or null>",
                 "confidence": "high" | "medium" | "low"}}],
   "not_recommended_yet": [{{"idea": "<action deliberately NOT recommended>", "why": "<what evidence is missing>"}}]}}"""
 
@@ -227,9 +271,18 @@ def generate_revenue_plan(db: Session, tenant_id: int) -> dict:
     """Diagnosis + a verified, prioritised plan. Never raises -- a model failure returns the
     deterministic diagnosis on its own, which is still useful, rather than nothing."""
     diagnosis = build_revenue_diagnosis(db, tenant_id)
+    # Research is driven BY the constraints just found -- never a standing topic list, so nothing
+    # is searched (or paid for) unless a real problem in the data asks for it.
+    research = research_constraints(db, tenant_id, diagnosis.get("constraints") or [])
     try:
-        plan = generate_json(PLAN_PROMPT.format(diagnosis=json.dumps(diagnosis, indent=2, default=str)), db, tenant_id, max_tokens=2000)
+        plan = generate_json(
+            PLAN_PROMPT.format(
+                diagnosis=json.dumps(diagnosis, indent=2, default=str),
+                research=json.dumps(research.get("findings") or [], indent=2, default=str),
+            ),
+            db, tenant_id, max_tokens=2000,
+        )
     except Exception as e:  # noqa: BLE001 -- the diagnosis alone is a real, usable result
         logger.exception("revenue_plan: plan generation failed")
-        return {"diagnosis": diagnosis, "plan": None, "error": str(e)}
-    return {"diagnosis": diagnosis, "plan": _verify_actions(plan, diagnosis)}
+        return {"diagnosis": diagnosis, "research": research, "plan": None, "error": str(e)}
+    return {"diagnosis": diagnosis, "research": research, "plan": _verify_actions(plan, diagnosis)}
