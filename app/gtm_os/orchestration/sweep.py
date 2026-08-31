@@ -127,6 +127,7 @@ from app.gtm_os.content.content_opportunity import run_content_opportunity_gener
 from app.gtm_os.content.promotion import run_candidate_promotion_sweep
 from app.gtm_os.content.topic_linking import run_content_topic_linking_sweep
 from app.gtm_os.content.trend_intelligence import run_trend_intelligence_sweep
+from app.gtm_os.decisions.revenue_plan import generate_revenue_plan
 from app.gtm_os.icp.company_enrichment import run_company_enrichment_sweep
 from app.gtm_os.orchestration.discovery_profiles import get_enabled_discovery_profiles
 from app.gtm_os.icp.icp_matching import run_icp_matching_sweep
@@ -384,6 +385,10 @@ ACCOUNT_STRATEGY_STAGES_CONTACT_TO_MESSAGE: list[tuple[str, callable]] = [
 # Must run AFTER message_generation (nothing to send before a draft exists) and BEFORE
 # outcome_detection (which reads reply signals that only matter once something was actually sent).
 ACCOUNT_STRATEGY_STAGES_POST_SEND: list[tuple[str, callable]] = [
+    # The decision layer runs LAST, after every measuring stage in this tick has updated its own
+    # evidence -- a plan built on this morning's numbers would be advising on a funnel that has
+    # already moved. Deterministic diagnosis + a verified plan; see decisions/revenue_plan.py.
+    ("revenue_plan", lambda db, tenant_id: generate_revenue_plan(db, tenant_id)),
     ("sales_readiness", lambda db, tenant_id: run_sales_agent_sweep(db, tenant_id)),
     # Batch 7 -- outcome detection reuses existing linkedin_reply InterpretedSignal rows only
     # (zero LLM/external calls, see outcome.py).
