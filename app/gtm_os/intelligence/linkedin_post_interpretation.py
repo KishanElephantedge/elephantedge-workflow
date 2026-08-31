@@ -266,6 +266,29 @@ Return JSON exactly:
     }
 
 
+def _promote_if_concurrent_hiring(result: dict | None, text: str) -> dict | None:
+    """Upgrades a growth_hiring_mention to concurrent_hiring_surge when the post states hiring of
+    several roles at once. Applied at the single point BOTH classification paths (deterministic
+    phrase match and LLM semantic) funnel through, so the two can never disagree.
+
+    Only ever touches growth_hiring_mention -- the weakest hiring classification, tier "none". A
+    problem_statement or anything else is returned untouched."""
+    if not result or result.get("event_type") != "growth_hiring_mention":
+        return result
+    detected = detect_concurrent_hiring_in_post(text)
+    if not detected:
+        return result
+    result = dict(result)
+    result["event_type"] = "concurrent_hiring_surge"
+    result["method"] = f"{result.get('method', 'unknown')}+deterministic:concurrent_hiring_post"
+    count, evidence = detected["count"], detected["evidence"]
+    result["business_change"] = (
+        lambda who: f"{who} states they are hiring {count} roles at once ({evidence}) -- "
+        f"a real concurrent hiring surge, not a passing mention of growth."
+    )
+    return result
+
+
 def _classify_text(text: str, db=None, tenant_id: int | None = None, headline: str | None = None, company_name_raw: str | None = None) -> dict | None:
     """The classification decision, factored out of interpret_linkedin_post_signal so the same
     logic can run either against one post's text (the original behavior) or against several posts
@@ -316,16 +339,16 @@ def _classify_text(text: str, db=None, tenant_id: int | None = None, headline: s
 
     matched = _matches_any(text_lower, GROWTH_HIRING_PHRASES)
     if matched:
-        return {
+        return _promote_if_concurrent_hiring({
             "event_type": "growth_hiring_mention", "affected_function": affected_function, "matched_phrase": matched,
             "method": "deterministic:phrase_match:growth_hiring",
             "business_change": lambda who: f"{who} mentions team growth/hiring related to {affected_function}.",
-        }
+        }, text)
 
     if db is not None and tenant_id is not None:
         semantic = _classify_text_semantic(text, db, tenant_id, headline=headline, company_name_raw=company_name_raw)
         if semantic is not None:
-            return semantic
+            return _promote_if_concurrent_hiring(semantic, text)
 
     return None  # no confident pattern matched (deterministic or semantic) -- not guessed at
 
@@ -349,6 +372,65 @@ def interpret_linkedin_post_signal(signal: GtmSignal, db=None, tenant_id: int | 
         business_change=classification["business_change"](who), matched_phrase=classification["matched_phrase"],
         text=text, method=classification["method"],
     )
+
+
+
+
+# --- Concurrent-hiring promotion for POSTS (2026-08-31) -------------------------------------
+# The post taxonomy has no concurrency notion: every hiring mention, at any scale, collapses to
+# "growth_hiring_mention", which demand_detection.py maps to tier "none" -- a dead end. Confirmed
+# live on a real post: "We just closed a $60M Series B. Now we're hiring 6 GTM roles" (followed by
+# the list: VP Marketing, Director of Enablement, SMB AE, ...) was filed identically to someone
+# idly mentioning they'd made a hire, and could therefore never open a DemandHypothesis. The
+# strongest buying signal in the dataset was structurally unusable.
+#
+# Deterministic on purpose, exactly like _promote_concurrent_hiring_signals does for job signals:
+# a counted fact ("6 roles") is checked, never re-judged by the model, so this can never introduce
+# LLM variance into a tier decision. Only ever UPGRADES growth_hiring_mention -- it cannot touch a
+# problem_statement or any other classification.
+_HIRING_CONTEXT = re.compile(r"\b(hir(?:e|es|ing)|open(?:ing)?s?|roles?|positions?|reqs?|join(?:ing)? (?:us|the team))\b", re.I)
+_EXPLICIT_COUNT = re.compile(
+    r"\b(?:hiring|adding|opening|recruiting|filling)\b[^.\n]{0,40}?\b(\d{1,2}|two|three|four|five|six|seven|eight|nine|ten)\b"
+    r"[^.\n]{0,30}?\b(roles?|positions?|openings?|hires?|reqs?|people|seats?)\b",
+    re.I,
+)
+_WORD_NUMBERS = {"two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10}
+# Distinct GTM/sales role titles -- used only as corroboration when no explicit count is stated.
+_ROLE_TITLES = re.compile(
+    r"\b(VP\s+(?:of\s+)?(?:Sales|Marketing|Revenue)|Head\s+of\s+(?:Sales|Marketing|Growth|Revenue)|"
+    r"Chief\s+Revenue\s+Officer|CRO|Account\s+Executive|AE|SDR|BDR|Sales\s+Development|"
+    r"Business\s+Development|Director\s+of\s+(?:Sales|Enablement|Marketing|Revenue)|"
+    r"Sales\s+Manager|GTM\s+Engineer|Revenue\s+Operations|RevOps|Sales\s+Enablement)\b",
+    re.I,
+)
+MIN_CONCURRENT_ROLES = 2
+
+
+def detect_concurrent_hiring_in_post(text: str) -> dict | None:
+    """Returns {"count", "evidence"} when the post states hiring of MIN_CONCURRENT_ROLES or more
+    at once, else None. Requires a real hiring context -- a post merely listing job titles (an
+    opinion piece about sales roles, say) is not a hiring surge."""
+    if not text or not _HIRING_CONTEXT.search(text):
+        return None
+
+    match = _EXPLICIT_COUNT.search(text)
+    if match:
+        raw = match.group(1).lower()
+        count = _WORD_NUMBERS.get(raw, None)
+        if count is None:
+            try:
+                count = int(raw)
+            except ValueError:
+                count = None
+        if count is not None and count >= MIN_CONCURRENT_ROLES:
+            return {"count": count, "evidence": match.group(0).strip()}
+
+    # No explicit count -- fall back to distinct named roles, which is weaker but still counted,
+    # never inferred. Deduped case-insensitively so one role repeated is not read as several.
+    titles = {t.lower() for t in _ROLE_TITLES.findall(text)}
+    if len(titles) >= MIN_CONCURRENT_ROLES:
+        return {"count": len(titles), "evidence": ", ".join(sorted(titles))}
+    return None
 
 
 def interpret_linkedin_post_signals_grouped(signals: list[GtmSignal], db=None, tenant_id: int | None = None) -> list[InterpretedSignal]:
