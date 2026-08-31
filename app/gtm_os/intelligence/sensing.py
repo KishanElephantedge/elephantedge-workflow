@@ -54,6 +54,26 @@ from app.gtm_os.content.competitors import get_enabled_content_competitors
 from app.rss_client import fetch_feed_entries
 
 
+# Bounded so a large inbox can never turn one sensing run into an unbounded crawl. 100 threads
+# per page; 10 pages is far more history than a daily incremental sweep needs.
+# The endpoint returns 20 per page regardless of what is asked for, so this is stated rather
+# than requested. 60 pages = 1200 threads, comfortably past the current 822, and the loop exits
+# early anyway as soon as every replying prospect has been located.
+SYNCED_INBOX_PAGE_SIZE = 20
+SYNCED_INBOX_MAX_PAGES = 60
+
+
+def _synced_total_pages(raw_response: dict) -> int | None:
+    """totalPages off the real (second) pagination wrapper -- see _extract_thread_pages for why
+    data[0] is the wrong one."""
+    for wrapper in (raw_response.get("data") or []):
+        if isinstance(wrapper, dict) and wrapper.get("data") is not None:
+            pages = wrapper.get("totalPages")
+            if isinstance(pages, int):
+                return pages
+    return None
+
+
 def _dedup_key(source: str, source_ref: str) -> str:
     return hashlib.sha256(f"{source}:{source_ref}".encode()).hexdigest()
 
@@ -436,7 +456,7 @@ def sense_linkedin_replies(
     is preserved on every signal regardless of whether the match succeeds, so a future
     Contact.salesrobot_prospect_uuid column (not added in this step) could re-attribute
     historical signals without re-fetching from the API."""
-    reply_prospect_uuids: list[str] = []
+    reply_prospects: list[dict] = []
     for campaign_uuid in campaign_uuids:
         page = 0
         while True:
@@ -447,28 +467,131 @@ def sense_linkedin_replies(
             prospects = result.get("data", {}).get("data", [])
             for p in prospects:
                 if p.get("isReplied") and p.get("prospectUuid"):
-                    reply_prospect_uuids.append(p["prospectUuid"])
+                    reply_prospects.append(p)
             if len(prospects) < 100:
                 break
             page += 1
 
     signals: list[GtmSignal] = []
-    for prospect_uuid in reply_prospect_uuids:
-        try:
-            raw_response = get_synced_messages(
-                linkedin_account_uuid, db, tenant_id, prospect_uuid_filter=[prospect_uuid], size=1,
-            )
-        except SalesRobotError:
-            continue
 
-        for thread in _extract_thread_pages(raw_response):
+    # 2026-08-31, real fix confirmed live: prospectUuidFilter matches NOTHING. SalesRobot's
+    # synced inbox returns those threads with prospectData/campaignUuid/campaignName all null --
+    # the inbox simply is not attributed back to campaign prospects -- so filtering by prospect
+    # UUID returns totalElements=0 every time, for prospects who demonstrably HAVE replied.
+    # Verified against real data: 5 prospects with isReplied=True and lastActivity="REPLIED",
+    # and every filtered call came back empty while the SAME unfiltered call returned threads.
+    # That is why this source produced 1 signal in its entire lifetime and the whole
+    # outcome/learning loop downstream of it (sales_outcomes, confirmed_patterns) sat at zero:
+    # it was failing silently, reporting success with nothing found.
+    #
+    # So: fetch the inbox UNFILTERED and match threads to the reply-flagged prospects ourselves,
+    # on LinkedIn's stable ACoAA-style unique id, which BOTH sides really do carry (thread
+    # profileUrl vs prospect uniqueLinkedinId). Matching on our own side is also strictly safer
+    # than trusting a provider filter we cannot see inside.
+    def _unique_id(url: str | None) -> str | None:
+        if not url:
+            return None
+        tail = url.rstrip("/").rsplit("/", 1)[-1]
+        return tail.lower() or None
+
+    wanted_ids = {}
+    for prospect in reply_prospects:
+        uid = _unique_id(prospect.get("uniqueLinkedinId"))
+        if uid:
+            wanted_ids[uid] = prospect
+
+    # syncedMessages IGNORES the `size` parameter -- confirmed live: asking for size=100 still
+    # returns 20 per page and echoes size=20, across a real inbox of 822 threads / 42 pages. So
+    # page count must come from the response's own totalPages, never inferred from "a short page
+    # means the last page" -- that assumption stopped this after ONE page, reading 20 of 822
+    # threads and missing every reply.
+    threads: list[dict] = []
+    remaining = dict(wanted_ids)
+    page = 0
+    while page < SYNCED_INBOX_MAX_PAGES and remaining:
+        try:
+            raw_response = get_synced_messages(linkedin_account_uuid, db, tenant_id, page=page, size=SYNCED_INBOX_PAGE_SIZE)
+        except SalesRobotError:
+            break
+        page_threads = _extract_thread_pages(raw_response)
+        if not page_threads:
+            break
+        for thread in page_threads:
+            uid = _unique_id(thread.get("profileUrl"))
+            if uid in remaining:
+                threads.append(thread)
+                remaining.pop(uid, None)   # stop as soon as every replier is found
+        total_pages = _synced_total_pages(raw_response)
+        page += 1
+        if total_pages is not None and page >= total_pages:
+            break
+
+    # A replier with no matching inbox thread still gets a signal (2026-08-31). SalesRobot's
+    # synced inbox does not reliably contain a thread for every campaign prospect who replied --
+    # confirmed live: 5 prospects with lastActivity="REPLIED" and isReplied=True, and NONE of them
+    # matched any of the 822 threads in the inbox (the thread profileUrls are ACoAA-encoded while
+    # most prospect uniqueLinkedinIds are ACwAA-encoded, so the two identifier spaces do not even
+    # overlap).
+    #
+    # The fact of the reply comes from the CAMPAIGN endpoint, which is reliable and already
+    # fetched above; only the message TEXT needs the inbox. Refusing to record the reply because
+    # its text is unavailable is what left sales_outcomes and confirmed_patterns at zero while
+    # real people were replying -- the learning loop starved on a missing nice-to-have.
+    matched_ids = {_unique_id(t.get("profileUrl")) for t in threads}
+    for uid, prospect in wanted_ids.items():
+        if uid in matched_ids:
+            continue
+        source_ref = f"prospect:{prospect.get('prospectUuid')}"
+        already = (
+            db.query(GtmSignal)
+            .filter(GtmSignal.source == "linkedin_reply", GtmSignal.source_ref == source_ref)
+            .first()
+        )
+        if already:
+            continue
+        contact = _match_contact(db, prospect.get("profileUrl"))
+        signal = GtmSignal(
+            tenant_id=tenant_id,
+            source="linkedin_reply",
+            source_ref=source_ref,
+            signal_type="reply",
+            observed_at=None,   # SalesRobot exposes no reply timestamp on the prospect record
+            person_name_raw=prospect.get("fullName"),
+            company_name_raw=prospect.get("companyName"),
+            company_id=contact.company_id if contact else None,
+            contact_id=contact.id if contact else None,
+            raw_evidence=prospect,
+            extracted_info={
+                # No text: the reply is real and recorded, its CONTENT is simply not retrievable
+                # for this prospect. Downstream classification treats a textless reply as the
+                # generic "reply" outcome rather than guessing at sentiment.
+                "text": None,
+                "reply_evidence": "campaign_prospect.lastActivity == 'REPLIED'",
+                "last_activity": prospect.get("lastActivity"),
+                "campaign_name": prospect.get("campaignName"),
+                "campaign_uuid": prospect.get("campaignUuid"),
+                "profile_url": prospect.get("profileUrl"),
+            },
+            dedup_key=_dedup_key("linkedin_reply", source_ref),
+        )
+        db.add(signal)
+        signals.append(signal)
+    if signals:
+        db.commit()
+
+    for thread in threads:
             thread_id = thread.get("threadId")
             prospect_data = thread.get("prospectData") or {}
-            vanity_profile_url = prospect_data.get("profileUrl")  # NOT thread.get("profileUrl") -- see docstring
-            company_name_raw = prospect_data.get("companyName")
-            person_name_raw = thread.get("nameOfPerson")
-            campaign_uuid = thread.get("campaignUuid")
-            campaign_name = thread.get("campaignName")
+            # prospectData is null on real inbox threads, so fall back to the thread's own
+            # profileUrl -- which is the ACoAA unique-id form, matched against the prospect below.
+            vanity_profile_url = prospect_data.get("profileUrl") or thread.get("profileUrl")
+            matched_prospect = wanted_ids.get(_unique_id(thread.get("profileUrl")) or "")
+            if matched_prospect is None:
+                continue  # not one of the prospects who actually replied -- ignore the thread
+            company_name_raw = prospect_data.get("companyName") or matched_prospect.get("companyName")
+            person_name_raw = thread.get("nameOfPerson") or matched_prospect.get("fullName")
+            campaign_uuid = thread.get("campaignUuid") or matched_prospect.get("campaignUuid")
+            campaign_name = thread.get("campaignName") or matched_prospect.get("campaignName")
 
             contact = _match_contact(db, vanity_profile_url)
             company_id = contact.company_id if contact else None
