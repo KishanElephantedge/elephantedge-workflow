@@ -25,6 +25,7 @@ company, so that extra lookup isn't needed.
 """
 from sqlalchemy.orm import Session
 
+from app.apify_budget_guard import STATUS_ALLOWED as APIFY_BUDGET_ALLOWED, check_apify_budget
 from app.apify_client import ApifyError, estimate_cost_usd, search_linkedin_jobs
 from app.apify_client import _get_api_key as _get_apify_api_key
 from app.db.models import Company
@@ -72,6 +73,23 @@ def run_apify_discovery(batch_id: int, db: Session, tenant_id: int, target: int 
     discarding) postings already seen on a prior day -- never a duplicate Company row."""
     seen_domains = _existing_domains(tenant_id, db)
 
+    # Participate in the SHARED Apify budget (2026-08-31). The actor's own `limit` already bounds
+    # this call's worst case (~$0.76 at the 150 cap), but that ceiling was invisible to
+    # check_apify_budget, so discovery could spend against the account while every other source
+    # believed the daily/monthly cap was intact -- and the BudgetGuard passed in by V2's
+    # run_v2_discovery_if_due tracks the DEEPLINE balance, not Apify, so it never covered this
+    # either. Checked before the call, using the same worst-case estimate the limit implies.
+    discovery_limit = min(max(target * 20, 100), APIFY_DISCOVERY_LIMIT_CAP)
+    budget = check_apify_budget(db, tenant_id, estimate_cost_usd(discovery_limit))
+    if budget["status"] != APIFY_BUDGET_ALLOWED:
+        # A budget block is a real, intentional skip -- reported like the ApifyError path below
+        # (a normal empty result the caller already handles), never a crash.
+        return {
+            "companies_discovered": 0, "postings_checked": 0, "rejection_breakdown": {},
+            "budget_stopped_early": True, "api_error": f"apify_budget_blocked: {budget['reason']}",
+            "estimated_cost_usd": 0.0,
+        }
+
     try:
         api_key = _get_apify_api_key(db, tenant_id)
         jobs = search_linkedin_jobs(
@@ -91,7 +109,7 @@ def run_apify_discovery(batch_id: int, db: Session, tenant_id: int, target: int 
             # It's fine (explicitly confirmed, not a bug) if this cap means fewer than
             # `target` companies get kept on a low-inventory day -- the run still completes
             # normally with however many it found, never crashes or stops the pipeline.
-            limit=min(max(target * 20, 100), APIFY_DISCOVERY_LIMIT_CAP),
+            limit=discovery_limit,
         )
     except ApifyError as e:
         return {
