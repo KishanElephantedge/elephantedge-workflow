@@ -127,6 +127,7 @@ from app.gtm_os.content.promotion import run_candidate_promotion_sweep
 from app.gtm_os.content.topic_linking import run_content_topic_linking_sweep
 from app.gtm_os.content.trend_intelligence import run_trend_intelligence_sweep
 from app.gtm_os.icp.company_enrichment import run_company_enrichment_sweep
+from app.gtm_os.orchestration.discovery_profiles import get_enabled_discovery_profiles
 from app.gtm_os.icp.icp_matching import run_icp_matching_sweep
 from app.gtm_os.icp.revenue_estimation import run_revenue_backfill_sweep
 from app.gtm_os.intelligence.demand_detection import run_demand_hypothesis_sweep
@@ -515,21 +516,40 @@ def _run_linkedin_jobs(db: Session, tenant_id: int):
     from app.apify_budget_guard import STATUS_ALLOWED, check_apify_budget
     from app.phases.apify_discovery import APIFY_EMPLOYEE_MAX, APIFY_EMPLOYEE_MIN, APIFY_INDUSTRY_FILTER, APIFY_TITLE_SEARCH
 
+    # One search PER OFFERING PROFILE (2026-08-31), not a single hardcoded V1 filter set. The
+    # old call searched only "25-50 person software company hiring a salesperson" -- Execution's
+    # buyer -- so the other five offerings had no discovery at all. See discovery_profiles.py.
     limit = 25
-    budget_result = check_apify_budget(db, tenant_id, estimate_cost_usd(limit))
-    if budget_result["status"] != STATUS_ALLOWED:
-        raise SourceBudgetBlocked(budget_result["reason"])
+    profiles = get_enabled_discovery_profiles(db, tenant_id)
+    if not profiles:
+        raise MissingSourceConfiguration("no enabled V2 discovery profiles configured")
 
-    return sense_linkedin_jobs(
-        db, tenant_id,
-        title_search=APIFY_TITLE_SEARCH,
-        location_search=["United States"],
-        organization_employees_gte=APIFY_EMPLOYEE_MIN,
-        organization_employees_lte=APIFY_EMPLOYEE_MAX,
-        industry_filter=APIFY_INDUSTRY_FILTER,
-        time_range="24h",
-        limit=limit,
-    )
+    signals = []
+    blocked_reasons = []
+    for profile in profiles:
+        # Budget-checked per profile, so an exhausted budget skips the remaining profiles
+        # instead of the whole source failing -- and whatever ran before it still counts.
+        budget_result = check_apify_budget(db, tenant_id, estimate_cost_usd(limit))
+        if budget_result["status"] != STATUS_ALLOWED:
+            blocked_reasons.append(f"{profile['id']}: {budget_result['reason']}")
+            break
+        signals.extend(sense_linkedin_jobs(
+            db, tenant_id,
+            title_search=profile["title_search"],
+            location_search=["United States"],
+            organization_employees_gte=profile["employee_min"],
+            organization_employees_lte=profile["employee_max"],
+            industry_filter=profile.get("industry_filter") or APIFY_INDUSTRY_FILTER,
+            time_range="24h",
+            limit=limit,
+        ))
+
+    # Only a total block is a skip. If any profile ran, this is a real (partial) success -- the
+    # signals it produced are just as real as a full pass, and reporting it as "skipped" would
+    # discard them from the run record.
+    if not signals and blocked_reasons:
+        raise SourceBudgetBlocked("; ".join(blocked_reasons))
+    return signals
 
 
 def _run_linkedin_replies(db: Session, tenant_id: int):
