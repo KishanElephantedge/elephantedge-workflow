@@ -406,10 +406,25 @@ _ROLE_TITLES = re.compile(
 MIN_CONCURRENT_ROLES = 2
 
 
+# First-person ownership. A post is one PERSON speaking; the only reason it can stand as evidence
+# about their EMPLOYER is if they claim the action as their own company's. Real examples from
+# production show why: recruiters, agencies and consultants routinely post about roles they are
+# filling FOR CLIENTS ("helping a client hire 6 GTM roles"), and attributing that to the poster's
+# own company would target the recruiter instead of the hiring company. Sampling the existing
+# declared-tier posts found the same class of problem everywhere -- ads, opinions, and a
+# consultant quoting a CLIENT's numbers, none of them statements about their own company.
+_FIRST_PERSON = re.compile(r"\b(we|we're|we are|were|our|us|i'm|i am|im)\b", re.I)
+
+
 def detect_concurrent_hiring_in_post(text: str) -> dict | None:
-    """Returns {"count", "evidence"} when the post states hiring of MIN_CONCURRENT_ROLES or more
-    at once, else None. Requires a real hiring context -- a post merely listing job titles (an
-    opinion piece about sales roles, say) is not a hiring surge."""
+    """Returns {"count", "evidence"} when the post states THEIR OWN company is hiring
+    MIN_CONCURRENT_ROLES or more at once, else None.
+
+    Two independent requirements, both necessary:
+      1. a real hiring context -- a post merely listing job titles (an opinion piece about sales
+         roles) is not a hiring surge;
+      2. first-person ownership in the same sentence as the hiring claim -- otherwise a recruiter
+         announcing a client's roles becomes a buying signal about the recruiter."""
     if not text or not _HIRING_CONTEXT.search(text):
         return None
 
@@ -423,14 +438,30 @@ def detect_concurrent_hiring_in_post(text: str) -> dict | None:
             except ValueError:
                 count = None
         if count is not None and count >= MIN_CONCURRENT_ROLES:
-            return {"count": count, "evidence": match.group(0).strip()}
+            # Ownership is checked on the SENTENCE carrying the claim, not the whole post -- a
+            # "we" three paragraphs away in unrelated commentary does not make a client's job
+            # req the author's own.
+            sentence = _sentence_containing(text, match.start())
+            if _FIRST_PERSON.search(sentence):
+                return {"count": count, "evidence": match.group(0).strip()}
+            return None
 
     # No explicit count -- fall back to distinct named roles, which is weaker but still counted,
     # never inferred. Deduped case-insensitively so one role repeated is not read as several.
+    # The title-list fallback is weaker than a counted claim, so it requires ownership across the
+    # post as a whole before it may stand in for one.
+    if not _FIRST_PERSON.search(text):
+        return None
     titles = {t.lower() for t in _ROLE_TITLES.findall(text)}
     if len(titles) >= MIN_CONCURRENT_ROLES:
         return {"count": len(titles), "evidence": ", ".join(sorted(titles))}
     return None
+
+
+def _sentence_containing(text: str, index: int) -> str:
+    start = max(text.rfind(".", 0, index), text.rfind("\n", 0, index)) + 1
+    end = min([x for x in (text.find(".", index), text.find("\n", index)) if x != -1] or [len(text)])
+    return text[start:end]
 
 
 def interpret_linkedin_post_signals_grouped(signals: list[GtmSignal], db=None, tenant_id: int | None = None) -> list[InterpretedSignal]:
