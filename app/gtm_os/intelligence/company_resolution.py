@@ -118,6 +118,13 @@ PROFILE_ENRICHMENT_PAGE_SIZE = 1
 # crustdata_v3_person_search) and search_contact's own already-parsed top-level person fields.
 _PROFILE_COMPANY_DOMAIN_KEYS = ("company_website_domain", "company_domain", "domain", "website")
 _PROFILE_COMPANY_NAME_KEYS = ("company_name", "company", "current_company", "employer")
+# The author's role at that company. Captured because a post is one PERSON speaking, and whether
+# it can stand as evidence about their EMPLOYER depends on whether they are senior enough to speak
+# for it -- see AUTHOR_SENIORITY_KEY's consumers in demand_detection.py. Free: search_contact
+# already returns these on the same call that resolves the company, no extra lookup.
+_PROFILE_TITLE_KEYS = ("title", "job_title", "headline")
+_PROFILE_SENIORITY_KEYS = ("seniority", "seniority_level")
+_PROFILE_DEPARTMENT_KEYS = ("department", "function")
 
 
 def _first_present(person: dict, keys: tuple[str, ...]) -> str | None:
@@ -359,7 +366,7 @@ def create_company_from_signal(db: Session, tenant_id: int, company_name: str | 
     return {"status": "resolved", "method": "created_from_signal", "reason": None, "company_id": company.id, "created": True}
 
 
-def _try_profile_enrichment(db: Session, tenant_id: int, profile_url: str) -> dict:
+def _try_profile_enrichment(db: Session, tenant_id: int, profile_url: str, signal: GtmSignal | None = None) -> dict:
     """Only called when no exact company-name match was found AND the caller explicitly opted
     into paid enrichment AND the signal actually captured a real author profile URL (never
     invented here -- see resolve_company_for_signal). Same fail-safe discipline as
@@ -388,6 +395,20 @@ def _try_profile_enrichment(db: Session, tenant_id: int, profile_url: str) -> di
     person = persons[0]
     company_domain = _first_present(person, _PROFILE_COMPANY_DOMAIN_KEYS)
     company_name = _first_present(person, _PROFILE_COMPANY_NAME_KEYS)
+
+    # Persist the author's real role onto the signal, on the same call that resolved the company.
+    # Downstream gating needs it and must never have to pay for a second lookup to get it.
+    author_role = {
+        "title": _first_present(person, _PROFILE_TITLE_KEYS),
+        "seniority": _first_present(person, _PROFILE_SENIORITY_KEYS),
+        "department": _first_present(person, _PROFILE_DEPARTMENT_KEYS),
+    }
+    if any(author_role.values()) and signal is not None:
+        info = dict(signal.extracted_info or {})
+        info["author_role"] = author_role
+        signal.extracted_info = info
+        db.add(signal)
+        db.commit()
     if not company_domain and not company_name:
         return {
             "status": "unresolved",
@@ -482,7 +503,7 @@ def resolve_company_for_signal(
         if result is None and allow_paid_enrichment:
             profile_url = (signal.extracted_info or {}).get("author_profile_url")
             if profile_url:
-                profile_result = _try_profile_enrichment(db, tenant_id, profile_url)
+                profile_result = _try_profile_enrichment(db, tenant_id, profile_url, signal=signal)
                 if profile_result["status"] == "resolved":
                     result = profile_result
                 else:

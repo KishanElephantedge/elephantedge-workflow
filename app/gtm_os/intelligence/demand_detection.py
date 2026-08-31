@@ -26,12 +26,16 @@ evidence, full stop, per the Step 7 design doc's own independence model (§7).""
 
 from datetime import datetime
 
+import logging
+
 from sqlalchemy.orm import Session
 
 from app.gtm_os.intelligence.demand_hypothesis import DemandHypothesis, DemandHypothesisEvidence
 from app.gtm_os.intelligence.interpreted_signal import InterpretedSignal
 from app.gtm_os.intelligence.problem_detection import evaluate_interpreted_signal as evaluate_problem_signal
 from app.gtm_os.intelligence.signal import GtmSignal
+
+logger = logging.getLogger(__name__)
 
 # event_type -> demand tier. Anything not listed here does NOT qualify as Demand evidence at all
 # (DEFAULT_DEMAND_TIER = "none") -- distinct from the Problem layer's own tier map; see module
@@ -146,6 +150,47 @@ def _generic_demand_statement(interpreted_signal: InterpretedSignal) -> str:
     return f"{company} appears to be actively looking for ways to address a {function}-related need."
 
 
+
+# Seniority that can credibly speak FOR a company. A job posting is a company action -- the
+# company paid to publish it -- so it needs no such check. A POST is one person speaking, and a
+# junior employee's claim about company-wide intent is not the company's intent.
+# Values are matched case-insensitively as substrings, since providers vary ("Owner", "C-Level",
+# "CXO", "VP of Sales", "Head of Growth").
+DECISION_MAKER_SENIORITY_MARKERS = (
+    "owner", "founder", "c_level", "c-level", "clevel", "cxo", "chief", "partner",
+    "vp", "vice president", "head", "director", "president",
+)
+
+
+def _author_can_speak_for_company(db: Session, interpreted_signal: InterpretedSignal) -> tuple[bool, str]:
+    """Post-only gate (2026-08-31). Returns (allowed, reason).
+
+    Jobs are unaffected: a posted job req is a company ACTION, already company-level evidence.
+    This only governs whether a linkedin_post may open COMPANY-level demand, which is what
+    triggers outreach at that company.
+
+    Rationale from real data: sampling declared-tier posts found ads, opinions, and a consultant
+    quoting a CLIENT's numbers -- none of them statements about the author's own company. Even
+    for a genuine first-person claim, it only carries company weight if the author is senior
+    enough to make it. Gal Aga (CEO Co-Founder, seniority "Owner") does; an SDR posting the same
+    words does not.
+
+    Unknown seniority is NOT treated as senior. Author role is captured free on the same
+    search_contact call that resolves the company, so "unknown" means identity was never
+    established that way -- and an unverified speaker cannot be assumed to speak for the company."""
+    raw = db.get(GtmSignal, interpreted_signal.source_signal_id)
+    if raw is None or raw.source != "linkedin_post":
+        return True, "not a post -- company-level by construction"
+
+    role = (raw.extracted_info or {}).get("author_role") or {}
+    haystack = " ".join(str(v).lower() for v in (role.get("seniority"), role.get("title")) if v)
+    if not haystack:
+        return False, "post author's role is unknown -- cannot confirm they speak for the company"
+    if any(marker in haystack for marker in DECISION_MAKER_SENIORITY_MARKERS):
+        return True, f"post author is a decision maker ({role.get('title') or role.get('seniority')})"
+    return False, f"post author is not a decision maker ({role.get('title') or role.get('seniority')}) -- their post is not company-level demand"
+
+
 def evaluate_interpreted_signal_for_demand(
     db: Session,
     tenant_id: int,
@@ -159,6 +204,13 @@ def evaluate_interpreted_signal_for_demand(
     demand_tier = classify_demand_tier(interpreted_signal)
     if demand_tier not in DEMAND_QUALIFYING_TIERS:
         return None  # e.g. hiring_activity, problem_statement alone, growth_hiring_mention, solution_adoption_mention
+
+    # Post-only: a person must be senior enough to speak for their employer before their post
+    # becomes company-level demand and triggers outreach there. Jobs pass untouched.
+    allowed, reason = _author_can_speak_for_company(db, interpreted_signal)
+    if not allowed:
+        logger.info("demand_detection: interpreted_signal=%s not opened -- %s", interpreted_signal.id, reason)
+        return None
 
     # Ensure the underlying problem exists -- reuses the EXISTING Problem-layer gate with the
     # SAME signal, so a signal that both implies a problem and shows outward-looking evidence
