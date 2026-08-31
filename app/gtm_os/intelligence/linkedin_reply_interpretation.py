@@ -146,7 +146,34 @@ def interpret_linkedin_reply_signal(signal: GtmSignal) -> InterpretedSignal | No
     extracted = signal.extracted_info or {}
     text = extracted.get("text")
     if not text:
-        return None
+        # A reply we know happened but whose TEXT is unavailable (2026-08-31). SalesRobot's
+        # campaign endpoint reports lastActivity == "REPLIED" reliably, while its synced inbox
+        # cannot be matched back to most of those prospects at all -- see sensing.py's own note
+        # on the two non-overlapping LinkedIn identifier encodings.
+        #
+        # Returning None here is what silently discarded every such reply, and with it the entire
+        # outcome/learning loop: real people replied, and sales_outcomes stayed at zero. The fact
+        # of a reply is a genuine, verified outcome on its own -- it just cannot be classified as
+        # positive/negative without words. So it is recorded as a plain reply and left to map to
+        # the generic "reply" outcome category, never guessed at.
+        if not extracted.get("reply_evidence"):
+            return None
+        return InterpretedSignal(
+            tenant_id=signal.tenant_id,
+            source_signal_id=signal.id,
+            event_type="reply_received",   # unmapped in outcome.py -> generic "reply", by design
+            affected_function="sales",
+            business_change=f"{signal.person_name_raw or 'The prospect'} replied to outreach (message text not retrievable).",
+            evidence_excerpt=str(extracted.get("reply_evidence")),
+            extraction_method="deterministic:campaign_reply_flag",
+            # "low", not medium: we know THAT they replied, nothing about what they said.
+            extraction_confidence="low",
+            company_id=signal.company_id,
+            company_name_raw=signal.company_name_raw,
+            contact_id=signal.contact_id,
+            person_name_raw=signal.person_name_raw,
+            observed_at=signal.observed_at,
+        )
     text_lower = text.lower()
     previous_text = extracted.get("previous_message_text")
     previous_direction = extracted.get("previous_message_direction")
