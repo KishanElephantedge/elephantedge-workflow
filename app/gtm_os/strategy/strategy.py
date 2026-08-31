@@ -39,6 +39,8 @@ structurally never change the decision itself."""
 from datetime import datetime
 
 from sqlalchemy import Boolean, Column, DateTime, ForeignKey, Integer, JSON, String, Text
+import logging
+
 from sqlalchemy.orm import Session
 
 from app.db.models import Base, Contact
@@ -50,6 +52,8 @@ from app.gtm_os.intelligence.demand_hypothesis import DemandHypothesis, DemandHy
 from app.gtm_os.intelligence.interpreted_signal import InterpretedSignal
 from app.gtm_os.intelligence.problem_hypothesis import ProblemHypothesis, ProblemHypothesisEvidence
 from app.gtm_os.icp.icp_offering_matching import match_offerings_for_opportunity
+
+logger = logging.getLogger(__name__)
 from app.gtm_os.opportunity.opportunity import Opportunity
 
 STRATEGY_TYPES = {"insufficient_context", "diagnostic", "consultative", "execution-led", "nurture"}
@@ -206,6 +210,41 @@ def _demand_has_self_verified_hiring_evidence(db: Session, demand: DemandHypothe
     return bool(event_types & SELF_VERIFIED_HIRING_EVENT_TYPES)
 
 
+
+# Channels a message can actually be dispatched on today. "salesrobot" is the real LinkedIn
+# sender (see send/channels.py); "heyreach" is configured alongside it in offering_config.
+_DISPATCHABLE_CHANNELS = ("salesrobot", "heyreach")
+
+
+def _offering_is_actionable(db: Session, tenant_id: int, offering_name: str) -> bool:
+    """True when this offering has a campaign configured on at least one channel.
+
+    Why this gates offering SELECTION (2026-08-31): matching and dispatchability were decided
+    independently, so the system happily picked the best-fitting offering and only discovered at
+    send time that there was nowhere to send it. Measured in production: 9 of 15 strategies
+    matched "Consulting", which has no campaign on any channel -- 60% of qualified opportunities
+    were dead on arrival by configuration, not by fit."""
+    from app.gtm_os.opportunity.offering_config import get_offering_campaign_id
+
+    return any(get_offering_campaign_id(db, tenant_id, offering_name, channel) for channel in _DISPATCHABLE_CHANNELS)
+
+
+def _pick_matched_offering(db: Session, tenant_id: int, candidate_matches: list[dict]) -> tuple[str, bool]:
+    """Chooses among genuinely-matching offerings, preferring one that can actually be actioned.
+
+    Never widens what counts as a match -- every candidate here already passed the real ICP and
+    offering-fit rules in icp_offering_matching.py, which are untouched. This only breaks the tie
+    that `candidate_matches[0]` was resolving arbitrarily by config order.
+
+    If NO candidate is dispatchable, the best-fitting one is still returned (with False), because
+    the honest state is "this account fits an offering we cannot currently send for" -- silently
+    reporting no_match would hide a real, qualified opportunity behind a configuration gap."""
+    for match in candidate_matches:
+        if _offering_is_actionable(db, tenant_id, match["offering"]):
+            return match["offering"], True
+    return candidate_matches[0]["offering"], False
+
+
 def _select_strategy_type(db: Session, problem: ProblemHypothesis, demand: DemandHypothesis, opportunity: Opportunity, offering_fit_status: str) -> tuple[str, list[str]]:
     """Pure, deterministic taxonomy selection -- reads ONLY Problem/Demand tiers, affected_function,
     and offering_fit_status. Never reads market/trend context (see module docstring)."""
@@ -317,7 +356,13 @@ def generate_strategy_facts(db: Session, tenant_id: int, opportunity: Opportunit
     candidate_matches = [m for m in offering_matches if m["status"] == "candidate_match"]
     if candidate_matches:
         offering_fit_status = "candidate_match"
-        matched_offering_name = candidate_matches[0]["offering"]
+        matched_offering_name, offering_dispatchable = _pick_matched_offering(db, tenant_id, candidate_matches)
+        if not offering_dispatchable:
+            logger.warning(
+                "gtm_strategy: opportunity_id=%s matched offering %r, which has no campaign configured on any channel "
+                "-- it cannot be sent until one is set up",
+                opportunity.id, matched_offering_name,
+            )
     elif any(m["status"] == "excluded" for m in offering_matches):
         offering_fit_status = "excluded"
         matched_offering_name = None
