@@ -21,6 +21,8 @@ person's grouped signals) appear to say" -- never whether it constitutes demand,
 ICP fit, offering/playbook fit, urgency, or buying intent. Those are later, not-yet-built
 layers."""
 
+from datetime import datetime, timedelta
+
 from sqlalchemy.orm import Session
 
 from app.gtm_os.intelligence.interpreted_signal import InterpretedSignal
@@ -31,6 +33,7 @@ from app.gtm_os.intelligence.linkedin_post_interpretation import (
 )
 from app.gtm_os.intelligence.linkedin_reply_interpretation import interpret_linkedin_reply_signal
 from app.gtm_os.intelligence.signal import GtmSignal
+from app.phases.hiring_signal import JOB_POSTING_MAX_AGE_DAYS
 from app.phases.hiring_signal import _classify_role
 
 ROLE_AFFECTED_FUNCTION = {
@@ -228,6 +231,72 @@ def _promote_concurrent_hiring_signals(job_results: list[tuple[GtmSignal, Interp
             )
             result.extraction_method = "deterministic:concurrent_hiring_count"
             result.extraction_confidence = "medium"
+
+
+CONCURRENT_HIRING_WINDOW_DAYS = JOB_POSTING_MAX_AGE_DAYS
+
+
+def promote_concurrent_hiring_across_sweeps(db: Session, tenant_id: int) -> dict:
+    """Cross-sweep counterpart to _promote_concurrent_hiring_signals (2026-08-31).
+
+    That function only ever counted postings interpreted within a SINGLE sweep batch -- its own
+    docstring names this as a scope limitation. Real consequence, measured against production: 14
+    companies had 2-4 distinct sales roles open concurrently (Lumion 4, iCOUNTER 3, Elantis 3,
+    eleven more with 2) and every one stayed plain "hiring_activity" -- demand tier "none", a dead
+    end -- purely because their postings happened to arrive on different days. Since the daily
+    sweep senses "what's new" incrementally, a company's concurrent postings almost never land in
+    one batch, so the batch-scoped rule fires far less than intended.
+
+    Groups by resolved company_id first, falling back to company_name_raw only when identity was
+    never resolved -- name grouping was the original key, but it silently splits the same company
+    across spelling variants and cannot merge two names for one account.
+
+    Bounded to postings observed within CONCURRENT_HIRING_WINDOW_DAYS, matching the same
+    max-age window the job sensing query itself uses -- "open at once" has to mean currently
+    open, not ever-posted. Idempotent: only rows still at plain "hiring_activity" are promoted,
+    so re-running never double-counts or overwrites a JD-classifier promotion."""
+    cutoff = datetime.utcnow() - timedelta(days=CONCURRENT_HIRING_WINDOW_DAYS)
+    rows = (
+        db.query(InterpretedSignal, GtmSignal)
+        .join(GtmSignal, InterpretedSignal.source_signal_id == GtmSignal.id)
+        .filter(InterpretedSignal.tenant_id == tenant_id)
+        .filter(GtmSignal.source == "linkedin_job")
+        .filter(InterpretedSignal.event_type == "hiring_activity")
+        .filter(GtmSignal.created_at >= cutoff)
+        .all()
+    )
+
+    by_company: dict[tuple, list[tuple[InterpretedSignal, GtmSignal]]] = {}
+    for interpreted, signal in rows:
+        if signal.company_id is not None:
+            key = ("id", signal.company_id)
+        elif signal.company_name_raw:
+            key = ("name", signal.company_name_raw)
+        else:
+            continue
+        by_company.setdefault(key, []).append((interpreted, signal))
+
+    promoted = 0
+    companies_promoted = 0
+    for key, items in by_company.items():
+        if len(items) < 2:
+            continue
+        companies_promoted += 1
+        label = items[0][1].company_name_raw or f"company_id={key[1]}"
+        titles = [(sig.extracted_info or {}).get("title") or "unknown role" for _, sig in items]
+        for interpreted, _sig in items:
+            interpreted.event_type = "concurrent_hiring_surge"
+            interpreted.business_change = (
+                f"{label} has {len(items)} distinct sales-role job postings open at once "
+                f"({', '.join(titles)}) -- a real concurrent hiring surge, not a single ordinary hire."
+            )
+            interpreted.extraction_method = "deterministic:concurrent_hiring_count_cross_sweep"
+            interpreted.extraction_confidence = "medium"
+            db.add(interpreted)
+            promoted += 1
+    if promoted:
+        db.commit()
+    return {"status": "succeeded", "companies_promoted": companies_promoted, "signals_promoted": promoted}
 
 
 def run_interpretation_sweep(

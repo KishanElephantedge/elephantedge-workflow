@@ -130,7 +130,7 @@ from app.gtm_os.icp.company_enrichment import run_company_enrichment_sweep
 from app.gtm_os.icp.icp_matching import run_icp_matching_sweep
 from app.gtm_os.icp.revenue_estimation import run_revenue_backfill_sweep
 from app.gtm_os.intelligence.demand_detection import run_demand_hypothesis_sweep
-from app.gtm_os.intelligence.interpretation import run_interpretation_sweep
+from app.gtm_os.intelligence.interpretation import promote_concurrent_hiring_across_sweeps, run_interpretation_sweep
 from app.gtm_os.intelligence.investigation_cycle import run_investigation_cycle
 from app.gtm_os.intelligence.signal import GtmSignal
 from app.gtm_os.intelligence.problem_detection import run_problem_hypothesis_sweep
@@ -814,9 +814,15 @@ def run_gtm_intelligence_sweep(
 
     try:
         interpreted = run_interpretation_sweep(db, tenant_id, sources=ALL_INTERPRETED_SOURCES)
-        result["interpretation"] = {"status": "succeeded", "created": len(interpreted)}
+        # Cross-sweep concurrent-hiring promotion (2026-08-31): interpretation's own promotion
+        # only ever counted postings within one batch, so a company whose concurrent postings
+        # arrived on different days stayed at dead-end "hiring_activity". Measured against real
+        # data this recovered 14 companies / 32 signals on first run. Runs inside the same
+        # try/except -- it is part of interpreting job signals, not a separate stage.
+        promotion = promote_concurrent_hiring_across_sweeps(db, tenant_id)
+        result["interpretation"] = {"status": "succeeded", "created": len(interpreted), "concurrent_hiring_promotion": promotion}
         any_succeeded = True
-        logger.info("gtm_intelligence_sweep: interpretation succeeded (%d created)", len(interpreted))
+        logger.info("gtm_intelligence_sweep: interpretation succeeded (%d created, promotion=%s)", len(interpreted), promotion)
     except Exception as e:  # noqa: BLE001 -- see module docstring
         db.rollback()  # 2026-08-26, real fix -- see the ACCOUNT_STRATEGY_STAGES loop's own comment for the full explanation
         result["interpretation"] = {"status": "failed", "error": str(e)}
