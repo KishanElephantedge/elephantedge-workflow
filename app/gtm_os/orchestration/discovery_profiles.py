@@ -42,6 +42,15 @@ from app.phases.apify_discovery import (
 
 DISCOVERY_PROFILES_PARAMETER_KEY = "v2_discovery_profiles"
 
+# V1 moved its own job search off "24h" on 2026-08-10 after confirming live that a 24-hour window
+# "produced only 1 real posting on an otherwise-normal day, well short of the 5-10/day target".
+# V2's sensing was still on 24h and reproduced exactly that: 8 signals across three searches in
+# run 116. Cost stays bounded either way because Apify bills per RESULT RETURNED and each search
+# is capped by its own limit -- a wider window fills that cap with real postings instead of
+# leaving it mostly empty. Re-fetched postings already seen are dropped by sensing's own
+# source_ref guard, so a wider window never creates duplicate signals.
+DEFAULT_TIME_RANGE = "7d"
+
 
 class DiscoveryProfileError(ValueError):
     """Raised when a discovery profile fails validation -- never silently coerced."""
@@ -50,6 +59,7 @@ class DiscoveryProfileError(ValueError):
 DEFAULT_DISCOVERY_PROFILES: list[dict] = [
     {
         "id": "execution",
+        "time_range": DEFAULT_TIME_RANGE,
         "offering_names": ["Execution", "Consulting"],
         "enabled": True,
         # V1's real, proven filters, unchanged -- this is the one profile with a track record.
@@ -60,6 +70,7 @@ DEFAULT_DISCOVERY_PROFILES: list[dict] = [
     },
     {
         "id": "sales_os",
+        "time_range": DEFAULT_TIME_RANGE,
         "offering_names": ["Sales OS"],
         "enabled": True,
         # Sales OS is "agentic layers for sales" -- the buying signal is a company BUILDING GTM
@@ -76,6 +87,7 @@ DEFAULT_DISCOVERY_PROFILES: list[dict] = [
     },
     {
         "id": "workshop",
+        "time_range": DEFAULT_TIME_RANGE,
         "offering_names": ["Workshop"],
         "enabled": True,
         # Workshop teaches FOUNDERS how sales should work -- the signal is a founder-led company

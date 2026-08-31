@@ -540,7 +540,7 @@ def _run_linkedin_jobs(db: Session, tenant_id: int):
             organization_employees_gte=profile["employee_min"],
             organization_employees_lte=profile["employee_max"],
             industry_filter=profile.get("industry_filter") or APIFY_INDUSTRY_FILTER,
-            time_range="24h",
+            time_range=profile.get("time_range") or "7d",
             limit=limit,
         ))
 
