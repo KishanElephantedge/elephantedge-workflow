@@ -440,6 +440,7 @@ def _source_cadence_due(db: Session, tenant_id: int, source: str, cadence_days: 
 
 
 CONTENT_SENSING_CADENCE_DAYS = 7
+CONTENT_CADENCE_SOURCES = ("web_search_trend", "competitor_content")
 
 
 def _get_salesrobot_config(db: Session, tenant_id: int) -> tuple[str, list[str]] | None:
@@ -640,6 +641,12 @@ def _dry_run_source_status(db: Session, tenant_id: int, name: str) -> dict:
         if _get_salesrobot_config(db, tenant_id) is None:
             return {"status": "would_skip", "reason": "missing SalesRobot configuration for this tenant"}
         return {"status": "would_run"}
+    # The weekly content channels are skipped by cadence in a real run -- this preview has to say
+    # so, or dry_run reports "would_run" for sources that will not actually run (2026-08-31).
+    if name in CONTENT_CADENCE_SOURCES:
+        due, reason = _source_cadence_due(db, tenant_id, name, CONTENT_SENSING_CADENCE_DAYS)
+        if not due:
+            return {"status": "would_skip", "reason": f"not due: {reason}"}
     return {"status": "would_run"}
 
 
