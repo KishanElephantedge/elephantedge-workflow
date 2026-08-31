@@ -58,12 +58,17 @@ RESOLUTION ORDER (cheapest/safest first, per the approved task):
    test found Apify spend has NO budget tracking anywhere in this codebase yet (a real production
    incident, 2026-08-22) -- until a real Apify budget guard exists (an already-agreed separate
    follow-up), this fallback must never fire automatically. Callers must opt in deliberately.
-   If the verified domain matches an EXISTING Company in our own table -> resolved. If
-   enrichment identifies a real company that does not yet exist in our table, this is
-   deliberately still reported as unresolved: creating a new Company from a single social-media
-   mention is a materially bigger, riskier decision (a permanent business record) than resolving
-   an already-known one, and is explicitly out of scope for this build -- see this module's own
-   report for why Option A (link-only) was chosen over Option B (create-on-verify).
+   If the verified domain matches an EXISTING Company in our own table -> resolved. If enrichment
+   identifies a real company that does NOT yet exist in our table, it is now CREATED
+   (create_company_from_signal, 2026-08-31) rather than discarded.
+
+   This reverses the build's original "Option A (link-only) over Option B (create-on-verify)"
+   decision, and the reversal is the point: link-only meant a person-authored post could only ever
+   resolve to a company V1's jobs-first discovery had already happened to find. Since an
+   Opportunity requires company_id, every post about a company we had not already discovered was
+   discarded no matter how strong its evidence -- measured in production, 220 of 222 posts were
+   person-authored and 0 resolved. Creation requires a real DOMAIN from a verified provider
+   record, never a bare name, so it cannot manufacture identities from a guess.
 
 STEP 3 FIELD-NAME CAVEAT (be honest about what's confirmed): `search_contact`'s real schema
 (confirmed via `deepline tools describe search_contact --json`, 2026-08-23) documents
@@ -86,6 +91,7 @@ attempt happened (company_resolution_status/method/reason/resolved_at) so "never
 four NULL), "resolved", "unresolved", and "ambiguous" are all distinguishable afterward --
 categorical and explainable, never a numeric confidence score (per the task's own instruction)."""
 
+import logging
 from datetime import datetime
 
 from sqlalchemy import func
@@ -96,6 +102,8 @@ from app.db.models import Company
 from app.deepline_client import DeeplineError, execute_tool, extract_rows
 from app.gtm_os.intelligence.signal import GtmSignal
 from app.gtm_os.intelligence.interpreted_signal import InterpretedSignal
+
+logger = logging.getLogger(__name__)
 
 # Real cost per search_contact result RETURNED (confirmed live via decision_maker.py's own
 # documented figure and the schema's own pricing note, 2026-08-23) -- zero returned contacts are
@@ -207,11 +215,8 @@ def _try_paid_enrichment(db: Session, tenant_id: int, company_name_raw: str) -> 
     if existing:
         return {"status": "resolved", "method": "enrichment_domain_match", "reason": None, "company_id": existing.id}
 
-    return {
-        "status": "unresolved",
-        "method": None,
-        "reason": f"enrichment_verified_real_company (domain={guessed_domain!r}, name={verified_name!r}) but it does not exist in our Company table -- creating a new Company from a single social-post mention is out of scope for this build (see module docstring, Option A chosen over Option B)",
-    }
+    # Verified against a real provider record (not a bare Google guess) -- create it.
+    return create_company_from_signal(db, tenant_id, verified_name, guessed_domain)
 
 
 def _try_apify_profile_enrichment(db: Session, tenant_id: int, profile_url: str) -> dict:
@@ -266,14 +271,92 @@ def _try_apify_profile_enrichment(db: Session, tenant_id: int, profile_url: str)
     if existing:
         return {"status": "resolved", "method": "apify_profile_enrichment", "reason": None, "company_id": existing.id}
 
-    return {
-        "status": "unresolved",
-        "method": None,
-        "reason": (
-            f"apify_profile_enrichment_guessed_domain={guessed_domain!r} but no existing Company matches it -- "
-            "creating one from a single social-post mention is out of scope (see module docstring, Option A over Option B)"
-        ),
-    }
+    # Create it (2026-08-31). Previously this returned "unresolved", which is what made
+    # person-authored posts structurally unusable -- see create_company_from_signal.
+    return create_company_from_signal(db, tenant_id, None, guessed_domain)
+
+
+
+V2_SIGNAL_BATCH_SOURCE = "v2-signal"
+
+
+def _get_or_create_signal_batch(db: Session, tenant_id: int):
+    """One reusable batch for every company this module creates, so signal-created accounts are
+    always distinguishable from V1's ("deepline"/"jobo") and from V2's jobs-first discovery
+    ("v2_discovery") -- which is what lets company_enrichment.py scope itself to V2's own
+    companies without touching V1's backlog."""
+    from app.db.models import Batch
+
+    batch = (
+        db.query(Batch)
+        .filter(Batch.tenant_id == tenant_id, Batch.source == V2_SIGNAL_BATCH_SOURCE)
+        .order_by(Batch.created_at.desc())
+        .first()
+    )
+    if batch is None:
+        batch = Batch(tenant_id=tenant_id, name=f"v2-signal-{datetime.utcnow().isoformat()}", source=V2_SIGNAL_BATCH_SOURCE)
+        db.add(batch)
+        db.commit()
+        db.refresh(batch)
+    return batch
+
+
+def create_company_from_signal(db: Session, tenant_id: int, company_name: str | None, company_domain: str | None) -> dict:
+    """Creates a real Company row for a company a signal genuinely identified but that we do not
+    already have (2026-08-31).
+
+    This replaces the module's original "Option A over Option B" refusal, which returned
+    "unresolved" whenever enrichment had successfully identified a real company that simply was
+    not in our table yet. That refusal is what made person-authored posts structurally unusable:
+    an Opportunity requires company_id, so every post naming a company V1's jobs-first discovery
+    had never happened to find was discarded no matter how strong the evidence.
+
+    Identity comes from the enrichment result (already verified against a real provider record --
+    never a guess), and firmographics are then filled from crustdata_v3_company_identify, which
+    is FREE (verified: account balance unchanged across a real call). Refuses to create anything
+    without a domain: a bare name is not a durable identity, cannot be deduped reliably, and is
+    exactly how duplicate rows get created."""
+    if not company_domain:
+        return {"status": "unresolved", "method": None, "reason": f"cannot create a Company from name {company_name!r} with no domain -- a name alone is not a durable identity"}
+
+    domain = company_domain.strip().lower()
+    existing = db.query(Company).filter(func.lower(Company.domain) == domain).first()
+    if existing:
+        return {"status": "resolved", "method": "existing_domain_match", "reason": None, "company_id": existing.id}
+
+    name = company_name
+    linkedin_url = None
+    industry = None
+    employee_count = None
+    try:
+        from app.phases.jd_first_discovery import _real_firmographics
+
+        firmographics = _real_firmographics(domain) or {}
+        name = firmographics.get("name") or name
+        linkedin_url = firmographics.get("professional_network_url")
+        industries = firmographics.get("industries") or []
+        industry = industries[0] if industries else None
+        # Bucket low bound only, never a midpoint: an invented midpoint reads as a measurement.
+        # company_enrichment.derive/harvestapi replaces this with the exact count later.
+        rng = (firmographics.get("employee_count_range") or "").split("-")
+        if rng and rng[0].isdigit():
+            employee_count = int(rng[0])
+    except Exception as e:  # noqa: BLE001 -- firmographics are a bonus; identity already came from enrichment
+        logger.warning("create_company_from_signal: firmographics lookup failed for %s -- %s", domain, e)
+
+    if not name:
+        return {"status": "unresolved", "method": None, "reason": f"no company name available for domain {domain!r}"}
+
+    batch = _get_or_create_signal_batch(db, tenant_id)
+    company = Company(
+        batch_id=batch.id, name=name, domain=domain,
+        linkedin_url=linkedin_url, industry=industry, employee_count=employee_count,
+    )
+    db.add(company)
+    db.commit()
+    db.refresh(company)
+    logger.info("create_company_from_signal: created company_id=%s name=%r domain=%s", company.id, company.name, domain)
+    return {"status": "resolved", "method": "created_from_signal", "reason": None, "company_id": company.id, "created": True}
 
 
 def _try_profile_enrichment(db: Session, tenant_id: int, profile_url: str) -> dict:
@@ -329,15 +412,9 @@ def _try_profile_enrichment(db: Session, tenant_id: int, profile_url: str) -> di
     if existing:
         return {"status": "resolved", "method": "profile_enrichment_search_contact", "reason": None, "company_id": existing.id}
 
-    return {
-        "status": "unresolved",
-        "method": None,
-        "reason": (
-            f"profile_enrichment_identified_real_company (domain={company_domain!r}, name={company_name!r}) "
-            "but it does not exist in our Company table -- creating one from a single social-post mention is "
-            "out of scope (see module docstring, Option A over Option B)"
-        ),
-    }
+    # search_contact matched a REAL person record and returned their current employer -- the most
+    # reliable identity this module can obtain. Create it rather than discarding the signal.
+    return create_company_from_signal(db, tenant_id, company_name, company_domain)
 
 
 def resolve_company_for_signal(

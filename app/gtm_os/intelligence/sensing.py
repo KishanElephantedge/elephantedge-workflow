@@ -220,8 +220,16 @@ def sense_linkedin_posts(
             source_ref=source_ref,
             signal_type="post",
             observed_at=_parse_dt(item.get("postedAtISO") or item.get("postedAt") or item.get("date")),
-            person_name_raw=item.get("authorName") or item.get("author"),
-            company_name_raw=_guess_company_name(headline),
+            # A Company-authored post IS the company -- its authorName is the real org name, not
+            # a person's headline (2026-08-31). Parsing it through _guess_company_name, which is
+            # built to pull an employer out of a PERSON's "Title at Company" headline, threw that
+            # away and left these posts unresolvable like every other one. Person-authored posts
+            # keep the headline parser exactly as before.
+            person_name_raw=None if item.get("authorType") == "Company" else (item.get("authorName") or item.get("author")),
+            company_name_raw=(
+                item.get("authorName") if item.get("authorType") == "Company"
+                else _guess_company_name(headline)
+            ),
             raw_evidence=item,
             extracted_info={
                 "text": item.get("text") or item.get("content"),
@@ -231,6 +239,9 @@ def sense_linkedin_posts(
                 "author_public_id": author.get("publicId"),
                 "author_urn": item.get("authorUrn"),
                 "author_type": item.get("authorType"),
+                # For a Company-authored post this is the company page URL, which is a far
+                # stronger identity key than a name -- kept so resolution can use it directly.
+                "author_company_url": item.get("authorProfileUrl") if item.get("authorType") == "Company" else None,
             },
             dedup_key=_dedup_key("linkedin_post", source_ref),
         )
