@@ -27,6 +27,7 @@ evidence, full stop, per the Step 7 design doc's own independence model (§7).""
 from datetime import datetime
 
 import logging
+import re
 
 from sqlalchemy.orm import Session
 
@@ -184,11 +185,47 @@ def _author_can_speak_for_company(db: Session, interpreted_signal: InterpretedSi
 
     role = (raw.extracted_info or {}).get("author_role") or {}
     haystack = " ".join(str(v).lower() for v in (role.get("seniority"), role.get("title")) if v)
-    if not haystack:
-        return False, "post author's role is unknown -- cannot confirm they speak for the company"
-    if any(marker in haystack for marker in DECISION_MAKER_SENIORITY_MARKERS):
+    if haystack and any(marker in haystack for marker in DECISION_MAKER_SENIORITY_MARKERS):
         return True, f"post author is a decision maker ({role.get('title') or role.get('seniority')})"
-    return False, f"post author is not a decision maker ({role.get('title') or role.get('seniority')}) -- their post is not company-level demand"
+
+    # Second path: the author NAMES their own company in the post. Attribution is then explicit
+    # rather than inferred from who they are -- "we at Acme are hiring 6 GTM roles" states whose
+    # hiring it is, whatever the speaker's title. Only reachable alongside the first-person
+    # ownership check the hiring detector already applies, so this cannot admit someone naming a
+    # company they merely commented on.
+    if _post_names_own_company(db, raw):
+        return True, "post explicitly names the author's own company -- attribution is stated, not inferred"
+
+    if not haystack:
+        return False, "post author's role is unknown and the post does not name their company -- cannot confirm they speak for it"
+    return False, f"post author is not a decision maker ({role.get('title') or role.get('seniority')}) and the post does not name their company"
+
+
+def _post_names_own_company(db: Session, raw: GtmSignal) -> bool:
+    """True when the post text mentions the company the signal actually resolved to.
+
+    Matched against the RESOLVED company (or the enrichment-verified name), never against an
+    arbitrary company mentioned in passing -- so a post discussing some other business cannot
+    satisfy this. Short names are skipped: a two- or three-character token matches far too much
+    ordinary text to be evidence of anything."""
+    from app.db.models import Company
+
+    name = None
+    if raw.company_id:
+        company = db.get(Company, raw.company_id)
+        name = company.name if company else None
+    name = name or raw.company_name_raw
+    if not name or len(name.strip()) < 4:
+        return False
+
+    text = ((raw.extracted_info or {}).get("text") or "") + " " + ((raw.raw_evidence or {}).get("text") or "")
+
+    # Case-SENSITIVE, word-boundary match. Many real company names are ordinary English words --
+    # "Aligned", "Locate", "Watchful" all appear in this tenant's own data -- so a lowercase
+    # substring match would read "our teams are aligned" as naming the company Aligned. A brand
+    # is written as a proper noun when it is being named, so requiring the original casing
+    # separates "Aligned's brand" (naming it) from "we are aligned" (an adjective).
+    return re.search(rf"\b{re.escape(name.strip())}\b", text) is not None
 
 
 def evaluate_interpreted_signal_for_demand(
