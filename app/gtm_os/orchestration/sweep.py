@@ -131,6 +131,7 @@ from app.gtm_os.icp.revenue_estimation import run_revenue_backfill_sweep
 from app.gtm_os.intelligence.demand_detection import run_demand_hypothesis_sweep
 from app.gtm_os.intelligence.interpretation import run_interpretation_sweep
 from app.gtm_os.intelligence.investigation_cycle import run_investigation_cycle
+from app.gtm_os.intelligence.signal import GtmSignal
 from app.gtm_os.intelligence.problem_detection import run_problem_hypothesis_sweep
 from app.gtm_os.intelligence.sensing import (
     sense_competitor_content,
@@ -407,6 +408,40 @@ class SourceBudgetBlocked(Exception):
     as "partial" (mixed success/failure) for a tick where nothing actually went wrong."""
 
 
+class SourceNotDue(Exception):
+    """Raised by a source wrapper when that source runs on its OWN slower cadence and isn't due
+    this tick -- caught and reported as "skipped", same family as SourceBudgetBlocked: an
+    intentional schedule working as designed, never an error.
+
+    Why this exists (2026-08-31): web_search_trend + competitor_content cost $0.275 of every
+    sweep -- 36% of run cost -- and feed Content Intelligence's topic/trend layer, NOT the sales
+    pipeline. Confirmed against real data: 228 competitor_content + 89 web_search_trend signals
+    produced 0 sales opportunities, because every Opportunity in this system traces back to a
+    job-posting signal. Daily cadence for them buys content freshness nobody reads daily, while
+    consuming budget the 10-opportunities/day target needs. Weekly keeps the content layer fed
+    at 1/7th the cost."""
+
+
+def _source_cadence_due(db: Session, tenant_id: int, source: str, cadence_days: int) -> tuple[bool, str]:
+    """True when this source has no signal newer than cadence_days. Uses the source's own real
+    last-signal timestamp rather than a separate schedule table -- no new state to keep in sync,
+    and it self-corrects after an outage (a missed week simply runs on the next tick)."""
+    latest = (
+        db.query(func.max(GtmSignal.created_at))
+        .filter(GtmSignal.tenant_id == tenant_id, GtmSignal.source == source)
+        .scalar()
+    )
+    if latest is None:
+        return True, "never sensed"
+    elapsed_days = (datetime.utcnow() - latest).total_seconds() / 86400.0
+    if elapsed_days < cadence_days:
+        return False, f"last sensed {elapsed_days:.1f}d ago, cadence is {cadence_days}d"
+    return True, f"last sensed {elapsed_days:.1f}d ago"
+
+
+CONTENT_SENSING_CADENCE_DAYS = 7
+
+
 def _get_salesrobot_config(db: Session, tenant_id: int) -> tuple[str, list[str]] | None:
     """Mirrors app/routes/api.py's _get_salesrobot_linkedin_account_uuid()/_get_our_campaign_uuids()
     exactly -- same Parameter keys, same fallback from salesrobot_our_campaign_uuids to the
@@ -542,6 +577,10 @@ def _run_web_search_trends(db: Session, tenant_id: int):
     from app.apify_client import GOOGLE_SEARCH_COST_PER_QUERY_NO_AI_OVERVIEW_USD
     from app.apify_budget_guard import STATUS_ALLOWED, check_apify_budget
 
+    due, cadence_reason = _source_cadence_due(db, tenant_id, "web_search_trend", CONTENT_SENSING_CADENCE_DAYS)
+    if not due:
+        raise SourceNotDue(cadence_reason)
+
     limit = 20
     budget_result = check_apify_budget(db, tenant_id, limit * GOOGLE_SEARCH_COST_PER_QUERY_NO_AI_OVERVIEW_USD)
     if budget_result["status"] != STATUS_ALLOWED:
@@ -556,6 +595,10 @@ def _run_competitor_content(db: Session, tenant_id: int):
     already senses nothing if zero enabled topics or zero enabled competitors are configured."""
     from app.apify_client import GOOGLE_SEARCH_COST_PER_QUERY_NO_AI_OVERVIEW_USD
     from app.apify_budget_guard import STATUS_ALLOWED, check_apify_budget
+
+    due, cadence_reason = _source_cadence_due(db, tenant_id, "competitor_content", CONTENT_SENSING_CADENCE_DAYS)
+    if not due:
+        raise SourceNotDue(cadence_reason)
 
     limit = 30
     budget_result = check_apify_budget(db, tenant_id, limit * GOOGLE_SEARCH_COST_PER_QUERY_NO_AI_OVERVIEW_USD)
@@ -728,6 +771,9 @@ def run_gtm_intelligence_sweep(
         except SourceBudgetBlocked as e:
             result["sources"][name] = {"status": "skipped", "reason": str(e)}
             logger.info("gtm_intelligence_sweep: sensing %s skipped (budget) -- %s", name, e)
+        except SourceNotDue as e:
+            result["sources"][name] = {"status": "skipped", "reason": f"not due: {e}"}
+            logger.info("gtm_intelligence_sweep: sensing %s skipped (cadence) -- %s", name, e)
         except Exception as e:  # noqa: BLE001 -- one source's failure must never block the others; see module docstring
             db.rollback()  # 2026-08-26, real fix -- see the try/except above this function's ACCOUNT_STRATEGY_STAGES loop for the full explanation
             result["sources"][name] = {"status": "failed", "error": str(e)}
