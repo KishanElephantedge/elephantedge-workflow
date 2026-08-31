@@ -21,6 +21,7 @@ from app.deepline_client import DeeplineError, get_credit_balance_usd
 from app.heyreach_client import HeyReachError
 from app.hubspot_client import HubSpotError
 from app.outreach.selector import get_outreach_channel
+from app.gtm_os.send.auto_approval import approve_and_send
 from app.phases.autonomous_orchestrator import cancel_run, get_autonomous_discovery_source, get_autonomous_message_style, get_autonomous_schedule_utc, get_daily_budget_usd, get_daily_company_cap, is_autonomous_enabled, recover_run_to_awaiting_approval, resend_approval_notification, resume_pending_approvals, run_daily_autonomous_cycle
 from app.phases.buying_signal import run_buying_signal_check
 from app.phases.campaign_execution import run_campaign_execution
@@ -4076,7 +4077,7 @@ def post_gtm_os_message_review(message_draft_id: int, payload: dict = Body(...),
     limitation already named in the Phase 5 write routes: any authenticated user can perform this
     action, since no role/permission system exists anywhere in this app."""
     from app.gtm_os.learning.message_draft import (
-        approve_message_draft,
+        approve_message_draft,  # noqa: F401 -- still the single state-transition primitive, now composed by approve_and_send
         reject_message_draft,
         request_changes_message_draft,
     )
@@ -4091,7 +4092,11 @@ def post_gtm_os_message_review(message_draft_id: int, payload: dict = Body(...),
         raise HTTPException(status_code=400, detail="reviewed_by is required")
 
     handler = {
-        "approve": lambda: approve_message_draft(db, ELEPHANT_EDGE_TENANT_ID, message_draft_id, reviewed_by),
+        # Approving now PUSHES to the offering's campaign immediately (2026-08-31). Previously the
+        # only caller of the send path was the once-daily sweep, so an approval could sit unsent
+        # for up to 24h -- confirmed live: a draft approved at 03:19 was still unsent hours later
+        # because that day's run hung before reaching its send stage.
+        "approve": lambda: approve_and_send(db, ELEPHANT_EDGE_TENANT_ID, message_draft_id, reviewed_by),
         "reject": lambda: reject_message_draft(db, ELEPHANT_EDGE_TENANT_ID, message_draft_id, reviewed_by, note),
         "request_changes": lambda: request_changes_message_draft(db, ELEPHANT_EDGE_TENANT_ID, message_draft_id, reviewed_by, note),
     }[action]

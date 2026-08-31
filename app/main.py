@@ -55,6 +55,22 @@ def _scheduled_autonomous_tick():
         db.close()
 
 
+def _scheduled_auto_approval_sweep():
+    """Approves and sends drafts left unreviewed past the window -- see
+    app/gtm_os/send/auto_approval.py. Never raises: a provider failure must not kill the tick."""
+    db = SessionLocal()
+    try:
+        from app.gtm_os.send.auto_approval import run_auto_approval_sweep
+
+        result = run_auto_approval_sweep(db, ELEPHANT_EDGE_TENANT_ID)
+        if result.get("approved"):
+            logging.getLogger(__name__).info("auto_approval_sweep: %s", {k: v for k, v in result.items() if k != "details"})
+    except Exception:
+        logging.getLogger(__name__).exception("auto_approval_sweep: failed")
+    finally:
+        db.close()
+
+
 def _scheduled_approval_sweep():
     """Runs every few minutes -- resumes any run whose 1-hour approval window has elapsed.
     Deliberately a repeating sweep, not a one-shot delayed callback, so a server restart
@@ -284,6 +300,11 @@ def on_startup():
         misfire_grace_time=AUTONOMOUS_MISFIRE_GRACE_SECONDS,
     )
     scheduler.add_job(_scheduled_approval_sweep, "interval", minutes=5, id="approval_window_sweep")
+    # Unattended approval window (2026-08-31): a draft nobody reviews within AUTO_APPROVAL_HOURS
+    # is approved and pushed on its own, so human review is a chance to intervene rather than a
+    # requirement to proceed. Every 15 minutes rather than every 5 -- a 2-hour window does not
+    # need finer resolution, and each tick touches only drafts already past the deadline.
+    scheduler.add_job(_scheduled_auto_approval_sweep, "interval", minutes=15, id="auto_approval_sweep")
     # Widened from 3/15 minutes (2026-08-21) -- a 3-minute cache warmer and a 15-minute calendar
     # sync individually cost little, but together with every other job on this scheduler they
     # kept the DB compute effectively always-on, never idle long enough for the host's
