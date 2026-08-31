@@ -12,7 +12,7 @@ route in app/routes/api.py for the tenant_id filter that enforces that boundary.
 
 from datetime import datetime
 
-from sqlalchemy import JSON, Boolean, Column, Date, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import JSON, BigInteger, Boolean, Column, Date, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import declarative_base, relationship
 
 Base = declarative_base()
@@ -76,8 +76,13 @@ class Company(Base):
     decision_maker_searched_at = Column(DateTime, nullable=True)
 
     # Phase 3 (Discovery) -- captured free, same Crustdata query, per phase5's Finding 1 addendum.
-    estimated_revenue_lower_usd = Column(Integer, nullable=True)
-    estimated_revenue_higher_usd = Column(Integer, nullable=True)
+    # BigInteger, not Integer (2026-08-31, real crash confirmed live): a revenue estimate of
+    # $4,035,000,000 overflowed PostgreSQL's 32-bit integer (max 2,147,483,647) and raised
+    # NumericValueOutOfRange mid-commit, which the sweep records as a failed stage. Any company
+    # above ~$2.1B revenue hit this -- not hypothetical, just not yet reached by the small
+    # companies the backfill had processed so far.
+    estimated_revenue_lower_usd = Column(BigInteger, nullable=True)
+    estimated_revenue_higher_usd = Column(BigInteger, nullable=True)
     last_funding_round_type = Column(String, nullable=True)
     last_funding_date = Column(DateTime, nullable=True)
     crunchbase_total_investment_usd = Column(Float, nullable=True)

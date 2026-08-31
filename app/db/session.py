@@ -280,6 +280,10 @@ def ensure_indexes():
         # FALSE only ever permits one extra (budget-guarded) retry, never a duplicate spend on a
         # signal that already resolved. Rows with no attempt at all are correctly FALSE.
         conn.execute(text("ALTER TABLE gtm_signals ADD COLUMN IF NOT EXISTS company_resolution_paid_attempted BOOLEAN NOT NULL DEFAULT FALSE"))
+        # 32-bit integer overflowed on a real $4.035B revenue estimate (2026-08-31) -- widening
+        # is lossless and safe to re-run: ALTER TYPE to the same type is a no-op in Postgres.
+        conn.execute(text("ALTER TABLE companies ALTER COLUMN estimated_revenue_lower_usd TYPE BIGINT"))
+        conn.execute(text("ALTER TABLE companies ALTER COLUMN estimated_revenue_higher_usd TYPE BIGINT"))
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS interpreted_signals (
                 id SERIAL PRIMARY KEY,
