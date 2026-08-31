@@ -113,6 +113,7 @@ as structured failure data rather than a raised exception out of this function."
 
 import logging
 import re
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout, as_completed
 from datetime import datetime
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -133,6 +134,7 @@ from app.gtm_os.icp.revenue_estimation import run_revenue_backfill_sweep
 from app.gtm_os.intelligence.demand_detection import run_demand_hypothesis_sweep
 from app.gtm_os.intelligence.interpretation import promote_concurrent_hiring_across_sweeps, run_interpretation_sweep
 from app.gtm_os.intelligence.investigation_cycle import run_investigation_cycle
+from app.db.session import SessionLocal
 from app.gtm_os.intelligence.signal import GtmSignal
 from app.gtm_os.intelligence.problem_detection import run_problem_hypothesis_sweep
 from app.gtm_os.intelligence.sensing import (
@@ -661,6 +663,45 @@ SWEEPABLE_SOURCES: list[tuple[str, callable]] = [
 ]
 
 
+
+# Every sensing source runs INDEPENDENTLY and CONCURRENTLY (2026-08-31).
+#
+# The old loop ran sources one after another on a single shared session, so a source that hung
+# rather than failed froze every source behind it. Confirmed live in run 116: linkedin_job
+# finished at 08:28:51, linkedin_reply (SalesRobot) then hung, and linkedin_post_search --
+# which sits after it in the list -- never ran at all. Jobs and posts are two independent ways
+# of finding accounts, each with its own logic, and each is supposed to contribute to the daily
+# target on its own. Neither may depend on the other completing, or even succeeding.
+#
+# Each source gets its OWN database session because SQLAlchemy sessions are not thread-safe, and
+# a hard timeout so a hanging provider can cost at most that long instead of the whole run.
+SOURCE_TIMEOUT_SECONDS = 180
+SOURCE_MAX_WORKERS = 6
+
+
+def _run_one_source(name: str, runner, tenant_id: int) -> dict:
+    """Runs a single source on its own session and returns a plain, session-free result dict.
+
+    Returns counts rather than ORM objects on purpose: the objects belong to a session this
+    function closes, so handing them back would hand back rows that raise on attribute access.
+    """
+    db = SessionLocal()
+    try:
+        signals = runner(db, tenant_id)
+        return {"name": name, "status": "succeeded", "signals_created": len(signals)}
+    except MissingSourceConfiguration as e:
+        return {"name": name, "status": "skipped", "reason": str(e)}
+    except SourceBudgetBlocked as e:
+        return {"name": name, "status": "skipped", "reason": str(e), "budget": True}
+    except SourceNotDue as e:
+        return {"name": name, "status": "skipped", "reason": f"not due: {e}"}
+    except Exception as e:  # noqa: BLE001 -- one source's failure must never affect another
+        db.rollback()
+        return {"name": name, "status": "failed", "error": str(e)}
+    finally:
+        db.close()
+
+
 def _dry_run_source_status(db: Session, tenant_id: int, name: str) -> dict:
     if name == "linkedin_reply":
         if _get_salesrobot_config(db, tenant_id) is None:
@@ -787,30 +828,53 @@ def run_gtm_intelligence_sweep(
         any_failed = True
         logger.error("gtm_intelligence_sweep: discovery failed -- %s", discovery_result.get("error"))
 
-    for name, runner in SWEEPABLE_SOURCES:
+    runnable = [(name, runner) for name, runner in SWEEPABLE_SOURCES if name in selected]
+    for name, _runner in SWEEPABLE_SOURCES:
         if name not in selected:
             result["sources"][name] = {"status": "skipped", "reason": "not selected"}
-            continue
-        logger.info("gtm_intelligence_sweep: sensing %s started (tenant_id=%s)", name, tenant_id)
-        try:
-            signals = runner(db, tenant_id)
-            result["sources"][name] = {"status": "succeeded", "signals_created": len(signals)}
-            any_succeeded = True
-            logger.info("gtm_intelligence_sweep: sensing %s succeeded (%d signals)", name, len(signals))
-        except MissingSourceConfiguration as e:
-            result["sources"][name] = {"status": "skipped", "reason": str(e)}
-            logger.warning("gtm_intelligence_sweep: sensing %s skipped -- %s", name, e)
-        except SourceBudgetBlocked as e:
-            result["sources"][name] = {"status": "skipped", "reason": str(e)}
-            logger.info("gtm_intelligence_sweep: sensing %s skipped (budget) -- %s", name, e)
-        except SourceNotDue as e:
-            result["sources"][name] = {"status": "skipped", "reason": f"not due: {e}"}
-            logger.info("gtm_intelligence_sweep: sensing %s skipped (cadence) -- %s", name, e)
-        except Exception as e:  # noqa: BLE001 -- one source's failure must never block the others; see module docstring
-            db.rollback()  # 2026-08-26, real fix -- see the try/except above this function's ACCOUNT_STRATEGY_STAGES loop for the full explanation
-            result["sources"][name] = {"status": "failed", "error": str(e)}
+
+    # NOT a `with` block, deliberately: ThreadPoolExecutor's context manager calls
+    # shutdown(wait=True) on exit, which blocks until every worker finishes -- including the very
+    # hanging source this timeout exists to survive. Caught by testing a deliberately hanging
+    # source: the timeout fired correctly and the sweep then froze anyway on pool exit.
+    # shutdown(wait=False) lets the sweep continue; an orphaned worker holds only its own session
+    # and dies with the process.
+    pool = ThreadPoolExecutor(max_workers=SOURCE_MAX_WORKERS)
+    try:
+        futures = {pool.submit(_run_one_source, name, runner, tenant_id): name for name, runner in runnable}
+        logger.info("gtm_intelligence_sweep: sensing %d sources concurrently (tenant_id=%s)", len(futures), tenant_id)
+        for future in as_completed(futures, timeout=SOURCE_TIMEOUT_SECONDS * 2):
+            name = futures[future]
+            try:
+                outcome = future.result(timeout=SOURCE_TIMEOUT_SECONDS)
+            except FuturesTimeout:
+                # A hanging provider is reported as a real failure for THAT source only. Every
+                # other source has already run independently -- this is exactly the case that
+                # used to freeze the whole sweep.
+                result["sources"][name] = {"status": "failed", "error": f"timed out after {SOURCE_TIMEOUT_SECONDS}s"}
+                any_failed = True
+                logger.error("gtm_intelligence_sweep: sensing %s timed out after %ss", name, SOURCE_TIMEOUT_SECONDS)
+                continue
+            status = outcome["status"]
+            entry = {k: v for k, v in outcome.items() if k not in ("name", "budget")}
+            result["sources"][name] = entry
+            if status == "succeeded":
+                any_succeeded = True
+                logger.info("gtm_intelligence_sweep: sensing %s succeeded (%d signals)", name, outcome.get("signals_created", 0))
+            elif status == "failed":
+                any_failed = True
+                logger.error("gtm_intelligence_sweep: sensing %s failed -- %s", name, outcome.get("error"))
+            else:
+                logger.info("gtm_intelligence_sweep: sensing %s skipped -- %s", name, outcome.get("reason"))
+    except FuturesTimeout:
+        # as_completed's own overall deadline -- whatever has not reported by now is recorded as
+        # timed out, rather than leaving those sources silently absent from the run record.
+        for pending_name in {n for f, n in futures.items() if not f.done()}:
+            result["sources"][pending_name] = {"status": "failed", "error": f"timed out after {SOURCE_TIMEOUT_SECONDS}s"}
             any_failed = True
-            logger.error("gtm_intelligence_sweep: sensing %s failed -- %s", name, e)
+            logger.error("gtm_intelligence_sweep: sensing %s timed out (overall deadline)", pending_name)
+    finally:
+        pool.shutdown(wait=False)
 
     # Autonomous Sensing Phase S7 (app/gtm_os/intelligence/investigation_cycle.py) -- runs BEFORE
     # interpretation/problem/demand below so any GtmSignal rows S5 execution created this same
