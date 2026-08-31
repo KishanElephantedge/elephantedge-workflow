@@ -27,7 +27,8 @@ from sqlalchemy.orm import Session
 
 from app.db.models import Batch, Company
 from app.deepline_client import DeeplineError, execute_tool
-from app.phases.hiring_signal import assess_team_composition
+from app.gtm_os.intelligence.signal import GtmSignal
+from app.phases.hiring_signal import _classify_role, assess_team_composition
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +87,53 @@ def enrich_company_headcount(db: Session, tenant_id: int, company: Company) -> d
     return {"status": "succeeded", "updated": updated}
 
 
+
+# Rank used when a company has several concurrent postings: a leadership gap is the strongest
+# ICP trigger, so it wins over an individual-contributor req. Mirrors hiring_signal.py's own
+# preference for the strongest signal rather than the most recent one.
+_ROLE_PRIORITY = ("head_of_sales", "gtm", "ae", "sdr", "marketing")
+
+
+def derive_hiring_signal(db: Session, tenant_id: int, company: Company) -> dict:
+    """Sets Company.hiring_signal_role/hiring_signal_posting_count from the company's OWN
+    already-sensed job signals. FREE -- no provider call, this reads GtmSignal rows V2 already
+    paid for.
+
+    Why this exists: hiring_signal_role is computed only by V1's scoring phases, which V2 never
+    runs, so every V2-discovered company had it NULL. It is one of three fields
+    evaluate_icp_matches_for_company() requires, and measured against production it was the
+    scarcest of them (202 of 776) -- the single biggest contributor to 1,486 of 1,500 ICP checks
+    returning "insufficient_information".
+
+    Uses the same _classify_role() title parser V1 uses, so V2 and V1 can never disagree about
+    what a given job title means. Leaves the field NULL when no posting maps to a known role --
+    an unknown role is not the same as no hiring, and ICP matching already treats NULL as
+    honest missing information rather than a negative."""
+    signals = (
+        db.query(GtmSignal)
+        .filter(GtmSignal.tenant_id == tenant_id, GtmSignal.source == "linkedin_job", GtmSignal.company_id == company.id)
+        .all()
+    )
+    if not signals:
+        return {"status": "skipped", "reason": "no job signals on file for this company"}
+
+    roles = []
+    for signal in signals:
+        title = (signal.extracted_info or {}).get("title") or ""
+        role = _classify_role(title) if title else None
+        if role:
+            roles.append(role)
+    if not roles:
+        return {"status": "not_found", "reason": f"{len(signals)} job signals, none mapped to a known role"}
+
+    best = min(roles, key=lambda r: _ROLE_PRIORITY.index(r) if r in _ROLE_PRIORITY else len(_ROLE_PRIORITY))
+    company.hiring_signal_role = best
+    company.hiring_signal_posting_count = len(signals)
+    db.add(company)
+    db.commit()
+    return {"status": "succeeded", "hiring_signal_role": best, "posting_count": len(signals)}
+
+
 def enrich_company(db: Session, tenant_id: int, company: Company) -> dict:
     """One company, cheapest-first. Each step is independent: a failure in one never blocks the
     others, same per-stage isolation the sweep itself uses."""
@@ -93,6 +141,9 @@ def enrich_company(db: Session, tenant_id: int, company: Company) -> dict:
 
     if company.employee_count is None or company.industry is None:
         result["headcount"] = enrich_company_headcount(db, tenant_id, company)
+
+    if company.hiring_signal_role is None:
+        result["hiring_signal"] = derive_hiring_signal(db, tenant_id, company)
 
     if company.sales_headcount_percent is None and company.domain:
         try:
@@ -119,7 +170,7 @@ def run_company_enrichment_sweep(db: Session, tenant_id: int, limit: int = DEFAU
         # this filter a run that found fewer than `limit` new companies would quietly start
         # spending on it anyway.
         .filter(Batch.source.in_(V2_BATCH_SOURCES))
-        .filter((Company.employee_count.is_(None)) | (Company.sales_headcount_percent.is_(None)))
+        .filter((Company.employee_count.is_(None)) | (Company.sales_headcount_percent.is_(None)) | (Company.hiring_signal_role.is_(None)))
         .order_by(Company.created_at.desc())
         .limit(limit)
         .all()
