@@ -274,6 +274,12 @@ def ensure_indexes():
         conn.execute(text("ALTER TABLE gtm_signals ADD COLUMN IF NOT EXISTS company_resolution_method VARCHAR"))
         conn.execute(text("ALTER TABLE gtm_signals ADD COLUMN IF NOT EXISTS company_resolution_reason TEXT"))
         conn.execute(text("ALTER TABLE gtm_signals ADD COLUMN IF NOT EXISTS company_resolved_at TIMESTAMP"))
+        # NOT NULL DEFAULT FALSE is safe to backfill here: every existing recorded attempt ran
+        # under the old opening-tier-only rule, which always allowed the paid tiers -- so for
+        # rows with a status already set the truthful value would be TRUE, but marking them
+        # FALSE only ever permits one extra (budget-guarded) retry, never a duplicate spend on a
+        # signal that already resolved. Rows with no attempt at all are correctly FALSE.
+        conn.execute(text("ALTER TABLE gtm_signals ADD COLUMN IF NOT EXISTS company_resolution_paid_attempted BOOLEAN NOT NULL DEFAULT FALSE"))
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS interpreted_signals (
                 id SERIAL PRIMARY KEY,

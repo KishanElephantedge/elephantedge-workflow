@@ -354,13 +354,21 @@ def resolve_company_for_signal(
     Idempotent: if this signal already has company_resolution_status set (a previous attempt
     already ran, in any outcome), this is a no-op that just returns the already-persisted
     result -- never re-attempts (and never re-spends) on a signal already looked at."""
+    # Idempotent, but only for what has ACTUALLY been tried. Since 2026-08-31 the free
+    # exact-name step runs on every evidence tier while the paid tiers stay opening-tier-only,
+    # so a cached "unresolved" from a free-only attempt must NOT block a later paid attempt on
+    # the same signal -- otherwise opening the free path would silently cost us every paid
+    # resolution that used to happen. Re-attempt only when this call can genuinely add something
+    # the recorded attempt never tried: the paid tiers.
     if signal.company_resolution_status is not None:
-        return {
-            "status": signal.company_resolution_status,
-            "method": signal.company_resolution_method,
-            "reason": signal.company_resolution_reason,
-            "company_id": signal.company_id,
-        }
+        paid_still_available = allow_paid_enrichment and not signal.company_resolution_paid_attempted
+        if signal.company_resolution_status == "resolved" or not paid_still_available:
+            return {
+                "status": signal.company_resolution_status,
+                "method": signal.company_resolution_method,
+                "reason": signal.company_resolution_reason,
+                "company_id": signal.company_id,
+            }
 
     if signal.company_id is not None:
         result = {"status": "resolved", "method": "explicit", "reason": None, "company_id": signal.company_id}
@@ -432,6 +440,9 @@ def resolve_company_for_signal(
     signal.company_resolution_method = result.get("method")
     signal.company_resolution_reason = result.get("reason")
     signal.company_resolved_at = datetime.utcnow()
+    # Sticky: once a paid attempt has happened it stays recorded, so a later free-only call can
+    # never downgrade the flag and re-open an already-spent paid path.
+    signal.company_resolution_paid_attempted = bool(signal.company_resolution_paid_attempted) or allow_paid_enrichment
     if result["status"] == "resolved" and result.get("company_id"):
         signal.company_id = result["company_id"]
     db.add(signal)
@@ -455,14 +466,22 @@ def ensure_company_resolved_if_needed(
     underlying GtmSignal (the durable, reusable identity record) and this specific
     InterpretedSignal instance in-place, so the caller's own immediately-following logic sees the
     resolved company_id without a second read."""
-    if interpreted_signal.company_id is not None or not opening_tier:
+    if interpreted_signal.company_id is not None:
         return
 
     raw_signal = db.get(GtmSignal, interpreted_signal.source_signal_id)
     if raw_signal is None:
         return
 
-    result = resolve_company_for_signal(db, tenant_id, raw_signal, allow_paid_enrichment=allow_paid_enrichment)
+    # 2026-08-31: the tier gate now controls SPEND, not whether identity is attempted at all.
+    # Step 1 (exact name match) is a plain DB lookup costing nothing, and gating it behind
+    # opening-tier meant 790 of 821 real signals were never even looked up -- 67 of which match
+    # an existing company by name exactly, and therefore could have become opportunities from
+    # data already paid for. The paid tiers (Apify profile / Deepline) stay opening-tier-only,
+    # exactly as before, so this changes reach without changing cost.
+    result = resolve_company_for_signal(
+        db, tenant_id, raw_signal, allow_paid_enrichment=allow_paid_enrichment and opening_tier,
+    )
     if result["status"] == "resolved" and result.get("company_id"):
         interpreted_signal.company_id = result["company_id"]
         db.add(interpreted_signal)

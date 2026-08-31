@@ -15,7 +15,7 @@ directly (not app/phases/* orchestration), so this has zero coupling to the prod
 
 from datetime import datetime
 
-from sqlalchemy import Column, DateTime, ForeignKey, Integer, JSON, String, Text
+from sqlalchemy import Boolean, Column, DateTime, ForeignKey, Integer, JSON, String, Text
 
 from app.db.models import Base
 
@@ -60,3 +60,9 @@ class GtmSignal(Base):
     company_resolution_method = Column(String, nullable=True)  # "explicit" | "exact_name_match" | "enrichment_domain_match"
     company_resolution_reason = Column(Text, nullable=True)  # human-readable explanation, esp. for unresolved/ambiguous
     company_resolved_at = Column(DateTime, nullable=True)
+    # Whether the recorded attempt above ever got to try the PAID tiers (Apify profile / Deepline).
+    # Needed because the free exact-name step now runs on every tier (2026-08-31): without this,
+    # a free-only "unresolved" would be cached and permanently short-circuit the paid tiers for a
+    # signal that later qualifies as opening-tier. False + status set = "free tiers tried, paid
+    # still available to try later".
+    company_resolution_paid_attempted = Column(Boolean, nullable=False, default=False)
