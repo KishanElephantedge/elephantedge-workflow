@@ -168,6 +168,25 @@ def _validate_positive_int_or_none(value, field_name: str) -> None:
         raise ControlPlaneConfigError(f"'{field_name}' must be a positive integer or null")
 
 
+def _validate_non_negative_int_or_none(value, field_name: str) -> None:
+    """Like _validate_positive_int_or_none but admits 0, for fields where 0 is a real, meaningful
+    setting rather than a mistake.
+
+    Only the cooldown fields use this. A cooldown of 0 means "no cooldown", which is a deliberate
+    choice here: reaching several contacts at the SAME company on the same day is intended
+    behaviour (multi-contact outreach), and null cannot express it -- send.py treats an
+    unconfigured limit as "not configured" and refuses to send at all, precisely so an unset
+    value is never silently read as unlimited. 0 says "configured, and the answer is none".
+
+    max_sends_per_day deliberately still requires >= 1: a 0 there would mean "send nothing",
+    which the control-plane state (paused/stopped) already expresses far more clearly.
+    """
+    if value is None:
+        return
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise ControlPlaneConfigError(f"'{field_name}' must be a non-negative integer or null")
+
+
 def _validate_positive_number_or_none(value, field_name: str) -> None:
     if value is None:
         return
@@ -186,8 +205,10 @@ def _validate_control_config(config: dict) -> None:
     limits = config.get("limits")
     if not isinstance(limits, dict):
         raise ControlPlaneConfigError("'limits' must be an object")
-    for field_name in ("max_sends_per_day", "max_contacts_per_day", "company_cooldown_days", "contact_cooldown_days"):
+    for field_name in ("max_sends_per_day", "max_contacts_per_day"):
         _validate_positive_int_or_none(limits.get(field_name), f"limits.{field_name}")
+    for field_name in ("company_cooldown_days", "contact_cooldown_days"):
+        _validate_non_negative_int_or_none(limits.get(field_name), f"limits.{field_name}")
     _validate_positive_number_or_none(limits.get("contact_discovery_daily_budget_usd"), "limits.contact_discovery_daily_budget_usd")
 
     business_hours = config.get("business_hours")
