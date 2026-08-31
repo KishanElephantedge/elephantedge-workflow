@@ -168,6 +168,49 @@ def record_meeting_outcome(
     return booking
 
 
+
+def _annual_pace(db: Session, tenant_id: int, annual_goal, period: str, now: datetime) -> dict:
+    """Year-to-date position against an annual target: what has actually closed this year, what
+    should have closed by today at an even pace, and the gap between them.
+
+    Returns explicit nulls (never zeros) when no target is configured -- a missing target is not
+    the same as being $0 behind, and reporting it as 0 would read as "on track"."""
+    if annual_goal is None or period == "monthly":
+        return {
+            "annual_target_usd": annual_goal if period != "monthly" else None,
+            "ytd_actual_usd": None, "expected_by_now_usd": None, "ytd_gap_usd": None,
+            "pace_status": "no_annual_target_configured",
+        }
+
+    year_start = datetime(now.year, 1, 1)
+    next_year = datetime(now.year + 1, 1, 1)
+    days_in_year = (next_year - year_start).days
+    elapsed_days = max((now - year_start).days, 0)
+    expected = annual_goal * (elapsed_days / days_in_year)
+
+    won_this_year = (
+        db.query(CalendarBooking)
+        .join(Company, CalendarBooking.outcome_company_id == Company.id)
+        .join(Batch, Company.batch_id == Batch.id)
+        .filter(Batch.tenant_id == tenant_id)
+        .filter(CalendarBooking.outcome_status == "won")
+        .filter(CalendarBooking.outcome_recorded_at >= year_start, CalendarBooking.outcome_recorded_at < next_year)
+        .all()
+    )
+    ytd = float(sum(b.outcome_amount_usd or 0 for b in won_this_year))
+    gap = expected - ytd
+    return {
+        "annual_target_usd": annual_goal,
+        "ytd_actual_usd": ytd,
+        "expected_by_now_usd": round(expected, 2),
+        "ytd_gap_usd": round(gap, 2),
+        "days_elapsed": elapsed_days,
+        "days_remaining": days_in_year - elapsed_days,
+        # Categorical, never a fabricated confidence score -- same discipline as governance.py.
+        "pace_status": "on_or_ahead_of_pace" if ytd >= expected else "behind_pace",
+    }
+
+
 def get_revenue_pace(db: Session, tenant_id: int, month: str | None = None) -> dict:
     now = datetime.utcnow()
     if month:
@@ -178,8 +221,19 @@ def get_revenue_pace(db: Session, tenant_id: int, month: str | None = None) -> d
     period_end = datetime(year + (1 if mon == 12 else 0), 1 if mon == 12 else mon + 1, 1)
 
     context = get_business_context(db, tenant_id)
-    revenue_goal = (context.get("goals") or {}).get("revenue_goal")
-    target = revenue_goal if isinstance(revenue_goal, (int, float)) and not isinstance(revenue_goal, bool) else None
+    goals = context.get("goals") or {}
+    revenue_goal = goals.get("revenue_goal")
+    annual_goal = revenue_goal if isinstance(revenue_goal, (int, float)) and not isinstance(revenue_goal, bool) else None
+
+    # revenue_goal is the ANNUAL target (2026-08-31). It was previously compared straight against
+    # ONE month's closed revenue, which silently read a $1,000,000 yearly goal as "$1,000,000 due
+    # this month" -- a target the company would miss by definition every month, making the gap
+    # meaningless as a steering signal.
+    #
+    # goals.revenue_goal_period can override this ("monthly"), but annual is the default because
+    # that is how the real target is stated.
+    period = (goals.get("revenue_goal_period") or "annual").strip().lower()
+    target = annual_goal if period == "monthly" else (annual_goal / 12 if annual_goal is not None else None)
 
     # Deals closed (recorded) this month -- bucketed by outcome_recorded_at, i.e. when the human
     # actually logged the result, not when the meeting itself took place.
@@ -240,6 +294,11 @@ def get_revenue_pace(db: Session, tenant_id: int, month: str | None = None) -> d
     return {
         "month": f"{year:04d}-{mon:02d}",
         "target_configured": target is not None,
+        # Year-to-date pacing -- the number that actually answers "are we going to make it?".
+        # A monthly gap alone cannot: a good month after three bad ones still misses the year.
+        # elapsed_fraction is measured in DAYS, not whole months, so the expectation moves every
+        # day rather than stepping once a month.
+        **_annual_pace(db, tenant_id, annual_goal, period, now),
         "target_usd": target,
         "actual_usd": actual,
         "gap_usd": (target - actual) if target is not None else None,

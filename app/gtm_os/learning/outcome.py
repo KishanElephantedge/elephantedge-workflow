@@ -38,13 +38,26 @@ from app.gtm_os.intelligence.interpreted_signal import InterpretedSignal
 from app.gtm_os.intelligence.signal import GtmSignal
 from app.gtm_os.opportunity.opportunity import Opportunity
 
-OUTCOME_CATEGORIES = {"reply", "positive_reply", "not_interested", "timing_deferral"}
+# "connection_accepted" added 2026-08-31: SalesRobot reports it on the campaign record
+# (lastActivity == "CONNECTED") and 24 real prospects carried it while the learning layer had no
+# way to represent it -- so the single most common real outcome in the funnel was invisible here.
+# It is deliberately its OWN category, not folded into "reply": accepting a connection request is
+# a materially weaker signal than answering a message, and merging them would inflate reply rates
+# and teach the wrong lesson about what actually works.
+OUTCOME_CATEGORIES = {"reply", "positive_reply", "not_interested", "timing_deferral", "connection_accepted", "meeting_requested"}
 
 EVENT_TYPE_TO_OUTCOME_CATEGORY: dict[str, str] = {
     "not_interested": "not_interested",
     "timing_deferral": "timing_deferral",
     "pricing_request": "positive_reply",
     "demo_request": "positive_reply",
+    "connection_accepted": "connection_accepted",   # exact restatement, same discipline as the two above
+    # 2026-08-31: these come from SalesRobot's OWN tagList on the campaign record ("Interested",
+    # "Meeting Request") -- a real label applied in the tool, not our inference. The module
+    # docstring's note that "meeting_requested" is not observable was true when written and is
+    # no longer: it is observable, and faking it is exactly what is NOT happening here.
+    "interested_reply": "positive_reply",
+    "meeting_requested": "meeting_requested",
 }
 DEFAULT_OUTCOME_CATEGORY = "reply"
 

@@ -74,6 +74,22 @@ def _synced_total_pages(raw_response: dict) -> int | None:
     return None
 
 
+
+def _parse_tag_list(value) -> list[str]:
+    """SalesRobot returns tagList as a JSON-encoded STRING (e.g. '["Interested"]'), not a list --
+    iterating it raw yields individual characters. Confirmed live 2026-08-31."""
+    import json as _json
+    if isinstance(value, list):
+        return [str(t) for t in value]
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = _json.loads(value)
+            return [str(t) for t in parsed] if isinstance(parsed, list) else [value]
+        except ValueError:
+            return [value]
+    return []
+
+
 def _dedup_key(source: str, source_ref: str) -> str:
     return hashlib.sha256(f"{source}:{source_ref}".encode()).hexdigest()
 
@@ -457,6 +473,7 @@ def sense_linkedin_replies(
     Contact.salesrobot_prospect_uuid column (not added in this step) could re-attribute
     historical signals without re-fetching from the API."""
     reply_prospects: list[dict] = []
+    connected_prospects: list[dict] = []
     for campaign_uuid in campaign_uuids:
         page = 0
         while True:
@@ -466,8 +483,14 @@ def sense_linkedin_replies(
                 break
             prospects = result.get("data", {}).get("data", [])
             for p in prospects:
-                if p.get("isReplied") and p.get("prospectUuid"):
+                if not p.get("prospectUuid"):
+                    continue
+                if p.get("isReplied"):
                     reply_prospects.append(p)
+                elif p.get("lastActivity") == "CONNECTED":
+                    # Accepted the connection but hasn't replied. A real, weaker outcome that the
+                    # learning layer had no way to see -- 24 of them, against 5 replies.
+                    connected_prospects.append(p)
             if len(prospects) < 100:
                 break
             page += 1
@@ -555,7 +578,7 @@ def sense_linkedin_replies(
             source="linkedin_reply",
             source_ref=source_ref,
             signal_type="reply",
-            observed_at=None,   # SalesRobot exposes no reply timestamp on the prospect record
+            observed_at=_parse_dt(prospect.get("firstReplyAt")),
             person_name_raw=prospect.get("fullName"),
             company_name_raw=prospect.get("companyName"),
             company_id=contact.company_id if contact else None,
@@ -563,10 +586,15 @@ def sense_linkedin_replies(
             raw_evidence=prospect,
             extracted_info={
                 # No text: the reply is real and recorded, its CONTENT is simply not retrievable
-                # for this prospect. Downstream classification treats a textless reply as the
-                # generic "reply" outcome rather than guessing at sentiment.
+                # for this prospect. But SalesRobot's OWN human/AI classification of that reply is
+                # available on the record (tagList), so sentiment comes from a real label rather
+                # than being guessed at or abandoned.
                 "text": None,
                 "reply_evidence": "campaign_prospect.lastActivity == 'REPLIED'",
+                "tag_list": _parse_tag_list(prospect.get("tagList")),
+                # Which message variant actually earned the reply -- the single most directly
+                # actionable thing here for learning what works.
+                "replied_variant": prospect.get("repliedVariant"),
                 "last_activity": prospect.get("lastActivity"),
                 "campaign_name": prospect.get("campaignName"),
                 "campaign_uuid": prospect.get("campaignUuid"),
@@ -576,6 +604,32 @@ def sense_linkedin_replies(
         )
         db.add(signal)
         signals.append(signal)
+    if signals:
+        db.commit()
+
+    for prospect in connected_prospects:
+        source_ref = f"connected:{prospect.get('prospectUuid')}"
+        if db.query(GtmSignal).filter(GtmSignal.source == "linkedin_reply", GtmSignal.source_ref == source_ref).first():
+            continue
+        contact = _match_contact(db, prospect.get("profileUrl"))
+        signal = GtmSignal(
+            tenant_id=tenant_id, source="linkedin_reply", source_ref=source_ref,
+            signal_type="connection_accepted", observed_at=_parse_dt(prospect.get("connectionAcceptedAt")),
+            person_name_raw=prospect.get("fullName"), company_name_raw=prospect.get("companyName"),
+            company_id=contact.company_id if contact else None,
+            contact_id=contact.id if contact else None,
+            raw_evidence=prospect,
+            extracted_info={
+                "text": None,
+                "connection_evidence": "campaign_prospect.lastActivity == 'CONNECTED'",
+                "last_activity": prospect.get("lastActivity"),
+                "campaign_name": prospect.get("campaignName"),
+                "campaign_uuid": prospect.get("campaignUuid"),
+                "profile_url": prospect.get("profileUrl"),
+            },
+            dedup_key=_dedup_key("linkedin_reply", source_ref),
+        )
+        db.add(signal); signals.append(signal)
     if signals:
         db.commit()
 

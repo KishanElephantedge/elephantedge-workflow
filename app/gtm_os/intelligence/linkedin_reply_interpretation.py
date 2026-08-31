@@ -156,14 +156,42 @@ def interpret_linkedin_reply_signal(signal: GtmSignal) -> InterpretedSignal | No
         # of a reply is a genuine, verified outcome on its own -- it just cannot be classified as
         # positive/negative without words. So it is recorded as a plain reply and left to map to
         # the generic "reply" outcome category, never guessed at.
+        if extracted.get("connection_evidence"):
+            return InterpretedSignal(
+                tenant_id=signal.tenant_id, source_signal_id=signal.id,
+                event_type="connection_accepted",
+                affected_function="sales",
+                business_change=f"{signal.person_name_raw or 'The prospect'} accepted the connection request (no reply yet).",
+                evidence_excerpt=str(extracted.get("connection_evidence")),
+                extraction_method="deterministic:campaign_connection_flag",
+                extraction_confidence="low",
+                company_id=signal.company_id, company_name_raw=signal.company_name_raw,
+                contact_id=signal.contact_id, person_name_raw=signal.person_name_raw,
+                observed_at=signal.observed_at,
+            )
         if not extracted.get("reply_evidence"):
             return None
+        # SalesRobot's own tag is a REAL classification of the reply, not our inference -- so a
+        # textless reply can still be categorised honestly instead of collapsing to generic.
+        tags = {str(t).strip().lower() for t in (extracted.get("tag_list") or [])}
+        if "meeting request" in tags:
+            reply_event_type = "meeting_requested"
+        elif "interested" in tags:
+            reply_event_type = "interested_reply"
+        elif "not interested" in tags:
+            reply_event_type = "not_interested"
+        else:
+            reply_event_type = "reply_received"
         return InterpretedSignal(
             tenant_id=signal.tenant_id,
             source_signal_id=signal.id,
-            event_type="reply_received",   # unmapped in outcome.py -> generic "reply", by design
+            event_type=reply_event_type,
             affected_function="sales",
-            business_change=f"{signal.person_name_raw or 'The prospect'} replied to outreach (message text not retrievable).",
+            business_change=(
+                f"{signal.person_name_raw or 'The prospect'} replied to outreach"
+                + (f" -- tagged {', '.join(sorted(tags))} in the campaign" if tags else " (message text not retrievable)")
+                + "."
+            ),
             evidence_excerpt=str(extracted.get("reply_evidence")),
             extraction_method="deterministic:campaign_reply_flag",
             # "low", not medium: we know THAT they replied, nothing about what they said.
