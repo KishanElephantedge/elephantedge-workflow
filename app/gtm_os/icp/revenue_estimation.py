@@ -98,7 +98,13 @@ def _estimate_via_google(db: Session, tenant_id: int, company: Company) -> dict:
     if budget["status"] != APIFY_BUDGET_ALLOWED:
         return {"status": "unavailable", "reason": f"apify_budget_blocked: {budget['reason']}"}
 
-    query = f"{company.name} annual revenue"
+    # Domain-qualified, not name-only (2026-08-31, real mis-attribution confirmed live): the
+    # name-only query "Aligned annual revenue" returned $4.035B -- Aligned Data Centers, a
+    # completely different company from alignedup.com, a ~80-person Series B startup. A wrong
+    # revenue is strictly worse than none: it silently files a company into the wrong ICP
+    # revenue band and qualifies (or disqualifies) it on a fabricated basis. The domain is the
+    # one unambiguous identifier we always have here, so it goes in the query.
+    query = f"{company.name} {company.domain} annual revenue" if company.domain else f"{company.name} annual revenue"
     try:
         overview_text = search_google_ai_overview(api_key, query)
     except ApifyError as e:

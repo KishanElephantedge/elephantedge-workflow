@@ -126,6 +126,7 @@ from app.gtm_os.content.content_opportunity import run_content_opportunity_gener
 from app.gtm_os.content.promotion import run_candidate_promotion_sweep
 from app.gtm_os.content.topic_linking import run_content_topic_linking_sweep
 from app.gtm_os.content.trend_intelligence import run_trend_intelligence_sweep
+from app.gtm_os.icp.company_enrichment import run_company_enrichment_sweep
 from app.gtm_os.icp.icp_matching import run_icp_matching_sweep
 from app.gtm_os.icp.revenue_estimation import run_revenue_backfill_sweep
 from app.gtm_os.intelligence.demand_detection import run_demand_hypothesis_sweep
@@ -336,6 +337,10 @@ ACCOUNT_STRATEGY_STAGES_PRE_CONTACT: list[tuple[str, callable]] = [
     # cycle, so a company this backfills gets a real chance at a real ICP verdict immediately
     # rather than waiting for a future run. See revenue_estimation.py's own docstring for the
     # bounded/budget-gated real cost model.
+    # Runs BEFORE revenue_backfill/icp_matching: both read firmographics this stage fills in.
+    # Confirmed live 2026-08-31 -- without it only 17 of 776 companies had the fields ICP
+    # matching needs, so 1,486 of 1,500 checks returned "insufficient_information".
+    ("company_enrichment", lambda db, tenant_id: run_company_enrichment_sweep(db, tenant_id)),
     ("revenue_backfill", lambda db, tenant_id: run_revenue_backfill_sweep(db, tenant_id, limit=30)),
     # ICP matching (icp_matching.py) -- until this GTM-OS wiring pass, run_icp_matching_sweep()
     # had ZERO callers anywhere in the app (confirmed by full-repo grep): not the scheduler, not
