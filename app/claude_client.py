@@ -141,13 +141,19 @@ def call_claude_json(prompt: str, db: Session, tenant_id: int, system: str | Non
     text = call_claude(prompt, db, tenant_id, system=system, max_tokens=max_tokens, model=model)
     cleaned = text.strip()
     if cleaned.startswith("```"):
-        cleaned = cleaned.split("\n", 1)[1] if "\n" in cleaned else cleaned
-        if cleaned.endswith("```"):
-            cleaned = cleaned.rsplit("```", 1)[0]
-        cleaned = cleaned.strip()
+        # Close on the NEXT fence, not the end of the string. Haiku routinely follows the closing
+        # fence with a "**Note:** ..." paragraph explaining its answer, and an end-anchored strip
+        # leaves that prose attached -- which failed 3 partners on the first full ICP sweep.
+        body = cleaned.split("\n", 1)[1] if "\n" in cleaned else ""
+        cleaned = body.split("```", 1)[0].strip()
         if cleaned.startswith("json"):
             cleaned = cleaned[4:].strip()
     try:
-        return json.loads(cleaned)
-    except json.JSONDecodeError as e:
+        # raw_decode, not loads: it reads the first complete JSON value and ignores anything after
+        # it, so unfenced trailing commentary is survivable too.
+        obj, _ = json.JSONDecoder().raw_decode(cleaned)
+    except ValueError as e:
         raise ClaudeError(f"Claude did not return valid JSON: {e}. Raw response: {text[:500]}") from e
+    if not isinstance(obj, dict):
+        raise ClaudeError(f"Claude returned {type(obj).__name__}, not a JSON object. Raw response: {text[:500]}")
+    return obj

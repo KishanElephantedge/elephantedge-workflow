@@ -135,11 +135,20 @@ def run_partner_icp_parse_sweep(db: Session, tenant_id: int, limit: int = 200, f
         if parsed is None:
             result["skipped_no_text"] += 1
             continue
-        try:
-            store_structured_icp(db, profile, parsed)
-            result["parsed"] += 1
-        except Exception as e:  # noqa: BLE001
-            db.rollback()
-            result["failed"] += 1
-            logger.error("partner_icp: store failed for %r -- %s", profile.name, e)
+        # One retry: the write races the live sweep, which touches these same rows, and two
+        # partners lost their parse to a transient deadlock on the first full run. Re-doing the
+        # write costs nothing (the LLM call already happened and its result is in hand); losing it
+        # means that partner silently keeps an unfiltered candidate pool.
+        for attempt in (1, 2):
+            try:
+                store_structured_icp(db, profile, parsed)
+                result["parsed"] += 1
+                break
+            except Exception as e:  # noqa: BLE001
+                db.rollback()
+                if attempt == 1:
+                    logger.warning("partner_icp: store retry for %r -- %s", profile.name, e)
+                    continue
+                result["failed"] += 1
+                logger.error("partner_icp: store failed for %r -- %s", profile.name, e)
     return result
