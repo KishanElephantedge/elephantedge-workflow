@@ -36,6 +36,8 @@ override has been saved yet, get_linkedin_search_config() computes the curated d
 
 from datetime import datetime, timedelta
 
+import logging
+
 from sqlalchemy.orm import Session
 
 from app.db.models import Parameter
@@ -80,6 +82,8 @@ QUERY_CATALOG: list[dict] = [
     {"text": "looking for a sales consultant", "source": "offering:Consulting", "intent_family": "external_advisory_need", "pattern": "hiring_trigger"},
     {"text": "need outside help with our sales process", "source": "offering:Consulting", "intent_family": "external_advisory_need", "pattern": "declared_problem"},
 ]
+
+logger = logging.getLogger(__name__)
 
 SEARCH_CONFIG_PARAMETER_KEY = "gtm_os_linkedin_search_config"
 
@@ -151,6 +155,24 @@ def get_linkedin_search_config(db: Session, tenant_id: int) -> dict:
     )
     if param and isinstance(param.value, dict) and param.value.get("phrases"):
         config = dict(param.value)
+        # Loud warning when the STORED phrases share nothing with the curated catalog (2026-09-01).
+        # This exact situation ran in production for 10 days: the label-derived queries
+        # ("struggling to Stuck in Sales") were replaced in code on 2026-08-22, but the saved
+        # override kept shadowing the fix, so the tenant carried on searching nonsense and the
+        # channel produced 1 demand-qualifying signal out of 114 interpreted. Replacing the stored
+        # phrases with the catalog took that to 3 of 14.
+        #
+        # Not auto-corrected -- a deliberate human override is legitimate and must not be silently
+        # discarded. But a stored set with ZERO overlap is far more likely to be stale than
+        # intentional, and it must never again fail quietly.
+        stored = set(config.get("phrases") or [])
+        catalog = set(derive_default_search_phrases())
+        if stored and catalog and not (stored & catalog):
+            logger.warning(
+                "linkedin_search_config: stored phrases share NOTHING with the curated catalog -- "
+                "likely a stale override shadowing a code-level fix. stored=%s",
+                sorted(stored)[:5],
+            )
     else:
         config = {"phrases": derive_default_search_phrases()}
     config.setdefault("max_phrases_per_cycle", DEFAULT_MAX_PHRASES_PER_CYCLE)
