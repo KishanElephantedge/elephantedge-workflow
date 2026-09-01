@@ -24,6 +24,7 @@ from datetime import datetime
 from sqlalchemy.orm import Session
 
 from app.db.models import Batch, Company, LinkedinMonitorProfile, Parameter, PartnerCompanyRecommendation
+from app.phases.partner_icp import get_structured_icp
 from app.llm_client import generate_json
 from app.phases.linkedin_monitor import ScheduleConfigError
 
@@ -126,10 +127,59 @@ def _get_candidate_companies(db: Session, tenant_id: int, profile: LinkedinMonit
         .join(Batch)
         .filter(Batch.tenant_id == tenant_id)
         .filter(Company.industry.isnot(None))
-        .order_by(Company.hot_lead.desc().nulls_last(), Company.created_at.desc())
-        .limit(CANDIDATE_LIMIT)
     )
-    return query.all()
+
+    # Apply the partner's OWN stated bands as real filters (2026-09-01). Previously the only
+    # pre-filter was "has an industry", and the LLM was handed a paragraph and asked to honour
+    # numbers inside it. It cannot: confirmed against two real partners whose lists went out.
+    # Remy Piazza's stored ICP literally says "$3M - $30M ARR with less than 100 employees" and
+    # he was still sent generic IT/security companies that had NO revenue figure at all. Abbas
+    # Shivji rejected 2 of 3 for geography and headcount that were both already in his ICP.
+    #
+    # A band only filters when it is KNOWN to be violated -- a company with no revenue on file is
+    # kept, not dropped. Excluding unknowns would silently discard most of the table (only 595 of
+    # 777 companies carry a revenue figure) and would hide good accounts behind missing data.
+    icp = get_structured_icp(profile) or {}
+    revenue_max = icp.get("revenue_max_usd")
+    revenue_min = icp.get("revenue_min_usd")
+    if isinstance(revenue_min, int):
+        query = query.filter((Company.estimated_revenue_higher_usd.is_(None)) | (Company.estimated_revenue_higher_usd >= revenue_min))
+    if isinstance(revenue_max, int):
+        query = query.filter((Company.estimated_revenue_lower_usd.is_(None)) | (Company.estimated_revenue_lower_usd <= revenue_max))
+    employee_min, employee_max = icp.get("employee_min"), icp.get("employee_max")
+    if isinstance(employee_min, int):
+        query = query.filter((Company.employee_count.is_(None)) | (Company.employee_count >= employee_min))
+    if isinstance(employee_max, int):
+        query = query.filter((Company.employee_count.is_(None)) | (Company.employee_count <= employee_max))
+
+    industries = [i for i in (icp.get("industries") or []) if isinstance(i, str) and len(i.strip()) >= 3]
+    if industries:
+        # OR across the partner's own industry keywords, still keeping companies whose industry
+        # text simply does not mention them out -- this is a funnel into a bounded LLM call, not
+        # the final verdict, so it errs toward recall.
+        # Word-boundary-ish match, not a bare substring: "%technology%" also matches
+        # "Biotechnology Research", which put a biotech company into a SaaS partner's pool on the
+        # first live run. Matching " technology" / "technology " / exact keeps the keyword a word
+        # rather than a fragment of a longer one.
+        def _kw_clauses(keyword: str):
+            kw = keyword.strip().lower()
+            return [
+                Company.industry.ilike(f"{kw}%"),        # starts the field
+                Company.industry.ilike(f"% {kw}%"),      # preceded by a space
+                Company.industry.ilike(f"%,{kw}%"),      # preceded by a comma
+            ]
+
+        clauses = [c for kw in industries[:12] for c in _kw_clauses(kw)]
+        combined = clauses[0]
+        for clause in clauses[1:]:
+            combined = combined | clause
+        query = query.filter(combined)
+
+    return (
+        query.order_by(Company.hot_lead.desc().nulls_last(), Company.created_at.desc())
+        .limit(CANDIDATE_LIMIT)
+        .all()
+    )
 
 
 MATCHING_PROMPT = """You are helping Elephant Edge decide which of ITS OWN prospect companies \
