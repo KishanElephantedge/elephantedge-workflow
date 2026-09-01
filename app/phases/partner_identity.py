@@ -34,6 +34,37 @@ def _slug_parts(url: str | None) -> list[str]:
     return parts
 
 
+_LINKEDIN_IN_RE = re.compile(r"linkedin\.com/in/([^/?#]+)", re.I)
+
+
+def normalize_linkedin_url(url: str) -> str:
+    """Reduces a profile URL to its canonical /in/<slug> form.
+
+    Scraped URLs arrive with UI fragments attached -- Remy Piazza was stored twice because one row
+    had ".../in/rpiazza/overlay/about-this-profile" and the other ".../in/rpiazza", and a raw string
+    comparison saw two different people. The duplicate then shadowed the real row in matching.
+    """
+    m = _LINKEDIN_IN_RE.search(url or "")
+    if not m:
+        return (url or "").strip().rstrip("/")
+    return f"https://www.linkedin.com/in/{m.group(1).strip().lower()}"
+
+
+def resolve_profile_name(name: str | None, linkedin_url: str) -> tuple[str | None, str | None]:
+    """Returns (name_to_store, warning). Applies the same URL-wins rule as the backfill, at the
+    point of write, so a mismatched name is corrected before it ever reaches the table."""
+    parts = _slug_parts(linkedin_url)
+    stored = [t for t in re.findall(r"[a-z]+", (name or "").lower()) if len(t) > 2]
+    if not parts or not stored:
+        return name, None
+    if any(t in "".join(parts).lower() for t in stored):
+        return name, None
+    if len(parts) >= 2:
+        derived = " ".join(w.capitalize() for w in parts)
+        return derived, f"supplied name {name!r} does not match the profile URL; stored {derived!r} instead"
+    return name, f"supplied name {name!r} does not match the URL slug {parts[0]!r}; kept as given, needs review"
+
+
 def audit_profile_names(db: Session, tenant_id: int) -> dict:
     """Splits mismatched rows into ones whose slug yields a usable name and ones that don't.
 

@@ -3133,8 +3133,16 @@ def list_linkedin_monitor_profiles(db: Session = Depends(get_db)):
 
 @router.post("/linkedin-monitor/profiles")
 def add_linkedin_monitor_profile(name: str | None = None, linkedin_url: str = "", company: str | None = None, db: Session = Depends(get_db)):
+    from app.phases.partner_identity import normalize_linkedin_url, resolve_profile_name
+
     if not linkedin_url:
         raise HTTPException(status_code=400, detail="linkedin_url is required")
+
+    # Normalize BEFORE the duplicate check. The raw string comparison this used to do let the same
+    # person in twice whenever a scraped URL carried a UI fragment -- Remy Piazza existed as both
+    # ".../in/rpiazza" and ".../in/rpiazza/overlay/about-this-profile", and the duplicate (which had
+    # no GTM data) is the row partner matching was actually reading.
+    linkedin_url = normalize_linkedin_url(linkedin_url)
     existing = (
         db.query(LinkedinMonitorProfile)
         .filter(LinkedinMonitorProfile.tenant_id == ELEPHANT_EDGE_TENANT_ID)
@@ -3143,10 +3151,17 @@ def add_linkedin_monitor_profile(name: str | None = None, linkedin_url: str = ""
     )
     if existing:
         return {"id": existing.id, "already_existed": True}
+
+    # The name and the URL are two independent free-form inputs, and nothing used to check that
+    # they described the same person -- which is how "Traction Complete" ended up as the name on two
+    # different people's profiles and "Isabella (Kalender) Moore" on Samantha Blaine's. The URL
+    # wins, because it is what the rest of the system keys off.
+    name, warning = resolve_profile_name(name, linkedin_url)
+
     profile = LinkedinMonitorProfile(tenant_id=ELEPHANT_EDGE_TENANT_ID, name=name, linkedin_url=linkedin_url, company=company)
     db.add(profile)
     db.commit()
-    return {"id": profile.id, "already_existed": False}
+    return {"id": profile.id, "already_existed": False, "name": profile.name, "warning": warning}
 
 
 @router.delete("/linkedin-monitor/profiles/{profile_id}")
@@ -3364,13 +3379,35 @@ def backfill_linkedin_monitor_names(db: Session = Depends(get_db)):
 # app/phases/gtm_partner_matching.py and app/phases/gtm_partner_messaging.py.
 
 @router.post("/linkedin-monitor/match-companies")
-def trigger_partner_matching_sweep(only_new_profiles: bool = True, profile_id: int | None = None, db: Session = Depends(get_db)):
+def trigger_partner_matching_sweep(only_new_profiles: bool = True, profile_id: int | None = None, replace: bool = False, db: Session = Depends(get_db)):
     """profile_id, when given, scopes this run to exactly that one partner -- the real
     per-partner "Run matching" action in the Recommended Companies detail view. Without it, this
     runs across every eligible partner at once, which should stay a deliberate bulk action (or
-    just let the daily schedule handle it), not the default click target."""
+    just let the daily schedule handle it), not the default click target.
+
+    replace=True first clears that partner's un-reviewed ('proposed') recommendations so the run
+    produces a clean list instead of appending to a stale one. It requires profile_id: every
+    partner matched before structured ICPs existed has recommendations from a matcher that
+    pre-filtered on nothing, but re-running all of them at once is wasted work -- the list only
+    matters for a partner actually being contacted. Approved and rejected rows are never cleared;
+    those are human decisions, not machine output."""
     from app.phases.gtm_partner_matching import run_partner_matching_sweep
-    return run_partner_matching_sweep(db, ELEPHANT_EDGE_TENANT_ID, only_new_profiles=only_new_profiles, profile_id=profile_id)
+
+    cleared = 0
+    if replace:
+        if profile_id is None:
+            raise HTTPException(status_code=400, detail="replace=True requires profile_id")
+        cleared = (
+            db.query(PartnerCompanyRecommendation)
+            .filter(PartnerCompanyRecommendation.tenant_id == ELEPHANT_EDGE_TENANT_ID)
+            .filter(PartnerCompanyRecommendation.profile_id == profile_id)
+            .filter(PartnerCompanyRecommendation.status == "proposed")
+            .delete(synchronize_session=False)
+        )
+        db.commit()
+
+    result = run_partner_matching_sweep(db, ELEPHANT_EDGE_TENANT_ID, only_new_profiles=only_new_profiles, profile_id=profile_id)
+    return {**result, "cleared_stale": cleared}
 
 
 @router.get("/linkedin-monitor/match-cap")
