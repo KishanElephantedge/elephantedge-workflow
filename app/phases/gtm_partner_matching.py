@@ -173,7 +173,22 @@ def _get_candidate_companies(db: Session, tenant_id: int, profile: LinkedinMonit
         combined = clauses[0]
         for clause in clauses[1:]:
             combined = combined | clause
-        query = query.filter(combined)
+
+        # Industry is a SOFT filter: keep it only if it actually leaves something behind.
+        #
+        # A partner states their ICP in business-model language ("B2B SaaS", "HealthTech",
+        # "Life Sciences") while Company.industry holds LinkedIn's taxonomy ("Software
+        # Development", "IT Services and IT Consulting"). Those vocabularies do not overlap, so a
+        # hard AND on industry silently emptied the pool for 48 of 156 partners -- Abbas Shivji
+        # went to zero candidates on an ICP that 751 companies satisfy on revenue and 663 on
+        # headcount. Returning nothing is the worst outcome here: it reads as "no good accounts
+        # exist" when it really means "we asked in the wrong vocabulary".
+        #
+        # The numeric bands are objective and stay hard. Industry falls back to the LLM, which
+        # reads the company's full description and can bridge the two vocabularies.
+        narrowed = query.filter(combined)
+        if narrowed.limit(1).count():
+            query = narrowed
 
     return (
         query.order_by(Company.hot_lead.desc().nulls_last(), Company.created_at.desc())
