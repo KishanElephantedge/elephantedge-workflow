@@ -12,8 +12,20 @@ route in app/routes/api.py for the tenant_id filter that enforces that boundary.
 
 from datetime import datetime
 
+import re
+
 from sqlalchemy import JSON, BigInteger, Boolean, Column, Date, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint
-from sqlalchemy.orm import declarative_base, relationship
+from sqlalchemy.orm import declarative_base, relationship, validates
+
+# Link shorteners that turn up where a company website should be, because companies post
+# shortened links and scrapes follow them. Branded shortener domains (Treehouse's "trhouse.co")
+# cannot be enumerated, so this catches the generic ones; the rest are caught by the fact that a
+# shortener never serves the company's own site when checked.
+LINK_SHORTENER_DOMAINS = {
+    "bit.ly", "bitly.com", "lnkd.in", "tinyurl.com", "t.co", "goo.gl", "ow.ly", "buff.ly",
+    "hubs.ly", "hubs.li", "rb.gy", "cutt.ly", "shorturl.at", "is.gd", "trib.al", "dlvr.it",
+    "linktr.ee", "bl.ink", "smarturl.it", "rebrand.ly",
+}
 
 Base = declarative_base()
 
@@ -143,6 +155,30 @@ class Company(Base):
     signals = relationship("Signal", back_populates="company", cascade="all, delete-orphan")
     score = relationship("Score", back_populates="company", uselist=False, cascade="all, delete-orphan")
     contacts = relationship("Contact", back_populates="company", cascade="all, delete-orphan")
+
+    @validates("domain")
+    def _clean_domain(self, _key, value):
+        """Drops a domain that is a link shortener rather than the company's own site.
+
+        Scrapes pick these up because a company posts shortened links: Treehouse was stored as
+        "trhouse.co" (its Bitly branded domain), ideaForge as "bit.ly", GTM Buddy as "hubs.ly". A
+        wrong domain is worse than no domain -- every enrichment keyed on it silently describes
+        someone else, and Treehouse's two real contacts were graded as belonging to another company
+        because of it. Six separate call sites construct a Company, so this lives on the model where
+        all of them (and any future one) go through it.
+
+        Stored as None rather than raising: a bad domain should not abort a discovery run that is
+        otherwise fine, and the company is still worth keeping without one.
+        """
+        if not value:
+            return value
+        cleaned = str(value).strip().lower()
+        cleaned = re.sub(r"^\w+://", "", cleaned).split("/")[0].removeprefix("www.").strip(". ")
+        if not cleaned or "." not in cleaned:
+            return None
+        if cleaned in LINK_SHORTENER_DOMAINS:
+            return None
+        return cleaned
 
 
 class Signal(Base):

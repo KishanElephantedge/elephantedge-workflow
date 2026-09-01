@@ -27,6 +27,7 @@ whichever one's actual title contains one of our target keywords, rather than ac
 whatever the provider's relevance ranking put first.
 """
 
+import re
 from datetime import datetime
 
 from sqlalchemy.orm import Session
@@ -45,6 +46,42 @@ CEO_FILTER = "CEO OR Chief Executive Officer OR Founder OR Co-Founder OR Owner O
 # Executive Vice President too). Handled separately below with an explicit exclusion check.
 CEO_TITLE_KEYWORDS = ["ceo", "chief executive officer", "founder", "owner", "managing director"]
 CEO_TITLE_PRESIDENT_EXCLUSIONS = ["vice president", "svp", "avp", "evp"]
+
+# Board seats are not operating roles. Confirmed live on the Remy Piazza shortlist (2026-09-01):
+# this tier returned Troy Williams ("Board Member" at KickUp -- he is Managing Director at Achieve
+# Partners, an investor), Marise Kumar ("Advisory Board Member" at eTutorWorld -- she is a Vistage
+# chair), Scott Weiner, Robyn Dittrich and Daniel Allien. All are real people genuinely attached to
+# the company and none of them can be sold to; the outreach has to reach an operator. "Managing
+# Director" in CEO_TITLE_KEYWORDS is what admits most of them, since that is an investor's title as
+# often as a founder's.
+#
+# Checked BEFORE the keyword match rather than after, so a compound title ("Founder & Board
+# Member") is judged on the operating half and still kept -- Kapil Dev Advani is Founder & CEO of
+# AlmaShines and must not be dropped here.
+BOARD_ONLY_TITLE_MARKERS = [
+    "board member", "board of directors", "board of advisors", "advisory board", "board observer",
+    "non executive director", "non-executive director", "board chair", "chairman of the board",
+]
+# Operating words that override a board marker when both appear in one title. Matched on word
+# boundaries, not as bare substrings: "director" contains "cto" and "non executive director"
+# would otherwise read as an operating role -- the same substring trap that "president" inside
+# "Vice President" set above.
+OPERATING_TITLE_MARKERS = [
+    "ceo", "chief executive", "founder", "co-founder", "cofounder", "owner", "president",
+    "chief revenue", "chief operating", "chief technology", "chief marketing", "coo", "cto", "cmo",
+    "head of", "vp", "vice president", "director of", "managing director",
+]
+_OPERATING_RE = re.compile(
+    r"(?<![a-z])(" + "|".join(re.escape(m) for m in OPERATING_TITLE_MARKERS) + r")(?![a-z])"
+)
+
+
+def is_board_only_title(title: str | None) -> bool:
+    """True when a title is a board/advisory seat and nothing operational alongside it."""
+    t = (title or "").lower()
+    if not any(marker in t for marker in BOARD_ONLY_TITLE_MARKERS):
+        return False
+    return not _OPERATING_RE.search(t)
 
 SALES_LEADER_FILTER = (
     "Head of Sales OR VP Sales OR VP of Sales OR Head of GTM OR Head of Growth OR "
@@ -143,6 +180,8 @@ def _matching_persons(
     matches = []
     for person in persons:
         title = (person.get("title") or "").lower()
+        if is_board_only_title(title):
+            continue  # a board seat is not someone who can buy -- see BOARD_ONLY_TITLE_MARKERS
         is_match = any(keyword in title for keyword in title_keywords)
         if not is_match and require_bare_president and "president" in title and not any(excl in title for excl in CEO_TITLE_PRESIDENT_EXCLUSIONS):
             is_match = True
