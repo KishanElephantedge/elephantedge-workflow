@@ -155,6 +155,21 @@ def send_message_draft(db: Session, tenant_id: int, draft: MessageDraft) -> dict
         retryable=result.get("retryable"),
     )
     db.add(attempt)
+
+    # Close the Opportunity once its outreach has actually gone out. Opportunity.status has always
+    # had a "converted" value and nothing ever set it, so every Opportunity stayed "candidate"
+    # forever and every downstream stage re-read it on every run. The result: 18 opportunities were
+    # re-evaluated, re-strategised and re-drafted daily, and the send stage then blocked 29 of 31
+    # drafts because those people had already been messaged. The work was real, the cost was real,
+    # and none of it could ever produce a send.
+    #
+    # Marking it here -- at the one point where a message provably reached a provider -- rather
+    # than on approval or draft, so nothing is closed on intent alone.
+    if result["status"] in ("enrolled", "request_submitted") and opportunity is not None:
+        opportunity.status = "converted"
+        opportunity.last_updated_at = datetime.utcnow()
+        db.add(opportunity)
+
     db.commit()
 
     return {

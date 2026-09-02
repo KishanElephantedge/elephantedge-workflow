@@ -27,7 +27,7 @@ from app.gtm_os.context.business_context import get_business_context
 from app.gtm_os.intelligence.demand_hypothesis import DemandHypothesis
 from app.gtm_os.intelligence.problem_hypothesis import ProblemHypothesis
 from app.gtm_os.intelligence.signal import GtmSignal
-from app.gtm_os.opportunity.opportunity import Opportunity
+from app.gtm_os.opportunity.opportunity import TERMINAL_STATUSES, Opportunity
 from app.gtm_os.strategy.strategy import GtmStrategy, market_context
 
 READINESS_STATES = {
@@ -356,6 +356,9 @@ def run_sales_agent_sweep(db, tenant_id: int, limit: int = 200, dry_run: bool = 
         row[0]
         for row in db.query(Opportunity.id)
         .filter(Opportunity.tenant_id == tenant_id)
+        # Finished opportunities are not re-worked -- see TERMINAL_STATUSES. Without this every
+        # stage re-processed every opportunity ever created, on every run.
+        .filter(Opportunity.status.notin_(TERMINAL_STATUSES))
         .order_by(Opportunity.id)
         .limit(limit)
         .all()

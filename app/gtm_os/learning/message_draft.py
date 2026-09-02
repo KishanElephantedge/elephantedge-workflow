@@ -36,7 +36,7 @@ from sqlalchemy.orm import Session
 
 from app.db.models import Base, Contact
 from app.gtm_os.opportunity.offering_config import get_offering_messaging_reference
-from app.gtm_os.opportunity.opportunity import Opportunity
+from app.gtm_os.opportunity.opportunity import TERMINAL_STATUSES, Opportunity
 from app.gtm_os.sales.contact_discovery import get_eligible_contacts
 from app.gtm_os.sales.sales_agent import evaluate_decision_maker, evaluate_sales_readiness, gather_account_research, prepare_message
 from app.gtm_os.strategy.strategy import GtmStrategy
@@ -772,6 +772,9 @@ def run_message_generation_sweep(db: Session, tenant_id: int, limit: int = 20) -
         row[0]
         for row in db.query(Opportunity.id)
         .filter(Opportunity.tenant_id == tenant_id)
+        # Finished opportunities are not re-worked -- see TERMINAL_STATUSES. Without this every
+        # stage re-processed every opportunity ever created, on every run.
+        .filter(Opportunity.status.notin_(TERMINAL_STATUSES))
         .order_by(Opportunity.id)
         .all()
     ]

@@ -59,6 +59,16 @@ from app.gtm_os.opportunity.opportunity_config import get_opportunity_config
 
 VALID_STATUSES = {"candidate", "qualified", "dismissed", "converted"}
 
+# An Opportunity in one of these states is FINISHED and must not be re-worked by any downstream
+# stage. "converted" is set when its outreach actually reached a provider (see send.py);
+# "dismissed" is a human or rule decision not to pursue it.
+#
+# Every stage used to query Opportunity with no status filter at all, so all 18 open
+# opportunities were re-evaluated, re-strategised and re-drafted on every single daily run --
+# then the send stage blocked the drafts because those people had already been messaged. Real
+# LLM cost, every day, that could never produce a send.
+TERMINAL_STATUSES = {"converted", "dismissed"}
+
 
 class Opportunity(Base):
     __tablename__ = "opportunities"

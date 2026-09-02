@@ -17,7 +17,7 @@ from sqlalchemy.orm import Session
 from app.budget_guard import BudgetExceededError, BudgetGuard
 from app.db.models import Batch, Company, Contact
 from app.deepline_client import DeeplineError, get_credit_balance_usd
-from app.gtm_os.opportunity.opportunity import Opportunity
+from app.gtm_os.opportunity.opportunity import TERMINAL_STATUSES, Opportunity
 from app.gtm_os.orchestration.control import ControlPlaneHalted, check_can_run, get_control_config
 from app.gtm_os.strategy.strategy import GtmStrategy
 from app.phases.decision_maker import CANDIDATES_PER_SEARCH, MAX_CONTACTS_PER_COMPANY, find_decision_makers
@@ -270,6 +270,9 @@ def run_v2_contact_discovery_sweep(db: Session, tenant_id: int, limit: int = 50)
         row[0]
         for row in db.query(Opportunity.id)
         .filter(Opportunity.tenant_id == tenant_id)
+        # Finished opportunities are not re-worked -- see TERMINAL_STATUSES. Without this every
+        # stage re-processed every opportunity ever created, on every run.
+        .filter(Opportunity.status.notin_(TERMINAL_STATUSES))
         .order_by(Opportunity.id)
         .limit(limit)
         .all()
