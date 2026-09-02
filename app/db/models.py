@@ -127,6 +127,13 @@ class Company(Base):
     # was incomplete (it may have been enriched since) or that has never been checked at all.
     icp_last_evaluated_at = Column(DateTime, nullable=True)
     icp_last_evaluation_had_missing_information = Column(Boolean, nullable=True)
+    # How many times an incomplete ICP verdict has been retried. The retry exists because a
+    # company may get enriched between runs -- but with nothing to stop it, 737 of 804 companies
+    # were being re-checked on every single run, forever, crowding genuinely new companies out of
+    # the stage's own 500-row limit and leaving the funnel permanently showing them as stuck.
+    # Retries are now spaced (see ICP_RETRY_AFTER_DAYS) and capped (ICP_MAX_EVALUATION_ATTEMPTS),
+    # after which a company is left alone rather than re-checked for the rest of time.
+    icp_evaluation_attempts = Column(Integer, nullable=False, default=0, server_default="0")
     active_job_title = Column(String, nullable=True)  # title of the matched posting, if any
     hiring_signal_role = Column(String, nullable=True)  # head_of_sales | sdr | ae | marketing | gtm
     hiring_signal_hire_type = Column(String, nullable=True)  # first_hire | multiple_hire

@@ -17,7 +17,7 @@ TENANT SCOPING: Company has no direct tenant_id column (existing schema) -- tena
 through Company.batch_id -> Batch.tenant_id, exactly like every other Company query in this
 codebase already does."""
 
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from sqlalchemy import Column, DateTime, ForeignKey, Integer, JSON, String
 from sqlalchemy.orm import Session
@@ -242,6 +242,20 @@ def get_icp_context_for_company(db: Session, tenant_id: int, company_id: int | N
     }
 
 
+# An incomplete ICP verdict is retried because the company may get enriched between runs. With
+# no limit on that, 737 of 804 companies were re-checked on EVERY run forever -- they crowded
+# genuinely new companies out of this stage's own 500-row limit, and the funnel never converged
+# (the UI showed them permanently stuck at "insufficient context").
+#
+# A company that lacked revenue/headcount yesterday almost never has it today: enrichment is
+# weekly at best. So retries are spaced a week apart, and capped -- after ICP_MAX_EVALUATION_
+# ATTEMPTS incomplete verdicts the company is left alone rather than re-checked for the rest of
+# time. It is NOT deleted or marked bad: if it is ever enriched, revenue_backfill clears the
+# incomplete flag and it becomes eligible again on its own.
+ICP_RETRY_AFTER_DAYS = 7
+ICP_MAX_EVALUATION_ATTEMPTS = 3
+
+
 def run_icp_matching_sweep(db: Session, tenant_id: int, limit: int = 200, dry_run: bool = False) -> dict:
     """Evaluates up to `limit` companies (tenant-scoped via Batch.tenant_id) against the tenant's
     configured ICPs. `dry_run=True` computes everything but writes nothing. One company's failure
@@ -276,7 +290,16 @@ def run_icp_matching_sweep(db: Session, tenant_id: int, limit: int = 200, dry_ru
         for row in db.query(Company.id)
         .join(Batch, Company.batch_id == Batch.id)
         .filter(Batch.tenant_id == tenant_id)
-        .filter((Company.icp_last_evaluated_at.is_(None)) | (Company.icp_last_evaluation_had_missing_information.is_(True)))
+        .filter(
+            # Never checked -- always eligible, and ordered first below.
+            (Company.icp_last_evaluated_at.is_(None))
+            | (
+                # Incomplete, but only if it has waited a week AND has retries left.
+                (Company.icp_last_evaluation_had_missing_information.is_(True))
+                & (Company.icp_last_evaluated_at < datetime.utcnow() - timedelta(days=ICP_RETRY_AFTER_DAYS))
+                & (Company.icp_evaluation_attempts < ICP_MAX_EVALUATION_ATTEMPTS)
+            )
+        )
         .order_by(Company.icp_last_evaluated_at.is_(None).desc(), Company.icp_last_evaluated_at.asc())
         .limit(limit)
         .all()
@@ -312,6 +335,10 @@ def run_icp_matching_sweep(db: Session, tenant_id: int, limit: int = 200, dry_ru
             if not dry_run:
                 company.icp_last_evaluated_at = datetime.utcnow()
                 company.icp_last_evaluation_had_missing_information = had_missing_information
+                # Only an INCOMPLETE verdict burns an attempt -- a complete verdict is already
+                # excluded from re-checking by the flag itself, so counting it would be noise.
+                if had_missing_information:
+                    company.icp_evaluation_attempts = (company.icp_evaluation_attempts or 0) + 1
                 db.commit()
 
         except Exception:  # noqa: BLE001 -- one company's failure must never block the others
