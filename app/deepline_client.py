@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import re
 import signal
@@ -6,6 +7,8 @@ import subprocess
 import time
 
 from app.config import settings
+
+logger = logging.getLogger(__name__)
 
 
 class DeeplineError(Exception):
@@ -139,14 +142,29 @@ def get_credit_balance_usd() -> float:
     per-call cost estimate.
 
     This call has shown itself intermittently slow/hanging in production (observed: 2 of 3
-    real calls fast and correct in ~3s, 1 of 3 hung the full timeout) -- one retry on failure
-    smooths over that without masking a persistent problem, since BudgetGuard's caller still
-    sees a real DeeplineError (and fails the run safely, per its own docstring) if both
-    attempts fail."""
-    try:
-        return _get_credit_balance_usd_once(timeout_seconds=20)
-    except DeeplineError:
-        return _get_credit_balance_usd_once(timeout_seconds=20)
+    real calls fast and correct in ~3s, 1 of 3 hung the full timeout) -- retries smooth over
+    that without masking a persistent problem, since BudgetGuard's caller still sees a real
+    DeeplineError (and fails the run safely, per its own docstring) if every attempt fails.
+
+    Two attempts were not enough. On 2026-09-01 both timed out, BudgetGuard could not be
+    constructed, and the entire discovery stage failed -- so the day produced no new companies,
+    the run re-drafted to contacts it had already messaged, and the 30-day cooldown then blocked
+    almost every send. One flaky subprocess cost a full day of outreach.
+
+    The guard itself is NOT skippable: run_discovery spends real Deepline credits through
+    crustdata_companydb_search, so proceeding without a verified balance would be unguarded paid
+    spend. The fix is therefore to make the check succeed, not to bypass it. A local run measured
+    4-5s, so a 45s ceiling is far beyond a healthy call -- it only ever costs time on the hang
+    case, which is the case worth waiting through.
+    """
+    last_error: DeeplineError | None = None
+    for timeout_seconds in (20, 30, 45):
+        try:
+            return _get_credit_balance_usd_once(timeout_seconds=timeout_seconds)
+        except DeeplineError as e:
+            last_error = e
+            logger.warning("deepline billing balance failed at %ss timeout: %s", timeout_seconds, e)
+    raise last_error if last_error else DeeplineError("billing balance failed with no recorded error")
 
 
 def extract_rows(response: dict, *keys: str) -> list[dict]:

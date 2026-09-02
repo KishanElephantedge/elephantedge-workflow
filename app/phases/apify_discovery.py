@@ -52,6 +52,14 @@ APIFY_EMPLOYEE_MIN = 25
 APIFY_EMPLOYEE_MAX = 50
 APIFY_DISCOVERY_LIMIT_CAP = 150
 
+# Location was a hardcoded ["United States"] literal at the three call sites that run a job
+# search. Nothing about the actor requires it -- locationSearch takes any list -- so this was an
+# unstated assumption, not a capability limit, and it made the whole company table US-only: 0 of
+# 777 companies are confirmed non-US. That surfaced when Abbas Shivji's ICP turned out to read
+# "United Kingdom / European Union / EMEA", so no filtering could ever produce an account he
+# would accept; the companies were never discovered in the first place.
+APIFY_DEFAULT_LOCATION_SEARCH = ["United States"]
+
 
 def _normalize_domain(website: str) -> str:
     domain = (website or "").lower().strip()
@@ -60,7 +68,12 @@ def _normalize_domain(website: str) -> str:
     return domain.replace("www.", "")
 
 
-def run_apify_discovery(batch_id: int, db: Session, tenant_id: int, target: int = 5, time_range: str = "7d") -> dict:
+def run_apify_discovery(
+    batch_id: int, db: Session, tenant_id: int, target: int = 5, time_range: str = "7d",
+    location_search: list[str] | None = None, title_search: list[str] | None = None,
+    employee_min: int | None = None, employee_max: int | None = None,
+    industry_filter: list[str] | None = None,
+) -> dict:
     """Entrypoint -- single synchronous Apify actor call (no budget_guard/paging loop like
     jd_first, since the actor's own `limit` already bounds spend deterministically: N results
     costs exactly N*$0.005 + $0.01, no per-page uncertainty).
@@ -94,11 +107,11 @@ def run_apify_discovery(batch_id: int, db: Session, tenant_id: int, target: int 
         api_key = _get_apify_api_key(db, tenant_id)
         jobs = search_linkedin_jobs(
             api_key,
-            title_search=APIFY_TITLE_SEARCH,
-            location_search=["United States"],
-            organization_employees_gte=APIFY_EMPLOYEE_MIN,
-            organization_employees_lte=APIFY_EMPLOYEE_MAX,
-            industry_filter=APIFY_INDUSTRY_FILTER,
+            title_search=title_search or APIFY_TITLE_SEARCH,
+            location_search=location_search or APIFY_DEFAULT_LOCATION_SEARCH,
+            organization_employees_gte=employee_min if employee_min is not None else APIFY_EMPLOYEE_MIN,
+            organization_employees_lte=employee_max if employee_max is not None else APIFY_EMPLOYEE_MAX,
+            industry_filter=industry_filter or APIFY_INDUSTRY_FILTER,
             time_range=time_range,
             remove_agency=True,
             # Apify bills per actual result returned, not per limit requested -- so this cap

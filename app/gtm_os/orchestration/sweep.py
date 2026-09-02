@@ -521,7 +521,10 @@ def _run_linkedin_jobs(db: Session, tenant_id: int):
     same thing as broken."""
     from app.apify_client import estimate_cost_usd
     from app.apify_budget_guard import STATUS_ALLOWED, check_apify_budget
-    from app.phases.apify_discovery import APIFY_EMPLOYEE_MAX, APIFY_EMPLOYEE_MIN, APIFY_INDUSTRY_FILTER, APIFY_TITLE_SEARCH
+    from app.phases.apify_discovery import (
+        APIFY_DEFAULT_LOCATION_SEARCH, APIFY_EMPLOYEE_MAX, APIFY_EMPLOYEE_MIN, APIFY_INDUSTRY_FILTER,
+        APIFY_TITLE_SEARCH,
+    )
 
     # One search PER OFFERING PROFILE (2026-08-31), not a single hardcoded V1 filter set. The
     # old call searched only "25-50 person software company hiring a salesperson" -- Execution's
@@ -543,7 +546,7 @@ def _run_linkedin_jobs(db: Session, tenant_id: int):
         signals.extend(sense_linkedin_jobs(
             db, tenant_id,
             title_search=profile["title_search"],
-            location_search=["United States"],
+            location_search=profile.get("location_search") or APIFY_DEFAULT_LOCATION_SEARCH,
             organization_employees_gte=profile["employee_min"],
             organization_employees_lte=profile["employee_max"],
             industry_filter=profile.get("industry_filter") or APIFY_INDUSTRY_FILTER,
