@@ -137,8 +137,17 @@ def build_discovery_plan(db: Session, tenant_id: int, partner_name: str, icp: di
     if emp_min is None and emp_max is None:
         rev_lo, rev_hi = icp.get("revenue_min_usd"), icp.get("revenue_max_usd")
         if isinstance(rev_lo, int) or isinstance(rev_hi, int):
+            # ASYMMETRIC ON PURPOSE. Halving the floor as well as doubling the ceiling looked
+            # even-handed and was wrong: Isabel's $20M floor became 125 employees, and the run came
+            # back with three ~176-person companies earning $0.5-2.5M. A VC-funded startup can have
+            # 176 people and almost no revenue, so a low headcount floor admits exactly the
+            # companies a revenue floor exists to exclude -- 3 of 5 results were wasted on it.
+            #
+            # So the floor uses the median ratio straight (no widening) and only the ceiling is
+            # widened. Missing an unusually efficient company costs one candidate; admitting
+            # under-revenue ones costs most of the run.
             if isinstance(rev_lo, int):
-                emp_min = max(1, int(rev_lo / REVENUE_PER_EMPLOYEE_USD / 2))
+                emp_min = max(1, int(rev_lo / REVENUE_PER_EMPLOYEE_USD))
             if isinstance(rev_hi, int):
                 emp_max = int(rev_hi / REVENUE_PER_EMPLOYEE_USD * 2)
             derived_headcount = (
