@@ -17,6 +17,7 @@ relationship.
 from __future__ import annotations
 
 import re
+import unicodedata
 from datetime import datetime
 
 from sqlalchemy import func
@@ -36,14 +37,28 @@ WHAT THIS COMMUNITY IS, established from their own messages -- use it to interpr
 - Their pain is selling, not delivering: pricing 319 mentions, prospecting 210, referrals 189,
   delivery only 75.
 
-HOW TO ANSWER:
-- Always ground answers in what they actually wrote. Quote them. Name the channel and the date.
-- get_partner_profile is the right first call for any question about a specific person.
-- If someone asks what to discuss before a meeting, lead with what that person is currently
-  working on or stuck on in their own words -- not a generic profile summary.
-- Keep any URL you find exactly as-is so it stays clickable.
-- Say plainly when we do not have something. A partner with no Slack activity and no ICP on file
-  is a real answer; do not fill the gap with plausible-sounding inference.
+HOW TO ANSWER -- think, do not look up:
+- Read what the tools return and REASON about it. Do not restate the tool output as a list of
+  facts. The user can read a profile; what they need is what it means. If someone posts weekly
+  outbound scorecards and keeps missing their meetings target, say they are struggling to convert
+  activity into conversations -- do not just report the numbers.
+- Answer the question that was actually asked. "What should I talk about in this meeting" wants
+  two or three specific openers grounded in what that person said recently, not a biography.
+- Call more than one tool when it helps. A question about fit is a get_partner_profile AND a
+  search_gtm_community about what they are struggling with. Chain them; do not stop at the first
+  result.
+- Quote them. Real words, with the channel and the date, so the user can check you.
+- Notice what is missing or odd, and say so: no ICP on file, no Slack activity in months, a
+  profile that says one thing while their posts say another. Contradictions are usually the most
+  useful thing on the page.
+- Have a view. If asked who fits us best, rank them and give the reason. Hedging everything is
+  not neutrality, it is a non-answer.
+- Keep any URL exactly as-is so it stays clickable.
+- Never guess an identity. If get_partner_profile returns ambiguous=true, show the user the
+  options with their titles and companies and ask which one they mean. Answering about the wrong
+  person is worse than asking.
+- Say plainly when we do not have something. "No ICP on file and nothing in Slack since June" is
+  a real, useful answer; inventing plausible detail is not.
 
 A LINE YOU DO NOT CROSS: partners describe their own clients in confidence in #ask-a-question.
 Never propose approaching a partner's client, and never present client details as a lead list.
@@ -59,6 +74,40 @@ def _clean(text: str, names: dict[str, str] | None = None) -> str:
     if names:
         t = SLACK_USER.sub(lambda m: "@" + names.get(m.group(1), m.group(1)), t)
     return t
+
+
+
+def _fold(name: str) -> str:
+    """Name reduced to a comparable form: accents stripped, punctuation dropped, case and spacing
+    normalised.
+
+    SQL ILIKE compares codepoints, so a search for "Isabel Londono" does not match the stored
+    "Isabel Londono" -- confirmed live: she is partner 177 and posts in four Slack channels, and
+    the assistant answered "no profile data on her" because the tilde did not match. Names in this
+    data arrive from three separate sources (a GTM University scrape, Slack profiles, and typing),
+    so accents, trailing spaces and punctuation disagree constantly. Postgres unaccent would need
+    an extension; folding in Python needs nothing and the candidate sets here are small (183
+    partners, 200 Slack users).
+    """
+    decomposed = unicodedata.normalize("NFKD", name or "")
+    stripped = "".join(c for c in decomposed if not unicodedata.combining(c))
+    return " ".join(re.sub(r"[^a-z0-9 ]", " ", stripped.lower()).split())
+
+
+def _name_matches(needle: str, haystack: str) -> bool:
+    """True when the searched name is a sensible match for a stored one, ignoring accents.
+
+    Substring in either direction, so "Sarah" finds "Sarah Allen-Short" and "Isabel Londono" finds
+    "Isabel Londono". Also matches when every word of the shorter name appears in the longer, which
+    handles middle names and credentials ("Natasha Sinutko Morgan" vs "Natasha Morgan").
+    """
+    a, b = _fold(needle), _fold(haystack)
+    if not a or not b:
+        return False
+    if a in b or b in a:
+        return True
+    short, long_ = sorted((a.split(), b.split()), key=len)
+    return len(short) > 1 and all(w in long_ for w in short)
 
 
 NETWORK_CHAT_TOOLS = [
@@ -135,14 +184,69 @@ def get_partner_profile(db: Session, tenant_id: int, name: str, message_limit: i
     from app.gtm_os.community.slack_community import SlackCommunityMessage
     from app.phases.partner_icp import get_structured_icp
 
-    like = f"%{name.strip()}%"
-    profile = (
-        db.query(LinkedinMonitorProfile)
-        .filter(LinkedinMonitorProfile.tenant_id == tenant_id, LinkedinMonitorProfile.name.ilike(like))
-        .order_by(LinkedinMonitorProfile.active.desc()).first()
-    )
+    # Fold-match over all partners rather than an ILIKE: names disagree on accents, trailing
+    # spaces and punctuation across our three sources, and ILIKE compares codepoints. 183 rows.
+    candidates = [
+        p for p in db.query(LinkedinMonitorProfile).filter(LinkedinMonitorProfile.tenant_id == tenant_id).all()
+        if _name_matches(name, p.name or "")
+    ]
+    # Slack-only people matter here: 9 members post in the community but have no GTM University
+    # profile, so a partner-table-only search would report "we have nothing" about someone who is
+    # demonstrably active.
+    slack_only = [
+        n for (n,) in db.query(SlackCommunityMessage.user_name)
+        .filter(SlackCommunityMessage.tenant_id == tenant_id, SlackCommunityMessage.user_name.isnot(None))
+        .distinct().all()
+        if _name_matches(name, n) and not any(_name_matches(n, p.name or "") for p in candidates)
+    ]
 
-    out: dict = {"searched_for": name}
+    # AMBIGUITY IS RETURNED, NOT RESOLVED. "Isabel" matches both Isabel Londono and Isabella
+    # (Kalender) Moore, and silently picking the first produced a confident answer about the wrong
+    # person. When more than one person matches, hand back the full list with enough to tell them
+    # apart and let the human choose -- guessing an identity is the one thing this must not do.
+    total_matches = len(candidates) + len(slack_only)
+    if total_matches > 1:
+        activity = dict(
+            db.query(SlackCommunityMessage.user_name, func.count(SlackCommunityMessage.id))
+            .filter(SlackCommunityMessage.tenant_id == tenant_id)
+            .group_by(SlackCommunityMessage.user_name).all()
+        )
+
+        def _msgs(person_name: str) -> int:
+            """Message count by folded name -- a direct dict lookup misses whenever the partner
+            table and Slack spell the same person differently, which is most of the interesting
+            cases (accents, trailing spaces, credentials)."""
+            return sum(c for n, c in activity.items() if n and _name_matches(person_name, n))
+
+        options = [
+            {"name": (p.name or "").strip(), "title": p.title, "company": p.company,
+             "linkedin_url": p.linkedin_url,
+             "source": "GTM University + Slack" if _msgs(p.name or "") else "GTM University only",
+             "slack_messages": _msgs(p.name or ""), "active": p.active}
+            for p in candidates
+        ] + [
+            {"name": n, "title": None, "company": None, "linkedin_url": None,
+             "source": "Slack only (no GTM University profile)", "slack_messages": _msgs(n), "active": None}
+            for n in slack_only
+        ]
+        options.sort(key=lambda o: -o["slack_messages"])
+        return {
+            "searched_for": name,
+            "ambiguous": True,
+            "match_count": total_matches,
+            "message": (
+                f"{total_matches} people match '{name}'. Ask the user which one they mean before "
+                "answering -- do not pick one. List them with their titles and companies."
+            ),
+            "options": options,
+        }
+
+    candidates.sort(key=lambda p: (not p.active, len(p.name or "")))
+    profile = candidates[0] if candidates else None
+    if profile is None and slack_only:
+        name = slack_only[0]  # Slack-only person: resolve their activity under their Slack name
+
+    out: dict = {"searched_for": name, "ambiguous": False}
     if profile:
         gtm = profile.gtm_university_data or {}
         out["gtm_university_profile"] = {
@@ -160,8 +264,17 @@ def get_partner_profile(db: Session, tenant_id: int, name: str, message_limit: i
         out["gtm_university_profile"] = None
         out["note"] = "No GTM University profile on file under that name -- they may be in Slack only."
 
+    slack_names = [
+        n for (n,) in db.query(SlackCommunityMessage.user_name)
+        .filter(SlackCommunityMessage.tenant_id == tenant_id, SlackCommunityMessage.user_name.isnot(None))
+        .distinct().all()
+        if _name_matches(name, n) or (profile and _name_matches(profile.name or "", n))
+    ]
+    if not slack_names:
+        out["slack_activity"] = {"total_messages": 0, "note": "No Slack activity found under that name."}
+        return out
     q = db.query(SlackCommunityMessage).filter(
-        SlackCommunityMessage.tenant_id == tenant_id, SlackCommunityMessage.user_name.ilike(like)
+        SlackCommunityMessage.tenant_id == tenant_id, SlackCommunityMessage.user_name.in_(slack_names)
     )
     total = q.count()
     if not total:
@@ -170,13 +283,13 @@ def get_partner_profile(db: Session, tenant_id: int, name: str, message_limit: i
 
     by_channel = dict(
         db.query(SlackCommunityMessage.channel, func.count(SlackCommunityMessage.id))
-        .filter(SlackCommunityMessage.tenant_id == tenant_id, SlackCommunityMessage.user_name.ilike(like))
+        .filter(SlackCommunityMessage.tenant_id == tenant_id, SlackCommunityMessage.user_name.in_(slack_names))
         .group_by(SlackCommunityMessage.channel)
         .order_by(func.count(SlackCommunityMessage.id).desc()).all()
     )
     first, last = (
         db.query(func.min(SlackCommunityMessage.posted_at), func.max(SlackCommunityMessage.posted_at))
-        .filter(SlackCommunityMessage.tenant_id == tenant_id, SlackCommunityMessage.user_name.ilike(like)).first()
+        .filter(SlackCommunityMessage.tenant_id == tenant_id, SlackCommunityMessage.user_name.in_(slack_names)).first()
     )
     names = _slack_names(db)
     rows = q.order_by(SlackCommunityMessage.posted_at.desc()).limit(min(message_limit, 100)).all()

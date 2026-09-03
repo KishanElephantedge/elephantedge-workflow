@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session, selectinload
 from sqlalchemy import func, or_
 
 from app.cache import active_keys, bump_batch_version, cache_get, cache_set, get_batch_version, mark_active
-from app.claude_client import ClaudeError, call_claude_messages
+from app.claude_client import DEFAULT_MODEL as DEFAULT_CHAT_MODEL, ClaudeError, call_claude_messages
 from app.db.models import AutonomousRun, Batch, CalendarBooking, CampaignEvent, CampaignPush, ChatConversation, ChatMessage, Company, Contact, Credential, DailyReview, LinkedinMonitorProfile, LinkedinMonitorSignal, Notification, Parameter, PartnerCompanyRecommendation, PartnerRecommendationMessage, PersonalizedMessage, Proposal, ReverseDiscoveryCandidate, ReviewComment, Score
 from app.notifications import delete_expired_notifications
 from app.google_calendar_client import GoogleCalendarError
@@ -2565,12 +2565,23 @@ def _run_chat_turn(conversation_id: int, user_text: str, db: Session, scope: str
     else:
         system = CHAT_SYSTEM_PROMPT_TEMPLATE.format(today=datetime.utcnow().strftime("%Y-%m-%d"))
         tools = CHAT_TOOLS
+    # Model per scope, not one default for every chat. The default here is Haiku, which is right
+    # for the narrow lookup-style chats -- but the network assistant is asked to read dozens of
+    # Slack messages and reason about a person ("what should I talk to them about"), and on Haiku
+    # it answered like a lookup table rather than an analyst. That is a model-size problem, not a
+    # prompt problem, so the fix is the model. Cost is logged per call by claude_client.
+    chat_model = "claude-opus-5" if scope == "network" else DEFAULT_CHAT_MODEL
+    chat_max_tokens = 4000 if scope == "network" else 1500
+
     tools_used: list[str] = []
     csv_attachment = None
 
     for _ in range(CHAT_MAX_TOOL_ITERATIONS):
         try:
-            response = call_claude_messages(messages, db, ELEPHANT_EDGE_TENANT_ID, system=system, tools=tools)
+            response = call_claude_messages(
+                messages, db, ELEPHANT_EDGE_TENANT_ID, system=system, tools=tools,
+                model=chat_model, max_tokens=chat_max_tokens,
+            )
         except ClaudeError as e:
             reply = f"I hit an error talking to Claude: {e}"
             db.add(ChatMessage(conversation_id=conversation_id, role="assistant", content=reply, tools_used=tools_used))
