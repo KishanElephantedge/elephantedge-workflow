@@ -13,6 +13,13 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy.orm import Session
 
 from app.db.models import CalendarBooking
+# CalendarBooking.outcome_opportunity_id is a foreign key to "opportunities", whose model lives in
+# app/gtm_os/opportunity/opportunity.py. SQLAlchemy resolves FK targets against whatever is
+# registered on the shared Base, so unless that module has been imported every INSERT here dies
+# with NoReferencedTableError. That is invisible in the API process (routes import it in passing)
+# and fatal in any script or worker that does not -- imported explicitly so this module stands on
+# its own rather than depending on an unrelated import elsewhere.
+from app.gtm_os.opportunity.opportunity import Opportunity  # noqa: F401 -- registers the FK target
 from app.google_calendar_client import fetch_events
 from app.notifications import create_notification
 
@@ -56,15 +63,28 @@ def _extract_booker(event: dict) -> tuple[str | None, str | None]:
     comes from attendees[].displayName (Google doesn't populate it) -- see
     _name_from_booking_description for the real source, when there is one."""
     organizer_email = (event.get("organizer") or {}).get("email")
-    booker_email = None
-    for attendee in event.get("attendees", []):
-        if attendee.get("self"):
-            continue
-        if attendee.get("email") == organizer_email:
-            continue
-        booker_email = attendee.get("email")
-        break
-    if not booker_email and not event.get("attendees"):
+    attendees = event.get("attendees", [])
+
+    # The ONLY reliable exclusion is the account owner, whom Google marks self: true. Excluding
+    # the organizer as well was wrong and dropped real meetings: when the other person invites the
+    # owner, they are both the organizer AND the person being met. Confirmed live 2026-09-03 --
+    # four of that day's five external meetings (Isabel Londono, Jeff Ballard, Alex, Michele
+    # Hodde) were silently skipped for exactly this reason and never reached the Meetings tab.
+    #
+    # A synthetic Appointment Schedule organizer is not an attendee, so it never reaches this loop
+    # and needs no special case. Resources (rooms, equipment) do appear as attendees and are not
+    # people, so they are excluded explicitly.
+    external = [
+        a for a in attendees
+        if not a.get("self") and not a.get("resource") and a.get("email")
+    ]
+    # When several externals are present, prefer the organizer -- they called the meeting, so they
+    # are the counterparty rather than an additional invitee.
+    booker_email = next(
+        (a["email"] for a in external if a.get("organizer") or a.get("email") == organizer_email),
+        external[0]["email"] if external else None,
+    )
+    if not booker_email and not attendees:
         creator = event.get("creator", {})
         if creator.get("email") and creator.get("email") != organizer_email:
             booker_email = creator.get("email")

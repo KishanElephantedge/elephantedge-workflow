@@ -24,15 +24,23 @@ def create_notification(
     """Best-effort by design, same as the Slack senders it sits alongside -- a notification
     failing to write must never block or fail the real work (a run finishing, a message
     sending) that triggered it."""
+    # Best-effort means the NOTIFICATION may be lost -- never the caller's work. This used to
+    # db.add + db.commit on the caller's own session and db.rollback() on failure, which discarded
+    # whatever the caller had pending: a failing notification silently threw away a whole calendar
+    # sync's worth of meetings. A separate short-lived session keeps the blast radius to this row.
+    from app.db.session import SessionLocal
+
+    own = SessionLocal()
     try:
-        notif = Notification(
+        own.add(Notification(
             tenant_id=tenant_id, type=type_, severity=severity, title=title, message=message,
             batch_id=batch_id, run_id=run_id,
-        )
-        db.add(notif)
-        db.commit()
+        ))
+        own.commit()
     except Exception:  # noqa: BLE001 -- notifications are best-effort, never worth crashing the caller over
-        db.rollback()
+        own.rollback()
+    finally:
+        own.close()
 
 
 def delete_expired_notifications(db: Session, tenant_id: int) -> int:
