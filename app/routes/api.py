@@ -2558,6 +2558,10 @@ def _run_chat_turn(conversation_id: int, user_text: str, db: Session, scope: str
         from app.gtm_os.chat.content_chat_tools import CONTENT_CHAT_SYSTEM_PROMPT, CONTENT_CHAT_TOOLS
         system = CONTENT_CHAT_SYSTEM_PROMPT.format(today=datetime.utcnow().strftime("%Y-%m-%d"))
         tools = CONTENT_CHAT_TOOLS
+    elif scope == "network":
+        from app.gtm_os.chat.network_chat_tools import NETWORK_CHAT_SYSTEM_PROMPT, NETWORK_CHAT_TOOLS
+        system = NETWORK_CHAT_SYSTEM_PROMPT.format(today=datetime.utcnow().strftime("%Y-%m-%d"))
+        tools = NETWORK_CHAT_TOOLS
     else:
         system = CHAT_SYSTEM_PROMPT_TEMPLATE.format(today=datetime.utcnow().strftime("%Y-%m-%d"))
         tools = CHAT_TOOLS
@@ -2596,6 +2600,9 @@ def _run_chat_turn(conversation_id: int, user_text: str, db: Session, scope: str
                 if scope == "v2":
                     from app.gtm_os.chat.v2_chat_tools import execute_v2_chat_tool
                     result = execute_v2_chat_tool(tool_name, block.get("input", {}), db, ELEPHANT_EDGE_TENANT_ID)
+                elif scope == "network":
+                    from app.gtm_os.chat.network_chat_tools import execute_network_chat_tool
+                    result = execute_network_chat_tool(tool_name, block.get("input", {}), db, ELEPHANT_EDGE_TENANT_ID)
                 elif scope == "content":
                     from app.gtm_os.chat.content_chat_tools import execute_content_chat_tool
                     result = execute_content_chat_tool(tool_name, block.get("input", {}), db, ELEPHANT_EDGE_TENANT_ID)
