@@ -220,7 +220,7 @@ def _make_contact(company: Company, db: Session, tenant_id: int, person: dict, r
         # Deferred import -- same circular-import reason as the free-path call in
         # find_decision_maker below.
         from app.phases.free_decision_maker import resolve_fallback_email
-        fallback = resolve_fallback_email(db, tenant_id, company, contact.first_name)
+        fallback = resolve_fallback_email(db, tenant_id, company, contact.first_name, contact.last_name)
         if fallback:
             contact.email, contact.email_source = fallback
             db.commit()

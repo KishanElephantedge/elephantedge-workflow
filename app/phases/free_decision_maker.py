@@ -30,6 +30,8 @@ than strictly the requested first/last name (a real miss: searching for Neal Sar
 Resonance returned Timothy Gentry, Evan Sloss, and Karan Talati -- not Neal). Accepting an
 unverified top result risks messaging the wrong person, which is worse than finding nobody."""
 
+import logging
+
 import httpx
 from sqlalchemy.orm import Session
 
@@ -45,6 +47,8 @@ from app.phases.decision_maker import (
     CEO_TITLE_PRESIDENT_EXCLUSIONS,
     SALES_LEADER_TITLE_KEYWORDS,
 )
+
+logger = logging.getLogger(__name__)
 
 # Raised from 3 -> 7 (2026-08-12): confirmed live that a real, correct decision-maker can sit
 # outside the top 3 results -- KORONA POS's actual CEO (Till Freier) never appeared in a
@@ -253,7 +257,7 @@ def _find_via_google_search_candidates(db: Session, tenant_id: int, company: Com
     return results
 
 
-def resolve_fallback_email(db: Session, tenant_id: int, company: Company, first_name: str) -> tuple[str, str] | None:
+def resolve_fallback_email(db: Session, tenant_id: int, company: Company, first_name: str, last_name: str = "") -> tuple[str, str] | None:
     """Called for ANY contact (free-path or paid-Deepline-path) that still has no email after
     the primary resolution. Two free, zero-verification layers, in order:
 
@@ -270,6 +274,19 @@ def resolve_fallback_email(db: Session, tenant_id: int, company: Company, first_
        Caller must treat this as a real guess (see Contact.email_source), not a confirmed fact.
 
     Returns (email, source) or None if nothing found."""
+    # REAL lookup first, before either free fallback. Added 2026-09-03 after confirming that all
+    # 241 contacts in the database carried a guessed or generic address and not one real one --
+    # and that the guesses were actively wrong (Immuta's CEO is mcarroll@, we were guessing
+    # matthew@, which would bounce). Deepline bills these per RESULT, so the whole chain costs
+    # nothing on a miss and $0.014-$0.034 on a hit. See app/phases/email_finder.py.
+    try:
+        from app.phases.email_finder import find_verified_email
+        found = find_verified_email(db, tenant_id, first_name, last_name, company.domain or "", company.name)
+        if found and found.get("email"):
+            return found["email"], found["source"]
+    except Exception as e:  # noqa: BLE001 -- a provider outage must not stop the cheaper fallbacks below
+        logger.warning("resolve_fallback_email: verified lookup failed -- %s", e)
+
     try:
         api_key = _get_jobo_api_key(db, tenant_id)
         with httpx.Client() as client:
