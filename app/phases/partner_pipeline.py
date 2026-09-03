@@ -258,7 +258,7 @@ def run_partner_discovery(db: Session, partner_name: str, icp: dict | None = Non
     # evidence of a bad fit and dropping unknowns would discard most of what we just paid for.
     lo, hi = resolved_icp.get("revenue_min_usd"), resolved_icp.get("revenue_max_usd")
     excl = [e.strip().lower() for e in (exclude_locations or []) if e and e.strip()]
-    kept, dropped = [], []
+    kept, dropped, needs_review = [], [], []
     for c in companies:
         loc = (c.location or "").lower()
         if excl and any(x in loc for x in excl):
@@ -269,6 +269,14 @@ def run_partner_discovery(db: Session, partner_name: str, icp: dict | None = Non
             continue
         if isinstance(hi, int) and c.estimated_revenue_lower_usd and c.estimated_revenue_lower_usd > hi:
             dropped.append((c.name, f"revenue above ${hi:,}"))
+            continue
+        # A range that STRADDLES the ceiling is not a pass. Domaine came back as $100-250M against
+        # Isabel's $150M ceiling and was kept, because its lower bound sat inside the band -- so a
+        # company that may be $100M over her limit read as a clean match. Straddling is uncertainty,
+        # and uncertainty about a hard boundary belongs in front of a human, not silently on the
+        # "send" side of the list.
+        if isinstance(hi, int) and c.estimated_revenue_higher_usd and c.estimated_revenue_higher_usd > hi:
+            needs_review.append((c.name, f"revenue range ${(c.estimated_revenue_lower_usd or 0):,}-${c.estimated_revenue_higher_usd:,} straddles the ${hi:,} ceiling"))
             continue
         kept.append(c)
 
@@ -289,4 +297,5 @@ def run_partner_discovery(db: Session, partner_name: str, icp: dict | None = Non
             for c in kept
         ],
         "dropped_by_icp": dropped,
+        "needs_review": needs_review,
     }

@@ -55,10 +55,17 @@ def _extract_revenue_from_text(text: str, db: Session, tenant_id: int) -> dict |
 Text:
 \"\"\"{text}\"\"\"
 
-If the text states or clearly implies a specific annual revenue figure or range (e.g. "$5M in
-annual revenue", "revenue of $10-20 million"), extract it. If the text does not state a real
-revenue figure, return has_revenue: false -- do NOT guess or estimate from unrelated numbers
-(funding raised, employee count, valuation, ARR of a different metric, etc. are NOT revenue).
+If the text states a specific annual revenue figure or range for THIS EXACT company (e.g. "$5M in
+annual revenue", "revenue of $10-20 million"), extract it. Otherwise return has_revenue: false.
+
+Return has_revenue: false in ALL of these cases -- they are the ones that produce wrong numbers:
+- The text says revenue is private, undisclosed, not reported, or estimated only ("has not
+  publicly disclosed", "figures remain private"). A valuation or funding total sitting next to
+  that sentence is NOT a substitute.
+- The number is funding raised, valuation, total capital, market cap, or a growth multiple
+  ("500% growth", "20x increase"). None of those are revenue.
+- The text mentions other companies with a similar name, or you cannot tell which company a
+  figure belongs to. A revenue figure for the wrong company is worse than no figure at all.
 
 Return JSON exactly:
 {{"has_revenue": true | false, "lower_usd": <int or null>, "higher_usd": <int or null>, "quote": "<exact sentence/clause from the text above stating the revenue figure, verbatim, or empty string if has_revenue is false>"}}"""
@@ -74,6 +81,21 @@ Return JSON exactly:
     if not quote or quote.lower() not in text.lower():
         return None  # unverifiable/hallucinated -- discarded, not trusted
 
+    # The model can still latch onto a valuation sitting beside a non-disclosure sentence, so the
+    # same refusals are enforced deterministically rather than trusted to the prompt. Confirmed
+    # live 2026-09-03: Google's own overview for Serval said "has not publicly disclosed its exact
+    # financial revenue figures" and we stored a figure anyway; for Campfire it warned about
+    # "other similarly named entities" and we took the number regardless.
+    low_text = text.lower()
+    NON_DISCLOSURE = ["not publicly disclose", "not disclosed", "remain private", "are private",
+                      "does not disclose", "undisclosed", "not publicly available", "not reported"]
+    AMBIGUITY = ["similarly named", "similar name", "other companies named", "not to be confused",
+                 "separate estimated revenues", "different company"]
+    if any(k in low_text for k in NON_DISCLOSURE):
+        return None
+    if any(k in low_text for k in AMBIGUITY):
+        return None
+
     lower_usd = response.get("lower_usd")
     higher_usd = response.get("higher_usd")
     if not isinstance(lower_usd, int) and not isinstance(higher_usd, int):
@@ -85,6 +107,42 @@ Return JSON exactly:
         higher_usd = lower_usd
 
     return {"lower_usd": lower_usd, "higher_usd": higher_usd, "quote": quote}
+
+
+
+# The empirical spread across this tenant's own 562 companies with both figures is a median of
+# $79,545 revenue per employee, p25 $50,000, p75 $125,000 (see icp_matching.REVENUE_PER_EMPLOYEE_USD).
+# A figure implying far outside that is almost always the WRONG COMPANY rather than an unusual one:
+# Domaine (271 employees) came back at $100-250M, i.e. up to $923k/employee, when Sales Navigator
+# says $10-20M; PDQ (394) came back at up to $500M, i.e. $1.27M/employee, against a real $20-50M.
+# Both are real revenue figures -- for a different business sharing the name.
+#
+# The ceiling is 4x the p75. An 8x ceiling was tried first and let Domaine through at
+# $922k/employee against a real $10-20M -- generous bounds do not help if they still admit the
+# case they exist to catch.
+#
+# The FLOOR is deliberately far lower than the p25, not symmetric with the ceiling. A well-funded
+# early-stage company genuinely earns very little per head: Serval has 177 employees on
+# $500k-$1M revenue ($2.8k/employee) after raising $127M, and that figure is correct. A symmetric
+# floor would reject exactly the young companies these partner ICPs often want, which is the
+# opposite of the mistake being fixed here.
+REVENUE_PER_EMPLOYEE_MAX_USD = 500_000
+REVENUE_PER_EMPLOYEE_MIN_USD = 2_000
+
+
+def _implausible_for_headcount(lower_usd: int | None, higher_usd: int | None, headcount: int | None) -> str | None:
+    """Returns why a figure is implausible for the company's size, or None if it is credible."""
+    if not headcount or headcount < 5:
+        return None
+    top = higher_usd or lower_usd
+    bottom = lower_usd or higher_usd
+    if top and top / headcount > REVENUE_PER_EMPLOYEE_MAX_USD:
+        return (f"${top:,} across {headcount} employees is ${top / headcount:,.0f}/employee, "
+                f"above the ${REVENUE_PER_EMPLOYEE_MAX_USD:,} ceiling -- probably a different company")
+    if bottom and bottom / headcount < REVENUE_PER_EMPLOYEE_MIN_USD:
+        return (f"${bottom:,} across {headcount} employees is ${bottom / headcount:,.0f}/employee, "
+                f"below the ${REVENUE_PER_EMPLOYEE_MIN_USD:,} floor -- probably a different company")
+    return None
 
 
 def _estimate_via_google(db: Session, tenant_id: int, company: Company) -> dict:
@@ -172,6 +230,10 @@ def estimate_company_revenue(db: Session, tenant_id: int, company: Company) -> d
     attempts = []
 
     google_result = _estimate_via_google(db, tenant_id, company)
+    if google_result.get("status") == "found":
+        why = _implausible_for_headcount(google_result.get("lower_usd"), google_result.get("higher_usd"), company.employee_count)
+        if why:
+            google_result = {"status": "rejected_implausible", "reason": why, "quote": google_result.get("quote")}
     attempts.append({"source": "google_ai_overview", **google_result})
     if google_result["status"] == "found":
         company.estimated_revenue_lower_usd = google_result["lower_usd"]
@@ -180,6 +242,10 @@ def estimate_company_revenue(db: Session, tenant_id: int, company: Company) -> d
         return {"status": "resolved", "source": "google_ai_overview", "lower_usd": google_result["lower_usd"], "higher_usd": google_result["higher_usd"], "attempts": attempts}
 
     deepline_result = _estimate_via_deepline_identify(db, tenant_id, company)
+    if deepline_result.get("status") == "found":
+        why = _implausible_for_headcount(deepline_result.get("lower_usd"), deepline_result.get("higher_usd"), company.employee_count)
+        if why:
+            deepline_result = {"status": "rejected_implausible", "reason": why}
     attempts.append({"source": "deepline_crustdata_identify", **deepline_result})
     if deepline_result["status"] == "found":
         company.estimated_revenue_lower_usd = deepline_result["lower_usd"]
