@@ -72,7 +72,7 @@ def run_apify_discovery(
     batch_id: int, db: Session, tenant_id: int, target: int = 5, time_range: str = "7d",
     location_search: list[str] | None = None, title_search: list[str] | None = None,
     employee_min: int | None = None, employee_max: int | None = None,
-    industry_filter: list[str] | None = None,
+    industry_filter: list[str] | None = None, limit: int | None = None,
 ) -> dict:
     """Entrypoint -- single synchronous Apify actor call (no budget_guard/paging loop like
     jd_first, since the actor's own `limit` already bounds spend deterministically: N results
@@ -92,7 +92,10 @@ def run_apify_discovery(
     # believed the daily/monthly cap was intact -- and the BudgetGuard passed in by V2's
     # run_v2_discovery_if_due tracks the DEEPLINE balance, not Apify, so it never covered this
     # either. Checked before the call, using the same worst-case estimate the limit implies.
-    discovery_limit = min(max(target * 20, 100), APIFY_DISCOVERY_LIMIT_CAP)
+    # target*20 with a 100 floor is Elephant Edge's own daily-run rule, sized for a 10+ target and
+    # a high duplicate rate. It is wrong for a small one-off ask: a 5-company partner list would
+    # still pay for 100 postings. An explicit limit lets that caller pay for what it actually needs.
+    discovery_limit = min(limit or max(target * 20, 100), APIFY_DISCOVERY_LIMIT_CAP)
     budget = check_apify_budget(db, tenant_id, estimate_cost_usd(discovery_limit))
     if budget["status"] != APIFY_BUDGET_ALLOWED:
         # A budget block is a real, intentional skip -- reported like the ApifyError path below

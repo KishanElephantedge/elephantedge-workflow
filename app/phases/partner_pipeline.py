@@ -31,6 +31,7 @@ from app.apify_budget_guard import STATUS_ALLOWED as APIFY_BUDGET_ALLOWED, check
 from app.apify_client import estimate_cost_usd
 from app.db.models import Batch, Company, LinkedinMonitorProfile, Tenant
 from app.gtm_os.icp.icp_matching import REVENUE_PER_EMPLOYEE_USD
+from app.gtm_os.icp.revenue_estimation import estimate_company_revenue
 from app.llm_client import generate_json
 from app.phases.apify_discovery import APIFY_TITLE_SEARCH, run_apify_discovery
 from app.phases.partner_icp import get_structured_icp
@@ -117,7 +118,8 @@ def _geographies_to_locations(icp: dict) -> list[str]:
     return out
 
 
-def build_discovery_plan(db: Session, tenant_id: int, partner_name: str, icp: dict, target: int = 10) -> dict:
+def build_discovery_plan(db: Session, tenant_id: int, partner_name: str, icp: dict, target: int = 10,
+                         exclude_locations: list[str] | None = None) -> dict:
     """Everything the run WOULD do, priced, without doing it. The dry run exists because a search
     built from the wrong industry mapping returns nothing and still costs money."""
     industries, rejected = map_icp_to_linkedin_industries(db, tenant_id, icp)
@@ -146,7 +148,10 @@ def build_discovery_plan(db: Session, tenant_id: int, partner_name: str, icp: di
                 "instead would have found companies far too small for this ICP."
             )
 
-    limit = min(max(target * 20, 100), 150)
+    # Sized to the ask, not to Elephant Edge's daily run. Observed keep rates on real runs: 31
+    # postings -> 7 companies over a 7d window, 150 -> 10 over 6m (more duplicates). ~10x the
+    # target is a realistic oversample for a small list and costs a third of the old floor.
+    limit = max(25, min(target * 10, 150))
     warnings = []
     if not industries:
         warnings.append("No usable LinkedIn industries mapped -- the search would fall back to the default software set, which will not match this ICP.")
@@ -173,7 +178,9 @@ def build_discovery_plan(db: Session, tenant_id: int, partner_name: str, icp: di
         },
         "icp_filters_applied_after": {
             "revenue_usd": [icp.get("revenue_min_usd"), icp.get("revenue_max_usd")],
+            "exclude_locations": exclude_locations or [],
             "exclusions": icp.get("exclusions") or [],
+            "revenue_enrichment": "google AI overview -> deepline crustdata identify, run before filtering",
         },
         "estimated_max_cost_usd": round(estimate_cost_usd(limit), 3),
         "warnings": warnings,
@@ -181,7 +188,9 @@ def build_discovery_plan(db: Session, tenant_id: int, partner_name: str, icp: di
 
 
 def run_partner_discovery(db: Session, partner_name: str, icp: dict | None = None,
-                          target: int = 10, dry_run: bool = True, ee_tenant_id: int = 2) -> dict:
+                          target: int = 10, dry_run: bool = True, ee_tenant_id: int = 2,
+                          exclude_locations: list[str] | None = None,
+                          enrich_revenue: bool = True) -> dict:
     """Find companies for one partner, in their own tenant.
 
     icp overrides what we hold, so this works for someone with no GTM University profile at all --
@@ -200,7 +209,7 @@ def run_partner_discovery(db: Session, partner_name: str, icp: dict | None = Non
 
     # The mapping LLM call is made against Elephant Edge's tenant -- it is our API key and our
     # cost, not something to attribute to a partner tenant that exists only as a data boundary.
-    plan = build_discovery_plan(db, ee_tenant_id, partner_name, resolved_icp, target)
+    plan = build_discovery_plan(db, ee_tenant_id, partner_name, resolved_icp, target, exclude_locations)
     if dry_run:
         return {"status": "dry_run", "plan": plan, "icp_used": resolved_icp}
 
@@ -219,16 +228,41 @@ def run_partner_discovery(db: Session, partner_name: str, icp: dict | None = Non
         batch.id, db, tenant.id, target=target, time_range=s["time_range"],
         location_search=s["location_search"], title_search=s["title_search"],
         employee_min=s["employee_min"], employee_max=s["employee_max"],
-        industry_filter=s["industry_filter"],
+        industry_filter=s["industry_filter"], limit=s["limit"],
     )
 
-    # Post-filter on what the job search cannot express. Only a KNOWN violation removes a company:
-    # a missing revenue figure is not evidence of a bad fit, and dropping unknowns would discard
-    # most of what we just paid for.
-    lo, hi = resolved_icp.get("revenue_min_usd"), resolved_icp.get("revenue_max_usd")
     companies = db.query(Company).filter(Company.batch_id == batch.id).all()
+
+    # FIND the revenue before judging on it. The job actor exposes no revenue field, so without
+    # this every company arrives with revenue null and a revenue-banded ICP can only ever pass
+    # them on ignorance. estimate_company_revenue is the existing waterfall -- Google AI Overview
+    # (~$0.0085/query) first, then Deepline's Crustdata identify -- and it no-ops on a company that
+    # already has a figure, so this never re-pays for data we hold.
+    revenue_enrichment = {"attempted": 0, "resolved": 0, "not_found": 0}
+    if enrich_revenue and (resolved_icp.get("revenue_min_usd") or resolved_icp.get("revenue_max_usd")):
+        for c in companies:
+            if c.estimated_revenue_lower_usd or c.estimated_revenue_higher_usd:
+                continue
+            revenue_enrichment["attempted"] += 1
+            try:
+                r = estimate_company_revenue(db, ee_tenant_id, c)
+                revenue_enrichment["resolved" if r.get("status") == "resolved" else "not_found"] += 1
+            except Exception as e:  # noqa: BLE001 -- one company's lookup must not lose the run
+                db.rollback()
+                revenue_enrichment["not_found"] += 1
+                logger.warning("partner_pipeline: revenue lookup failed for %r -- %s", c.name, e)
+
+    # Post-filter on what the job search cannot express. Only a KNOWN violation removes a company:
+    # a company we still could not price is kept and flagged, because absence of a figure is not
+    # evidence of a bad fit and dropping unknowns would discard most of what we just paid for.
+    lo, hi = resolved_icp.get("revenue_min_usd"), resolved_icp.get("revenue_max_usd")
+    excl = [e.strip().lower() for e in (exclude_locations or []) if e and e.strip()]
     kept, dropped = [], []
     for c in companies:
+        loc = (c.location or "").lower()
+        if excl and any(x in loc for x in excl):
+            dropped.append((c.name, f"location excluded ({c.location})"))
+            continue
         if isinstance(lo, int) and c.estimated_revenue_higher_usd and c.estimated_revenue_higher_usd < lo:
             dropped.append((c.name, f"revenue below ${lo:,}"))
             continue
@@ -244,10 +278,12 @@ def run_partner_discovery(db: Session, partner_name: str, icp: dict | None = Non
         "batch_id": batch.id,
         "plan": plan,
         "discovery": {k: v for k, v in result.items() if k != "rejection_breakdown"},
+        "revenue_enrichment": revenue_enrichment,
         "kept": [
             {"name": c.name, "domain": c.domain, "industry": c.industry,
              "employees": c.employee_count, "location": c.location,
              "revenue_usd": [c.estimated_revenue_lower_usd, c.estimated_revenue_higher_usd],
+             "revenue_known": bool(c.estimated_revenue_lower_usd or c.estimated_revenue_higher_usd),
              "linkedin_url": c.linkedin_url}
             for c in kept
         ],
