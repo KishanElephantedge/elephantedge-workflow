@@ -69,6 +69,9 @@ def ensure_indexes():
         # 2026-08-25 -- real offering/campaign tracking link (Batch.offering_name/campaign_label,
         # CampaignPush.offering_name/campaign_label; see those models' own comments for why).
         conn.execute(text("ALTER TABLE companies ADD COLUMN IF NOT EXISTS icp_evaluation_attempts INTEGER NOT NULL DEFAULT 0"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_slack_community_tenant_channel ON slack_community_messages (tenant_id, channel)"))
+        conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ux_slack_community_msg ON slack_community_messages (tenant_id, channel, ts)"))
+
         conn.execute(text("ALTER TABLE batches ADD COLUMN IF NOT EXISTS offering_name VARCHAR"))
         conn.execute(text("ALTER TABLE batches ADD COLUMN IF NOT EXISTS campaign_label VARCHAR"))
         conn.execute(text("ALTER TABLE campaign_pushes ADD COLUMN IF NOT EXISTS offering_name VARCHAR"))

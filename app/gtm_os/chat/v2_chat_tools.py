@@ -154,6 +154,35 @@ V2_CHAT_TOOLS = [
         "input_schema": {"type": "object", "properties": {"status": {"type": "string", "enum": ["pending_review", "pending_interpretation", "confirmed", "dismissed"]}}},
     },
     {
+        "name": "search_gtm_community",
+        "description": (
+            "Search the GTM Partners certified-partner Slack community we belong to (~160 fractional "
+            "CMOs/CROs, 10,754 archived messages across 25 channels). Returns REAL messages, not a "
+            "summary. Use for questions like 'what are partners saying about pricing', 'what does "
+            "<person> post about', 'what happens in #brand-systems'. Filter by query text, channel "
+            "name, and/or person name. NOTE: this community is a relationship and referral network, "
+            "not a prospect list -- partners describe their own clients in confidence there."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "text to search for in message bodies"},
+                "channel": {"type": "string", "description": "channel name, e.g. brand-systems"},
+                "person": {"type": "string", "description": "partner name, e.g. Don Drury"},
+                "limit": {"type": "integer", "description": "default 25, max 100"},
+            },
+        },
+    },
+    {
+        "name": "get_gtm_community_overview",
+        "description": (
+            "Shape of the GTM Partners Slack community: every channel with message counts and date "
+            "span, plus the most active people and their titles. Use this first when asked broadly "
+            "what is going on in the community, before searching for specifics."
+        ),
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
         "name": "get_business_context",
         "description": "Real configured business context: revenue goal, positioning, and other company-level settings.",
         "input_schema": {"type": "object", "properties": {}},
@@ -293,6 +322,18 @@ def execute_v2_chat_tool(name: str, tool_input: dict, db: Session, tenant_id: in
     if name == "get_jobs_to_be_done":
         from app.gtm_os.jobs.jobs_to_be_done import get_jobs_to_be_done
         return get_jobs_to_be_done(db, tenant_id)
+
+    if name == "search_gtm_community":
+        from app.gtm_os.community.slack_community import search_community
+        return search_community(
+            db, tenant_id,
+            query=tool_input.get("query"), channel=tool_input.get("channel"),
+            person=tool_input.get("person"), limit=tool_input.get("limit", 25),
+        )
+
+    if name == "get_gtm_community_overview":
+        from app.gtm_os.community.slack_community import community_overview
+        return community_overview(db, tenant_id)
 
     if name == "search_accounts":
         from app.db.models import Batch, Company
