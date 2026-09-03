@@ -394,6 +394,13 @@ def run_account_agent_sweep(db: Session, tenant_id: int, limit: int = 200) -> di
             brief = build_account_brief(db, tenant_id, company_id)
             counts[brief["account_status"]] += 1
         except Exception:  # noqa: BLE001 -- one company's failure must never block the others
+            # Roll back before anything else: a per-item failure must not poison the SHARED session.
+            # Neon drops idle connections, and this sweep idles ~40s per LLM call under Gemini rate
+            # limiting -- when that lands mid-loop the transaction is left invalid and EVERY later item
+            # AND stage dies with PendingRollbackError. Confirmed live: run 122 lost its connection
+            # during topic_linking, then burned 233 minutes failing everything after it. The stage-level
+            # handler already rolled back; these per-item ones did not.
+            db.rollback()
             counts["failed"] += 1
 
     return counts

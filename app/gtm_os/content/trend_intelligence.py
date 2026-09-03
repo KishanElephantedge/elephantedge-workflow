@@ -210,6 +210,13 @@ def run_trend_intelligence_sweep(db: Session, tenant_id: int, limit: int = 200, 
             if state in counts:
                 counts[state] += 1
         except Exception as e:  # noqa: BLE001 -- one topic's failure must never block the others, see docstring
+            # Roll back before anything else: a per-item failure must not poison the SHARED session.
+            # Neon drops idle connections, and this sweep idles ~40s per LLM call under Gemini rate
+            # limiting -- when that lands mid-loop the transaction is left invalid and EVERY later item
+            # AND stage dies with PendingRollbackError. Confirmed live: run 122 lost its connection
+            # during topic_linking, then burned 233 minutes failing everything after it. The stage-level
+            # handler already rolled back; these per-item ones did not.
+            db.rollback()
             counts["failed"] += 1
             logger.error("trend_intelligence: topic id %s failed to evaluate: %s", topic_id, e)
 

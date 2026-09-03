@@ -216,6 +216,13 @@ def run_v2_send_sweep(db: Session, tenant_id: int, limit: int = 50) -> dict:
         try:
             result = send_message_draft(db, tenant_id, draft)
         except Exception:  # noqa: BLE001 -- one draft's failure must never block the others
+            # Roll back before anything else: a per-item failure must not poison the SHARED session.
+            # Neon drops idle connections, and this sweep idles ~40s per LLM call under Gemini rate
+            # limiting -- when that lands mid-loop the transaction is left invalid and EVERY later item
+            # AND stage dies with PendingRollbackError. Confirmed live: run 122 lost its connection
+            # during topic_linking, then burned 233 minutes failing everything after it. The stage-level
+            # handler already rolled back; these per-item ones did not.
+            db.rollback()
             counts["failed"] += 1
             continue
 
