@@ -15,6 +15,61 @@ class DeeplineError(Exception):
     pass
 
 
+
+# Deepline was the ONLY provider in this codebase reading its key from the process environment.
+# Apify, Jobo, Claude, Gemini, HubSpot, SalesRobot and Smartlead all read theirs from the
+# Credential table. That inconsistency is what keeps breaking: a key that works locally can be
+# rejected in production with AUTH_ERROR/401, and there is no way to see or change what the
+# container actually received without a redeploy. It cost a full day of discovery on 2026-09-01
+# and again on 2026-09-03, and a previous incident needed a temporary diagnostic route deployed
+# just to inspect the value.
+#
+# The key now comes from the Credential table first, exactly like every other provider, and is
+# passed EXPLICITLY into the CLI subprocess rather than inherited -- so what the CLI receives is
+# what the database holds, not whatever survived the deploy. The env var stays as a fallback so
+# nothing breaks if the row is missing.
+#
+# Whitespace is stripped: a key pasted into a Render env field can carry a trailing newline, which
+# is invisible in the dashboard and produces exactly the same 401 as a genuinely wrong key.
+_KEY_CACHE: dict[str, str] = {}
+
+
+def _resolve_api_key() -> str:
+    if "key" in _KEY_CACHE:
+        return _KEY_CACHE["key"]
+    key = ""
+    try:
+        from app.db.models import Credential
+        from app.db.session import SessionLocal
+
+        db = SessionLocal()
+        try:
+            row = (
+                db.query(Credential)
+                .filter(Credential.name == "deepline_api_key", Credential.value.isnot(None))
+                .order_by(Credential.id.desc())
+                .first()
+            )
+            key = (row.value or "").strip() if row else ""
+        finally:
+            db.close()
+    except Exception as e:  # noqa: BLE001 -- a DB hiccup must fall back to env, not break every call
+        logger.warning("deepline: could not read key from Credential table (%s), falling back to env", e)
+    if not key:
+        key = os.environ.get("DEEPLINE_API_KEY", "").strip()
+    _KEY_CACHE["key"] = key
+    return key
+
+
+def _cli_env() -> dict:
+    """Environment for the CLI subprocess, with the resolved key forced in."""
+    env = dict(os.environ)
+    key = _resolve_api_key()
+    if key:
+        env["DEEPLINE_API_KEY"] = key
+    return env
+
+
 def _run_deepline_cli(args: list[str], timeout_seconds: float) -> subprocess.CompletedProcess:
     """subprocess.run(timeout=...), but killing the WHOLE process group on timeout, not
     just the immediate child. Found live: a stuck run with 0 progress for 6+ minutes,
@@ -31,6 +86,7 @@ def _run_deepline_cli(args: list[str], timeout_seconds: float) -> subprocess.Com
         stderr=subprocess.PIPE,
         text=True,
         start_new_session=True,
+        env=_cli_env(),
     )
     try:
         stdout, stderr = proc.communicate(timeout=timeout_seconds)
@@ -49,10 +105,12 @@ def _masked_env_debug() -> str:
     diagnostic only, for a live 401 that a known-good key doesn't reproduce locally
     (suggests the value reaching this container differs from the intended one, e.g. a
     stray whitespace/newline from how it was pasted into Render)."""
-    key = os.environ.get("DEEPLINE_API_KEY", "")
+    key = _resolve_api_key()
+    env_key = os.environ.get("DEEPLINE_API_KEY", "")
     host = os.environ.get("DEEPLINE_HOST_URL", "")
-    key_view = f"len={len(key)} repr_ends={key[-6:]!r}" if key else "UNSET"
-    return f"DEEPLINE_API_KEY[{key_view}] DEEPLINE_HOST_URL={host!r}"
+    key_view = f"len={len(key)} ends={key[-6:]!r}" if key else "UNSET"
+    src = "credential_table" if key and key != env_key.strip() else ("env" if key else "none")
+    return f"DEEPLINE_API_KEY[{key_view} source={src}] DEEPLINE_HOST_URL={host!r}"
 
 
 RATE_LIMIT_MAX_RETRIES = 3
