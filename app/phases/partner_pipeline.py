@@ -119,9 +119,20 @@ def _geographies_to_locations(icp: dict) -> list[str]:
 
 
 def build_discovery_plan(db: Session, tenant_id: int, partner_name: str, icp: dict, target: int = 10,
-                         exclude_locations: list[str] | None = None) -> dict:
+                         exclude_locations: list[str] | None = None,
+                         title_search: list[str] | None = None) -> dict:
     """Everything the run WOULD do, priced, without doing it. The dry run exists because a search
-    built from the wrong industry mapping returns nothing and still costs money."""
+    built from the wrong industry mapping returns nothing and still costs money.
+
+    title_search overrides the hiring roles we search for, and defaults to APIFY_TITLE_SEARCH so
+    nothing that already calls this changes. WHY IT NEEDS TO BE OVERRIDABLE: the default is
+    Elephant Edge's own list of SDR/AE/VP Sales titles, which encodes OUR assumption that a
+    company hiring sellers is a company with a sales problem. Some partners sell against a
+    different problem entirely -- a channel consultant's ICP is "the partner program is
+    underperforming", and the only observable proxy for that is a company hiring a
+    channel/partnerships role, not a sales one. Leaving the titles hardcoded would silently run
+    every partner's search against Elephant Edge's hypothesis and return plausible-looking
+    companies that have nothing to do with what the partner sells."""
     industries, rejected = map_icp_to_linkedin_industries(db, tenant_id, icp)
     locations = _geographies_to_locations(icp)
     emp_min, emp_max = icp.get("employee_min"), icp.get("employee_max")
@@ -181,7 +192,7 @@ def build_discovery_plan(db: Session, tenant_id: int, partner_name: str, icp: di
             "location_search": locations or None,
             "employee_min": emp_min, "employee_max": emp_max,
             "industry_filter": industries or None,
-            "title_search": APIFY_TITLE_SEARCH,
+            "title_search": list(title_search) if title_search else APIFY_TITLE_SEARCH,
             "time_range": "6m",
             "limit": limit,
         },
@@ -199,12 +210,16 @@ def build_discovery_plan(db: Session, tenant_id: int, partner_name: str, icp: di
 def run_partner_discovery(db: Session, partner_name: str, icp: dict | None = None,
                           target: int = 10, dry_run: bool = True, ee_tenant_id: int = 2,
                           exclude_locations: list[str] | None = None,
-                          enrich_revenue: bool = True) -> dict:
+                          enrich_revenue: bool = True,
+                          title_search: list[str] | None = None) -> dict:
     """Find companies for one partner, in their own tenant.
 
     icp overrides what we hold, so this works for someone with no GTM University profile at all --
     paste their ICP and run it. dry_run defaults to True: this spends real money, and a search
     built on a bad industry mapping costs the same as a good one.
+
+    title_search likewise overrides the hiring signal (see build_discovery_plan) and defaults to
+    the existing SDR/AE/VP Sales list, so every current caller behaves exactly as before.
     """
     profile = (
         db.query(LinkedinMonitorProfile)
@@ -218,7 +233,8 @@ def run_partner_discovery(db: Session, partner_name: str, icp: dict | None = Non
 
     # The mapping LLM call is made against Elephant Edge's tenant -- it is our API key and our
     # cost, not something to attribute to a partner tenant that exists only as a data boundary.
-    plan = build_discovery_plan(db, ee_tenant_id, partner_name, resolved_icp, target, exclude_locations)
+    plan = build_discovery_plan(db, ee_tenant_id, partner_name, resolved_icp, target, exclude_locations,
+                                title_search=title_search)
     if dry_run:
         return {"status": "dry_run", "plan": plan, "icp_used": resolved_icp}
 
