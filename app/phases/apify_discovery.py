@@ -73,6 +73,7 @@ def run_apify_discovery(
     location_search: list[str] | None = None, title_search: list[str] | None = None,
     employee_min: int | None = None, employee_max: int | None = None,
     industry_filter: list[str] | None = None, limit: int | None = None,
+    budget_tenant_id: int | None = None,
 ) -> dict:
     """Entrypoint -- single synchronous Apify actor call (no budget_guard/paging loop like
     jd_first, since the actor's own `limit` already bounds spend deterministically: N results
@@ -96,7 +97,12 @@ def run_apify_discovery(
     # a high duplicate rate. It is wrong for a small one-off ask: a 5-company partner list would
     # still pay for 100 postings. An explicit limit lets that caller pay for what it actually needs.
     discovery_limit = min(limit or max(target * 20, 100), APIFY_DISCOVERY_LIMIT_CAP)
-    budget = check_apify_budget(db, tenant_id, estimate_cost_usd(discovery_limit))
+    # The budget is checked against whoever OWNS the Apify account, which is not always the tenant
+    # the companies are being written for. Partner discovery writes into a partner's own tenant (a
+    # data boundary, deliberately isolated from Elephant Edge's pipeline) while spending Elephant
+    # Edge's Apify credits -- checking the partner tenant found no budget configured and blocked a
+    # run that was properly funded.
+    budget = check_apify_budget(db, budget_tenant_id or tenant_id, estimate_cost_usd(discovery_limit))
     if budget["status"] != APIFY_BUDGET_ALLOWED:
         # A budget block is a real, intentional skip -- reported like the ApifyError path below
         # (a normal empty result the caller already handles), never a crash.
@@ -106,14 +112,17 @@ def run_apify_discovery(
             "estimated_cost_usd": 0.0,
         }
 
+    effective_emp_min = employee_min if employee_min is not None else APIFY_EMPLOYEE_MIN
+    effective_emp_max = employee_max if employee_max is not None else APIFY_EMPLOYEE_MAX
+
     try:
-        api_key = _get_apify_api_key(db, tenant_id)
+        api_key = _get_apify_api_key(db, budget_tenant_id or tenant_id)
         jobs = search_linkedin_jobs(
             api_key,
             title_search=title_search or APIFY_TITLE_SEARCH,
             location_search=location_search or APIFY_DEFAULT_LOCATION_SEARCH,
-            organization_employees_gte=employee_min if employee_min is not None else APIFY_EMPLOYEE_MIN,
-            organization_employees_lte=employee_max if employee_max is not None else APIFY_EMPLOYEE_MAX,
+            organization_employees_gte=effective_emp_min,
+            organization_employees_lte=effective_emp_max,
             industry_filter=industry_filter or APIFY_INDUSTRY_FILTER,
             time_range=time_range,
             remove_agency=True,
@@ -159,7 +168,11 @@ def run_apify_discovery(
         seen_this_run.add(domain)
 
         headcount = job.get("org_linkedin_headcount")
-        if headcount is not None and not (APIFY_EMPLOYEE_MIN <= headcount <= APIFY_EMPLOYEE_MAX):
+        # Check against the band THIS RUN asked for, not the module defaults. Parameterising the
+        # actor call without parameterising this safety net made it silently contradict the search:
+        # a partner run for a $20-150M ICP asked LinkedIn for 125-3771 employees and then rejected
+        # all 50 results for not being 25-50, reporting "0 companies discovered" as if nothing matched.
+        if headcount is not None and not (effective_emp_min <= headcount <= effective_emp_max):
             # Real safety net: the actor's own filter has shown occasional stale-bucket
             # mismatches (validated live -- RADICL/QED Investors passed organizationSizeFilter
             # "11-50" despite org_linkedin_headcount 67/75) -- trust the raw number over the

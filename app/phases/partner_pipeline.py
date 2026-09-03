@@ -229,6 +229,7 @@ def run_partner_discovery(db: Session, partner_name: str, icp: dict | None = Non
         location_search=s["location_search"], title_search=s["title_search"],
         employee_min=s["employee_min"], employee_max=s["employee_max"],
         industry_filter=s["industry_filter"], limit=s["limit"],
+        budget_tenant_id=ee_tenant_id,  # our Apify account funds this, not the partner's tenant
     )
 
     companies = db.query(Company).filter(Company.batch_id == batch.id).all()
