@@ -2570,7 +2570,12 @@ def _run_chat_turn(conversation_id: int, user_text: str, db: Session, scope: str
     # Slack messages and reason about a person ("what should I talk to them about"), and on Haiku
     # it answered like a lookup table rather than an analyst. That is a model-size problem, not a
     # prompt problem, so the fix is the model. Cost is logged per call by claude_client.
-    chat_model = "claude-opus-5" if scope == "network" else DEFAULT_CHAT_MODEL
+    # Haiku for every scope. The network chat briefly ran on Opus for answer quality, and that was
+    # a mistake twice over: it is the most expensive model in the system attached to a chat feature
+    # rather than the pipeline, AND MODEL_PRICING_PER_MTOK_USD has no Opus row, so its lookup fell
+    # back to Haiku's prices and every logged cost for those calls understated the real spend.
+    # Never reintroduce a model here without adding its real prices to that table first.
+    chat_model = DEFAULT_CHAT_MODEL
     chat_max_tokens = 4000 if scope == "network" else 1500
 
     tools_used: list[str] = []

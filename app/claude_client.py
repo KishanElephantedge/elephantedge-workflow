@@ -24,7 +24,15 @@ ANTHROPIC_VERSION = "2023-06-01"
 MODEL_PRICING_PER_MTOK_USD = {
     "claude-haiku-4-5-20251001": (1.0, 5.0),
     "claude-sonnet-5": (3.0, 15.0),
+    "claude-opus-5": (15.0, 75.0),
 }
+
+# A model missing from the table used to fall back to Haiku's prices, which meant the logged cost
+# was not merely approximate but WRONG in the expensive direction: the network chat ran on Opus for
+# part of 2026-09-03 and every one of those calls was reported at Haiku rates, understating real
+# spend by ~15x. Cost telemetry that silently under-reports is worse than none, because it is
+# trusted. An unknown model now logs a loud marker instead of a comfortable lie.
+UNKNOWN_MODEL_PRICING = (0.0, 0.0)
 
 logger = logging.getLogger("claude_client")
 
@@ -76,7 +84,9 @@ def call_claude(prompt: str, db: Session, tenant_id: int, system: str | None = N
     usage = data.get("usage", {})
     input_tokens = usage.get("input_tokens", 0)
     output_tokens = usage.get("output_tokens", 0)
-    input_price, output_price = MODEL_PRICING_PER_MTOK_USD.get(model, MODEL_PRICING_PER_MTOK_USD[DEFAULT_MODEL])
+    input_price, output_price = MODEL_PRICING_PER_MTOK_USD.get(model, UNKNOWN_MODEL_PRICING)
+    if model not in MODEL_PRICING_PER_MTOK_USD:
+        logger.error("claude_client: NO PRICING for model %r -- cost below is reported as 0, not real", model)
     cost_usd = (input_tokens / 1_000_000 * input_price) + (output_tokens / 1_000_000 * output_price)
     logger.warning(
         "claude_client call: model=%s input_tokens=%d output_tokens=%d cost_usd=%.5f",
@@ -125,7 +135,9 @@ def call_claude_messages(messages: list[dict], db: Session, tenant_id: int, syst
     usage = data.get("usage", {})
     input_tokens = usage.get("input_tokens", 0)
     output_tokens = usage.get("output_tokens", 0)
-    input_price, output_price = MODEL_PRICING_PER_MTOK_USD.get(model, MODEL_PRICING_PER_MTOK_USD[DEFAULT_MODEL])
+    input_price, output_price = MODEL_PRICING_PER_MTOK_USD.get(model, UNKNOWN_MODEL_PRICING)
+    if model not in MODEL_PRICING_PER_MTOK_USD:
+        logger.error("claude_client: NO PRICING for model %r -- cost below is reported as 0, not real", model)
     cost_usd = (input_tokens / 1_000_000 * input_price) + (output_tokens / 1_000_000 * output_price)
     logger.warning(
         "claude_client call_messages: model=%s input_tokens=%d output_tokens=%d cost_usd=%.5f stop_reason=%s",

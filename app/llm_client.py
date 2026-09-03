@@ -41,10 +41,30 @@ logger = logging.getLogger("llm_client")
 PRIMARY = "gemini"  # "claude" | "gemini"
 
 
+def _gemini_with_model_fallback(fn, prompt, db, tenant_id, max_tokens):
+    """Gemini's free quota is per-DAY and per-MODEL, so an exhausted model is not an exhausted
+    provider. Walk the models before declaring Gemini unavailable -- otherwise one sweep's ~525
+    calls burn the default model's 500/day and every later run fails with a fallback that is
+    itself unavailable (Anthropic has no credit), which is exactly how 2026-09-03 lost three runs.
+    """
+    from app.gemini_client import DEFAULT_MODEL, FALLBACK_MODELS
+
+    last = None
+    for model in [DEFAULT_MODEL, *FALLBACK_MODELS]:
+        try:
+            return fn(prompt, db, tenant_id, max_tokens=max_tokens, model=model)
+        except GeminiError as e:
+            last = e
+            if "429" not in str(e):
+                raise  # a real error, not a quota wall -- do not burn the other models on it
+            logger.warning("Gemini model %s quota-exhausted, trying next", model)
+    raise last
+
+
 def generate_text(prompt: str, db: Session, tenant_id: int, max_tokens: int = 2000) -> str:
     if PRIMARY == "gemini":
         try:
-            return call_gemini(prompt, db, tenant_id, max_tokens=max_tokens)
+            return _gemini_with_model_fallback(call_gemini, prompt, db, tenant_id, max_tokens)
         except GeminiError as e:
             logger.warning("Gemini call failed, falling back to Claude Haiku: %s", e)
             return call_claude(prompt, db, tenant_id, max_tokens=max_tokens)
@@ -52,13 +72,13 @@ def generate_text(prompt: str, db: Session, tenant_id: int, max_tokens: int = 20
         return call_claude(prompt, db, tenant_id, max_tokens=max_tokens)
     except ClaudeError as e:
         logger.warning("Claude call failed, falling back to Gemini: %s", e)
-        return call_gemini(prompt, db, tenant_id, max_tokens=max_tokens)
+        return _gemini_with_model_fallback(call_gemini, prompt, db, tenant_id, max_tokens)
 
 
 def generate_json(prompt: str, db: Session, tenant_id: int, max_tokens: int = 2000) -> dict:
     if PRIMARY == "gemini":
         try:
-            return call_gemini_json(prompt, db, tenant_id, max_tokens=max_tokens)
+            return _gemini_with_model_fallback(call_gemini_json, prompt, db, tenant_id, max_tokens)
         except GeminiError as e:
             logger.warning("Gemini call failed, falling back to Claude Haiku: %s", e)
             return call_claude_json(prompt, db, tenant_id, max_tokens=max_tokens)
@@ -66,4 +86,4 @@ def generate_json(prompt: str, db: Session, tenant_id: int, max_tokens: int = 20
         return call_claude_json(prompt, db, tenant_id, max_tokens=max_tokens)
     except ClaudeError as e:
         logger.warning("Claude call failed, falling back to Gemini: %s", e)
-        return call_gemini_json(prompt, db, tenant_id, max_tokens=max_tokens)
+        return _gemini_with_model_fallback(call_gemini_json, prompt, db, tenant_id, max_tokens)
