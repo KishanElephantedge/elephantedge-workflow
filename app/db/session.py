@@ -1,7 +1,11 @@
+import logging
+
 from sqlalchemy import create_engine, event, text
 from sqlalchemy.orm import sessionmaker
 
 from app.config import settings
+
+logger = logging.getLogger(__name__)
 
 # pool_pre_ping guards against Neon's pooled ("-pooler") endpoint handing back a stale
 # connection after the app has been idle -- see synefi/app/db/session.py for the full
@@ -84,8 +88,47 @@ def get_db():
 # calendar_bookings -- Google Calendar appointment sync). Shared-table indexes (companies,
 # contacts, etc.) are ensured by Synefi's backend, the schema owner -- see
 # synefi/app/db/session.py for why this is raw SQL rather than an Alembic migration.
+# Every statement below runs in its OWN short transaction, and a failure is logged and skipped
+# rather than raised. This exists because of a real production outage on 2026-09-04: all 151 DDL
+# statements ran inside a SINGLE engine.begin() block, called from FastAPI's startup event. One
+# of them --
+#
+#     ALTER TABLE gtm_signals ADD COLUMN IF NOT EXISTS company_resolution_status VARCHAR
+#
+# -- hit the statement timeout waiting for its ACCESS EXCLUSIVE lock (a long-running sweep was
+# writing gtm_signals at the time). ADD COLUMN IF NOT EXISTS still takes that lock even when the
+# column already exists, so this was a NO-OP that took the entire API down: the exception
+# propagated out of on_startup and Render exited with status 3.
+#
+# Two things were wrong and both are fixed here:
+#   1. one transaction for everything -- a single unlucky statement aborted all 151, and held
+#      every lock it had already taken for the duration;
+#   2. a schema-convergence helper was allowed to be fatal. Every statement here is idempotent
+#      (IF NOT EXISTS / no-op ALTER), so the correct response to a transient lock is to skip it
+#      and let the next boot re-run it -- never to refuse to start.
+#
+# lock_timeout fails fast (2s) instead of sitting behind a busy table for the full statement
+# timeout, so a contended boot stays quick rather than merely surviving.
+class _ResilientDDL:
+    """conn-shaped object whose .execute() is per-statement transactional and non-fatal."""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def execute(self, statement):
+        try:
+            with engine.begin() as conn:
+                conn.execute(text("SET LOCAL lock_timeout = '2s'"))
+                conn.execute(statement)
+        except Exception as e:  # noqa: BLE001 -- schema convergence must never block startup
+            logger.warning("ensure_indexes: skipping statement (%s): %s", type(e).__name__, str(statement)[:120])
+
+
 def ensure_indexes():
-    with engine.begin() as conn:
+    with _ResilientDDL() as conn:
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_campaign_events_contact_id ON campaign_events (contact_id)"))
         # 2026-08-25 -- real offering/campaign tracking link (Batch.offering_name/campaign_label,
         # CampaignPush.offering_name/campaign_label; see those models' own comments for why).
