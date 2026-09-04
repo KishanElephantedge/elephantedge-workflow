@@ -19,10 +19,31 @@ from app.config import settings
 # through the failed deploys rather than surfacing it immediately. Setting it via a
 # post-connect SET command instead (below) works fine through the pooler, since that's a
 # normal query, not a startup packet field.
+# TCP keepalives + pool_recycle, added 2026-09-03 after four consecutive sweeps died on
+# "server closed the connection unexpectedly". pool_pre_ping only validates a connection when it is
+# CHECKED OUT of the pool; it cannot help a connection that dies while a long-running session is
+# already holding it. The V2 sweep holds one session for 30-70 minutes and, under Gemini's
+# free-tier rate limiting, idles ~40 seconds per LLM call -- long enough for Neon (or the pooler in
+# front of it) to decide the connection is dead and close it. Every stage after that point then
+# failed, and runs 122 and 123 lost 233 and 73 minutes respectively producing nothing.
+#
+# keepalives_idle=30 sends a TCP keepalive every 30 seconds of inactivity, so the connection is
+# never silently idle long enough to be reaped. pool_recycle=1800 retires connections after 30
+# minutes regardless, so a stale one is replaced rather than handed out.
+#
+# This does not make a dropped connection impossible -- the per-item db.rollback() calls added
+# alongside it are what stop one drop taking the whole run down -- it makes it far less likely.
 engine = create_engine(
     settings.database_url,
     pool_pre_ping=True,
-    connect_args={"connect_timeout": 10},
+    pool_recycle=1800,
+    connect_args={
+        "connect_timeout": 10,
+        "keepalives": 1,
+        "keepalives_idle": 30,
+        "keepalives_interval": 10,
+        "keepalives_count": 5,
+    },
 )
 
 
