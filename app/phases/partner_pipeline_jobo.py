@@ -132,11 +132,24 @@ def _revenue_bounds(profile: dict) -> tuple[int | None, int | None, str]:
 
 
 def _geo_matches(profile: dict, geographies: list[str]) -> bool:
+    """Word-boundary match, never a substring one.
+
+    "Fort Wayne, Indiana, United States" contains the substring "india", so a plain `in` test
+    passed Franklin Electric -- an Indiana company -- as a match for an India ICP. Confirmed live.
+    The same trap exists for other pairs (Niger/Nigeria, Oman/Romania), so this matches whole
+    words rather than adding a special case for one country.
+    """
+    import re
+
     if not geographies:
         return True
     hay = " ".join(str(profile.get(k) or "") for k in
                    ("headquarters_location", "headquarters_region", "country_code", "continent")).lower()
-    return any(g.strip().lower() in hay for g in geographies if g.strip())
+    for g in geographies:
+        g = g.strip().lower()
+        if g and re.search(rf"\b{re.escape(g)}\b", hay):
+            return True
+    return False
 
 
 def _industry_matches(profile: dict, industries: list[str]) -> bool:
@@ -177,8 +190,17 @@ def _operating_leadership(profile: dict) -> list[dict]:
 
 def run_partner_discovery_jobo(db: Session, partner_name: str, icp: dict, target: int = 5,
                                title_search: list[str] | None = None, dry_run: bool = True,
-                               ee_tenant_id: int = 2, pages: int = 2, page_size: int = 25) -> dict:
-    """Find companies for one partner, in their own tenant, sourced from Jobo."""
+                               ee_tenant_id: int = 2, pages: int = 2, page_size: int = 25,
+                               trust_search_location: bool = False) -> dict:
+    """Find companies for one partner, in their own tenant, sourced from Jobo.
+
+    trust_search_location: Jobo's `locations` is a real SERVER-SIDE filter, so every posting
+    returned is already in the requested country. Re-checking the company PROFILE's headquarters
+    afterwards then rejects companies whose profile simply has no HQ field -- measured on a real
+    India run, that discarded a large share of the results for missing data rather than for being
+    a bad fit. Set this when a posting in the country is sufficient evidence (a company hiring in
+    India operates in India), which is what a market-entry partner actually cares about.
+    """
     titles = (title_search or [])[:MAX_QUERY_TERMS]
     if not titles:
         return {"status": "failed", "error": "title_search is required -- it is the buying signal for this partner"}
@@ -233,9 +255,23 @@ def run_partner_discovery_jobo(db: Session, partner_name: str, icp: dict, target
                 name = profile.get("name") or co.get("name")
                 if not name:
                     continue
-                if not _geo_matches(profile, geographies):
-                    dropped.append((name, f"geography ({profile.get('headquarters_location')})"))
-                    continue
+                # Geography, three-way rather than two. A strict profile-HQ check discards every
+                # company whose profile simply lacks an HQ field (a large share of Indian results),
+                # rejecting them for missing data rather than for being a bad fit. But trusting the
+                # search location alone is worse: Jobo's `locations` filter matches the POSTING, so
+                # "India" returned Arista, Lam Research, Nike, Amazon and Johnson Matthey -- US and
+                # UK multinationals hiring in India, the opposite of a partner's India-market ICP.
+                # So: an HQ that is present and elsewhere is a real rejection; only a MISSING HQ
+                # falls back to the posting's own location.
+                if geographies:
+                    has_hq = bool(profile.get("headquarters_location") or profile.get("country_code"))
+                    if has_hq:
+                        if not _geo_matches(profile, geographies):
+                            dropped.append((name, f"HQ elsewhere ({profile.get('headquarters_location')})"))
+                            continue
+                    elif not trust_search_location:
+                        dropped.append((name, "no HQ on file and posting location not trusted"))
+                        continue
                 if not _industry_matches(profile, industries):
                     dropped.append((name, f"industry ({profile.get('primary_industry')})"))
                     continue
@@ -284,6 +320,9 @@ def run_partner_discovery_jobo(db: Session, partner_name: str, icp: dict, target
         "status": "completed", "partner": partner_name, "tenant_id": tenant.id, "batch_id": batch.id,
         "jobs_seen": jobs_seen, "companies_evaluated": len(seen),
         "kept": kept, "dropped": dropped,
-        "credits_used": (credits_start - credits_end) if (credits_start and credits_end) else None,
+        # Jobo returns the balance only AFTER a call, so the true starting balance is never seen.
+        # Spend is therefore derived from jobs actually delivered at the measured rate, not from a
+        # first-to-last difference (which reads 0 on a single-page run and understates every run).
+        "credits_used": jobs_seen * CREDITS_PER_JOB,
         "credits_balance": credits_end,
     }
