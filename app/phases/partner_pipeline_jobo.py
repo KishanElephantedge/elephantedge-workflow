@@ -12,9 +12,21 @@ industries, headquarters, funding AND a leadership list. So one paid call yields
 that Apify needs a paid enrichment pass to approximate, plus decision makers at no cost.
 
 WHAT JOBO DOES NOT GIVE. Its leadership entries carry Crunchbase person URLs, not LinkedIn ones,
-and no email addresses. So this finds the company and names the people; it does not produce a
-SalesRobot-ready prospect. That is a real limit, not an oversight -- outreach still needs a
-LinkedIn URL from somewhere else.
+and no email addresses. Verified against the live API, not assumed: /api/people, /api/contacts,
+/api/persons and /api/companies/{id}/people all 404, and a job record exposes only an apply_url.
+Jobo has exactly two endpoints. So this finds the company and names the people; it does not
+produce a SalesRobot-ready prospect.
+
+AND THE PEOPLE DATA IS STALE. Checked against LinkedIn by a human on 2026-09-04, two of the five
+leadership names this returned had left their company nine months earlier -- OpenLoop's Director
+of Customer Success (departed Dec 2023) and Ontra's Senior Managing Director (departed Dec 2023) --
+and both were still listed as current. Worse, the person who actually holds the buying role at
+Ontra today (its Chief Revenue Officer) does not appear in Jobo's list at all.
+
+The cause is the source: this list is Crunchbase-derived, and Crunchbase people records are not
+maintained on departure. So treat leadership here as a RESEARCH STARTING POINT that must be
+confirmed before anyone is contacted -- never as a current org chart. The company firmographics
+(size, revenue, industry, HQ) showed no such problem and can be relied on.
 
 ISOLATION is unchanged and deliberate: one tenant per partner, reusing
 partner_pipeline.get_or_create_partner_tenant, so nothing a partner's search finds can ever leak
