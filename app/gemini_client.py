@@ -25,8 +25,24 @@ BASE_URL_TEMPLATE = "https://generativelanguage.googleapis.com/v1beta/models/{mo
 # FALLBACK_MODELS is tried in order when the primary is quota-exhausted. Keep them ordered by
 # preference, and expect to add to it: each entry is a separate 500/day bucket, not extra capacity
 # on the same one.
-DEFAULT_MODEL = "gemini-flash-latest"
-FALLBACK_MODELS = ["gemini-flash-lite-latest"]
+# SIX models, each with its OWN 500/day free-tier bucket -- ~3000 calls/day against a sweep's ~525.
+# Two was not enough: on 2026-09-04 run 124 exhausted both within one run and produced nothing.
+#
+# The aliases are NOT distinct models. "gemini-flash-latest" resolves to gemini-3.8-flash and
+# "gemini-flash-lite-latest" to gemini-3.5-flash-lite -- the 429 body names the real model the
+# quota was charged against, which is how this was worked out. Listing explicit versions alongside
+# them keeps the buckets genuinely separate rather than accidentally aliasing onto one another.
+#
+# Ordered cheapest/fastest first. gemma-4-31b-it is deliberately excluded: it ignores JSON
+# instructions and answers in prose, so it would fail every generate_json caller.
+DEFAULT_MODEL = "gemini-3.1-flash-lite"
+FALLBACK_MODELS = [
+    "gemini-3-flash-preview",
+    "gemini-3.6-flash",
+    "gemini-3.7-flash",
+    "gemini-flash-latest",
+    "gemini-flash-lite-latest",
+]
 
 # gemini-flash-latest is a THINKING model: it spends output tokens on internal reasoning before
 # emitting any text, so a small budget returns finishReason=MAX_TOKENS with no content at all --
@@ -36,7 +52,7 @@ FALLBACK_MODELS = ["gemini-flash-lite-latest"]
 #
 # The floor applies only to models that reason before answering; flash-lite is unaffected and keeps
 # whatever the caller asked for.
-THINKING_MODELS = {"gemini-flash-latest"}
+THINKING_MODELS = {"gemini-flash-latest", "gemini-3.6-flash", "gemini-3.7-flash", "gemini-3-flash-preview"}
 THINKING_MIN_MAX_TOKENS = 1200
 
 TRANSIENT_STATUS = {500, 502, 503, 504}
