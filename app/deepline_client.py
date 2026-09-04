@@ -113,6 +113,73 @@ def _masked_env_debug() -> str:
     return f"DEEPLINE_API_KEY[{key_view} source={src}] DEEPLINE_HOST_URL={host!r}"
 
 
+# OPERATOR KILL SWITCH (2026-09-04). Deepline's monthly cost was overrun, so the operator
+# instructed that NO billed Deepline call may be made until they say otherwise.
+#
+# It guards execute_tool -- the single function through which every billed tool call in this
+# codebase passes -- rather than the individual call sites, because a per-call-site edit only
+# stops the paths someone remembered to audit. Team composition (crustdata_v3_person_search) is
+# the one that quietly spent on every discovered company; it would have been easy to miss.
+#
+# It raises DeeplineError rather than returning empty, because every caller already handles that
+# exception as "this provider is unavailable" and degrades to its next source -- verified for
+# assess_team_composition (_department_count returns None) and revenue estimation (falls through
+# to the Google AI Overview step). So switching this on disables Deepline without breaking a
+# single flow.
+#
+# get_credit_balance_usd is deliberately NOT guarded: it is free and read-only, and BudgetGuard
+# needs it to construct at all -- blocking it would fail runs rather than merely de-fund them.
+#
+# Flip it back with set_deepline_enabled(db, True), no redeploy.
+DEEPLINE_ENABLED_PARAMETER_KEY = "deepline_enabled"
+_ENABLED_CACHE: dict[str, tuple[float, bool]] = {}
+_ENABLED_CACHE_TTL_SECONDS = 60
+
+
+class DeeplineDisabled(DeeplineError):
+    """Billed Deepline access is switched off by the operator."""
+
+
+def is_deepline_enabled() -> bool:
+    if os.environ.get("DEEPLINE_DISABLED", "").strip().lower() in ("1", "true", "yes"):
+        return False
+    cached = _ENABLED_CACHE.get("v")
+    if cached and (time.time() - cached[0]) < _ENABLED_CACHE_TTL_SECONDS:
+        return cached[1]
+    enabled = True
+    try:
+        from app.db.models import Parameter
+        from app.db.session import SessionLocal
+
+        db = SessionLocal()
+        try:
+            row = db.query(Parameter).filter(Parameter.key == DEEPLINE_ENABLED_PARAMETER_KEY).first()
+            if row and isinstance(row.value, dict) and row.value.get("enabled") is False:
+                enabled = False
+        finally:
+            db.close()
+    except Exception as e:  # noqa: BLE001 -- a DB hiccup must not silently re-enable spending
+        logger.warning("deepline: could not read the enabled flag (%s); assuming ENABLED", e)
+    _ENABLED_CACHE["v"] = (time.time(), enabled)
+    return enabled
+
+
+def set_deepline_enabled(db, enabled: bool, tenant_id: int = 2) -> None:
+    """parameters.tenant_id is NOT NULL, and this backend serves exactly one tenant, so the flag
+    is stored against it. The read above deliberately does not filter by tenant -- any row
+    switching Deepline off switches it off for this process."""
+    from app.db.models import Parameter
+
+    row = db.query(Parameter).filter(Parameter.key == DEEPLINE_ENABLED_PARAMETER_KEY).first()
+    if row is None:
+        row = Parameter(tenant_id=tenant_id, key=DEEPLINE_ENABLED_PARAMETER_KEY, value={"enabled": enabled})
+        db.add(row)
+    else:
+        row.value = {"enabled": enabled}
+    db.commit()
+    _ENABLED_CACHE.pop("v", None)
+
+
 RATE_LIMIT_MAX_RETRIES = 3
 RATE_LIMIT_DEFAULT_DELAY_SECONDS = 5
 
@@ -134,6 +201,11 @@ def execute_tool(tool_id: str, payload: dict) -> dict:
     """Run `deepline tools execute <tool_id> --input '<json>' --json` and return the parsed
     response. Retries on a rate-limit response (see _rate_limit_retry_delay) before giving up
     -- any other failure still raises immediately, no change there."""
+    if not is_deepline_enabled():
+        raise DeeplineDisabled(
+            f"{tool_id} not called: billed Deepline access is switched off by the operator "
+            "(deepline_enabled=false). Re-enable with set_deepline_enabled(db, True)."
+        )
     result = None
     for attempt in range(RATE_LIMIT_MAX_RETRIES + 1):
         try:
