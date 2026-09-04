@@ -180,11 +180,20 @@ def _operating_leadership(profile: dict) -> list[dict]:
     """
     out = []
     for person in (profile.get("leadership") or []):
-        title = (person.get("title") or "").strip()
+        # Jobo writes these as machine tokens -- "board_member", "advisor" -- not prose, so the
+        # underscores are normalised before the shared title check. Without this,
+        # is_board_only_title("board_member") is False (it matches "board member", with a space)
+        # and board members ship to a partner as decision makers, which is exactly the error that
+        # put five board members on Remy's list. "advisor"/"investor" are added here rather than
+        # to the shared marker list because they are Crunchbase's vocabulary, not job-title prose.
+        raw_title = (person.get("title") or "").strip()
+        title = raw_title.replace("_", " ").strip()
         name = (person.get("name") or "").strip()
-        if not name or not title or is_board_only_title(title):
+        if not name or not title:
             continue
-        out.append({"name": name, "title": title, "url": person.get("linkedin_url")})
+        if is_board_only_title(title) or title.lower() in ("advisor", "adviser", "investor", "mentor"):
+            continue
+        out.append({"name": name, "title": raw_title, "url": person.get("linkedin_url")})
     return out
 
 
