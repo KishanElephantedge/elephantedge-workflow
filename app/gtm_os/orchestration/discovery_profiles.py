@@ -120,6 +120,94 @@ def apply_icp_headcount_bands(db: Session, tenant_id: int, profiles: list[dict])
     return out
 
 
+# TITLES ARE DERIVED FROM THE ICP TRIGGER, FOR THE SAME REASON THE BANDS ARE.
+#
+# Each ICP declares trigger_hiring_roles plus a trigger_mode of requires_presence or
+# requires_absence. That IS the job-title specification, so searching a different set means
+# paying for results the matcher is guaranteed to reject:
+#
+#   icp_1 requires the ABSENCE of gtm/head_of_sales hiring -- yet V1's shared title list searches
+#         "Head of Sales", "VP Sales", "CRO" and "GTM Engineer" alongside rep titles. Every company
+#         those terms find fails icp_1 by construction. Confirmed live 2026-09-04: Opal Security
+#         (hiring a GTM Engineer) and Simple AI (hiring a Head of Sales) were both discovered and
+#         both discarded for exactly this reason. Apify bills per RESULT RETURNED, so those were
+#         paid for.
+#   icp_2 and icp_3 require the PRESENCE of those same roles -- and nothing searched for them.
+#
+# Deriving titles from the trigger makes each search return companies that can actually pass the
+# ICP it feeds, which raises precision and lowers cost at the same time.
+ROLE_TITLES: dict[str, list[str]] = {
+    "gtm": [
+        "GTM Engineer", "Head of GTM", "RevOps", "Revenue Operations", "Sales Operations",
+        "Forward Deployed Engineer", "Sales Enablement", "Sales Systems",
+    ],
+    "head_of_sales": [
+        "Head of Sales", "VP Sales", "VP of Sales", "Director of Sales", "Sales Director",
+        "CRO", "Chief Revenue Officer",
+    ],
+}
+
+# What a company hires when it is adding CAPACITY rather than LEADERSHIP -- the observable
+# signal for a requires_absence ICP. Strictly individual-contributor: any leadership or GTM title
+# here would search for the very thing the ICP requires to be absent.
+REP_LEVEL_TITLES: list[str] = [
+    "SDR", "BDR", "AE", "Sales Development Representative",
+    "Business Development Representative", "Business Development Manager",
+    "Account Executive", "Sales Executive", "Sales Representative",
+]
+
+
+def titles_for_icp(icp: dict) -> list[str]:
+    """The job titles whose presence (or absence) this ICP is actually defined by."""
+    roles = icp.get("trigger_hiring_roles") or []
+    if icp.get("trigger_mode") == "requires_absence":
+        return list(REP_LEVEL_TITLES)
+    titles: list[str] = []
+    for role in roles:
+        for t in ROLE_TITLES.get(role, []):
+            if t not in titles:
+                titles.append(t)
+    return titles or list(REP_LEVEL_TITLES)
+
+
+def build_icp_discovery_profiles(db: Session, tenant_id: int) -> list[dict]:
+    """One profile PER ICP -- not per offering.
+
+    Discovery is gated by ICP, and several offerings share one ICP (icp_1 feeds Consulting,
+    Workshop and Digital Playbook). A profile per offering therefore runs the same search two or
+    three times and pays Apify for the same companies repeatedly, while an offering with no
+    profile of its own is invisible. One search per ICP covers every offering that ICP feeds,
+    exactly once.
+
+    An ICP with no offering mapped to it is skipped: there would be nothing to sell the result.
+    """
+    from app.gtm_os.icp.icp_offering_matching import get_icps_offerings_overview
+    from app.gtm_os.opportunity.offering_config import get_offering_config
+
+    by_icp: dict[str, list[str]] = {}
+    for offering in get_offering_config(db, tenant_id):
+        for icp_id in (offering.get("applicable_icps") or []):
+            by_icp.setdefault(icp_id, []).append(offering["name"])
+
+    profiles = []
+    for icp in get_icps_offerings_overview(db, tenant_id).get("icps", []):
+        offerings = by_icp.get(icp["id"])
+        if not offerings:
+            continue
+        lo, hi = headcount_band_for_icp(icp)
+        profiles.append({
+            "id": icp["id"],
+            "time_range": DEFAULT_TIME_RANGE,
+            "offering_names": offerings,
+            "enabled": True,
+            "title_search": titles_for_icp(icp),
+            "employee_min": lo,
+            "employee_max": hi,
+            "industry_filter": list(APIFY_INDUSTRY_FILTER),
+        })
+    return profiles
+
+
 DEFAULT_DISCOVERY_PROFILES: list[dict] = [
     {
         "id": "consulting",
@@ -212,12 +300,21 @@ def get_discovery_profiles(db: Session, tenant_id: int) -> list[dict]:
         .filter(Parameter.tenant_id == tenant_id, Parameter.key == DISCOVERY_PROFILES_PARAMETER_KEY)
         .first()
     )
-    profiles = param.value if (param and isinstance(param.value, list)) else DEFAULT_DISCOVERY_PROFILES
+    if param and isinstance(param.value, list):
+        # An explicit human override always wins -- only its bands are corrected.
+        try:
+            return apply_icp_headcount_bands(db, tenant_id, param.value)
+        except Exception:  # noqa: BLE001 -- a config read failure must not stop discovery
+            logger.warning("could not derive ICP headcount bands; using the stored profiles as-is", exc_info=True)
+            return param.value
     try:
-        return apply_icp_headcount_bands(db, tenant_id, profiles)
-    except Exception:  # noqa: BLE001 -- a config read failure must not stop discovery entirely
-        logger.warning("could not derive ICP headcount bands; using the profiles' own values", exc_info=True)
-        return profiles
+        profiles = build_icp_discovery_profiles(db, tenant_id)
+        if profiles:
+            return profiles
+        logger.warning("no ICP has an offering mapped to it; falling back to the static profiles")
+    except Exception:  # noqa: BLE001
+        logger.warning("could not build ICP discovery profiles; falling back to the static ones", exc_info=True)
+    return DEFAULT_DISCOVERY_PROFILES
 
 
 def get_enabled_discovery_profiles(db: Session, tenant_id: int) -> list[dict]:
