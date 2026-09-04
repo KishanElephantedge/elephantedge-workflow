@@ -23,10 +23,24 @@ of Customer Success (departed Dec 2023) and Ontra's Senior Managing Director (de
 and both were still listed as current. Worse, the person who actually holds the buying role at
 Ontra today (its Chief Revenue Officer) does not appear in Jobo's list at all.
 
+Two further cases from an India batch the same day make it worse than staleness alone:
+
+  - Log9 Materials' listed "Co-Founder and CEO" held that role Apr 2015 - Apr 2025. It ended
+    seventeen months ago and is still returned as current.
+  - Strides Pharma Science's listed "CEO - International Operations" is in fact a NON-EXECUTIVE
+    DIRECTOR AND BOARD ADVISOR, and at Strides CONSUMER Pvt Ltd, a sibling entity. Both the title
+    and the company were wrong -- a board role at one company presented as an operating CEO at
+    another. Meanwhile the real Managing Director & Group CEO was absent from the list entirely.
+
+So the failure mode is not only "this person left" but "this title is not what they do, at a
+company they do not run". That is the wrong-company-attribution risk this codebase has already
+been bitten by twice (Isabel -> Isabella Moore, and the Domaine revenue figure).
+
 The cause is the source: this list is Crunchbase-derived, and Crunchbase people records are not
 maintained on departure. So treat leadership here as a RESEARCH STARTING POINT that must be
-confirmed before anyone is contacted -- never as a current org chart. The company firmographics
-(size, revenue, industry, HQ) showed no such problem and can be relied on.
+confirmed before anyone is contacted -- never as a current org chart, and never as evidence of
+what someone's job actually is. The company firmographics (size, revenue, industry, HQ) showed no
+such problem across either batch and can be relied on.
 
 ISOLATION is unchanged and deliberate: one tenant per partner, reusing
 partner_pipeline.get_or_create_partner_tenant, so nothing a partner's search finds can ever leak
