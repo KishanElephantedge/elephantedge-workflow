@@ -34,11 +34,22 @@ DEFAULT_ICP_CONFIG: list[dict] = [
     {
         "id": "icp_1",
         "name": "Stuck in Sales",
-        "description": "$3-10M revenue, up to 5 sales reps, generic marketing with no dedicated "
+        "description": "$3-10M revenue, up to 10 sales reps, generic marketing with no dedicated "
         "GTM function -- growth has plateaued and no active GTM/sales-leadership hiring is underway.",
         "revenue_min_usd": 3_000_000,
         "revenue_max_usd": 10_000_000,
-        "sales_team_size_max": 5,
+        # 5 -> 10 on 2026-09-04. The 5 made this ICP unsatisfiable: its own $3-10M band needs
+        # >=37 employees (at REVENUE_PER_EMPLOYEE_USD), while 5 reps allows <=25 at the tenant-median
+        # 19.85% sales-headcount rate. The two rules excluded each other, which is why real batches
+        # matched nothing -- all 10 of 2026-09-04's opportunities scored 7.5-9.3 estimated reps and
+        # had to be matched by hand.
+        #
+        # 10 is not a loosening to make numbers work, it is what Elephant Edge's own ICP research
+        # already says: phase1-icp-notes.md records "GTM/Sales team size ... should be small, under
+        # ~10 people", and phase2-icp.md records an 11-50 employee gate CONFIRMED DIRECTLY BY GOKUL.
+        # Those two agree with each other: 10 reps / 19.85% = ~50 employees, exactly that gate's
+        # upper bound. A max of 5 implies ~25 employees, which contradicts it.
+        "sales_team_size_max": 10,
         "trigger_mode": "requires_absence",
         "trigger_hiring_roles": ["gtm", "head_of_sales"],
         "trigger_description": "No active GTM engineer or Head-of-Sales hiring detected -- "
