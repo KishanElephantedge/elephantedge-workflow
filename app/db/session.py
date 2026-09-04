@@ -335,6 +335,30 @@ def ensure_indexes():
                 created_at TIMESTAMP
             )
         """))
+        # Granola meeting notes (app/gtm_os/meetings/). Transcripts live in their own table, not
+        # as a column on calendar_bookings: they are large and client-confidential, so keeping them
+        # separate keeps every existing booking query cheap and stops a transcript being selected
+        # into a payload that was never meant to carry one.
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS meeting_notes (
+                id SERIAL PRIMARY KEY,
+                tenant_id INTEGER NOT NULL,
+                granola_note_id VARCHAR NOT NULL,
+                title VARCHAR,
+                owner_name VARCHAR,
+                owner_email VARCHAR,
+                summary TEXT,
+                transcript_text TEXT,
+                note_created_at TIMESTAMP,
+                calendar_booking_id INTEGER REFERENCES calendar_bookings(id),
+                match_method VARCHAR,
+                match_confidence VARCHAR,
+                raw_payload JSON,
+                ingested_at TIMESTAMP
+            )
+        """))
+        conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ux_meeting_notes_tenant_note ON meeting_notes (tenant_id, granola_note_id)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_meeting_notes_booking ON meeting_notes (calendar_booking_id)"))
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_gtm_signals_dedup_key ON gtm_signals (dedup_key)"))
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_gtm_signals_tenant_source ON gtm_signals (tenant_id, source)"))
         # Person -> Company resolution (app/gtm_os/intelligence/company_resolution.py).

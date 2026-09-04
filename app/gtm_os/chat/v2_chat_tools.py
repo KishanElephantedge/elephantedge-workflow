@@ -149,6 +149,46 @@ V2_CHAT_TOOLS = [
         "input_schema": {"type": "object", "properties": {"search": {"type": "string"}, "page": {"type": "integer"}}},
     },
     {
+        "name": "get_meeting_brief",
+        "description": (
+            "Before a call: what was agreed with this person last time, what WE still owe them, "
+            "what THEY still owe us, and what to focus on. Built from real Granola transcripts of "
+            "past meetings, not from memory. Use this whenever the user says they have a call "
+            "coming up, or asks what to discuss with someone."
+        ),
+        "input_schema": {"type": "object", "properties": {
+            "person_email": {"type": "string", "description": "The other person's email address"},
+            "booking_id": {"type": "integer", "description": "A specific calendar booking id instead"}}},
+    },
+    {
+        "name": "draft_meeting_outcome",
+        "description": (
+            "Read the Granola transcript of a meeting that already happened and PROPOSE its "
+            "outcome (won/lost/pending, amount, offering, next steps, objections). Returns a draft "
+            "only -- it records nothing. Use it to fill in a meeting whose outcome nobody logged, "
+            "then confirm with record_meeting_outcome once the user agrees."
+        ),
+        "input_schema": {"type": "object", "properties": {"booking_id": {"type": "integer"}},
+                         "required": ["booking_id"]},
+    },
+    {
+        "name": "get_open_commitments",
+        "description": (
+            "Everything we promised across recent meetings and have not closed, plus what others "
+            "promised us. Answers 'what have I committed to and not done'."
+        ),
+        "input_schema": {"type": "object", "properties": {"limit": {"type": "integer"}}},
+    },
+    {
+        "name": "meeting_coverage",
+        "description": (
+            "How much meeting history the system can actually see: bookings, Granola notes ingested, "
+            "how many are linked, and how many still have no confirmed outcome. Use it to answer "
+            "honestly when asked what the system knows about meetings."
+        ),
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
         "name": "list_human_knowledge",
         "description": "Facts previously taught to the assistant/system, with their status (confirmed/pending/dismissed).",
         "input_schema": {"type": "object", "properties": {"status": {"type": "string", "enum": ["pending_review", "pending_interpretation", "confirmed", "dismissed"]}}},
@@ -397,6 +437,23 @@ def execute_v2_chat_tool(name: str, tool_input: dict, db: Session, tenant_id: in
     if name == "get_overrides_evals":
         from app.gtm_os.learning.overrides_evals import get_overrides_evals
         return get_overrides_evals(db, tenant_id, month=tool_input.get("month"))
+
+    if name == "get_meeting_brief":
+        from app.gtm_os.meetings.meeting_intelligence import get_meeting_brief
+        return get_meeting_brief(db, tenant_id, person_email=tool_input.get("person_email"),
+                                 booking_id=tool_input.get("booking_id"))
+
+    if name == "draft_meeting_outcome":
+        from app.gtm_os.meetings.meeting_intelligence import draft_outcome_for_booking
+        return draft_outcome_for_booking(db, tenant_id, tool_input["booking_id"])
+
+    if name == "get_open_commitments":
+        from app.gtm_os.meetings.meeting_intelligence import get_open_commitments
+        return get_open_commitments(db, tenant_id, limit=tool_input.get("limit", 20))
+
+    if name == "meeting_coverage":
+        from app.gtm_os.meetings.meeting_intelligence import meeting_coverage
+        return meeting_coverage(db, tenant_id)
 
     if name == "list_meetings":
         from sqlalchemy import or_
