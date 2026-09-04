@@ -83,11 +83,34 @@ def _estimated_revenue(company: Company) -> tuple[int | None, str | None]:
     return None, None
 
 
+# Empirical, same discipline as REVENUE_PER_EMPLOYEE_USD above: the median sales_headcount_percent
+# across the 570 companies in THIS database that have a real measured value (p25 11.93%,
+# p75 28.46%). Used ONLY when the measured percentage is absent.
+#
+# WHY A FALLBACK AT ALL. sales_headcount_percent comes from assess_team_composition, a PAID call,
+# so a company discovered from a job posting never has it. icp_matching then recorded
+# "cannot estimate sales team size" and refused to match -- not "does not match", but "cannot
+# tell". Measured 2026-09-04: all 10 of that day's real opportunities were blocked on exactly
+# this, and had to be matched by hand.
+#
+# "Cannot tell" is the worst of the three answers: it is indistinguishable from a genuine
+# non-match downstream, and it hides WHY an ICP never fires. With the proxy the matcher returns a
+# real verdict from data already on file, and the evidence string says plainly that it is derived.
+SALES_HEADCOUNT_PERCENT_MEDIAN = 19.85
+
+
 def _estimated_sales_team_size(company: Company) -> tuple[float | None, str | None]:
-    if company.employee_count is not None and company.sales_headcount_percent is not None:
+    if company.employee_count is None:
+        return None, None
+    if company.sales_headcount_percent is not None:
         estimate = company.employee_count * company.sales_headcount_percent / 100
         return estimate, f"employee_count={company.employee_count} * sales_headcount_percent={company.sales_headcount_percent}%"
-    return None, None
+    estimate = company.employee_count * SALES_HEADCOUNT_PERCENT_MEDIAN / 100
+    return estimate, (
+        f"DERIVED from employee_count={company.employee_count} x {SALES_HEADCOUNT_PERCENT_MEDIAN}% "
+        f"(tenant-median sales headcount) = {estimate:.1f} -- no measured sales_headcount_percent on "
+        f"file, this is a proxy, not a counted sales team"
+    )
 
 
 def evaluate_icp_matches_for_company(company: Company, icp_config: list[dict]) -> list[dict]:

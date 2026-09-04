@@ -549,6 +549,65 @@ def resolve_company_for_signal(
     return result
 
 
+def apply_job_posting_facts(db: Session, company_id: int, raw_signal: GtmSignal) -> dict:
+    """Fill a Company's matcher inputs from the job posting that produced the signal. FREE.
+
+    WHY THIS EXISTS. icp_matching gates every ICP on company.hiring_signal_role, and records
+    "missing_information" (never a match) when it is null. Measured 2026-09-04: only 241 of 842
+    companies had it, and 9 of the 10 opportunities produced that day had to be matched by hand
+    because the automated matcher could not evaluate them at all.
+
+    The value was already in our possession. A linkedin_job signal carries the posting's title in
+    extracted_info, and _classify_role() turns a title into exactly the head_of_sales/sdr/ae/gtm
+    vocabulary the ICP triggers are written in -- a pure keyword function, no provider call. The
+    same payload carries organization_headcount, which is what the revenue proxy needs.
+
+    So the matcher was blocked on data we had already paid Apify for and then thrown away.
+
+    Only fills nulls: a real enrichment result always wins over a posting-derived one.
+    """
+    from app.gtm_os.icp.icp_matching import REVENUE_PER_EMPLOYEE_USD
+    from app.phases.hiring_signal import _classify_role
+
+    if raw_signal.source != "linkedin_job":
+        return {"applied": []}
+    company = db.get(Company, company_id)
+    if company is None:
+        return {"applied": []}
+
+    info = raw_signal.extracted_info or {}
+    applied = []
+
+    if company.hiring_signal_role is None:
+        role = _classify_role(info.get("title") or "")
+        if role:
+            company.hiring_signal_role = role
+            company.hiring_signal_reasoning = (
+                f"Role derived from the job posting title {info.get('title')!r} "
+                f"[posting: {(raw_signal.raw_evidence or {}).get('url')}]"
+            )
+            applied.append(f"hiring_signal_role={role}")
+
+    if company.employee_count is None:
+        headcount = info.get("organization_headcount")
+        if isinstance(headcount, int) and headcount > 0:
+            company.employee_count = headcount
+            applied.append(f"employee_count={headcount}")
+
+    if company.estimated_revenue_lower_usd is None and company.employee_count:
+        # Deliberately a BAND, not a point: the underlying spread is ~2.5x (p25-p75
+        # $50k-$125k/employee), so a single number would read as a measurement.
+        company.estimated_revenue_lower_usd = int(company.employee_count * REVENUE_PER_EMPLOYEE_USD * 0.8)
+        company.estimated_revenue_higher_usd = int(company.employee_count * REVENUE_PER_EMPLOYEE_USD * 1.2)
+        applied.append("estimated_revenue band (headcount proxy)")
+
+    if applied:
+        db.add(company)
+        db.commit()
+        logger.info("apply_job_posting_facts: company_id=%s %s", company_id, ", ".join(applied))
+    return {"applied": applied}
+
+
 def ensure_company_resolved_if_needed(
     db: Session,
     tenant_id: int,
@@ -584,3 +643,12 @@ def ensure_company_resolved_if_needed(
         interpreted_signal.company_id = result["company_id"]
         db.add(interpreted_signal)
         db.commit()
+        # The posting that produced this signal already contains the role title and headcount the
+        # ICP matcher needs. Filling them here -- at the moment identity is established -- is what
+        # lets a job-sourced company be evaluated at all. Never fatal: identity is the job of this
+        # function, and enrichment is a bonus on top of it.
+        try:
+            apply_job_posting_facts(db, result["company_id"], raw_signal)
+        except Exception:  # noqa: BLE001
+            db.rollback()
+            logger.warning("apply_job_posting_facts failed for company_id=%s", result["company_id"], exc_info=True)
