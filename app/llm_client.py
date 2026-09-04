@@ -51,6 +51,28 @@ PRIMARY = "gemini"  # "claude" | "gemini"
 # -- the run destroyed more quota failing than it would have used succeeding.
 _EXHAUSTED: dict[str, str] = {}
 
+# The free tier enforces TWO separate 429s and they mean opposite things:
+#
+#   GenerateRequestsPerDayPerProjectPerModel-FreeTier      500/day  -- gone until UTC midnight
+#   GenerateRequestsPerMinutePerProjectPerModel-FreeTier   15/min   -- gone for a few seconds
+#
+# Telling them apart is not optional. The first version of this memo blacklisted a model for the
+# whole day on ANY 429, which is wrong and dangerous: measured on run 125, gemini-3.1-flash-lite
+# reported 429 twenty-eight times AND served 491 successful calls in the same run. Those were
+# per-minute limits. Blacklisting on the first one would have thrown away the model that did 90%
+# of the day's useful work, then done the same to the other five in turn, and killed the run
+# within minutes -- strictly worse than having no memo at all.
+#
+# So: only a PerDay violation is permanent. A per-minute limit means wait, not give up.
+RATE_LIMIT_SLEEP_SECONDS = 20
+
+
+def _is_daily_quota(message: str) -> bool:
+    """True only for the per-DAY quota. Gemini names the exact quota it charged in the 429 body,
+    and GeminiError carries that body verbatim -- so this reads the provider's own words rather
+    than guessing from the status code."""
+    return "PerDay" in message
+
 
 def _is_exhausted(model: str) -> bool:
     from datetime import datetime
@@ -62,30 +84,56 @@ def _mark_exhausted(model: str) -> None:
     _EXHAUSTED[model] = datetime.utcnow().strftime("%Y-%m-%d")
 
 
-def _gemini_with_model_fallback(fn, prompt, db, tenant_id, max_tokens):
-    """Gemini's free quota is per-DAY and per-MODEL, so an exhausted model is not an exhausted
-    provider. Walk the models before declaring Gemini unavailable -- otherwise one sweep's ~525
-    calls burn the default model's 500/day and every later run fails with a fallback that is
-    itself unavailable (Anthropic has no credit), which is exactly how 2026-09-03 lost three runs.
-    """
+def _try_models(fn, prompt, db, tenant_id, max_tokens):
+    """One pass over the live models. Returns (result, ok, last_error, hit_minute_limit)."""
+    import time
     from app.gemini_client import DEFAULT_MODEL, FALLBACK_MODELS
 
     last = None
     tried = False
+    minute_limited = False
     for model in [DEFAULT_MODEL, *FALLBACK_MODELS]:
         if _is_exhausted(model):
-            continue  # already proved dead today -- asking again only burns more quota
+            continue  # daily allowance provably gone -- asking again only burns more quota
         tried = True
         try:
-            return fn(prompt, db, tenant_id, max_tokens=max_tokens, model=model)
+            return fn(prompt, db, tenant_id, max_tokens=max_tokens, model=model), True, None, False
         except GeminiError as e:
             last = e
-            if "429" not in str(e):
+            message = str(e)
+            if "429" not in message:
                 raise  # a real error, not a quota wall -- do not burn the other models on it
-            _mark_exhausted(model)
-            logger.warning("Gemini model %s quota-exhausted for today, skipping it from now on", model)
+            if _is_daily_quota(message):
+                _mark_exhausted(model)
+                logger.warning("Gemini model %s is out of its DAILY quota, skipping it until UTC midnight", model)
+            else:
+                minute_limited = True
+                logger.warning("Gemini model %s hit its per-minute rate limit, trying the next model", model)
     if not tried:
-        raise GeminiError("all Gemini models are quota-exhausted for today (free tier, 500/day each)")
+        raise GeminiError("all Gemini models are out of daily quota (free tier, 500/day each)")
+    return None, False, last, minute_limited
+
+
+def _gemini_with_model_fallback(fn, prompt, db, tenant_id, max_tokens):
+    """Gemini's daily quota is per-MODEL, so an exhausted model is not an exhausted provider.
+
+    Two passes: if the first pass failed ONLY because every live model was inside its 15/min
+    window, that is a wait-and-retry condition, not a failure -- sleeping once and retrying costs
+    20 seconds and saves the call, where giving up costs the whole stage.
+    """
+    import time
+
+    result, ok, last, minute_limited = _try_models(fn, prompt, db, tenant_id, max_tokens)
+    if ok:
+        return result
+    if not minute_limited:
+        raise last
+
+    logger.warning("All live Gemini models are rate-limited; waiting %ss and retrying once", RATE_LIMIT_SLEEP_SECONDS)
+    time.sleep(RATE_LIMIT_SLEEP_SECONDS)
+    result, ok, last, _ = _try_models(fn, prompt, db, tenant_id, max_tokens)
+    if ok:
+        return result
     raise last
 
 
