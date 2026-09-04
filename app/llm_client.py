@@ -41,6 +41,27 @@ logger = logging.getLogger("llm_client")
 PRIMARY = "gemini"  # "claude" | "gemini"
 
 
+# Models known to be quota-dead, and the UTC date that knowledge belongs to. Gemini's free quota
+# is per-day, so this resets naturally when the date rolls over.
+#
+# WITHOUT THIS, the fallback re-tries every exhausted model on EVERY call. Measured on run 124: 368
+# quota-rejected requests for 1 useful answer, because each of ~130 calls walked the whole list
+# from the top and got a 429 from each dead model. A rejected request still counts against the
+# daily quota, so the retries were themselves consuming the very allowance they were trying to find
+# -- the run destroyed more quota failing than it would have used succeeding.
+_EXHAUSTED: dict[str, str] = {}
+
+
+def _is_exhausted(model: str) -> bool:
+    from datetime import datetime
+    return _EXHAUSTED.get(model) == datetime.utcnow().strftime("%Y-%m-%d")
+
+
+def _mark_exhausted(model: str) -> None:
+    from datetime import datetime
+    _EXHAUSTED[model] = datetime.utcnow().strftime("%Y-%m-%d")
+
+
 def _gemini_with_model_fallback(fn, prompt, db, tenant_id, max_tokens):
     """Gemini's free quota is per-DAY and per-MODEL, so an exhausted model is not an exhausted
     provider. Walk the models before declaring Gemini unavailable -- otherwise one sweep's ~525
@@ -50,14 +71,21 @@ def _gemini_with_model_fallback(fn, prompt, db, tenant_id, max_tokens):
     from app.gemini_client import DEFAULT_MODEL, FALLBACK_MODELS
 
     last = None
+    tried = False
     for model in [DEFAULT_MODEL, *FALLBACK_MODELS]:
+        if _is_exhausted(model):
+            continue  # already proved dead today -- asking again only burns more quota
+        tried = True
         try:
             return fn(prompt, db, tenant_id, max_tokens=max_tokens, model=model)
         except GeminiError as e:
             last = e
             if "429" not in str(e):
                 raise  # a real error, not a quota wall -- do not burn the other models on it
-            logger.warning("Gemini model %s quota-exhausted, trying next", model)
+            _mark_exhausted(model)
+            logger.warning("Gemini model %s quota-exhausted for today, skipping it from now on", model)
+    if not tried:
+        raise GeminiError("all Gemini models are quota-exhausted for today (free tier, 500/day each)")
     raise last
 
 
