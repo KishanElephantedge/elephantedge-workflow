@@ -35,6 +35,62 @@ from app.phases.hiring_signal import (
     assess_team_composition,
 )
 
+# 2026-09-07 real fix: locationSearch/countries_derived filter the JOB POSTING's location, not
+# the company's own headquarters -- confirmed live that a company can post a US-market-targeted
+# role ("... - USA Market") while the company itself is headquartered elsewhere, and that role
+# still matches a "United States" job search. org_linkedin_headquarters (a real, LinkedIn-sourced
+# field already present in the actor's own response, just never read before this fix) is the
+# actual company HQ. US state names/abbreviations, same as a plain resident of this codebase
+# would check by eye -- not exhaustive of every US territory, but real US company HQs
+# overwhelmingly resolve to "City, State" or "City, State, US".
+_US_STATES = {
+    "alabama", "al", "alaska", "ak", "arizona", "az", "arkansas", "ar", "california", "ca",
+    "colorado", "co", "connecticut", "ct", "delaware", "de", "florida", "fl", "georgia", "ga",
+    "hawaii", "hi", "idaho", "id", "illinois", "il", "indiana", "in", "iowa", "ia", "kansas", "ks",
+    "kentucky", "ky", "louisiana", "la", "maine", "me", "maryland", "md", "massachusetts", "ma",
+    "michigan", "mi", "minnesota", "mn", "mississippi", "ms", "missouri", "mo", "montana", "mt",
+    "nebraska", "ne", "nevada", "nv", "new hampshire", "nh", "new jersey", "nj", "new mexico", "nm",
+    "new york", "ny", "north carolina", "nc", "north dakota", "nd", "ohio", "oh", "oklahoma", "ok",
+    "oregon", "or", "pennsylvania", "pa", "rhode island", "ri", "south carolina", "sc",
+    "south dakota", "sd", "tennessee", "tn", "texas", "tx", "utah", "ut", "vermont", "vt",
+    "virginia", "va", "washington", "wa", "west virginia", "wv", "wisconsin", "wi", "wyoming",
+    "wy", "district of columbia", "dc",
+}
+
+
+def _is_us_headquarters(org_linkedin_headquarters: str | None) -> bool | None:
+    """True/False when the field lets us tell; None when there's genuinely nothing to check
+    against (missing data is not the same as a non-US company, so this is never coerced to
+    False on its own -- caller decides what to do with an unknown).
+
+    Structural, not a blocklist -- several US state postal codes ARE real ISO country codes
+    (IN=Indiana/India, CA=California/Canada), so the same 2-letter token is genuinely ambiguous
+    out of context. What disambiguates it is SEGMENT COUNT: LinkedIn's own shape is either
+    "City, State" (2 segments, no separate country slot -- confirmed live: "Austin, TX") or
+    "City, Region, Country" (3 segments, the LAST one is a country marker -- confirmed live:
+    "Bengaluru, Karnataka, IN" and "Toronto, ON, CA", neither a US company). So a trailing
+    2-letter code is only trusted as a bare state abbreviation when there is NO separate country
+    segment already claiming that slot -- with 3+ segments, the last one must read as an actual
+    US country marker ("US"/"USA"/"United States"), never a coincidentally-matching state code."""
+    if not org_linkedin_headquarters:
+        return None
+    segments = [s.strip().lower() for s in org_linkedin_headquarters.split(",") if s.strip()]
+    if not segments:
+        return None
+    if segments[-1] in ("us", "usa", "united states"):
+        return True
+    if len(segments) >= 3:
+        # The last segment is playing the country role here -- it already claimed that slot, so
+        # it not being "US"/"USA"/"United States" (checked above) means this is NOT a US company,
+        # regardless of whether the code also happens to spell a US state's postal abbreviation.
+        return False
+    # Exactly 2 segments (or 1): no separate country slot, so the last segment is free to be
+    # read as a bare US state -- either the full name or its 2-letter postal code.
+    last = segments[-1]
+    if last in _US_STATES:
+        return True
+    return None
+
 APIFY_TITLE_SEARCH = [
     "SDR", "BDR", "AE", "Sales Development Representative",
     "Business Development Representative", "Business Development Manager", "Account Executive",
@@ -180,6 +236,16 @@ def run_apify_discovery(
             rejection_counts["headcount_out_of_target"] = rejection_counts.get("headcount_out_of_target", 0) + 1
             continue
 
+        org_headquarters = job.get("org_linkedin_headquarters")
+        if _is_us_headquarters(org_headquarters) is False:
+            # Real, confirmed miss (2026-09-07): a company hiring for a "... - USA Market" role
+            # is not the same as a US-headquartered company -- locationSearch/countries_derived
+            # only filter the job posting's own location, never the org's real HQ. Only rejects
+            # on a CONFIRMED non-US headquarters string; missing data (None) falls through
+            # unfiltered rather than discarding a company we simply have no HQ text for.
+            rejection_counts["non_us_headquarters"] = rejection_counts.get("non_us_headquarters", 0) + 1
+            continue
+
         title = job.get("title") or ""
         description = job.get("description_text") or ""
         role = _classify_role(title)
@@ -194,6 +260,7 @@ def run_apify_discovery(
             domain=domain,
             industry=job.get("org_linkedin_industry") or None,
             employee_count=headcount,
+            location=org_headquarters or None,
             source="apify:fantastic-jobs_advanced-linkedin-job-search-api",
             active_job_title=title or None,
             product_fit_jd_categories=product_fit_categories or None,
