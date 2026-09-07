@@ -81,11 +81,26 @@ class DiscoveryProfileError(ValueError):
 # estimate revenue from headcount -- so the two can no longer drift apart. Change an ICP's revenue
 # band and discovery follows it automatically.
 def headcount_band_for_icp(icp: dict) -> tuple[int, int]:
-    """The employee range whose ESTIMATED revenue lands inside this ICP's revenue band."""
-    from app.gtm_os.icp.icp_matching import REVENUE_PER_EMPLOYEE_USD
+    """The employee range whose ESTIMATED revenue lands inside this ICP's revenue band --
+    narrowed further by sales_team_size_max when the ICP configures one (2026-09-07 fix).
+
+    Confirmed live against batch 103: this band was derived from revenue ALONE, so icp_1's
+    37-126 range let discovery pay for and decision-maker-enrich 8 real companies (69-126
+    employees) that then correctly failed icp_matching.py's OWN sales_team_size_max=10 check
+    every time -- at the tenant-median 19.85% sales-headcount rate, that cap only holds up to
+    ~50 employees, not 126. Real, wasted spend on companies that could never pass, not a
+    matching bug. This does NOT touch sales_team_size_max itself (that's the ICP's own
+    business rule, left exactly as configured) -- it only stops discovery from searching past
+    the point that rule can ever satisfy, using the SAME constant icp_matching.py's own
+    fallback already uses, so the two can never drift back apart."""
+    from app.gtm_os.icp.icp_matching import REVENUE_PER_EMPLOYEE_USD, SALES_HEADCOUNT_PERCENT_MEDIAN
 
     lo = int(icp["revenue_min_usd"] // REVENUE_PER_EMPLOYEE_USD)
     hi = -(-int(icp["revenue_max_usd"]) // REVENUE_PER_EMPLOYEE_USD)  # ceiling
+    sales_team_size_max = icp.get("sales_team_size_max")
+    if sales_team_size_max is not None:
+        sales_hi = int(sales_team_size_max / (SALES_HEADCOUNT_PERCENT_MEDIAN / 100))
+        hi = min(hi, sales_hi)
     return max(lo, 1), hi
 
 
