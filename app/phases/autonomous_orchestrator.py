@@ -785,14 +785,74 @@ def _run_jd_first_autonomous_cycle(batch: Batch, run: AutonomousRun, db: Session
     }
 
 
+def _run_apify_discovery_across_offerings(batch: Batch, db: Session, tenant_id: int, cap: int) -> dict:
+    """Splits the daily company cap across every enabled offering profile (2026-09-07), instead
+    of one run_apify_discovery() call using V1's single hardcoded filter set (25-50 person
+    software company hiring a salesperson -- Execution's buyer only). That single-filter call is
+    exactly the bug already root-caused and fixed for V2's sensing sweep (see
+    discovery_profiles.py's module docstring and sweep.py's _run_linkedin_jobs): five of six
+    offerings had no discovery at all, so every real outreach batch was matching Execution alone
+    regardless of what business_context.py's other five offerings actually needed. This applies
+    that same fix to the function that actually produces outreach (this one), not just to V2's
+    separate signal-detection pipeline where it already lived.
+
+    Mirrors _run_linkedin_jobs' own loop shape: one call per profile, budget-checked inside
+    run_apify_discovery() itself (no separate pre-check needed here), and a budget block on one
+    profile stops the loop but keeps whatever earlier profiles already found -- a partial result
+    is real progress, not a failure to report as api_error."""
+    from app.gtm_os.orchestration.discovery_profiles import get_enabled_discovery_profiles
+
+    profiles = get_enabled_discovery_profiles(db, tenant_id)
+    if not profiles:
+        return run_apify_discovery(batch.id, db, tenant_id, target=cap)
+
+    # Even split with the remainder going to the earliest profiles -- no offering is a priori
+    # more important than another, so there is no real basis for a weighted split.
+    base, remainder = divmod(cap, len(profiles))
+    merged = {"companies_discovered": 0, "postings_checked": 0, "rejection_breakdown": {},
+              "budget_stopped_early": False, "api_error": None, "estimated_cost_usd": 0.0}
+    errors = []
+    for i, profile in enumerate(profiles):
+        profile_target = base + (1 if i < remainder else 0)
+        if profile_target <= 0:
+            continue
+        result = run_apify_discovery(
+            batch.id, db, tenant_id, target=profile_target,
+            time_range=profile.get("time_range") or "7d",
+            title_search=profile.get("title_search"),
+            employee_min=profile.get("employee_min"), employee_max=profile.get("employee_max"),
+            industry_filter=profile.get("industry_filter"),
+        )
+        merged["companies_discovered"] += result["companies_discovered"]
+        merged["postings_checked"] += result["postings_checked"]
+        for reason, count in (result.get("rejection_breakdown") or {}).items():
+            merged["rejection_breakdown"][reason] = merged["rejection_breakdown"].get(reason, 0) + count
+        merged["estimated_cost_usd"] += result.get("estimated_cost_usd") or 0.0
+        if result.get("budget_stopped_early"):
+            merged["budget_stopped_early"] = True
+        if result.get("api_error"):
+            errors.append(f"{profile['id']}: {result['api_error']}")
+            if result["budget_stopped_early"]:
+                break  # budget exhausted -- remaining profiles would only repeat the same block
+
+    # Only a total failure (nothing kept, every profile errored) is reported as api_error, same
+    # "partial success is still success" rule sweep.py's _run_linkedin_jobs already follows.
+    if merged["companies_discovered"] == 0 and errors:
+        merged["api_error"] = "; ".join(errors)
+    return merged
+
+
 def _run_apify_autonomous_cycle(batch: Batch, run: AutonomousRun, db: Session, tenant_id: int, budget_usd: float) -> dict:
     """Apify's autonomous branch -- validated live 2026-08-05/06 as a real second discovery
     source (8/8 and 5/5 real qualifying companies across two real test days, vs. jd_first's
-    2/5 on the intervening real production day). Single synchronous Apify call per run (see
-    apify_discovery.py) -- no paging/BudgetGuard loop needed since cost is deterministic from
-    the actor's own `limit` parameter, unlike jd_first's per-page TheirStack billing."""
+    2/5 on the intervening real production day).
+
+    Discovery now runs once PER ENABLED OFFERING PROFILE (2026-09-07 fix, see
+    _run_apify_discovery_across_offerings), not one call using V1's single hardcoded filter --
+    cost stays deterministic either way (each profile call bounds its own spend via the actor's
+    own `limit`, same guarantee a single call always had)."""
     cap = get_daily_company_cap(db, tenant_id)
-    result = run_apify_discovery(batch.id, db, tenant_id, target=cap)
+    result = _run_apify_discovery_across_offerings(batch, db, tenant_id, cap)
 
     if result.get("api_error"):
         # Same treatment as jobo's api_error path -- a real Apify failure (e.g. a missing/
