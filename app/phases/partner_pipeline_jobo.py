@@ -55,6 +55,7 @@ from sqlalchemy.orm import Session
 from app.db.models import Batch, Company, Contact
 from app.jobo_client import _get_api_key, get_company_profile, search_jobs
 from app.phases.decision_maker import is_board_only_title
+from app.phases.jobo_discovery import _existing_domains
 from app.phases.partner_pipeline import PARTNER_BATCH_SOURCE, get_or_create_partner_tenant
 
 # Jobo bills per DELIVERED job, measured live at 3 credits each (1,000,015 -> 1,000,000 for 5).
@@ -358,6 +359,121 @@ def run_partner_discovery_jobo(db: Session, partner_name: str, icp: dict, target
         # Jobo returns the balance only AFTER a call, so the true starting balance is never seen.
         # Spend is therefore derived from jobs actually delivered at the measured rate, not from a
         # first-to-last difference (which reads 0 on a single-page run and understates every run).
+        "credits_used": jobs_seen * CREDITS_PER_JOB,
+        "credits_balance": credits_end,
+    }
+
+
+def run_tenant_discovery_jobo(batch_id: int, db: Session, tenant_id: int, icp: dict, title_search: list[str],
+                              target: int = 8, pages: int = 2, page_size: int = 25) -> dict:
+    """Same real Jobo pipeline as run_partner_discovery_jobo (bucket parsing, dedup, geo/industry
+    matching, operating-leadership filtering -- all reused, none reimplemented), but writing into
+    an EXISTING tenant's batch instead of creating a partner tenant. Built 2026-09-07 so Elephant
+    Edge's own daily discovery can use Jobo across all ICP profiles, the same way discovery_profiles.py
+    already lets Apify do -- see that module for why one search per ICP (not per offering) covers
+    every offering an ICP feeds exactly once.
+
+    Also dedupes against every company this tenant has EVER seen (_existing_domains), not just
+    this run -- run_partner_discovery_jobo doesn't need that (a partner tenant's own history is
+    always empty on day one), but our own tenant has months of prior batches.
+
+    Decision-makers are NOT auto-drafted or auto-pushed from this function -- Jobo's leadership
+    list is Crunchbase-derived and this module's own docstring documents real staleness/wrong-
+    attribution problems (stale titles, departed people still listed, one case of a board role at
+    a DIFFERENT company presented as an operating CEO). Treat every Contact this creates as a
+    starting point for manual verification, never as ready-to-push -- per the explicit instruction
+    that today's contacts get found and enriched by hand, not auto-drafted."""
+    titles = (title_search or [])[:MAX_QUERY_TERMS]
+    if not titles:
+        return {"status": "failed", "error": "title_search is required -- it is the buying signal for this profile"}
+    geographies = icp.get("geographies") or []
+    industries = icp.get("industries") or []
+    rev_min, rev_max = icp.get("revenue_min_usd"), icp.get("revenue_max_usd")
+
+    api_key = _get_api_key(db, tenant_id)
+    excluded_domains = _existing_domains(tenant_id, db)
+
+    seen: set[str] = set()
+    seen_identity: set[str] = set()
+    kept, dropped = [], []
+    jobs_seen = 0
+    credits_end = None
+
+    with httpx.Client() as client:
+        for page in range(1, pages + 1):
+            if len(kept) >= target:
+                break
+            data, balance = search_jobs(client, api_key, titles, page, page_size, locations=geographies or None)
+            credits_end = balance
+            jobs = data.get("jobs") or []
+            jobs_seen += len(jobs)
+            if not jobs:
+                break
+            for job in jobs:
+                if len(kept) >= target:
+                    break
+                co = job.get("company") or {}
+                cid = co.get("id")
+                if not cid or cid in seen:
+                    continue
+                seen.add(cid)
+                profile = get_company_profile(client, cid) or {}
+                name = profile.get("name") or co.get("name")
+                if not name:
+                    continue
+                if geographies:
+                    has_hq = bool(profile.get("headquarters_location") or profile.get("country_code"))
+                    if has_hq and not _geo_matches(profile, geographies):
+                        dropped.append((name, f"HQ elsewhere ({profile.get('headquarters_location')})"))
+                        continue
+                if not _industry_matches(profile, industries):
+                    dropped.append((name, f"industry ({profile.get('primary_industry')})"))
+                    continue
+                lo, hi, basis = _revenue_bounds(profile)
+                if isinstance(rev_min, int) and hi is not None and hi < rev_min:
+                    dropped.append((name, f"revenue below ${rev_min:,} ({basis})"))
+                    continue
+                if isinstance(rev_max, int) and lo is not None and lo > rev_max:
+                    dropped.append((name, f"revenue above ${rev_max:,} ({basis})"))
+                    continue
+
+                website = profile.get("website") or ""
+                domain = website.replace("https://", "").replace("http://", "").strip("/").split("/")[0] or None
+                identity = (domain or "").lower().replace("www.", "") or _fold_name(name)
+                if identity in seen_identity or (domain and domain.lower() in excluded_domains):
+                    dropped.append((name, "duplicate (already kept this run, or already known to this tenant)"))
+                    continue
+                seen_identity.add(identity)
+                emp_lo, emp_hi = _size_bounds(profile.get("company_size"))
+                company = Company(
+                    batch_id=batch_id, name=name, domain=domain,
+                    industry=profile.get("primary_industry"),
+                    employee_count=emp_lo,
+                    location=profile.get("headquarters_location"),
+                    linkedin_url=profile.get("linkedin_url"),
+                    source="jobo_discovery",
+                    estimated_revenue_lower_usd=lo, estimated_revenue_higher_usd=hi,
+                )
+                db.add(company)
+                db.flush()
+
+                people = _operating_leadership(profile)
+                for p in people:
+                    first, _, last = p["name"].partition(" ")
+                    db.add(Contact(company_id=company.id, first_name=first, last_name=last or None,
+                                   title=p["title"], linkedin_url=p.get("url"),
+                                   email=None, email_source=None, thread_role="primary",
+                                   matched_title_reasoning="Operating leadership from Jobo company profile (free) -- UNVERIFIED, confirm before contacting"))
+                db.commit()
+                kept.append({"company": name, "domain": domain, "size": profile.get("company_size"),
+                             "revenue_basis": basis, "revenue": [lo, hi],
+                             "location": profile.get("headquarters_location"),
+                             "job_title_seen": job.get("title"), "people": people})
+
+    return {
+        "status": "completed", "batch_id": batch_id,
+        "jobs_seen": jobs_seen, "companies_evaluated": len(seen),
+        "kept": kept, "dropped": dropped,
         "credits_used": jobs_seen * CREDITS_PER_JOB,
         "credits_balance": credits_end,
     }
