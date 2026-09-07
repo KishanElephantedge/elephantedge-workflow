@@ -13,7 +13,7 @@ from sqlalchemy import func, or_
 from app.cache import active_keys, bump_batch_version, cache_get, cache_set, get_batch_version, mark_active
 from app.claude_client import DEFAULT_MODEL as DEFAULT_CHAT_MODEL, ClaudeError, call_claude_messages
 from app.db.models import AutonomousRun, Batch, CalendarBooking, CampaignEvent, CampaignPush, ChatConversation, ChatMessage, Company, Contact, Credential, DailyReview, LinkedinMonitorProfile, LinkedinMonitorSignal, Notification, Parameter, PartnerCompanyRecommendation, PartnerRecommendationMessage, PersonalizedMessage, Proposal, ReverseDiscoveryCandidate, ReviewComment, Score
-from app.notifications import delete_expired_notifications
+from app.notifications import create_notification, delete_expired_notifications
 from app.google_calendar_client import GoogleCalendarError
 from app.phases.hiring_signal import has_qualifying_hiring_signal
 from app.db.session import get_db
@@ -5024,12 +5024,34 @@ def put_partner_icp(request: Request, body: dict = Body(...), db: Session = Depe
     define what a usable ICP looks like."""
     tenant_id = _resolve_tenant_id(request)
     param = db.query(Parameter).filter(Parameter.tenant_id == tenant_id, Parameter.key == PARTNER_ICP_PARAMETER_KEY).first()
+    changed = param is None or param.value != body
     if param is None:
         param = Parameter(tenant_id=tenant_id, key=PARTNER_ICP_PARAMETER_KEY, value=body)
         db.add(param)
     else:
         param.value = body
     db.commit()
+
+    # Real spend, not a UI toggle. A partner's ICP change should lead to a fresh discovery run
+    # for them (per explicit instruction), but that run costs real Apify/Jobo credits -- see
+    # this codebase's own repeated, hard-learned rule about never spending unattended ("please
+    # be careful while spending... never by mistake also we should not spend more"; "you should
+    # have asked me before you used that"). Auto-firing a paid run the instant someone submits a
+    # form would apply that exact mistake to money a PARTNER, not even our own team, can trigger.
+    # So: flag it for a human to act on, via the same Notification system the rest of this
+    # backend already uses -- never a silent auto-run. Only for a REAL partner tenant (never our
+    # own) and only when the ICP actually changed (a re-save of the same values is not a signal).
+    if changed and tenant_id != ELEPHANT_EDGE_TENANT_ID:
+        from app.db.models import Tenant
+
+        tenant = db.get(Tenant, tenant_id)
+        tenant_label = tenant.name if tenant else f"tenant {tenant_id}"
+        create_notification(
+            db, ELEPHANT_EDGE_TENANT_ID, type_="partner_icp_updated",
+            title=f"{tenant_label} updated their ICP",
+            message=f"New ICP: {json.dumps(body)}. Run discovery for them when ready.",
+            severity="info",
+        )
     return param.value
 
 
@@ -5082,8 +5104,15 @@ def get_partner_company_detail(company_id: int, request: Request, db: Session = 
                 "title": c.title,
                 "linkedin_url": c.linkedin_url,
                 "email": c.email,
+                "email_source": c.email_source,
                 "is_primary": c.thread_role == "primary",
                 "verified": bool(c.linkedin_url) and "crunchbase.com" not in (c.linkedin_url or ""),
+                # Real provenance, not filler -- how/why this person was surfaced (e.g. "Verified
+                # on LinkedIn by a human; Jobo did not have this person"). Same information
+                # already stored for the internal team; a partner asking "where did this come
+                # from" deserves the same answer, not a re-derived summary.
+                "source_note": c.matched_title_reasoning,
+                "found_at": c.created_at.isoformat() if c.created_at else None,
             }
             for c in contacts
         ],
