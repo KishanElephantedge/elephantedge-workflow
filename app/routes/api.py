@@ -5031,3 +5031,60 @@ def put_partner_icp(request: Request, body: dict = Body(...), db: Session = Depe
         param.value = body
     db.commit()
     return param.value
+
+
+# ---- Partner account detail (multi-tenant onboarding, stage 1) ----
+# The click-through from PartnerAccounts.jsx's list. Deliberately its own minimal route, not a
+# reuse of /gtm-os/accounts/{company_id}/brief -- that one hardcodes ELEPHANT_EDGE_TENANT_ID
+# (would 404 for every partner company) and calls build_account_brief(), a full V2 aggregation
+# (ICP matches, opportunities, strategy, hypotheses) a stage-1 partner tenant has never
+# populated -- it would either error or surface a page full of "insufficient_context" jargon
+# that doesn't apply to what a partner was actually promised (accounts + who we found).
+@router.get("/companies/{company_id}/detail")
+def get_partner_company_detail(company_id: int, request: Request, db: Session = Depends(get_db)):
+    """Real tenant-isolation check, not just a header trust: the resolved tenant_id must match
+    this SPECIFIC company's own tenant, not just be a valid tenant somewhere -- otherwise a
+    partner could enumerate ids and read another tenant's company by number alone. This is the
+    one place a wrong X-Tenant-Id value (forged or, in this backend's own no-auth-model design,
+    simply omitted) fails closed instead of silently returning someone else's account."""
+    tenant_id = _resolve_tenant_id(request)
+    company = db.get(Company, company_id)
+    if company is None or company.batch.tenant_id != tenant_id:
+        raise HTTPException(status_code=404, detail="Company not found")
+
+    contacts = db.query(Contact).filter(Contact.company_id == company_id).order_by(Contact.id).all()
+
+    def _is_verified(c: Contact) -> bool:
+        return bool(c.linkedin_url) and "crunchbase.com" not in c.linkedin_url
+
+    # Sorted in Python, not SQL -- a compound boolean ORDER BY is easy to get backwards (does
+    # Postgres put NULL/false first or last for THIS expression?) and hard to verify by eye.
+    # Real, verified LinkedIn first; Crunchbase-only (Jobo's leadership feed, confirmed
+    # stale/sometimes wrong -- see partner_pipeline_jobo.py's own module docstring) after;
+    # primary role wins ties either way.
+    contacts.sort(key=lambda c: (not _is_verified(c), c.thread_role != "primary", c.id))
+
+    return {
+        "id": company.id,
+        "name": company.name,
+        "domain": company.domain,
+        "industry": company.industry,
+        "location": company.location,
+        "employee_count": company.employee_count,
+        "estimated_revenue_lower_usd": company.estimated_revenue_lower_usd,
+        "estimated_revenue_higher_usd": company.estimated_revenue_higher_usd,
+        "linkedin_url": company.linkedin_url,
+        "contacts": [
+            {
+                "id": c.id,
+                "first_name": c.first_name,
+                "last_name": c.last_name,
+                "title": c.title,
+                "linkedin_url": c.linkedin_url,
+                "email": c.email,
+                "is_primary": c.thread_role == "primary",
+                "verified": bool(c.linkedin_url) and "crunchbase.com" not in (c.linkedin_url or ""),
+            }
+            for c in contacts
+        ],
+    }
