@@ -53,6 +53,31 @@ router = APIRouter()
 ELEPHANT_EDGE_TENANT_ID = 2
 
 
+def _resolve_tenant_id(request: Request) -> int:
+    """The one place a route may serve a tenant OTHER than Elephant Edge -- for the new
+    partner-dashboard stage (2026-09-07, "accounts" is stage 1).
+
+    X-Tenant-Id is set by the GATEWAY, from the Tenant row it looked up server-side after
+    verifying the caller's session is allowed that tenant -- never by the browser or any
+    client this backend talks to directly. This backend still has no auth model of its own
+    (per every other route's own "session-cookie auth via the gateway proxy" note), so trusting
+    this one header is exactly as safe as trusting the request reached us via the gateway at
+    all, which every route here already assumes.
+
+    Falls back to ELEPHANT_EDGE_TENANT_ID when the header is absent, so the existing app --
+    which has never sent this header and isn't being changed to -- gets byte-for-byte the same
+    behavior it always had. Only routes that opt in by calling this see any change at all;
+    every other one of the ~45 tenant_id call sites in this file is untouched.
+    """
+    raw = request.headers.get("x-tenant-id")
+    if not raw:
+        return ELEPHANT_EDGE_TENANT_ID
+    try:
+        return int(raw)
+    except ValueError:
+        return ELEPHANT_EDGE_TENANT_ID
+
+
 def _is_company_qualified(company: Company) -> bool:
     """"Qualified" has to mean more than has_qualifying_hiring_signal alone -- found live
     (2026-08-06) that companies discovered through the older company-first flow or manual/
@@ -889,7 +914,7 @@ def _fetch_our_salesrobot_prospects(db: Session) -> dict[str, dict]:
 
 
 @router.get("/companies")
-def list_companies(page: int = 1, page_size: int = 25, search: str = "", qualified: str = "", account_filter: str = "", db: Session = Depends(get_db)):
+def list_companies(request: Request, page: int = 1, page_size: int = 25, search: str = "", qualified: str = "", account_filter: str = "", db: Session = Depends(get_db)):
     """Cross-batch company list -- previously the only way to see companies at all was per-
     batch (BatchDetail), with no single "everything we've researched" view. `qualified`
     ("true"/"false") filters by the exact same has_qualifying_hiring_signal check that's the
@@ -909,7 +934,7 @@ def list_companies(page: int = 1, page_size: int = 25, search: str = "", qualifi
     query = (
         db.query(Company)
         .join(Batch)
-        .filter(Batch.tenant_id == ELEPHANT_EDGE_TENANT_ID)
+        .filter(Batch.tenant_id == _resolve_tenant_id(request))
     )
     if search.strip():
         like = f"%{search.strip()}%"
