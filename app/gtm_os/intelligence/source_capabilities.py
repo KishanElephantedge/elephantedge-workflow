@@ -84,9 +84,16 @@ SOURCE_CAPABILITIES: dict[str, dict] = {
         "supports_company_identity": True,
         "supports_person_identity": False,
         "cost_category": COST_DEEPLINE_BUDGET_GUARDED,
-        "fallback_allowed": True,
-        "wired_into_hourly_sweep": True,
-        "interpreted_downstream": True,  # GtmSignal.source="theirstack_job", in ALL_INTERPRETED_SOURCES
+        # Permanently disabled 2026-09-07 (real, repeated credit exhaustion on Deepline's
+        # workspace balance -- explicit instruction: never call this source again). Already
+        # replaced in the hourly sweep by linkedin_job (Apify) on 2026-08-23 -- wired_into_
+        # hourly_sweep below was stale True, left over from before that switch; corrected here.
+        # investigation_execution.py hard-blocks this source directly (see
+        # EXEC_BLOCKED_BY_DISABLED_SOURCE), so fallback_allowed=False is belt-and-suspenders:
+        # no future S3/S4 strategy selection should even propose it.
+        "fallback_allowed": False,
+        "wired_into_hourly_sweep": False,
+        "interpreted_downstream": True,  # GtmSignal.source="theirstack_job", in ALL_INTERPRETED_SOURCES -- historical signals still need to interpret correctly
     },
     "web_search": {
         "evidence_type": "broad open-web text (Google AI Overview) -- least targeted, most expensive",

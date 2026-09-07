@@ -121,6 +121,7 @@ EXEC_BLOCKED_BY_BUDGET = "blocked_by_budget"
 EXEC_BLOCKED_BY_GENERATION_FAILED = "blocked_by_generation_failed"
 EXEC_BLOCKED_BY_UNSUPPORTED_SOURCE = "blocked_by_unsupported_source"
 EXEC_BLOCKED_BY_MISSING_CREDENTIALS = "blocked_by_missing_credentials"
+EXEC_BLOCKED_BY_DISABLED_SOURCE = "blocked_by_disabled_source"
 
 # Only these 4 -- exactly the ones S3/S4 can actually produce, per the explicit task scope.
 SUPPORTED_SOURCES = {"linkedin_post_search", "web_search", "theirstack_job", "company_website", "linkedin_job"}
@@ -289,7 +290,17 @@ def execute_investigation_action(db: Session, tenant_id: int, action: dict) -> d
             queries = parameters.get("queries", [])
             signals = sense_web_search(db, tenant_id, queries[0]) if queries else []
         elif source == "theirstack_job":
-            signals = sense_theirstack_jobs(db, tenant_id, offset=parameters.get("offset", 0), limit=parameters.get("limit", 25), exclude_domains=parameters.get("exclude_domains") or None)
+            # Hard-disabled (2026-09-07), not just budget-gated: TheirStack via Deepline was
+            # already dropped from the hourly sweep on 2026-08-23 for repeated credit exhaustion
+            # (see sweep.py's _run_linkedin_jobs docstring), and sense_linkedin_jobs (Apify,
+            # ~$0.005/job) already covers this same evidence_type more cheaply. This explicit S5
+            # capability was the one remaining path that could still call it (fallback_allowed in
+            # source_capabilities.py), so it is blocked here directly rather than left to the
+            # Deepline budget guard, which only stops it AFTER credits are configured/available --
+            # explicit instruction: never call this source again, regardless of budget state.
+            return _result(objective_id, source, action_type, EXEC_BLOCKED_BY_DISABLED_SOURCE,
+                           error_reason="theirstack_job is permanently disabled -- use linkedin_job (Apify) instead",
+                           started_at=started_at)
         elif source == "linkedin_job":
             # Real fix (2026-08-24) -- reuses V1's own proven sense_linkedin_jobs() adapter and
             # S4's deterministic parameters (see investigation_generation.py), bounded to
