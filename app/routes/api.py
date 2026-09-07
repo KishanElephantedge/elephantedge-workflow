@@ -3155,17 +3155,24 @@ def deepline_balance():
 
 
 @router.get("/linkedin-monitor/profiles")
-def list_linkedin_monitor_profiles(db: Session = Depends(get_db)):
+def list_linkedin_monitor_profiles(page: int | None = None, page_size: int = 25, search: str = "", db: Session = Depends(get_db)):
+    """`page` is optional and changes the response SHAPE, not just its content -- with no page
+    given, this returns the bare list it always has (RecommendedCompaniesTab's own
+    getNetworkProfiles() call relies on exactly that shape and is untouched). Passing page opts
+    into the paginated envelope ({page, page_size, total, total_pages, profiles}), which is what
+    WatchedProfilesTab now uses -- that tab was fetching and rendering all ~183 profiles in one
+    request with no page control at all, which is the real cause of both complaints: it loads
+    slowly, and there's nothing to page through once it does."""
     from app.phases.gtm_partner_matching import is_cro_focused
 
-    profiles = (
-        db.query(LinkedinMonitorProfile)
-        .filter(LinkedinMonitorProfile.tenant_id == ELEPHANT_EDGE_TENANT_ID)
-        .order_by(LinkedinMonitorProfile.id)
-        .all()
-    )
-    return [
-        {
+    query = db.query(LinkedinMonitorProfile).filter(LinkedinMonitorProfile.tenant_id == ELEPHANT_EDGE_TENANT_ID)
+    if search.strip():
+        like = f"%{search.strip()}%"
+        query = query.filter(or_(LinkedinMonitorProfile.name.ilike(like), LinkedinMonitorProfile.company.ilike(like)))
+    query = query.order_by(LinkedinMonitorProfile.id)
+
+    def serialize(p):
+        return {
             "id": p.id, "name": p.name, "linkedin_url": p.linkedin_url, "company": p.company,
             "active": p.active, "last_checked_at": p.last_checked_at,
             "industry": p.industry, "sells_to": p.sells_to,
@@ -3175,8 +3182,17 @@ def list_linkedin_monitor_profiles(db: Session = Depends(get_db)):
             "classified_at": p.classified_at,
             "is_cro": is_cro_focused(p),
         }
-        for p in profiles
-    ]
+
+    if page is None:
+        return [serialize(p) for p in query.all()]
+
+    total = query.count()
+    profiles = query.offset((page - 1) * page_size).limit(page_size).all()
+    return {
+        "page": page, "page_size": page_size, "total": total,
+        "total_pages": max(1, -(-total // page_size)),
+        "profiles": [serialize(p) for p in profiles],
+    }
 
 
 @router.post("/linkedin-monitor/profiles")
