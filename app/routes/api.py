@@ -4998,3 +4998,36 @@ def delete_proposal(proposal_id: int, db: Session = Depends(get_db)):
     db.delete(p)
     db.commit()
     return {"deleted": True}
+
+
+# ---- Partner ICP (multi-tenant onboarding, stage 1) ----
+# Step 3 of the "Add user" wizard in Settings. Tenant-scoped via _resolve_tenant_id -- the
+# gateway only lets this route be reached for a tenant the caller (internal admin running the
+# wizard, or the partner themselves later) is actually allowed, via X-Tenant-Id. Stored as a
+# Parameter, the same mechanism icp_config.py and discovery_profiles.py already use for
+# tenant-scoped configuration -- no new storage concept for one small JSON blob.
+PARTNER_ICP_PARAMETER_KEY = "partner_icp"
+
+
+@router.get("/gtm-os/partner/icp")
+def get_partner_icp(request: Request, db: Session = Depends(get_db)):
+    tenant_id = _resolve_tenant_id(request)
+    param = db.query(Parameter).filter(Parameter.tenant_id == tenant_id, Parameter.key == PARTNER_ICP_PARAMETER_KEY).first()
+    return param.value if param else None
+
+
+@router.put("/gtm-os/partner/icp")
+def put_partner_icp(request: Request, body: dict = Body(...), db: Session = Depends(get_db)):
+    """Accepts the same shape run_partner_discovery/_jobo already take as their icp= override
+    (industries, geographies, revenue_min_usd, revenue_max_usd) -- deliberately not re-validated
+    into a stricter schema here, since those two functions are the actual consumers and already
+    define what a usable ICP looks like."""
+    tenant_id = _resolve_tenant_id(request)
+    param = db.query(Parameter).filter(Parameter.tenant_id == tenant_id, Parameter.key == PARTNER_ICP_PARAMETER_KEY).first()
+    if param is None:
+        param = Parameter(tenant_id=tenant_id, key=PARTNER_ICP_PARAMETER_KEY, value=body)
+        db.add(param)
+    else:
+        param.value = body
+    db.commit()
+    return param.value
