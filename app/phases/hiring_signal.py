@@ -39,7 +39,17 @@ ROLE_KEYWORDS = {
         "digital marketing manager", "field marketing manager", "regional marketing manager",
         "head of growth marketing",
     ],
-    "gtm": ["head of gtm", "gtm engineer", "gtm operations"],
+    # 2026-09-07: synced with discovery_profiles.py's icp_2 title_search list, which already
+    # searches "RevOps"/"Revenue Operations"/"Sales Operations"/"Forward Deployed Engineer"/
+    # "Sales Enablement"/"Sales Systems" for the Sales OS offering -- this list had drifted out
+    # of sync (same class of bug already found and fixed once for offering_config.py's ICP
+    # mapping), so every icp_2 company discovery correctly found came back with
+    # hiring_signal_role=None here, meaning icp_2/Sales OS could never actually match an ICP
+    # downstream even though discovery was finding the right companies.
+    "gtm": [
+        "head of gtm", "gtm engineer", "gtm operations", "revops", "revenue operations",
+        "sales operations", "forward deployed engineer", "sales enablement", "sales systems",
+    ],
 }
 
 COMBINED_JOB_KEYWORD = (
