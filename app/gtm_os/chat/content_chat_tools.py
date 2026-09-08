@@ -21,8 +21,11 @@ Edge toward more leads and revenue, not just "what's trending" for its own sake.
 
 You have real access to: real trending topics (from live Google Search sensing, standing in for \
 Reddit/X/Perplexity until those API keys exist), real competitor content (from Elephant Edge's 9 \
-named competitors' own sites), and the real Content Opportunities already generated from that \
-evidence (each with a why-now and a suggested angle, citing real URLs).
+named competitors' own sites), the real Content Opportunities already generated from that \
+evidence (each with a why-now and a suggested angle, citing real URLs), and real Granola meeting \
+notes/transcripts from actual sales calls -- the single best source of real customer language, \
+objections, and pain points, worth pulling on before proposing a "customer pain" angle from \
+guesswork.
 
 Elephant Edge's real positioning: most competitors in this space RENT you sales capacity (they do \
 the selling, capability leaves when the engagement ends); Elephant Edge builds a sales system the \
@@ -103,6 +106,21 @@ CONTENT_CHAT_TOOLS = [
     {
         "name": "run_fresh_sensing",
         "description": "Trigger a real, on-demand check for new trending/competitor content evidence right now (real cost, real Apify/Google Search calls) -- use when explicitly asked to look for fresh topics rather than relying on the daily automatic sweep.",
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "get_meeting_brief",
+        "description": "Real Granola meeting notes/transcripts for one person or booking -- what was actually said, objections raised, buying signals -- useful for grounding content in real customer language rather than a generic idea.",
+        "input_schema": {"type": "object", "properties": {"person_email": {"type": "string"}, "booking_id": {"type": "integer"}}},
+    },
+    {
+        "name": "get_open_commitments",
+        "description": "Every commitment made across recent real sales meetings (ours and theirs) -- surfaces real, current customer pain/language worth writing about.",
+        "input_schema": {"type": "object", "properties": {"limit": {"type": "integer"}}},
+    },
+    {
+        "name": "meeting_coverage",
+        "description": "How many real Granola meeting notes exist and how many are usable -- the honest denominator before claiming a customer-language angle is well-evidenced.",
         "input_schema": {"type": "object", "properties": {}},
     },
 ]
@@ -195,5 +213,18 @@ def execute_content_chat_tool(name: str, tool_input: dict, db: Session, tenant_i
             "topic_linking": linking,
             "opportunity_generation": opportunities,
         }
+
+    if name == "get_meeting_brief":
+        from app.gtm_os.meetings.meeting_intelligence import get_meeting_brief
+        return get_meeting_brief(db, tenant_id, person_email=tool_input.get("person_email"),
+                                  booking_id=tool_input.get("booking_id"))
+
+    if name == "get_open_commitments":
+        from app.gtm_os.meetings.meeting_intelligence import get_open_commitments
+        return get_open_commitments(db, tenant_id, limit=tool_input.get("limit", 20))
+
+    if name == "meeting_coverage":
+        from app.gtm_os.meetings.meeting_intelligence import meeting_coverage
+        return meeting_coverage(db, tenant_id)
 
     return {"error": f"unknown tool {name!r}"}
