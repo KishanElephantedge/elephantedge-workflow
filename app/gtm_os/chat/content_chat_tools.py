@@ -49,17 +49,29 @@ these real numbers, and say what you'd trade off (e.g. "X has more raw buzz, but
 target accounts already circling it, so Y is the better revenue bet right now").
 
 Your real jobs:
-1. SUGGEST TOPICS -- pull real trending topics and existing content opportunities, then RANK
-them by the real revenue-relevance reasoning above, not just by how new or big they look. If a
-genuinely promising topic doesn't have a Content Opportunity yet, generate one -- but only for a
-topic that actually has real evidence behind it; say so honestly if a topic isn't ready.
-2. WRITE CONTENT -- generate a real draft for the specific platform requested (blog, LinkedIn, or
-Twitter/X -- each has a genuinely different length and voice, never reuse the same draft across
-platforms). The opportunity must be approved first; if it isn't, say so and offer to get it
-approved.
+1. SUGGEST TOPICS -- pull real trending topics/meetings and existing content opportunities, then
+RANK them by the real revenue-relevance reasoning above, not just by how new or big they look.
+2. WRITE CONTENT -- once the user has picked (or you've proposed and they've confirmed) an angle,
+write it. There are TWO separate paths, and using the wrong one is what causes dead ends:
+   - Market-trend/competitor angle -> generate_opportunity_for_topic, get it approved, THEN
+     generate_platform_draft. This path genuinely needs real market evidence first.
+   - Meeting/call-grounded angle ("from my meetings", "what my customers are saying") ->
+     draft_post_from_meetings DIRECTLY. Never route this through generate_opportunity_for_topic --
+     that tool checks for market-trend evidence, which a meeting-grounded angle doesn't have and
+     doesn't need. If you find yourself about to say "not enough market trend evidence" for a
+     request that was about meetings, that's the sign you called the wrong tool -- stop and call
+     draft_post_from_meetings instead.
+
+DECISIVENESS: don't ask more than one clarifying question per request. If topics were already
+suggested and the user picked one, go straight to writing it -- don't re-verify who they are or
+second-guess which meetings are "real" ones; the tenant's own meeting data is the real data. Ask
+again only if a tool call itself fails or returns nothing usable.
 
 Be direct and decisive, like an operator making a real call, not a mentor listing options. Never
-invent evidence, a URL, a statistic, or an engagement number not returned by a tool."""
+invent evidence, a URL, a statistic, a dollar figure, or an engagement number not returned by a
+tool -- a vague-but-true point beats a specific-but-invented one. A finished draft must be ready
+to publish as-is: no meta-commentary about why it works, no bracketed placeholders, no explaining
+your reasoning inside the post itself."""
 
 
 CONTENT_CHAT_TOOLS = [
@@ -122,6 +134,26 @@ CONTENT_CHAT_TOOLS = [
         "name": "meeting_coverage",
         "description": "How many real Granola meeting notes exist and how many are usable -- the honest denominator before claiming a customer-language angle is well-evidenced.",
         "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "draft_post_from_meetings",
+        "description": (
+            "Write a real, ready-to-post draft grounded directly in recent meetings -- the "
+            "correct tool whenever the user wants content 'from my meetings/calls', not from "
+            "market trends. Do NOT route a meeting-grounded request through "
+            "generate_opportunity_for_topic/review_content_opportunity first -- that pipeline "
+            "requires market-trend evidence meetings don't have and don't need, and forcing it "
+            "through there just produces a dead end. Call this directly with the angle the user "
+            "picked (or one you've proposed and they confirmed) and it returns the finished post."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "angle": {"type": "string", "description": "The topic/angle to write about, in plain language"},
+                "platform": {"type": "string", "enum": ["blog", "linkedin", "twitter"]},
+            },
+            "required": ["angle"],
+        },
     },
 ]
 
@@ -226,5 +258,10 @@ def execute_content_chat_tool(name: str, tool_input: dict, db: Session, tenant_i
     if name == "meeting_coverage":
         from app.gtm_os.meetings.meeting_intelligence import meeting_coverage
         return meeting_coverage(db, tenant_id)
+
+    if name == "draft_post_from_meetings":
+        from app.gtm_os.meetings.meeting_intelligence import draft_post_from_meetings
+        return draft_post_from_meetings(db, tenant_id, angle=tool_input["angle"],
+                                         platform=tool_input.get("platform", "linkedin"))
 
     return {"error": f"unknown tool {name!r}"}

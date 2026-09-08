@@ -211,6 +211,70 @@ Only real commitments that were actually stated. Do not invent follow-ups that s
             "commitments": data.get("commitments", [])}
 
 
+def draft_post_from_meetings(db: Session, tenant_id: int, angle: str, platform: str = "linkedin",
+                              limit: int = 10) -> dict:
+    """Write a real, ready-to-post draft grounded in recent meetings directly -- deliberately NOT
+    routed through content_opportunity.py's approve/generate_opportunity_for_topic pipeline, which
+    requires market-trend evidence (competitor content, web search signals) that a meeting-grounded
+    request has no reason to need. Meetings are their own evidence source; forcing this request
+    through the trend-opportunity gate is what previously produced "not enough market trend
+    evidence" dead ends and multi-turn back-and-forth for something that should draft directly.
+    """
+    from app.gtm_os.content.content_opportunity import PLATFORM_BRIEF, VALID_PLATFORMS
+
+    if platform not in VALID_PLATFORMS:
+        return {"status": "invalid_platform", "reason": f"platform must be one of {sorted(VALID_PLATFORMS)}, got {platform!r}"}
+
+    notes = (db.query(MeetingNote)
+             .filter(MeetingNote.tenant_id == tenant_id, MeetingNote.summary.isnot(None))
+             .order_by(MeetingNote.note_created_at.desc()).limit(limit).all())
+    if not notes:
+        return {"status": "no_notes", "reason": "no meeting notes with a summary exist yet"}
+
+    blocks = "\n\n---\n\n".join(
+        f"MEETING: {n.title} ({n.note_created_at:%Y-%m-%d})\n{n.summary}" if n.note_created_at
+        else f"MEETING: {n.title}\n{n.summary}"
+        for n in notes
+    )
+
+    prompt = f"""Write a real, publishable {PLATFORM_BRIEF[platform]}
+
+Angle to write about: {angle}
+
+Real recent meetings this should be grounded in (the underlying insight/theme, not a transcript
+to copy from):
+{blocks}
+
+RULES, and they matter more than sounding polished:
+- Extract the real THEME or insight these meetings actually show about this angle -- do not quote
+  or closely paraphrase any single meeting, and never name a real person, client, or company that
+  appears in the meeting notes above inside the post itself.
+- NEVER invent a statistic, dollar amount, percentage, count, or timeframe that is not explicitly
+  stated in the meetings above (no "$200K", no "15-20 per quarter", no invented years of
+  experience). If you don't have a real number, make the point qualitatively instead of inventing
+  a precise-sounding one -- a false-precision number is worse than none.
+- This must be genuinely ready to post as-is: the post itself only, no meta-commentary explaining
+  why it works, no placeholders, no bracketed notes.
+
+Return JSON only:
+{{"draft_text": "the post, ready to publish as-is", "grounded_in": ["one short phrase per real meeting insight actually used, for the human's own reference -- not part of the post"]}}"""
+
+    try:
+        response = generate_json(prompt, db, tenant_id, max_tokens=1200)
+    except Exception as e:  # noqa: BLE001
+        return {"status": "llm_unavailable", "error": str(e)}
+
+    draft_text = response.get("draft_text") if isinstance(response, dict) else None
+    if not draft_text:
+        return {"status": "discarded", "reason": "no draft_text returned"}
+
+    return {
+        "status": "ok", "platform": platform, "draft_text": draft_text,
+        "grounded_in": response.get("grounded_in", []),
+        "meetings_considered": len(notes),
+    }
+
+
 def meeting_coverage(db: Session, tenant_id: int) -> dict:
     """How much of the meeting history the system can actually see -- the honest denominator."""
     total_bookings = db.query(CalendarBooking).count()
