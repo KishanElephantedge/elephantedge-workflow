@@ -154,11 +154,16 @@ V2_CHAT_TOOLS = [
             "Before a call: what was agreed with this person last time, what WE still owe them, "
             "what THEY still owe us, and what to focus on. Built from real Granola transcripts of "
             "past meetings, not from memory. Use this whenever the user says they have a call "
-            "coming up, or asks what to discuss with someone."
+            "coming up, or asks what to discuss with someone. IMPORTANT: person_email and "
+            "booking_id are both OPTIONAL -- call with NO arguments to get a brief across the "
+            "most recent meetings overall (e.g. for 'what have my last few calls been about', "
+            "'write a LinkedIn post from my recent meetings', or any request that isn't about "
+            "one specific person). Never ask the user for an email or booking id first -- call "
+            "the tool with no arguments and see what comes back before asking anything."
         ),
         "input_schema": {"type": "object", "properties": {
-            "person_email": {"type": "string", "description": "The other person's email address"},
-            "booking_id": {"type": "integer", "description": "A specific calendar booking id instead"}}},
+            "person_email": {"type": "string", "description": "Optional -- one specific person's email address"},
+            "booking_id": {"type": "integer", "description": "Optional -- one specific calendar booking id instead"}}},
     },
     {
         "name": "draft_meeting_outcome",

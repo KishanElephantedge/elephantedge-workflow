@@ -110,7 +110,7 @@ CONTENT_CHAT_TOOLS = [
     },
     {
         "name": "get_meeting_brief",
-        "description": "Real Granola meeting notes/transcripts for one person or booking -- what was actually said, objections raised, buying signals -- useful for grounding content in real customer language rather than a generic idea.",
+        "description": "Real Granola meeting notes/transcripts -- what was actually said, objections raised, buying signals -- useful for grounding content in real customer language rather than a generic idea. person_email and booking_id are both OPTIONAL: call with NO arguments to pull a brief across the most recent meetings overall -- e.g. for 'write a post from my recent meetings' or any request not about one specific person. Never ask the user for an email or booking id first; call with no arguments and see what comes back.",
         "input_schema": {"type": "object", "properties": {"person_email": {"type": "string"}, "booking_id": {"type": "integer"}}},
     },
     {

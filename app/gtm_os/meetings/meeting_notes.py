@@ -154,7 +154,7 @@ def ingest_granola_notes(db: Session, tenant_id: int, created_after: str | None 
             row.title = note.get("title")
             row.owner_name = owner.get("name")
             row.owner_email = owner.get("email")
-            row.summary = note.get("summary")
+            row.summary = note.get("summary_markdown") or note.get("summary_text")
             row.transcript_text = transcript_to_text(note.get("transcript") or [])
             row.note_created_at = created
             row.raw_payload = note
