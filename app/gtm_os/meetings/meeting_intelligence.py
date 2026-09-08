@@ -200,7 +200,11 @@ Return JSON only:
 ]}}
 Only real commitments that were actually stated. Do not invent follow-ups that sound sensible."""
     try:
-        data = generate_json(prompt, db, tenant_id, max_tokens=2000)
+        # 2000 was tuned for a handful of meetings; with the default limit=20 real meetings each
+        # contributing several commitments, the response was measured truncating mid-JSON-string
+        # (both Gemini and its Claude fallback) rather than a model-quality issue -- raised to give
+        # real headroom for the actual output size, not a guess.
+        data = generate_json(prompt, db, tenant_id, max_tokens=4000)
     except Exception as e:  # noqa: BLE001
         return {"status": "failed", "reason": f"LLM unavailable: {type(e).__name__}: {e}"[:200]}
     return {"status": "ready", "meetings_reviewed": len(notes),
