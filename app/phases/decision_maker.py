@@ -113,6 +113,26 @@ BROADER_LEADERSHIP_TITLE_KEYWORDS = [
     "cto", "chief technology officer",
 ]
 
+# Size threshold above which a CEO/Founder is unlikely to be the real buyer -- matches icp_1's
+# own upper employee bound (discovery_profiles.py's headcount_band_for_icp tops out ~50 there).
+# Real user finding (2026-09-09): CEO-first made sense for icp_1's 11-50 employee companies but
+# not for icp_2/icp_3's 125-300 employee band, where a CEO/Founder is rarely who evaluates or
+# signs a sales-tooling purchase -- a functional sales leader (VP Sales/Head of Sales/CRO) is
+# the more realistic real buyer there.
+CEO_FIRST_MAX_EMPLOYEES = 50
+
+
+def _size_ordered_tiers(company: Company, tiers: list) -> list:
+    """Reorders a [ceo_tier, sales_leader_tier, ...rest] tier list so that, for companies above
+    CEO_FIRST_MAX_EMPLOYEES, the sales-leader tier is tried BEFORE the CEO/Founder tier -- the
+    CEO tier still runs, just second, so it still fills the quota if the sales-leader tier comes
+    up short. Falls back to the given (CEO-first) order whenever employee_count isn't known --
+    never guesses a company's size."""
+    if company.employee_count is not None and company.employee_count > CEO_FIRST_MAX_EMPLOYEES and len(tiers) >= 2:
+        return [tiers[1], tiers[0], *tiers[2:]]
+    return tiers
+
+
 # search_contact's own tool guidance: broad OR-filters like ours rank less precisely than
 # narrow ones, and recommends a small page_size (1-3) specifically "so you can inspect
 # candidate quality" -- confirmed live (Gulf & Western Industries: the #1-ranked result was
@@ -290,39 +310,29 @@ def find_decision_makers(
 
     used_paid = False
 
-    # CEO/Founder tier -- search_contact already returns up to CANDIDATES_PER_SEARCH real
-    # candidates in this one billed call; every one whose title actually matches is kept (not
-    # just the top-ranked), filling the quota from a call we're already paying for.
-    persons = _run_search_contact(company, {"title_filters": [{"name": "ceo_filter", "filter": CEO_FILTER}]})
-    used_paid = True
-    for person in _matching_persons(persons, CEO_TITLE_KEYWORDS, require_bare_president=True, exclude_keys=seen_keys):
+    # Tier order is size-aware (see _size_ordered_tiers) -- CEO/Founder first for small
+    # companies, sales-leader first above CEO_FIRST_MAX_EMPLOYEES employees. Each tier still
+    # only runs if the quota isn't already filled (same cost-bounding principle throughout:
+    # never more paid calls than the quota genuinely still needs), and a company can genuinely
+    # end up with contacts from more than one tier.
+    tiers = _size_ordered_tiers(company, [
+        (CEO_FILTER, CEO_TITLE_KEYWORDS, True, "founder_ceo"),
+        (SALES_LEADER_FILTER, SALES_LEADER_TITLE_KEYWORDS, False, "sales_leader"),
+        # Broader leadership tier -- last resort, only reached if the two tiers above together
+        # still haven't filled the quota. Widens to Vice President generally and CTO, plus
+        # another pass at CEO/Founder/President in case this call's own candidate set surfaces
+        # someone the earlier (differently-ranked) CEO-tier call didn't.
+        (BROADER_LEADERSHIP_FILTER, BROADER_LEADERSHIP_TITLE_KEYWORDS, False, "other_leadership"),
+    ])
+    for title_filter, title_keywords, require_bare_president, thread_role in tiers:
         if len(contacts) >= target:
             break
-        contacts.append(_make_contact(company, db, tenant_id, person, f"title_filter={CEO_FILTER}, verified_title={person.get('title')!r}", "founder_ceo"))
-
-    # Sales-leader tier -- only called if the quota still isn't filled (same cost-bounding
-    # principle throughout: never more paid calls than the quota genuinely still needs), not
-    # "only when zero primary found" -- a company can genuinely want both a founder AND a
-    # sales-leader contact.
-    if len(contacts) < target:
-        persons = _run_search_contact(company, {"title_filters": [{"name": "sales_leader_filter", "filter": SALES_LEADER_FILTER}]})
+        persons = _run_search_contact(company, {"title_filters": [{"name": f"{thread_role}_filter", "filter": title_filter}]})
         used_paid = True
-        for person in _matching_persons(persons, SALES_LEADER_TITLE_KEYWORDS, exclude_keys=seen_keys):
+        for person in _matching_persons(persons, title_keywords, require_bare_president=require_bare_president, exclude_keys=seen_keys):
             if len(contacts) >= target:
                 break
-            contacts.append(_make_contact(company, db, tenant_id, person, f"title_filter={SALES_LEADER_FILTER}, verified_title={person.get('title')!r}", "sales_leader"))
-
-    # Broader leadership tier -- last resort, only called if the first two tiers together
-    # still haven't filled the quota. Widens to Vice President generally and CTO, plus another
-    # pass at CEO/Founder/President in case this call's own candidate set surfaces someone the
-    # first (differently-ranked) CEO-tier call didn't.
-    if len(contacts) < target:
-        persons = _run_search_contact(company, {"title_filters": [{"name": "broader_leadership_filter", "filter": BROADER_LEADERSHIP_FILTER}]})
-        used_paid = True
-        for person in _matching_persons(persons, BROADER_LEADERSHIP_TITLE_KEYWORDS, exclude_keys=seen_keys):
-            if len(contacts) >= target:
-                break
-            contacts.append(_make_contact(company, db, tenant_id, person, f"title_filter={BROADER_LEADERSHIP_FILTER}, verified_title={person.get('title')!r}", "other_leadership"))
+            contacts.append(_make_contact(company, db, tenant_id, person, f"title_filter={title_filter}, verified_title={person.get('title')!r}", thread_role))
 
     return contacts, used_paid
 

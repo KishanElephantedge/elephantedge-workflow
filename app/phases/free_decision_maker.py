@@ -46,6 +46,7 @@ from app.phases.decision_maker import (
     CEO_TITLE_KEYWORDS,
     CEO_TITLE_PRESIDENT_EXCLUSIONS,
     SALES_LEADER_TITLE_KEYWORDS,
+    _size_ordered_tiers,
 )
 
 logger = logging.getLogger(__name__)
@@ -329,14 +330,19 @@ def find_free_decision_makers(db: Session, tenant_id: int, company: Company, max
     seen: set[tuple[str, str]] = set()
 
     leadership = _jobo_leadership_candidates(db, tenant_id, company)
-    for keywords, require_bare_president, thread_role in [
+    # Tier order is size-aware, same threshold/rationale as the paid layer (decision_maker.py's
+    # _size_ordered_tiers): CEO/Founder first for small companies, sales-leader first above
+    # CEO_FIRST_MAX_EMPLOYEES employees, since a CEO is rarely the real buyer at 125-300+
+    # employee companies.
+    tiers = _size_ordered_tiers(company, [
         (CEO_TITLE_KEYWORDS, True, "founder_ceo"),
         (SALES_LEADER_TITLE_KEYWORDS, False, "sales_leader"),
         # Same last-resort broadening as the paid layer (decision_maker.py) -- Vice President
         # generally and CTO, tried only once the two tiers above haven't filled the quota from
         # this company's own free leadership list.
         (BROADER_LEADERSHIP_TITLE_KEYWORDS, False, "other_leadership"),
-    ]:
+    ])
+    for keywords, require_bare_president, thread_role in tiers:
         if len(found) >= max_contacts:
             break
         for person in leadership:
