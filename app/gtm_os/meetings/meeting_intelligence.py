@@ -137,8 +137,11 @@ def get_meeting_brief(db: Session, tenant_id: int, person_email: str | None = No
         return {"status": "no_history", "person": person_email,
                 "reason": "meetings exist but no Granola note is linked to them"}
 
+    from app.gtm_os.content.content_business_context import get_content_business_context
+
+    business_name = get_content_business_context(db, tenant_id).get("business_name") or "the business"
     history = "\n\n---\n\n".join(_context(n) for n in notes)
-    prompt = f"""You are briefing the CEO of Elephant Edge before a call. Below are the real notes
+    prompt = f"""You are briefing the CEO of {business_name} before a call. Below are the real notes
 and transcripts of the last {len(notes)} meeting(s) with this person.
 
 {history}
@@ -187,7 +190,10 @@ def get_open_commitments(db: Session, tenant_id: int, limit: int = 20) -> dict:
             who = f" with {b.booker_email}" if b and b.booker_email else ""
         blocks.append(f"MEETING: {n.title}{who} ({n.note_created_at:%Y-%m-%d})\n{n.summary}"
                       if n.note_created_at else f"MEETING: {n.title}{who}\n{n.summary}")
-    prompt = f"""Across these {len(notes)} recent meetings for Elephant Edge, list every commitment
+    from app.gtm_os.content.content_business_context import get_content_business_context
+
+    business_name = get_content_business_context(db, tenant_id).get("business_name") or "the business"
+    prompt = f"""Across these {len(notes)} recent meetings for {business_name}, list every commitment
 made and who owns it.
 
 {chr(10).join(blocks)}
@@ -275,8 +281,27 @@ Return JSON only:
     }
 
 
+# Real, structural fact, not a policy choice: CalendarBooking has no tenant_id column at all --
+# it's populated by ONE periodic sync of Elephant Edge's own Google Calendar
+# (google_calendar_client.py), never scoped per tenant. Real bug found live (2026-09-09): this
+# function used to run `db.query(CalendarBooking).count()` unconditionally, so a partner tenant's
+# content chat reported ELEPHANT EDGE'S OWN real booking count as if it were that partner's --
+# confirmed live, Jeff Platt's chat said "you have 24 calendar bookings" using Elephant Edge's
+# real number. Gated behind ELEPHANT_EDGE_TENANT_ID until CalendarBooking is genuinely
+# multi-tenant (a real schema change, not done here) -- any other tenant gets an honest 0/None
+# rather than someone else's real numbers.
+ELEPHANT_EDGE_TENANT_ID = 2
+
+
 def meeting_coverage(db: Session, tenant_id: int) -> dict:
     """How much of the meeting history the system can actually see -- the honest denominator."""
+    if tenant_id != ELEPHANT_EDGE_TENANT_ID:
+        notes = db.query(MeetingNote).filter(MeetingNote.tenant_id == tenant_id).count()
+        return {"calendar_bookings": None, "granola_notes": notes,
+                "notes_linked_to_a_booking": 0,
+                "bookings_with_a_confirmed_outcome": None,
+                "bookings_we_could_draft_an_outcome_for": None,
+                "note": "Calendar booking sync isn't available for this tenant yet -- only Granola notes not linked to a booking are visible."}
     total_bookings = db.query(CalendarBooking).count()
     notes = db.query(MeetingNote).filter(MeetingNote.tenant_id == tenant_id).count()
     linked = (db.query(MeetingNote)
