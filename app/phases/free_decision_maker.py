@@ -41,13 +41,8 @@ from app.db.models import Company
 from app.jobo_client import JoboError, find_company_id_by_name, get_company_profile
 from app.jobo_client import _get_api_key as _get_jobo_api_key
 from app.llm_client import generate_json
-from app.phases.decision_maker import (
-    BROADER_LEADERSHIP_TITLE_KEYWORDS,
-    CEO_TITLE_KEYWORDS,
-    CEO_TITLE_PRESIDENT_EXCLUSIONS,
-    SALES_LEADER_TITLE_KEYWORDS,
-    _size_ordered_tiers,
-)
+from app.phases.decision_maker import CEO_TITLE_PRESIDENT_EXCLUSIONS, SALES_LEADER_TITLE_KEYWORDS
+from app.phases.decision_maker_reasoning import select_best_decision_makers
 
 logger = logging.getLogger(__name__)
 
@@ -330,45 +325,37 @@ def find_free_decision_makers(db: Session, tenant_id: int, company: Company, max
     seen: set[tuple[str, str]] = set()
 
     leadership = _jobo_leadership_candidates(db, tenant_id, company)
-    # Tier order is size-aware, same threshold/rationale as the paid layer (decision_maker.py's
-    # _size_ordered_tiers): CEO/Founder first for small companies, sales-leader first above
-    # CEO_FIRST_MAX_EMPLOYEES employees, since a CEO is rarely the real buyer at 125-300+
-    # employee companies.
-    tiers = _size_ordered_tiers(company, [
-        (CEO_TITLE_KEYWORDS, True, "founder_ceo"),
-        (SALES_LEADER_TITLE_KEYWORDS, False, "sales_leader"),
-        # Same last-resort broadening as the paid layer (decision_maker.py) -- Vice President
-        # generally and CTO, tried only once the two tiers above haven't filled the quota from
-        # this company's own free leadership list.
-        (BROADER_LEADERSHIP_TITLE_KEYWORDS, False, "other_leadership"),
-    ])
-    for keywords, require_bare_president, thread_role in tiers:
+    # Real per-company reasoning (2026-09-09), not a fixed keyword tier -- see
+    # decision_maker_reasoning.py's own module docstring for why. Jobo's leadership call already
+    # returned this company's ENTIRE real list for free, so there's no cost reason left to filter
+    # it through a mechanical rule instead of actually judging who's the real buyer here.
+    selections = select_best_decision_makers(db, tenant_id, company, leadership, max_contacts)
+    by_name = {p.get("name"): p for p in leadership if p.get("name")}
+    for selection in selections:
         if len(found) >= max_contacts:
             break
-        for person in leadership:
-            if len(found) >= max_contacts:
-                break
-            title = person.get("title") or ""
-            if not _matches_title(title, keywords, require_bare_president):
-                continue
-            first_name, last_name = _split_name(person.get("name") or "")
-            if not first_name or not last_name:
-                continue
-            key = _dedup_key(first_name, last_name)
-            if key in seen:
-                continue
-            linkedin_url = _resolve_linkedin_url(db, tenant_id, first_name, last_name, company.name)
-            if not linkedin_url:
-                continue
-            seen.add(key)
-            found.append({
-                "first_name": first_name,
-                "last_name": last_name,
-                "title": title,
-                "linkedin_url": linkedin_url,
-                "thread_role": thread_role,
-                "reasoning": f"Jobo leadership match (title={title!r}), LinkedIn resolved+verified via Apify people-search",
-            })
+        person = by_name.get(selection["name"])
+        if not person:
+            continue
+        title = person.get("title") or ""
+        first_name, last_name = _split_name(person.get("name") or "")
+        if not first_name or not last_name:
+            continue
+        key = _dedup_key(first_name, last_name)
+        if key in seen:
+            continue
+        linkedin_url = _resolve_linkedin_url(db, tenant_id, first_name, last_name, company.name)
+        if not linkedin_url:
+            continue
+        seen.add(key)
+        found.append({
+            "first_name": first_name,
+            "last_name": last_name,
+            "title": title,
+            "linkedin_url": linkedin_url,
+            "thread_role": selection["thread_role"],
+            "reasoning": f"Jobo leadership match (title={title!r}), LinkedIn resolved+verified via Apify people-search. {selection['reasoning']}",
+        })
 
     if len(found) < max_contacts:
         for candidate in _find_via_google_search_candidates(db, tenant_id, company, max_contacts - len(found)):
