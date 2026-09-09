@@ -50,6 +50,15 @@ def _get(url: str, **kwargs) -> httpx.Response:
         raise ApifyError(f"request to {url} failed: {e}") from e
 
 
+# Matches app/routes/api.py's own constant -- duplicated rather than imported to avoid a
+# low-level client importing from the routes layer. Same real product decision as
+# claude_client.py's own ELEPHANT_EDGE_TENANT_ID fallback -- one real key, one place. Apify spend
+# triggered on a partner's behalf (content sensing, partner company discovery) is already real,
+# explicit, "our account funds this" policy -- this fallback just makes that true generically
+# instead of requiring every partner tenant to get its own copy of the key.
+ELEPHANT_EDGE_TENANT_ID = 2
+
+
 def _get_api_key(db: Session, tenant_id: int) -> str:
     cred = (
         db.query(Credential)
@@ -57,9 +66,18 @@ def _get_api_key(db: Session, tenant_id: int) -> str:
         .filter(Credential.name == "apify_api_key")
         .first()
     )
-    if not cred or not cred.value:
-        raise ApifyError("apify_api_key credential is not set")
-    return cred.value
+    if cred and cred.value:
+        return cred.value
+    if tenant_id != ELEPHANT_EDGE_TENANT_ID:
+        ee_cred = (
+            db.query(Credential)
+            .filter(Credential.tenant_id == ELEPHANT_EDGE_TENANT_ID)
+            .filter(Credential.name == "apify_api_key")
+            .first()
+        )
+        if ee_cred and ee_cred.value:
+            return ee_cred.value
+    raise ApifyError("apify_api_key credential is not set")
 
 
 def search_linkedin_jobs(

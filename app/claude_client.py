@@ -36,6 +36,14 @@ UNKNOWN_MODEL_PRICING = (0.0, 0.0)
 
 logger = logging.getLogger("claude_client")
 
+# Matches app/routes/api.py's own constant -- duplicated rather than imported to avoid a
+# low-level client importing from the routes layer. Real, explicit product decision (2026-09-09):
+# partner tenants never get their own Anthropic account -- Elephant Edge's own key funds every
+# tenant's calls, same "our account funds this" pattern already used for partner Apify discovery.
+# Keeping one real key in one place (rather than copying it into every partner tenant's own
+# Credential row) means a key rotation only ever has to happen once.
+ELEPHANT_EDGE_TENANT_ID = 2
+
 
 class ClaudeError(Exception):
     pass
@@ -48,9 +56,18 @@ def _get_api_key(db: Session, tenant_id: int) -> str:
         .filter(Credential.name == "anthropic_api_key")
         .first()
     )
-    if not cred or not cred.value:
-        raise ClaudeError("anthropic_api_key credential is not set for this tenant")
-    return cred.value
+    if cred and cred.value:
+        return cred.value
+    if tenant_id != ELEPHANT_EDGE_TENANT_ID:
+        ee_cred = (
+            db.query(Credential)
+            .filter(Credential.tenant_id == ELEPHANT_EDGE_TENANT_ID)
+            .filter(Credential.name == "anthropic_api_key")
+            .first()
+        )
+        if ee_cred and ee_cred.value:
+            return ee_cred.value
+    raise ClaudeError("anthropic_api_key credential is not set for this tenant")
 
 
 def call_claude(prompt: str, db: Session, tenant_id: int, system: str | None = None, max_tokens: int = 2000, model: str = DEFAULT_MODEL) -> str:

@@ -67,6 +67,11 @@ OUTPUT_COST_PER_MTOK_USD = 2.50
 
 logger = logging.getLogger("gemini_client")
 
+# Matches app/routes/api.py's own constant -- duplicated rather than imported to avoid a
+# low-level client importing from the routes layer. Same real product decision as
+# claude_client.py's own ELEPHANT_EDGE_TENANT_ID fallback -- one real key, one place.
+ELEPHANT_EDGE_TENANT_ID = 2
+
 
 class GeminiError(Exception):
     pass
@@ -79,9 +84,18 @@ def _get_api_key(db: Session, tenant_id: int) -> str:
         .filter(Credential.name == "gemini_api_key")
         .first()
     )
-    if not cred or not cred.value:
-        raise GeminiError("gemini_api_key credential is not set for this tenant")
-    return cred.value
+    if cred and cred.value:
+        return cred.value
+    if tenant_id != ELEPHANT_EDGE_TENANT_ID:
+        ee_cred = (
+            db.query(Credential)
+            .filter(Credential.tenant_id == ELEPHANT_EDGE_TENANT_ID)
+            .filter(Credential.name == "gemini_api_key")
+            .first()
+        )
+        if ee_cred and ee_cred.value:
+            return ee_cred.value
+    raise GeminiError("gemini_api_key credential is not set for this tenant")
 
 
 def call_gemini(prompt: str, db: Session, tenant_id: int, max_tokens: int = 2000, model: str = DEFAULT_MODEL) -> str:
