@@ -283,17 +283,20 @@ def run_partner_discovery(db: Session, partner_name: str, icp: dict | None = Non
     # evidence of a bad fit and dropping unknowns would discard most of what we just paid for.
     lo, hi = resolved_icp.get("revenue_min_usd"), resolved_icp.get("revenue_max_usd")
     excl = [e.strip().lower() for e in (exclude_locations or []) if e and e.strip()]
-    kept, dropped, needs_review = [], [], []
+    kept, dropped, dropped_companies, needs_review = [], [], [], []
     for c in companies:
         loc = (c.location or "").lower()
         if excl and any(x in loc for x in excl):
             dropped.append((c.name, f"location excluded ({c.location})"))
+            dropped_companies.append(c)
             continue
         if isinstance(lo, int) and c.estimated_revenue_higher_usd and c.estimated_revenue_higher_usd < lo:
             dropped.append((c.name, f"revenue below ${lo:,}"))
+            dropped_companies.append(c)
             continue
         if isinstance(hi, int) and c.estimated_revenue_lower_usd and c.estimated_revenue_lower_usd > hi:
             dropped.append((c.name, f"revenue above ${hi:,}"))
+            dropped_companies.append(c)
             continue
         # A range that STRADDLES the ceiling is not a pass. Domaine came back as $100-250M against
         # Isabel's $150M ceiling and was kept, because its lower bound sat inside the band -- so a
@@ -304,6 +307,20 @@ def run_partner_discovery(db: Session, partner_name: str, icp: dict | None = Non
             needs_review.append((c.name, f"revenue range ${(c.estimated_revenue_lower_usd or 0):,}-${c.estimated_revenue_higher_usd:,} straddles the ${hi:,} ceiling"))
             continue
         kept.append(c)
+
+    # Real bug fix (2026-09-09): dropped/kept above used to be reflected only in this function's
+    # RETURN VALUE -- the Company rows themselves stayed in the batch regardless, with no field
+    # anywhere to mark one rejected. A partner's dashboard (GET /companies) reads Company rows
+    # directly by tenant_id/batch_id with no other filter, so every "dropped" company kept
+    # showing up in their real Accounts view as if it had passed -- confirmed live: Sandy Yu's
+    # batch kept two companies ($319M and $800M revenue) against her stated $25-250M ceiling,
+    # both correctly identified by this same filter and then silently left visible anyway.
+    # Deleting the actual rejected Company objects (tracked directly, not re-matched by name) is
+    # what makes "dropped" actually mean dropped.
+    for c in dropped_companies:
+        db.delete(c)
+    if dropped_companies:
+        db.commit()
 
     return {
         "status": "succeeded",
