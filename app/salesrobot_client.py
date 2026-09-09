@@ -145,6 +145,26 @@ def add_single_prospect(campaign_uuid: str, linkedin_account_uuid: str, prospect
     return response.json()
 
 
+def delete_single_prospect(prospect_uuid: str, linkedin_account_uuid: str, db: Session, tenant_id: int) -> dict:
+    """Real, documented endpoint (docs.salesrobot.co/reference/deletesingleprospect) -- removes
+    one prospect from whichever campaign they're currently in. Needed 2026-09-09: a real batch
+    of prospects was pushed to Sales OS without an approved personalized message, so their
+    connectionNote/personalizedMessage custom fields were never set at push time; before the
+    campaign resumes, those specific prospects need to come out and go back in WITH a real
+    message attached, rather than risk SalesRobot rendering an empty merge tag to a real
+    person."""
+    api_key = _get_api_key(db, tenant_id)
+    response = httpx.delete(
+        f"{BASE_URL}/delete-single-prospect",
+        params={"linkedinAccountUuid": linkedin_account_uuid, "prospectUuid": prospect_uuid},
+        headers={"X-API-KEY": api_key, "content-type": "application/json;charset=UTF-8"},
+        timeout=30,
+    )
+    if response.status_code != 200:
+        raise SalesRobotError(f"delete-single-prospect failed ({response.status_code}): {response.text}")
+    return response.json()
+
+
 def get_synced_messages(
     linkedin_account_uuid: str,
     db: Session,
