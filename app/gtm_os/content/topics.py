@@ -121,7 +121,20 @@ def get_content_topics(db: Session, tenant_id: int) -> list[dict]:
     pattern as linkedin_search_config.py's get_linkedin_search_config() -- not a frozen snapshot,
     so editing ICP/offering config also updates what HN/RSS sensing looks for, without a separate
     manual sync step. Once a human edits and saves via set_content_topics(), that saved list is
-    the source of truth going forward, exactly like the search-phrase config."""
+    the source of truth going forward, exactly like the search-phrase config.
+
+    Real fix (2026-09-09): the ICP/offering/business-context config this derivation reads is
+    Elephant Edge's own (icp_config.py's get_icp_config() falls back to EE's real ICPs for ANY
+    tenant with no icp_config Parameter row of its own -- true for every partner tenant). Deriving
+    topics from that for a partner would silently hand them Elephant Edge's own product topics.
+    So: only use the EE-style derivation when this tenant actually HAS its own real icp_config row
+    (checked directly, not via get_icp_config()'s own fallback). Otherwise, for a tenant with a
+    real content_business_context configured (partner_content_context -- business_name/
+    positioning/audience), derive topics from THAT instead, via one real grounded LLM call the
+    first time this is called with nothing configured -- then SAVE it via set_content_topics(),
+    so every later call hits the stored-override branch above and costs nothing further. A tenant
+    with neither a real icp_config nor a real content_business_context gets an honest empty list
+    -- never Elephant Edge's own topics, never an invented generic default."""
     param = (
         db.query(Parameter)
         .filter(Parameter.tenant_id == tenant_id)
@@ -131,14 +144,81 @@ def get_content_topics(db: Session, tenant_id: int) -> list[dict]:
     if param and isinstance(param.value, list) and param.value:
         return param.value
 
-    # Same "empty saved value doesn't count as a real override" convention as
-    # linkedin_search_config.py's get_linkedin_search_config() -- falls through to the derived
-    # default rather than treating an empty list as "sensing intentionally disabled".
-    from app.gtm_os.context.business_context import get_business_context
-    from app.gtm_os.icp.icp_config import get_icp_config
-    from app.gtm_os.opportunity.offering_config import get_offering_config
+    from app.gtm_os.icp.icp_config import ICP_CONFIG_PARAMETER_KEY
 
-    return derive_default_topics(get_icp_config(db, tenant_id), get_offering_config(db, tenant_id), get_business_context(db, tenant_id))
+    has_real_icp_config = (
+        db.query(Parameter.id)
+        .filter(Parameter.tenant_id == tenant_id, Parameter.key == ICP_CONFIG_PARAMETER_KEY)
+        .first()
+        is not None
+    )
+
+    if has_real_icp_config:
+        # Same "empty saved value doesn't count as a real override" convention as
+        # linkedin_search_config.py's get_linkedin_search_config() -- falls through to the
+        # derived default rather than treating an empty list as "sensing intentionally disabled".
+        from app.gtm_os.context.business_context import get_business_context
+        from app.gtm_os.icp.icp_config import get_icp_config
+        from app.gtm_os.opportunity.offering_config import get_offering_config
+
+        return derive_default_topics(get_icp_config(db, tenant_id), get_offering_config(db, tenant_id), get_business_context(db, tenant_id))
+
+    from app.gtm_os.content.content_business_context import get_content_business_context
+
+    business_context = get_content_business_context(db, tenant_id)
+    if not business_context.get("business_name"):
+        return []
+
+    derived = derive_topics_from_content_business_context(db, tenant_id, business_context)
+    if derived:
+        set_content_topics(db, tenant_id, derived)
+    return derived
+
+
+TOPIC_DERIVATION_PROMPT = """A business has described its own real positioning and audience below \
+-- nothing else is known about them. Extract 4-8 real content topics they should be creating \
+content about, grounded ONLY in what's actually stated here -- never invent an industry, \
+technology, or theme not implied by this real text.
+
+Business name: {business_name}
+Real positioning (their own words): {positioning}
+Real audience (their own words): {audience}
+
+Return strict JSON: {{"topics": ["<topic name>", ...]}} -- each topic name should be a short (2-5 \
+word) real concept a content-sensing system could search for (e.g. "Revenue Operations", not \
+"things about revenue"). If the positioning/audience genuinely don't support even 4 distinct real \
+topics, return fewer -- never pad with a generic filler topic."""
+
+
+def derive_topics_from_content_business_context(db: Session, tenant_id: int, business_context: dict) -> list[dict]:
+    """One real, grounded LLM call -- only reached when nothing is cached yet (see
+    get_content_topics() above, which saves the result so this never re-runs for the same
+    tenant). Never invents a topic beyond what the business's own real positioning/audience text
+    supports; returns [] rather than guessing if the model can't ground anything real."""
+    from app.llm_client import generate_json
+
+    try:
+        result = generate_json(
+            TOPIC_DERIVATION_PROMPT.format(
+                business_name=business_context["business_name"],
+                positioning=business_context.get("positioning") or "(not stated)",
+                audience=business_context.get("audience") or "(not stated)",
+            ),
+            db, tenant_id, max_tokens=300,
+        )
+    except Exception:
+        return []
+
+    names = [n.strip() for n in (result.get("topics") or []) if isinstance(n, str) and n.strip()]
+    seen: set[str] = set()
+    topics = []
+    for name in names:
+        key = name.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        topics.append({"name": name, "aliases": [], "enabled": True, "description": None, "category": None})
+    return topics
 
 
 def get_enabled_content_topics(db: Session, tenant_id: int) -> list[dict]:

@@ -2633,7 +2633,25 @@ def _run_chat_turn(conversation_id: int, user_text: str, db: Session, scope: str
                 model=chat_model, max_tokens=chat_max_tokens,
             )
         except ClaudeError as e:
-            reply = f"I hit an error talking to Claude: {e}"
+            # A partner must never see a raw backend/credential error -- it's confusing (they
+            # can't act on it) and it exposes internal plumbing. Internal (Elephant Edge) chats
+            # keep the raw error since it's the actual useful debugging signal for us. Either
+            # way, a real Notification fires so the failure doesn't just vanish once the tenant
+            # is anyone but Elephant Edge -- best-effort, never blocks returning a reply.
+            if tenant_id == ELEPHANT_EDGE_TENANT_ID:
+                reply = f"I hit an error talking to Claude: {e}"
+            else:
+                reply = "Something went wrong generating a response. Our team has been notified and will take a look."
+                try:
+                    from app.notifications import create_notification
+                    create_notification(
+                        db, ELEPHANT_EDGE_TENANT_ID, type_="partner_chat_error",
+                        title=f"Content chat failed for tenant {tenant_id}",
+                        message=f"scope={scope!r}: {e}",
+                        severity="warning",
+                    )
+                except Exception:  # noqa: BLE001 -- a failed notification must never mask the real error path
+                    pass
             db.add(ChatMessage(conversation_id=conversation_id, role="assistant", content=reply, tools_used=tools_used))
             db.commit()
             return {"reply": reply, "tools_used": tools_used, "csv": None}
