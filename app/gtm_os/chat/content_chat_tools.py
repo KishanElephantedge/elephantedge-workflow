@@ -22,11 +22,13 @@ recommendation you make has one real objective behind it: which content actually
 You have real access to: real trending topics (from live Google Search sensing, standing in for \
 Reddit/X/Perplexity until those API keys exist), real competitor content (from this tenant's \
 configured competitors' own sites), the real Content Opportunities already generated from that \
-evidence (each with a why-now and a suggested angle, citing real URLs), and -- if this tenant has \
-real meeting notes/transcripts synced -- the single best source of real customer language, \
-objections, and pain points, worth pulling on before proposing a "customer pain" angle from \
-guesswork. If no meetings are synced for this tenant, say so honestly rather than guessing at \
-what customers might be saying.
+evidence (each with a why-now and a suggested angle, citing real URLs), this tenant's own \
+configured topic list (real topics derived from their real positioning/audience, even before any \
+trend evidence exists for them), and -- ONLY when the user explicitly wants something grounded in \
+real customer language, objections, or "what my customers are saying" -- real meeting \
+notes/transcripts, if this tenant has any synced. Do NOT check meetings by default for every \
+request; check them only when the request is actually about customer meetings/calls. If asked and \
+no meetings are synced, say so honestly rather than guessing at what customers might be saying.
 
 {business_name}'s real positioning: {positioning}. Every suggestion you make should connect back \
 to this positioning, grounded in real evidence -- never a generic content idea. Writing for: \
@@ -49,13 +51,18 @@ these real numbers, and say what you'd trade off (e.g. "X has more raw buzz, but
 target accounts already circling it, so Y is the better revenue bet right now").
 
 Your real jobs:
-1. SUGGEST TOPICS -- pull real trending topics/meetings and existing content opportunities, then
-RANK them by the real revenue-relevance reasoning above, not just by how new or big they look.
-This is a SUGGESTION, never a gate: if nothing is trending yet and no meetings are synced, that
-just means you have nothing extra to suggest -- it never means you can't write anything. Say so in
-one line, then move straight to job 2.
-2. WRITE CONTENT -- once the user has picked (or you've proposed and they've confirmed) an angle,
-OR the user has directly told you what to write about, write it. THREE separate paths exist, and
+1. SUGGEST TOPICS -- FIRST STEP whenever the user's request is generic ("give me content for my
+LinkedIn post", "what should I write about", any request that does NOT already name a specific
+topic/angle). Pull real trending topics (list_trending_topics) and this tenant's configured topic
+list, then present a short real menu (3-6 real topic names, never invented) and ask the user to
+pick one -- do NOT silently choose one yourself and generate content for it. Rank by the real
+revenue-relevance reasoning above when trending topics exist; when nothing is trending yet, offer
+the configured topics plainly (they're real, derived from this tenant's own positioning, just not
+yet evidenced as trending) rather than treating an empty trending list as "nothing to suggest."
+Skip this step ONLY when the user's own message already names a specific topic/angle -- go
+straight to job 2 in that case.
+2. WRITE CONTENT -- once the user has picked from the menu (or their original message already
+named a specific topic/angle), write it. THREE separate paths exist, and
 using the wrong one is what causes dead ends -- most requests are path 3, not 1 or 2:
    - Market-trend/competitor angle -> generate_opportunity_for_topic, get it approved, THEN
      generate_platform_draft. Only for a request that specifically wants market/competitor
@@ -88,7 +95,7 @@ your reasoning inside the post itself."""
 CONTENT_CHAT_TOOLS = [
     {
         "name": "list_trending_topics",
-        "description": "Real trending topics with their trend state (emerging/accelerating/persistent/stable/declining/insufficient_evidence), evidence counts, and account-bridge coverage.",
+        "description": "Real trending topics with their trend state (emerging/accelerating/persistent/stable/declining/insufficient_evidence), evidence counts, and account-bridge coverage. Also includes this tenant's full configured_topics list (real topic names derived from their own positioning/audience) so there's always a real menu to offer even when nothing has trend evidence yet -- use configured_topics as your suggestion menu whenever topics is empty or everything in it is insufficient_evidence.",
         "input_schema": {"type": "object", "properties": {}},
     },
     {
@@ -212,8 +219,12 @@ def execute_content_chat_tool(name: str, tool_input: dict, db: Session, tenant_i
     to Claude, not a crashed chat turn (same discipline as v2_chat_tools.py)."""
 
     if name == "list_trending_topics":
+        from app.gtm_os.content.topics import get_content_topics
         from app.gtm_os.content.trend_intelligence import get_market_intelligence_overview
-        return get_market_intelligence_overview(db, tenant_id)
+
+        result = get_market_intelligence_overview(db, tenant_id)
+        result["configured_topics"] = [t["name"] for t in get_content_topics(db, tenant_id) if t.get("enabled", True)]
+        return result
 
     if name == "list_content_opportunities":
         from app.gtm_os.content.content_opportunity import ContentOpportunity
