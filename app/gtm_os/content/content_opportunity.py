@@ -355,3 +355,59 @@ def generate_content_draft(db: Session, tenant_id: int, content_opportunity_id: 
     opportunity.draft_generated_at = datetime.utcnow()
     db.commit()
     return {"status": "ok", "platform": platform, "draft_text": draft_text}
+
+
+DIRECT_DRAFT_PROMPT = """Write a real, publishable {platform_label} for {business_name} on the \
+topic/angle the user asked for below. This is NOT grounded in external market evidence -- it's \
+{business_name}'s own real expertise, opinion, or experience, which needs no outside evidence to \
+justify writing about. Ground it in the business's real positioning and audience below; never \
+invent an external statistic, a named source, a quote, or a specific real-world event as if it \
+were fact -- if the user's request implies a claim that would need real evidence (e.g. "cite a \
+study showing X"), write the piece around the business's own real point of view instead, without \
+fabricating the missing evidence.
+
+What the user asked to write about: {user_request}
+
+{business_name}'s real positioning: {positioning}
+Real audience: {audience}
+
+Format for this platform specifically: {platform_brief}
+
+Write in {business_name}'s real voice: direct, no fluff, a genuine point of view -- not a \
+generic listicle unless the user specifically asked for one. Return JSON exactly:
+{{"draft_text": "<the full draft, formatted for this exact platform>"}}"""
+
+
+def generate_direct_draft(db: Session, tenant_id: int, user_request: str, platform: str = "linkedin") -> dict:
+    """The third real content path, alongside market-trend-grounded (generate_content_draft) and
+    meeting-grounded (draft_post_from_meetings): "just write about what I'm telling you," grounded
+    in the business's own real positioning/audience, no external evidence required at all. Real
+    gap found live (2026-09-09): a partner asking directly for a post on a topic they already
+    know they want to write about was told "no" by both other paths (no market-trend evidence, no
+    synced meeting notes) -- but most real thought-leadership content (a personal story, a
+    framework, an opinion) never needed external evidence to justify itself in the first place.
+    Never writes anything into a ContentOpportunity row -- this is a standalone draft, not tied
+    to the trend-evidence pipeline, so there's nothing here to approve/reject."""
+    if platform not in VALID_PLATFORMS:
+        return {"status": "invalid_platform", "reason": f"platform must be one of {sorted(VALID_PLATFORMS)}, got {platform!r}"}
+
+    business_context = get_content_business_context(db, tenant_id)
+    if not business_context.get("business_name"):
+        return {"status": "no_business_context", "reason": "this tenant hasn't set business_name/positioning/audience yet (PUT /gtm-os/partner/content-context)"}
+
+    prompt = DIRECT_DRAFT_PROMPT.format(
+        business_name=business_context["business_name"], positioning=business_context["positioning"],
+        audience=business_context["audience"],
+        platform_label={"blog": "blog post", "linkedin": "LinkedIn post", "twitter": "X/Twitter thread"}[platform],
+        user_request=user_request, platform_brief=PLATFORM_BRIEF[platform],
+    )
+
+    try:
+        response = generate_json(prompt, db, tenant_id, max_tokens=900)
+    except Exception as e:  # noqa: BLE001
+        return {"status": "llm_unavailable", "error": str(e)}
+
+    draft_text = response.get("draft_text") if isinstance(response, dict) else None
+    if not draft_text:
+        return {"status": "discarded", "reason": "no draft_text returned"}
+    return {"status": "ok", "platform": platform, "draft_text": draft_text}

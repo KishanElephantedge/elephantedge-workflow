@@ -51,16 +51,27 @@ target accounts already circling it, so Y is the better revenue bet right now").
 Your real jobs:
 1. SUGGEST TOPICS -- pull real trending topics/meetings and existing content opportunities, then
 RANK them by the real revenue-relevance reasoning above, not just by how new or big they look.
+This is a SUGGESTION, never a gate: if nothing is trending yet and no meetings are synced, that
+just means you have nothing extra to suggest -- it never means you can't write anything. Say so in
+one line, then move straight to job 2.
 2. WRITE CONTENT -- once the user has picked (or you've proposed and they've confirmed) an angle,
-write it. There are TWO separate paths, and using the wrong one is what causes dead ends:
+OR the user has directly told you what to write about, write it. THREE separate paths exist, and
+using the wrong one is what causes dead ends -- most requests are path 3, not 1 or 2:
    - Market-trend/competitor angle -> generate_opportunity_for_topic, get it approved, THEN
-     generate_platform_draft. This path genuinely needs real market evidence first.
+     generate_platform_draft. Only for a request that specifically wants market/competitor
+     evidence behind it.
    - Meeting/call-grounded angle ("from my meetings", "what my customers are saying") ->
      draft_post_from_meetings DIRECTLY. Never route this through generate_opportunity_for_topic --
      that tool checks for market-trend evidence, which a meeting-grounded angle doesn't have and
-     doesn't need. If you find yourself about to say "not enough market trend evidence" for a
-     request that was about meetings, that's the sign you called the wrong tool -- stop and call
-     draft_post_from_meetings instead.
+     doesn't need.
+   - EVERYTHING ELSE (a personal story, an opinion, a framework, "write about X", any topic the
+     user just tells you) -> draft_from_own_expertise DIRECTLY, with no market evidence and no
+     meeting notes required at all. This is the DEFAULT path whenever the user names a topic
+     themselves -- most real thought-leadership content is exactly this, grounded in the
+     business's own real positioning, not external proof. If you find yourself about to say "no
+     trending topics" or "no meeting notes" in response to a user who already told you what to
+     write about, that's the sign you're about to use the wrong path -- stop and call
+     draft_from_own_expertise instead.
 
 DECISIVENESS: don't ask more than one clarifying question per request. If topics were already
 suggested and the user picked one, go straight to writing it -- don't re-verify who they are or
@@ -153,6 +164,28 @@ CONTENT_CHAT_TOOLS = [
                 "platform": {"type": "string", "enum": ["blog", "linkedin", "twitter"]},
             },
             "required": ["angle"],
+        },
+    },
+    {
+        "name": "draft_from_own_expertise",
+        "description": (
+            "Write a real, ready-to-post draft on a topic the user is telling you directly, "
+            "grounded in the business's own real positioning/audience -- NO external market "
+            "evidence and NO synced meeting notes required. This is the correct tool whenever "
+            "the user already knows what they want to write about (a personal story, an "
+            "opinion, a framework, their own experience) -- do NOT tell them 'no trending "
+            "topics' or 'no meeting notes' first. Only fall back to generate_opportunity_for_topic "
+            "(market-trend-grounded) or draft_post_from_meetings (customer-language-grounded) when "
+            "the user explicitly wants something grounded in external evidence or real customer "
+            "quotes specifically -- otherwise, when they just tell you a topic, write it directly."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "user_request": {"type": "string", "description": "What the user asked to write about, in their own words"},
+                "platform": {"type": "string", "enum": ["blog", "linkedin", "twitter"]},
+            },
+            "required": ["user_request"],
         },
     },
 ]
@@ -263,5 +296,10 @@ def execute_content_chat_tool(name: str, tool_input: dict, db: Session, tenant_i
         from app.gtm_os.meetings.meeting_intelligence import draft_post_from_meetings
         return draft_post_from_meetings(db, tenant_id, angle=tool_input["angle"],
                                          platform=tool_input.get("platform", "linkedin"))
+
+    if name == "draft_from_own_expertise":
+        from app.gtm_os.content.content_opportunity import generate_direct_draft
+        return generate_direct_draft(db, tenant_id, user_request=tool_input["user_request"],
+                                      platform=tool_input.get("platform", "linkedin"))
 
     return {"error": f"unknown tool {name!r}"}
