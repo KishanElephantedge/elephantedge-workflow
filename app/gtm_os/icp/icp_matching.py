@@ -144,6 +144,23 @@ def evaluate_icp_matches_for_company(company: Company, icp_config: list[dict]) -
                 else:
                     checks_satisfied = False
 
+        # Employee count check (2026-09-09) -- the real, primary size gate now that icp_1/2/3
+        # each configure an explicit employee_min/employee_max, independent of the revenue-derived
+        # proxy (see icp_config.py's own note on Gokul's confirmed 11-50 gate for icp_1). Checked
+        # directly against Company.employee_count, not the sales-team-size estimate below.
+        if icp.get("employee_min") is not None or icp.get("employee_max") is not None:
+            if company.employee_count is None:
+                missing_information.append("no employee_count on file")
+                checks_satisfied = False
+            else:
+                trigger_evidence["employee_count"] = company.employee_count
+                min_ok = icp.get("employee_min") is None or company.employee_count >= icp["employee_min"]
+                max_ok = icp.get("employee_max") is None or company.employee_count <= icp["employee_max"]
+                if min_ok and max_ok:
+                    reasons.append(f"employee count ({company.employee_count}) within configured range")
+                else:
+                    checks_satisfied = False
+
         # Sales team size check (only ICP 1 configures this today)
         if icp.get("sales_team_size_max") is not None:
             if sales_team_size is None:

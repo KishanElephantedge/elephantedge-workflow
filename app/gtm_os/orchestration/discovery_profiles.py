@@ -101,6 +101,13 @@ def headcount_band_for_icp(icp: dict) -> tuple[int, int]:
     if sales_team_size_max is not None:
         sales_hi = int(sales_team_size_max / (SALES_HEADCOUNT_PERCENT_MEDIAN / 100))
         hi = min(hi, sales_hi)
+    # employee_max (2026-09-09, icp_3 only so far): a direct, explicit size ceiling independent
+    # of the revenue-derived one -- same "take the more restrictive constraint" rule as
+    # sales_team_size_max above, so discovery never pays to find companies icp_matching.py's own
+    # employee_max check would reject anyway.
+    employee_max = icp.get("employee_max")
+    if employee_max is not None:
+        hi = min(hi, employee_max)
     return max(lo, 1), hi
 
 

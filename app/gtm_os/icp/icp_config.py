@@ -74,6 +74,12 @@ DEFAULT_ICP_CONFIG: list[dict] = [
         "hiring a VP/Head of Sales role they may prefer to fill fractionally rather than full-time.",
         "revenue_min_usd": 20_000_000,
         "revenue_max_usd": 50_000_000,
+        # employee_max added 2026-09-09 (explicit instruction): companies at the large end of this
+        # revenue band already have working tech/budget and are a poor real fit. Real, known
+        # tension left as-is per instruction: 300 sits just above the ~251 employees mathematically
+        # needed to reach the $20M revenue floor at REVENUE_PER_EMPLOYEE_USD, so this ICP will only
+        # ever match a narrow band (roughly 251-300 employees), not the full revenue range.
+        "employee_max": 300,
         "sales_team_size_max": None,
         "trigger_mode": "requires_presence",
         "trigger_hiring_roles": ["head_of_sales"],
