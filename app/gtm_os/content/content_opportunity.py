@@ -34,6 +34,7 @@ from sqlalchemy import Column, DateTime, ForeignKey, Integer, JSON, String, Text
 from sqlalchemy.orm import Session
 
 from app.db.models import Base
+from app.gtm_os.content.content_business_context import get_content_business_context
 from app.gtm_os.content.topic import ContentTopic, ContentTopicEvidence
 from app.gtm_os.content.trend_config import get_trend_config
 from app.gtm_os.content.trend_intelligence import evaluate_topic_trend
@@ -108,13 +109,10 @@ def _gather_evidence(db: Session, tenant_id: int, content_topic_id: int) -> list
     return evidence
 
 
-CONTENT_OPPORTUNITY_PROMPT = """You are helping Elephant Edge (a fractional/outsourced sales \
-leadership company -- see real positioning below) decide whether and why to write content about \
-one real, trending topic.
+CONTENT_OPPORTUNITY_PROMPT = """You are helping {business_name} decide whether and why to write \
+content about one real, trending topic.
 
-Elephant Edge's real positioning: most competitors in this space RENT you sales capacity (they \
-do the selling, capability leaves when the engagement ends); Elephant Edge builds a sales system \
-the client's own team ends up owning and keeping.
+{business_name}'s real positioning: {positioning}
 
 Topic: {topic_name}
 Real trend state: {trend_state} -- {trend_explanation}
@@ -125,8 +123,8 @@ Real evidence for this topic (nothing below is invented -- if a fact isn't here,
 Based ONLY on the real evidence above, write:
 1. why_now -- 2-3 sentences on why this topic is worth writing about right now, grounded in the \
 specific real evidence above (cite what's actually happening, not a generic claim).
-2. suggested_angle -- 1-2 sentences on the specific angle Elephant Edge should take, consistent \
-with its real "build vs. rent" positioning above.
+2. suggested_angle -- 1-2 sentences on the specific angle {business_name} should take, consistent \
+with its real positioning above.
 
 Return JSON exactly:
 {{"why_now": "<2-3 sentences>", "suggested_angle": "<1-2 sentences>", "cited_urls": ["<url from \
@@ -153,6 +151,10 @@ def generate_content_opportunity(db: Session, tenant_id: int, content_topic_id: 
     if existing is not None:
         return {"status": "already_exists", "content_opportunity_id": existing.id}
 
+    business_context = get_content_business_context(db, tenant_id)
+    if not business_context.get("business_name"):
+        return {"status": "no_business_context", "reason": "this tenant hasn't set business_name/positioning/audience yet (PUT /gtm-os/partner/content-context) -- content can't be written without knowing who it's being written for"}
+
     trend_config = get_trend_config(db, tenant_id)
     trend = evaluate_topic_trend(db, tenant_id, topic, trend_config)
     if trend["state"] not in ELIGIBLE_TREND_STATES:
@@ -169,6 +171,7 @@ def generate_content_opportunity(db: Session, tenant_id: int, content_topic_id: 
         for e in evidence
     )
     prompt = CONTENT_OPPORTUNITY_PROMPT.format(
+        business_name=business_context["business_name"], positioning=business_context["positioning"],
         topic_name=topic.canonical_name, trend_state=trend["state"], trend_explanation=trend["explanation"], evidence_block=evidence_block,
     )
 
@@ -273,11 +276,27 @@ VALID_PLATFORMS = {"blog", "linkedin", "twitter"}
 # invented style rules.
 PLATFORM_BRIEF = {
     "blog": "A blog post (500-700 words): structured with a clear opening hook, 2-3 body sections, and a real conclusion. Can go deeper into the evidence and reasoning than a social post would.",
-    "linkedin": "A LinkedIn post (120-200 words): short paragraphs or line breaks, a direct hook in the first line, no headers, conversational but substantive -- written to be read on a phone in a feed, not a formal article.",
-    "twitter": "An X/Twitter thread (4-7 short posts, each under 280 characters, numbered): the first post is the hook, each following post makes one real point building on the evidence, the last post lands the angle.",
+    "linkedin": (
+        "A LinkedIn post (120-200 words): short paragraphs or line breaks, no headers, "
+        "conversational but substantive -- written to be read on a phone in a feed, not a formal "
+        "article. Pick whichever REAL, proven hook formula actually fits this topic's evidence "
+        "(never force one that doesn't fit): a Challenge hook (\"Everyone says X. That's wrong.\"), "
+        "a Research hook (\"I analyzed N things. The pattern was clear.\"), a Story opening (a "
+        "specific real moment), or an Unpopular-opinion hook (\"Unpopular opinion: ...\"). "
+        "Structure: sharp hook first line -> specific value in the body (grounded in the real "
+        "evidence, never generic) -> a clean, single call to action at the end -- never a listicle "
+        "of unrelated tips."
+    ),
+    "twitter": (
+        "An X/Twitter thread (4-7 short posts, each under 280 characters, numbered): the first "
+        "post is the hook (same real formulas as the LinkedIn brief -- challenge, research, story, "
+        "or unpopular-opinion, whichever the evidence actually supports), each following post "
+        "makes one real point building on the evidence, the last post lands the angle without a "
+        "generic \"follow for more\" tack-on."
+    ),
 }
 
-DRAFT_PROMPT = """Write a real, publishable {platform_label} for Elephant Edge on the topic \
+DRAFT_PROMPT = """Write a real, publishable {platform_label} for {business_name} on the topic \
 below, grounded ONLY in the real evidence and angle already established -- never invent a \
 statistic, quote, or claim not present below.
 
@@ -290,8 +309,8 @@ Real evidence this is grounded in:
 
 Format for this platform specifically: {platform_brief}
 
-Write in Elephant Edge's real voice: direct, no fluff, grounded in real evidence, consistent \
-with their "build vs. rent" positioning. Return JSON exactly:
+Write in {business_name}'s real voice: direct, no fluff, grounded in real evidence, consistent \
+with this positioning: {positioning}. Return JSON exactly:
 {{"draft_text": "<the full draft, formatted for this exact platform>"}}"""
 
 
@@ -307,10 +326,15 @@ def generate_content_draft(db: Session, tenant_id: int, content_opportunity_id: 
     if opportunity.status != "approved":
         return {"status": "not_approved", "reason": f"opportunity status is {opportunity.status!r}, must be 'approved'"}
 
+    business_context = get_content_business_context(db, tenant_id)
+    if not business_context.get("business_name"):
+        return {"status": "no_business_context", "reason": "this tenant hasn't set business_name/positioning/audience yet (PUT /gtm-os/partner/content-context)"}
+
     topic = db.get(ContentTopic, opportunity.content_topic_id)
     evidence = _gather_evidence(db, tenant_id, opportunity.content_topic_id)
     evidence_block = "\n".join(f"- {e['title'] or '(no title)'} -- {e['summary'] or '(no summary)'} ({e['url']})" for e in evidence)
     prompt = DRAFT_PROMPT.format(
+        business_name=business_context["business_name"], positioning=business_context["positioning"],
         platform_label={"blog": "blog post", "linkedin": "LinkedIn post", "twitter": "X/Twitter thread"}[platform],
         topic_name=topic.canonical_name, why_now=opportunity.why_now, suggested_angle=opportunity.suggested_angle,
         evidence_block=evidence_block, platform_brief=PLATFORM_BRIEF[platform],

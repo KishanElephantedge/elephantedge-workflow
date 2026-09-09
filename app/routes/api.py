@@ -2555,11 +2555,16 @@ CHAT_HISTORY_WINDOW = 20  # prior turns fed back to Claude as context -- not unb
 CHAT_MAX_TOOL_ITERATIONS = 6
 
 
-def _run_chat_turn(conversation_id: int, user_text: str, db: Session, scope: str = "v1") -> dict:
+def _run_chat_turn(conversation_id: int, user_text: str, db: Session, scope: str = "v1", tenant_id: int = ELEPHANT_EDGE_TENANT_ID) -> dict:
     """`scope` selects the system prompt/tool list/dispatcher -- "v1" (default, unchanged
     behavior) is V1's legacy funnel-scoped chat; "v2" is the GTM-OS V2 assistant
     (app/gtm_os/chat/v2_chat_tools.py), with a much broader real read/write tool set. Both share
-    the exact same tool-calling loop mechanism below -- only the prompt/tools/dispatch differ."""
+    the exact same tool-calling loop mechanism below -- only the prompt/tools/dispatch differ.
+
+    tenant_id defaults to ELEPHANT_EDGE_TENANT_ID (unchanged behavior for every existing caller)
+    -- only the "content" scope's partner-facing caller (2026-09-09) resolves and passes a real
+    partner tenant_id, so a partner's content chat reads/writes their own tenant's data instead
+    of Elephant Edge's."""
     prior = (
         db.query(ChatMessage)
         .filter(ChatMessage.conversation_id == conversation_id)
@@ -2581,7 +2586,22 @@ def _run_chat_turn(conversation_id: int, user_text: str, db: Session, scope: str
         tools = V2_CHAT_TOOLS
     elif scope == "content":
         from app.gtm_os.chat.content_chat_tools import CONTENT_CHAT_SYSTEM_PROMPT, CONTENT_CHAT_TOOLS
-        system = CONTENT_CHAT_SYSTEM_PROMPT.format(today=datetime.utcnow().strftime("%Y-%m-%d"))
+        from app.gtm_os.content.content_business_context import get_content_business_context
+
+        business_context = get_content_business_context(db, tenant_id)
+        if not business_context.get("business_name"):
+            reply = ("This tenant hasn't set up its content context yet -- I don't know what "
+                      "business I'm writing for, who its audience is, or how it's positioned. "
+                      "Set business_name/positioning/audience first (Settings), then ask again.")
+            db.add(ChatMessage(conversation_id=conversation_id, role="assistant", content=reply, tools_used=[]))
+            db.commit()
+            return {"reply": reply, "tools_used": [], "csv": None}
+        system = CONTENT_CHAT_SYSTEM_PROMPT.format(
+            today=datetime.utcnow().strftime("%Y-%m-%d"),
+            business_name=business_context["business_name"],
+            positioning=business_context["positioning"],
+            audience=business_context["audience"],
+        )
         tools = CONTENT_CHAT_TOOLS
     elif scope == "network":
         from app.gtm_os.chat.network_chat_tools import NETWORK_CHAT_SYSTEM_PROMPT, NETWORK_CHAT_TOOLS
@@ -2609,7 +2629,7 @@ def _run_chat_turn(conversation_id: int, user_text: str, db: Session, scope: str
     for _ in range(CHAT_MAX_TOOL_ITERATIONS):
         try:
             response = call_claude_messages(
-                messages, db, ELEPHANT_EDGE_TENANT_ID, system=system, tools=tools,
+                messages, db, tenant_id, system=system, tools=tools,
                 model=chat_model, max_tokens=chat_max_tokens,
             )
         except ClaudeError as e:
@@ -2640,13 +2660,13 @@ def _run_chat_turn(conversation_id: int, user_text: str, db: Session, scope: str
             try:
                 if scope == "v2":
                     from app.gtm_os.chat.v2_chat_tools import execute_v2_chat_tool
-                    result = execute_v2_chat_tool(tool_name, block.get("input", {}), db, ELEPHANT_EDGE_TENANT_ID)
+                    result = execute_v2_chat_tool(tool_name, block.get("input", {}), db, tenant_id)
                 elif scope == "network":
                     from app.gtm_os.chat.network_chat_tools import execute_network_chat_tool
-                    result = execute_network_chat_tool(tool_name, block.get("input", {}), db, ELEPHANT_EDGE_TENANT_ID)
+                    result = execute_network_chat_tool(tool_name, block.get("input", {}), db, tenant_id)
                 elif scope == "content":
                     from app.gtm_os.chat.content_chat_tools import execute_content_chat_tool
-                    result = execute_content_chat_tool(tool_name, block.get("input", {}), db, ELEPHANT_EDGE_TENANT_ID)
+                    result = execute_content_chat_tool(tool_name, block.get("input", {}), db, tenant_id)
                 else:
                     result = _execute_chat_tool(tool_name, block.get("input", {}), db)
             except Exception as e:
@@ -2669,15 +2689,15 @@ def _run_chat_turn(conversation_id: int, user_text: str, db: Session, scope: str
     return {"reply": reply, "tools_used": tools_used, "csv": csv_attachment}
 
 
-def _get_or_create_latest_conversation(db: Session, scope: str = "v1") -> ChatConversation:
+def _get_or_create_latest_conversation(db: Session, scope: str = "v1", tenant_id: int = ELEPHANT_EDGE_TENANT_ID) -> ChatConversation:
     # scope filter: "v1" also matches legacy rows with scope=None (every conversation created
     # before this column existed) -- never silently orphans pre-existing V1 chat history.
-    query = db.query(ChatConversation).filter(ChatConversation.tenant_id == ELEPHANT_EDGE_TENANT_ID)
+    query = db.query(ChatConversation).filter(ChatConversation.tenant_id == tenant_id)
     query = query.filter(ChatConversation.scope.is_(None)) if scope == "v1" else query.filter(ChatConversation.scope == scope)
     conv = query.order_by(ChatConversation.updated_at.desc()).first()
     if conv:
         return conv
-    conv = ChatConversation(tenant_id=ELEPHANT_EDGE_TENANT_ID, scope=None if scope == "v1" else scope)
+    conv = ChatConversation(tenant_id=tenant_id, scope=None if scope == "v1" else scope)
     db.add(conv)
     db.commit()
     db.refresh(conv)
@@ -2685,8 +2705,9 @@ def _get_or_create_latest_conversation(db: Session, scope: str = "v1") -> ChatCo
 
 
 @router.get("/chat/latest")
-def get_latest_chat_conversation(scope: str = "v1", db: Session = Depends(get_db)):
-    conv = _get_or_create_latest_conversation(db, scope=scope)
+def get_latest_chat_conversation(request: Request, scope: str = "v1", db: Session = Depends(get_db)):
+    tenant_id = _resolve_tenant_id(request)
+    conv = _get_or_create_latest_conversation(db, scope=scope, tenant_id=tenant_id)
     messages = (
         db.query(ChatMessage)
         .filter(ChatMessage.conversation_id == conv.id)
@@ -2700,8 +2721,9 @@ def get_latest_chat_conversation(scope: str = "v1", db: Session = Depends(get_db
 
 
 @router.post("/chat/new")
-def start_new_chat_conversation(scope: str = "v1", db: Session = Depends(get_db)):
-    conv = ChatConversation(tenant_id=ELEPHANT_EDGE_TENANT_ID, scope=None if scope == "v1" else scope)
+def start_new_chat_conversation(request: Request, scope: str = "v1", db: Session = Depends(get_db)):
+    tenant_id = _resolve_tenant_id(request)
+    conv = ChatConversation(tenant_id=tenant_id, scope=None if scope == "v1" else scope)
     db.add(conv)
     db.commit()
     db.refresh(conv)
@@ -2714,11 +2736,12 @@ class ChatMessageIn(BaseModel):
 
 
 @router.post("/chat/conversations/{conversation_id}/messages")
-def send_chat_message(conversation_id: int, body: ChatMessageIn, db: Session = Depends(get_db)):
+def send_chat_message(conversation_id: int, body: ChatMessageIn, request: Request, db: Session = Depends(get_db)):
+    tenant_id = _resolve_tenant_id(request)
     conv = (
         db.query(ChatConversation)
         .filter(ChatConversation.id == conversation_id)
-        .filter(ChatConversation.tenant_id == ELEPHANT_EDGE_TENANT_ID)
+        .filter(ChatConversation.tenant_id == tenant_id)
         .first()
     )
     if not conv:
@@ -2726,7 +2749,7 @@ def send_chat_message(conversation_id: int, body: ChatMessageIn, db: Session = D
     if not body.message.strip():
         raise HTTPException(status_code=400, detail="message cannot be empty")
 
-    result = _run_chat_turn(conversation_id, body.message.strip(), db, scope=body.scope)
+    result = _run_chat_turn(conversation_id, body.message.strip(), db, scope=body.scope, tenant_id=tenant_id)
     csv_payload = None
     if result["csv"]:
         csv_payload = {
@@ -3737,74 +3760,76 @@ def get_gtm_os_pipeline(page: int = 1, page_size: int = 25, db: Session = Depend
 
 
 @router.get("/gtm-os/market-intelligence")
-def get_gtm_os_market_intelligence(db: Session = Depends(get_db)):
+def get_gtm_os_market_intelligence(request: Request, db: Session = Depends(get_db)):
     """V2 Market Intelligence page (Phase 4, Part 4) -- read-only wrapper over
     get_market_intelligence_overview() (Batch 2/6/11's trend intelligence + market-account
     bridge, unmodified reuse of evaluate_topic_trend() per configured topic)."""
     from app.gtm_os.content.trend_intelligence import get_market_intelligence_overview
 
-    return get_market_intelligence_overview(db, ELEPHANT_EDGE_TENANT_ID)
+    return get_market_intelligence_overview(db, _resolve_tenant_id(request))
 
 
 @router.get("/gtm-os/content-topics")
-def get_gtm_os_content_topics(db: Session = Depends(get_db)):
+def get_gtm_os_content_topics(request: Request, db: Session = Depends(get_db)):
     """Content Intelligence topic configuration (topics.py, Step 16A) -- no override saved yet
     returns the live-derived default (from this tenant's real ICP/offering/business-context
     config), same "no override -> compute fresh" contract as get_content_topics() itself."""
     from app.gtm_os.content.topics import get_content_topics
 
-    return {"topics": get_content_topics(db, ELEPHANT_EDGE_TENANT_ID)}
+    return {"topics": get_content_topics(db, _resolve_tenant_id(request))}
 
 
 @router.put("/gtm-os/content-topics")
-def put_gtm_os_content_topics(body: dict = Body(...), db: Session = Depends(get_db)):
+def put_gtm_os_content_topics(request: Request, body: dict = Body(...), db: Session = Depends(get_db)):
     """Saves a human override of the topic list -- same Parameter-backed pattern as
     pattern-detection-config above. Once saved, this list is the source of truth going forward
     (see topics.py's set_content_topics() docstring)."""
     from app.gtm_os.content.topics import TopicConfigError, get_content_topics, set_content_topics
 
+    tenant_id = _resolve_tenant_id(request)
     topics = body.get("topics")
     if not isinstance(topics, list):
         raise HTTPException(status_code=400, detail="body must be an object with a 'topics' list")
     try:
-        set_content_topics(db, ELEPHANT_EDGE_TENANT_ID, topics)
+        set_content_topics(db, tenant_id, topics)
     except TopicConfigError as e:
         raise HTTPException(status_code=400, detail=str(e))
-    return {"topics": get_content_topics(db, ELEPHANT_EDGE_TENANT_ID)}
+    return {"topics": get_content_topics(db, tenant_id)}
 
 
 @router.get("/gtm-os/content-competitors")
-def get_gtm_os_content_competitors(db: Session = Depends(get_db)):
+def get_gtm_os_content_competitors(request: Request, db: Session = Depends(get_db)):
     """Content Intelligence competitor configuration (competitors.py, 2026-08-28) -- same
     "no override -> real default" contract as get_content_topics() above."""
     from app.gtm_os.content.competitors import get_content_competitors
 
-    return {"competitors": get_content_competitors(db, ELEPHANT_EDGE_TENANT_ID)}
+    return {"competitors": get_content_competitors(db, _resolve_tenant_id(request))}
 
 
 @router.put("/gtm-os/content-competitors")
-def put_gtm_os_content_competitors(body: dict = Body(...), db: Session = Depends(get_db)):
+def put_gtm_os_content_competitors(request: Request, body: dict = Body(...), db: Session = Depends(get_db)):
     from app.gtm_os.content.competitors import CompetitorConfigError, get_content_competitors, set_content_competitors
 
+    tenant_id = _resolve_tenant_id(request)
     competitors = body.get("competitors")
     if not isinstance(competitors, list):
         raise HTTPException(status_code=400, detail="body must be an object with a 'competitors' list")
     try:
-        set_content_competitors(db, ELEPHANT_EDGE_TENANT_ID, competitors)
+        set_content_competitors(db, tenant_id, competitors)
     except CompetitorConfigError as e:
         raise HTTPException(status_code=400, detail=str(e))
-    return {"competitors": get_content_competitors(db, ELEPHANT_EDGE_TENANT_ID)}
+    return {"competitors": get_content_competitors(db, tenant_id)}
 
 
 @router.get("/gtm-os/content-opportunities")
-def list_gtm_os_content_opportunities(status: str | None = None, db: Session = Depends(get_db)):
+def list_gtm_os_content_opportunities(request: Request, status: str | None = None, db: Session = Depends(get_db)):
     """Real content opportunities (content_opportunity.py, 2026-08-28), joined with their real
     topic name so the frontend never needs a second lookup. `status` optionally filters
     (candidate/approved/rejected/changes_requested); defaults to every status."""
     from app.gtm_os.content.content_opportunity import ContentOpportunity
     from app.gtm_os.content.topic import ContentTopic
 
-    query = db.query(ContentOpportunity).filter(ContentOpportunity.tenant_id == ELEPHANT_EDGE_TENANT_ID)
+    query = db.query(ContentOpportunity).filter(ContentOpportunity.tenant_id == _resolve_tenant_id(request))
     if status:
         query = query.filter(ContentOpportunity.status == status)
     opportunities = query.order_by(ContentOpportunity.created_at.desc()).all()
@@ -3837,26 +3862,27 @@ def list_gtm_os_content_opportunities(status: str | None = None, db: Session = D
 
 
 @router.post("/gtm-os/content-opportunities/{content_opportunity_id}/review")
-def post_gtm_os_content_opportunity_review(content_opportunity_id: int, payload: dict = Body(...), db: Session = Depends(get_db)):
+def post_gtm_os_content_opportunity_review(content_opportunity_id: int, request: Request, payload: dict = Body(...), db: Session = Depends(get_db)):
     """Approve/reject/request changes on one content opportunity -- mirrors
     POST /gtm-os/messages/{id}/review's exact dispatch shape (Phase 7's human approval boundary)."""
     from app.gtm_os.content.content_opportunity import (
         approve_content_opportunity, reject_content_opportunity, request_content_opportunity_changes,
     )
 
+    tenant_id = _resolve_tenant_id(request)
     action = payload.get("action")
     reviewed_by = payload.get("reviewed_by")
     note = payload.get("note")
 
     try:
         if action == "approve":
-            opportunity = approve_content_opportunity(db, ELEPHANT_EDGE_TENANT_ID, content_opportunity_id, reviewed_by)
+            opportunity = approve_content_opportunity(db, tenant_id, content_opportunity_id, reviewed_by)
         elif action == "reject":
-            opportunity = reject_content_opportunity(db, ELEPHANT_EDGE_TENANT_ID, content_opportunity_id, reviewed_by, note)
+            opportunity = reject_content_opportunity(db, tenant_id, content_opportunity_id, reviewed_by, note)
         elif action == "request_changes":
             if not note:
                 raise HTTPException(status_code=400, detail="note is required for request_changes")
-            opportunity = request_content_opportunity_changes(db, ELEPHANT_EDGE_TENANT_ID, content_opportunity_id, reviewed_by, note)
+            opportunity = request_content_opportunity_changes(db, tenant_id, content_opportunity_id, reviewed_by, note)
         else:
             raise HTTPException(status_code=400, detail="action must be one of 'approve', 'reject', 'request_changes'")
     except LookupError as e:
@@ -3868,14 +3894,14 @@ def post_gtm_os_content_opportunity_review(content_opportunity_id: int, payload:
 
 
 @router.post("/gtm-os/content-opportunities/{content_opportunity_id}/generate-draft")
-def post_gtm_os_content_opportunity_generate_draft(content_opportunity_id: int, payload: dict = Body(default={}), db: Session = Depends(get_db)):
+def post_gtm_os_content_opportunity_generate_draft(content_opportunity_id: int, request: Request, payload: dict = Body(default={}), db: Session = Depends(get_db)):
     """The deck's "write this specific topic" mode -- real, on-demand LLM call, only on an
     already-approved opportunity, one real platform (blog/linkedin/twitter) at a time. See
     generate_content_draft()'s own docstring."""
     from app.gtm_os.content.content_opportunity import generate_content_draft
 
     platform = payload.get("platform", "blog")
-    return generate_content_draft(db, ELEPHANT_EDGE_TENANT_ID, content_opportunity_id, platform=platform)
+    return generate_content_draft(db, _resolve_tenant_id(request), content_opportunity_id, platform=platform)
 
 
 @router.get("/gtm-os/debug/signal-texts")
@@ -5068,6 +5094,38 @@ def put_partner_icp(request: Request, body: dict = Body(...), db: Session = Depe
             message=f"New ICP: {json.dumps(body)}. Run discovery for them when ready.",
             severity="info",
         )
+    return param.value
+
+
+# ---- Partner content context (stage 2 -- Content feature, 2026-09-09) ----
+# Same Parameter-backed pattern as PARTNER_ICP_PARAMETER_KEY above -- one small JSON blob, no new
+# storage concept. Holds what a partner's content prompts need to write AS them instead of as
+# Elephant Edge: business_name, positioning (their real stated differentiation), and audience
+# (who they write for). content_opportunity.py/content_chat_tools.py read this per-tenant instead
+# of the literal "Elephant Edge" text those prompts used to hardcode.
+PARTNER_CONTENT_CONTEXT_PARAMETER_KEY = "partner_content_context"
+
+
+@router.get("/gtm-os/partner/content-context")
+def get_partner_content_context(request: Request, db: Session = Depends(get_db)):
+    tenant_id = _resolve_tenant_id(request)
+    param = db.query(Parameter).filter(Parameter.tenant_id == tenant_id, Parameter.key == PARTNER_CONTENT_CONTEXT_PARAMETER_KEY).first()
+    return param.value if param else None
+
+
+@router.put("/gtm-os/partner/content-context")
+def put_partner_content_context(request: Request, body: dict = Body(...), db: Session = Depends(get_db)):
+    """body: {business_name, positioning, audience} -- all real, human-supplied text, never
+    inferred. See get_business_content_context()'s own docstring for exactly how each field
+    is used inside the content-generation prompts."""
+    tenant_id = _resolve_tenant_id(request)
+    param = db.query(Parameter).filter(Parameter.tenant_id == tenant_id, Parameter.key == PARTNER_CONTENT_CONTEXT_PARAMETER_KEY).first()
+    if param is None:
+        param = Parameter(tenant_id=tenant_id, key=PARTNER_CONTENT_CONTEXT_PARAMETER_KEY, value=body)
+        db.add(param)
+    else:
+        param.value = body
+    db.commit()
     return param.value
 
 
