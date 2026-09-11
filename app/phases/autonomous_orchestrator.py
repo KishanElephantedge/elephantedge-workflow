@@ -56,7 +56,14 @@ APPROVAL_WINDOW_MINUTES = 60
 # run have used the paid fallback, any further free-miss just gets no contact instead of
 # costing more -- confirmed acceptable (2026-08-11): a lower-yield day is fine, a hung or
 # runaway-cost run is not.
-PAID_DECISION_MAKER_FALLBACK_CAP = 5
+# 5 -> 1 on 2026-09-10, sized against the REAL measured cost per paid search_contact call rather
+# than an assumed one. The provider dashboard shows 157.36 credits across 278 calls = $0.566/call,
+# not the ~$0.17 decision_maker.py's own docstring estimates. At 5/day that is 5 * $0.566 * 30 =
+# ~$85/month against a $25/month Deepline budget -- 3.4x over, structurally, before any other
+# source spends anything. This cap was the single largest driver of the real overspend that forced
+# Deepline to be switched off entirely (deepline_enabled=false). 1/day holds it to ~$17/month and
+# leaves real headroom for the cheap company-discovery calls.
+PAID_DECISION_MAKER_FALLBACK_CAP = 1
 
 
 def _get_tenant_param(db: Session, tenant_id: int, key: str) -> Parameter | None:

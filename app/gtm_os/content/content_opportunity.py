@@ -81,10 +81,17 @@ class ContentOpportunity(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
-def _gather_evidence(db: Session, tenant_id: int, content_topic_id: int) -> list[dict]:
+def get_topic_evidence(db: Session, tenant_id: int, content_topic_id: int) -> list[dict]:
     """Real evidence excerpts for one topic, most recently-added first, bounded to
     MAX_EVIDENCE_ITEMS. Only title/summary/url -- the same fields topic_linking.py's own
-    extract_signal_text() already treats as this schema's text-content convention."""
+    extract_signal_text() already treats as this schema's text-content convention.
+
+    Public (2026-09-10): this used to be a private helper (_gather_evidence) feeding only the
+    opportunity-generation prompt. Real gap found live -- a real question ("where do these 38
+    observations actually come from?") could only be answered by manually querying the database;
+    neither the V2 dashboard nor the partner dashboard nor the content chat itself could answer
+    it. Exposed here so GET /gtm-os/content-topics/{id}/evidence and the content chat's
+    list_topic_evidence tool can both show the same real, itemized sources."""
     rows = (
         db.query(ContentTopicEvidence, GtmSignal)
         .join(GtmSignal, ContentTopicEvidence.gtm_signal_id == GtmSignal.id)
@@ -160,7 +167,7 @@ def generate_content_opportunity(db: Session, tenant_id: int, content_topic_id: 
     if trend["state"] not in ELIGIBLE_TREND_STATES:
         return {"status": "insufficient_evidence", "trend_state": trend["state"], "reason": trend["explanation"]}
 
-    evidence = _gather_evidence(db, tenant_id, content_topic_id)
+    evidence = get_topic_evidence(db, tenant_id, content_topic_id)
     if not evidence:
         return {"status": "insufficient_evidence", "trend_state": trend["state"], "reason": "no citable evidence (with a real URL) linked to this topic yet"}
 
@@ -331,7 +338,7 @@ def generate_content_draft(db: Session, tenant_id: int, content_opportunity_id: 
         return {"status": "no_business_context", "reason": "this tenant hasn't set business_name/positioning/audience yet (PUT /gtm-os/partner/content-context)"}
 
     topic = db.get(ContentTopic, opportunity.content_topic_id)
-    evidence = _gather_evidence(db, tenant_id, opportunity.content_topic_id)
+    evidence = get_topic_evidence(db, tenant_id, opportunity.content_topic_id)
     evidence_block = "\n".join(f"- {e['title'] or '(no title)'} -- {e['summary'] or '(no summary)'} ({e['url']})" for e in evidence)
     prompt = DRAFT_PROMPT.format(
         business_name=business_context["business_name"], positioning=business_context["positioning"],

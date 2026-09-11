@@ -1,5 +1,5 @@
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -22,6 +22,7 @@ from app.phases.autonomous_orchestrator import get_autonomous_schedule_utc, resu
 from app.phases.calendar_sync import sync_calendar_bookings
 from app.phases.gtm_partner_matching import get_match_schedule, run_partner_matching_sweep
 from app.phases.linkedin_monitor import get_monitor_schedule, run_linkedin_monitor_sweep
+from app.gtm_os.meetings.meeting_notes import MeetingNote, ingest_granola_notes
 from app.gtm_os.efficiency.activity_recorder import record_activity
 from app.routes import api
 from app.routes.api import ELEPHANT_EDGE_TENANT_ID, refresh_active_batch_caches
@@ -105,6 +106,57 @@ def _scheduled_calendar_sync():
         sync_calendar_bookings(db, tenant_id=ELEPHANT_EDGE_TENANT_ID)
     except GoogleCalendarError:
         pass
+    finally:
+        db.close()
+
+
+GRANOLA_SYNC_LOOKBACK_MINUTES = 60  # overlap past the 12h cadence -- see docstring below
+
+
+def _scheduled_granola_sync():
+    """Syncs Granola meeting notes every 12 hours -- confirmed live 2026-09-11 that this had
+    NEVER been scheduled at all: ingest_granola_notes() existed and worked, but the only time it
+    had ever run was a single manual bulk import on 2026-09-08, so the dashboard chat was
+    answering real questions ("meetings yesterday?", "meeting with Bo Wandell?") off data up to
+    a week stale, including one real meeting (Bo Wandell, discussed in the very next day's own
+    meeting) it had no way to know about.
+
+    created_after is computed from the latest note_created_at already on file, not a fixed
+    date -- same "derive the cursor from real state" pattern _last_v2_discovery_at already uses
+    for V2 discovery cadence, so this keeps working correctly regardless of how long the gap
+    since the last successful tick was. A small overlap (GRANOLA_SYNC_LOOKBACK_MINUTES) is
+    subtracted so a note whose created_at landed exactly at the boundary is never missed --
+    ingest_granola_notes() upserts by granola_note_id, so re-seeing an already-synced note is a
+    harmless no-op, not a duplicate.
+
+    A brand-new tenant with zero notes yet passes created_after=None, which iter_notes already
+    treats as "from the beginning" -- no separate first-run branch needed.
+
+    Never raises: ingest_granola_notes() itself already turns GranolaNotConfigured (credentials
+    not set yet) and any other failure into a status dict rather than an exception, so this is
+    purely a periodic-call wrapper, same shape as every other _scheduled_* function here."""
+    db = SessionLocal()
+    try:
+        latest = (
+            db.query(MeetingNote.note_created_at)
+            .filter(MeetingNote.tenant_id == ELEPHANT_EDGE_TENANT_ID)
+            .filter(MeetingNote.note_created_at.isnot(None))
+            .order_by(MeetingNote.note_created_at.desc())
+            .first()
+        )
+        created_after = None
+        if latest and latest[0]:
+            # Granola's /notes endpoint rejects Python's default isoformat() (microseconds, no
+            # 'Z') and a "+00:00" offset alike with a 400 -- confirmed live 2026-09-11, both
+            # failed with the same VALIDATION_ERROR. It wants a bare "Z"-suffixed UTC timestamp,
+            # to the second, no fractional part.
+            cursor_dt = latest[0] - timedelta(minutes=GRANOLA_SYNC_LOOKBACK_MINUTES)
+            created_after = cursor_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+        result = ingest_granola_notes(db, ELEPHANT_EDGE_TENANT_ID, created_after=created_after)
+        if result.get("status") not in ("completed", "not_configured"):
+            logging.getLogger(__name__).warning("granola_sync: %s", result)
+    except Exception:
+        logging.getLogger(__name__).exception("granola_sync: failed")
     finally:
         db.close()
 
@@ -315,6 +367,7 @@ def on_startup():
     # cadence, only how fresh a background view can be, so widening costs nothing but staleness.
     scheduler.add_job(_scheduled_cache_refresh, "interval", minutes=15, id="batch_cache_refresh")
     scheduler.add_job(_scheduled_calendar_sync, "interval", minutes=300, id="calendar_booking_sync")
+    scheduler.add_job(_scheduled_granola_sync, "interval", hours=12, id="granola_meeting_sync")
     # Interval read from real, editable config (Targets > Settings) -- was hardcoded
     # minutes=45 until 2026-08-18, with no way to change it without a code change/redeploy.
     scheduler.add_job(_scheduled_linkedin_monitor_sweep, "interval", minutes=linkedin_monitor_interval_minutes, id="linkedin_monitor_sweep")

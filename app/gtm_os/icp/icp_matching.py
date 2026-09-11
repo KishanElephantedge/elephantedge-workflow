@@ -52,6 +52,23 @@ class ICPMatch(Base):
 # p75 $125,000). Used only as a last-resort proxy -- see _estimated_revenue below.
 REVENUE_PER_EMPLOYEE_USD = 79_545
 
+# The real SPREAD behind that median, recomputed 2026-09-10 across 601 real companies in this
+# tenant's data (p25 $54,348 / p50 $83,333 / p75 $129,310). Kept separate from the median above,
+# which stays the right single-point answer when ESTIMATING one company's revenue from its
+# headcount.
+#
+# These two exist because a SEARCH RANGE and a POINT ESTIMATE are different problems, and
+# conflating them was a real, measured bug (see headcount_band_for_icp in discovery_profiles.py).
+# Converting an ICP's revenue band into an employee-count band with the median alone assumes every
+# company in that band earns exactly the median per head. Real ones don't: a $5M company is a
+# genuine ICP-1 match at 40 employees (efficient) or at 100 (services-heavy), and searching only
+# 37-50 structurally cannot see the second one. A search range must therefore use the efficient end
+# for its lower bound and the inefficient end for its upper bound, or it silently excludes most of
+# the real addressable market. Nothing downstream is loosened by this: icp_matching still checks
+# every discovered company against the ICP's own real revenue/sales-team rules.
+REVENUE_PER_EMPLOYEE_P25_USD = 54_348
+REVENUE_PER_EMPLOYEE_P75_USD = 129_310
+
 
 def _estimated_revenue(company: Company) -> tuple[int | None, str | None]:
     lower, higher = company.estimated_revenue_lower_usd, company.estimated_revenue_higher_usd
@@ -83,6 +100,43 @@ def _estimated_revenue(company: Company) -> tuple[int | None, str | None]:
     return None, None
 
 
+def _estimated_revenue_range(company: Company) -> tuple[int | None, int | None, bool, str | None]:
+    """(low, high, is_derived, evidence) -- the PLAUSIBLE revenue range, for band checks.
+
+    Split out from _estimated_revenue (2026-09-10) because a point estimate and a band test are
+    different questions. When there is no reported revenue, the headcount proxy carries a ~2.4x
+    spread (p25 $54,348 to p75 $129,310 per employee), which _estimated_revenue's own comment has
+    always acknowledged -- and the caller then compared that single median-derived number against
+    an ICP's revenue band as a hard pass/fail anyway.
+
+    Measured 2026-09-10: Ocient (241 employees, really hiring a VP of Sales, employee count inside
+    icp_3's band) was rejected because 241 x the median = $19,170,345, four percent under icp_3's
+    $20M floor. Its real plausible range at that headcount is $13.1M-$31.2M, which straddles the
+    floor. 23 of 28 companies that day failed on proxy-derived checks like this one.
+
+    A reported figure keeps its own real bounds. A derived one returns the honest range, and the
+    caller tests for OVERLAP with the ICP band -- "this company could plausibly be in this band",
+    which is what a proxy can actually support. It is deliberately not presented as a confirmed
+    revenue match; see the evidence string and the reason text the caller writes."""
+    lower, higher = company.estimated_revenue_lower_usd, company.estimated_revenue_higher_usd
+    if lower is not None and higher is not None:
+        return lower, higher, False, f"reported range ${lower:,}-${higher:,}"
+    if lower is not None or higher is not None:
+        value = lower if lower is not None else higher
+        which = "estimated_revenue_lower_usd" if lower is not None else "estimated_revenue_higher_usd"
+        return value, value, False, f"{which}=${value:,} (only bound available)"
+
+    if company.employee_count is not None and company.employee_count > 0:
+        low = company.employee_count * REVENUE_PER_EMPLOYEE_P25_USD
+        high = company.employee_count * REVENUE_PER_EMPLOYEE_P75_USD
+        return low, high, True, (
+            f"PLAUSIBLE RANGE derived from employee_count={company.employee_count} x "
+            f"${REVENUE_PER_EMPLOYEE_P25_USD:,}-${REVENUE_PER_EMPLOYEE_P75_USD:,}/employee (tenant p25-p75) "
+            f"= ${low:,}-${high:,} -- no reported revenue on file, this is a headcount proxy, not a revenue figure"
+        )
+    return None, None, False, None
+
+
 # Empirical, same discipline as REVENUE_PER_EMPLOYEE_USD above: the median sales_headcount_percent
 # across the 570 companies in THIS database that have a real measured value (p25 11.93%,
 # p75 28.46%). Used ONLY when the measured percentage is absent.
@@ -97,6 +151,14 @@ def _estimated_revenue(company: Company) -> tuple[int | None, str | None]:
 # non-match downstream, and it hides WHY an ICP never fires. With the proxy the matcher returns a
 # real verdict from data already on file, and the evidence string says plainly that it is derived.
 SALES_HEADCOUNT_PERCENT_MEDIAN = 19.85
+
+# Same median-vs-spread distinction as REVENUE_PER_EMPLOYEE_P25/P75_USD above, recomputed
+# 2026-09-10 across 579 real companies (p25 11.87% / p50 19.70% / p75 28.13%). The p25 figure is
+# the one a SEARCH range needs: a "<=10 sales reps" ICP rule is still satisfied by a 84-person
+# company that runs a lean 11.87% sales function, so a discovery band that stops at the median's
+# ~50 employees excludes real matches the ICP itself would accept.
+SALES_HEADCOUNT_PERCENT_P25 = 11.87
+SALES_HEADCOUNT_PERCENT_P75 = 28.13
 
 
 def _estimated_sales_team_size(company: Company) -> tuple[float | None, str | None]:
@@ -113,14 +175,64 @@ def _estimated_sales_team_size(company: Company) -> tuple[float | None, str | No
     )
 
 
+def _estimated_sales_team_size_range(company: Company) -> tuple[float | None, float | None, bool, str | None]:
+    """(low, high, is_derived, evidence) -- same median-vs-spread split as
+    _estimated_revenue_range, for the sales_team_size_max check.
+
+    Measured 2026-09-10: Parabola (77 employees, hiring an AE, revenue inside icp_1's band) failed
+    icp_1 because 77 x the 19.85% median = 15.3 estimated reps against a max of 10. At the p25 rate
+    the same headcount is 9.1 reps, inside the cap. The real spread is 11.87%-28.13%, so a single
+    median cannot decide this."""
+    if company.employee_count is None:
+        return None, None, False, None
+    if company.sales_headcount_percent is not None:
+        exact = company.employee_count * company.sales_headcount_percent / 100
+        return exact, exact, False, f"employee_count={company.employee_count} * measured sales_headcount_percent={company.sales_headcount_percent}%"
+    low = company.employee_count * SALES_HEADCOUNT_PERCENT_P25 / 100
+    high = company.employee_count * SALES_HEADCOUNT_PERCENT_P75 / 100
+    return low, high, True, (
+        f"PLAUSIBLE RANGE derived from employee_count={company.employee_count} x "
+        f"{SALES_HEADCOUNT_PERCENT_P25}%-{SALES_HEADCOUNT_PERCENT_P75}% (tenant p25-p75) = {low:.1f}-{high:.1f} "
+        f"-- no measured sales_headcount_percent on file, this is a proxy, not a counted sales team"
+    )
+
+
+# Industries where revenue routinely includes pass-through billings (contractor/placement
+# revenue), so revenue-per-employee runs far above the tenant's own p25-p75 of $54k-$129k and the
+# headcount proxy understates real revenue by an order of magnitude.
+#
+# Real case this exists for (2026-09-10): Centraprise, an IT staffing firm, 330 employees, was
+# discovered and matched as a $26M company by the proxy. Its real revenue is $500M-$1B -- 10-20x
+# above every ICP ceiling. It reached the decision-maker stage before a human spotted it.
+#
+# Only applied above PASS_THROUGH_REVENUE_MIN_EMPLOYEES: small firms in these same industries are
+# genuine ICP matches (Beyond Cloud Consulting at 41 employees, Saltech Systems at 34), and the
+# proxy is not meaningfully wrong for them. This does not reject anything -- it records that the
+# proxy cannot be trusted for this company, which surfaces as insufficient_information rather than
+# a clean match, so a human checks the real figure before it is pushed. run_icp_matching_sweep
+# already re-evaluates companies whose last check had missing information, so a later revenue
+# backfill resolves it automatically.
+PASS_THROUGH_REVENUE_INDUSTRY_KEYWORDS = [
+    "it services", "staffing", "recruiting", "consulting", "human resources",
+]
+PASS_THROUGH_REVENUE_MIN_EMPLOYEES = 200
+
+
+def _needs_real_revenue_check(company: Company) -> bool:
+    if company.employee_count is None or company.employee_count <= PASS_THROUGH_REVENUE_MIN_EMPLOYEES:
+        return False
+    industry = (company.industry or "").lower()
+    return any(keyword in industry for keyword in PASS_THROUGH_REVENUE_INDUSTRY_KEYWORDS)
+
+
 def evaluate_icp_matches_for_company(company: Company, icp_config: list[dict]) -> list[dict]:
     """Pure, read-only evaluation of one Company against every configured ICP. Returns one
     structured result per ICP (matched or not) -- never a single score, never silently skips an
     ICP. Reads ONLY existing Company columns -- no new computation beyond the two documented
     derivations above (revenue midpoint, sales-team-size estimate), both computed from real,
     already-populated fields."""
-    revenue, revenue_evidence = _estimated_revenue(company)
-    sales_team_size, sales_team_evidence = _estimated_sales_team_size(company)
+    revenue_low, revenue_high, revenue_derived, revenue_evidence = _estimated_revenue_range(company)
+    sales_low, sales_high, sales_derived, sales_team_evidence = _estimated_sales_team_size_range(company)
 
     results = []
     for icp in icp_config:
@@ -131,16 +243,31 @@ def evaluate_icp_matches_for_company(company: Company, icp_config: list[dict]) -
 
         # Revenue range check
         if icp.get("revenue_min_usd") is not None or icp.get("revenue_max_usd") is not None:
-            if revenue is None:
+            if revenue_low is None:
                 missing_information.append("no estimated revenue available (Company.estimated_revenue_lower_usd/higher_usd both null)")
                 checks_satisfied = False
             else:
-                trigger_evidence["estimated_revenue_usd"] = revenue
+                trigger_evidence["estimated_revenue_usd"] = revenue_low if revenue_low == revenue_high else [revenue_low, revenue_high]
                 trigger_evidence["estimated_revenue_basis"] = revenue_evidence
-                min_ok = icp.get("revenue_min_usd") is None or revenue >= icp["revenue_min_usd"]
-                max_ok = icp.get("revenue_max_usd") is None or revenue <= icp["revenue_max_usd"]
+                trigger_evidence["estimated_revenue_is_derived"] = revenue_derived
+                if revenue_derived and _needs_real_revenue_check(company):
+                    missing_information.append(
+                        f"revenue is a headcount proxy and this is a {company.employee_count}-employee "
+                        f"{company.industry!r} company -- revenue per employee in these industries routinely "
+                        f"includes pass-through billings and runs far above the $54,348-$129,310 range this "
+                        f"proxy assumes (real case: a 330-employee IT staffing firm proxied at $26M actually "
+                        f"reports $500M-$1B). Needs a real revenue figure before this match can be trusted."
+                    )
+                    checks_satisfied = False
+                # Overlap, not point-containment -- a range that straddles a band boundary still
+                # means this company could genuinely be in the band. See _estimated_revenue_range.
+                min_ok = icp.get("revenue_min_usd") is None or revenue_high >= icp["revenue_min_usd"]
+                max_ok = icp.get("revenue_max_usd") is None or revenue_low <= icp["revenue_max_usd"]
                 if min_ok and max_ok:
-                    reasons.append(f"estimated revenue ${revenue:,} within configured range")
+                    if revenue_derived:
+                        reasons.append(f"plausible revenue ${revenue_low:,}-${revenue_high:,} (headcount proxy) overlaps configured range")
+                    else:
+                        reasons.append(f"reported revenue ${revenue_low:,}-${revenue_high:,} within configured range")
                 else:
                     checks_satisfied = False
 
@@ -163,14 +290,20 @@ def evaluate_icp_matches_for_company(company: Company, icp_config: list[dict]) -
 
         # Sales team size check (only ICP 1 configures this today)
         if icp.get("sales_team_size_max") is not None:
-            if sales_team_size is None:
+            if sales_low is None:
                 missing_information.append("cannot estimate sales team size (Company.employee_count and/or sales_headcount_percent null)")
                 checks_satisfied = False
             else:
-                trigger_evidence["estimated_sales_team_size"] = round(sales_team_size, 1)
+                trigger_evidence["estimated_sales_team_size"] = round(sales_low, 1) if sales_low == sales_high else [round(sales_low, 1), round(sales_high, 1)]
                 trigger_evidence["estimated_sales_team_size_basis"] = sales_team_evidence
-                if sales_team_size <= icp["sales_team_size_max"]:
-                    reasons.append(f"estimated sales team size ({round(sales_team_size, 1)}) within configured max ({icp['sales_team_size_max']})")
+                trigger_evidence["estimated_sales_team_size_is_derived"] = sales_derived
+                # The LOW end deciding it mirrors the revenue overlap rule above: a lean sales
+                # function at this headcount would still satisfy the cap, so the ICP can still fit.
+                if sales_low <= icp["sales_team_size_max"]:
+                    if sales_derived:
+                        reasons.append(f"plausible sales team size {round(sales_low, 1)}-{round(sales_high, 1)} (headcount proxy) can satisfy configured max ({icp['sales_team_size_max']})")
+                    else:
+                        reasons.append(f"measured sales team size ({round(sales_low, 1)}) within configured max ({icp['sales_team_size_max']})")
                 else:
                     checks_satisfied = False
 

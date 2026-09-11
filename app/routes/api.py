@@ -3839,6 +3839,21 @@ def put_gtm_os_content_competitors(request: Request, body: dict = Body(...), db:
     return {"competitors": get_content_competitors(db, tenant_id)}
 
 
+@router.get("/gtm-os/content-topics/{content_topic_id}/evidence")
+def get_gtm_os_content_topic_evidence(content_topic_id: int, request: Request, db: Session = Depends(get_db)):
+    """Real, itemized sources (title/url/summary/which source type) behind one topic's real
+    observation/entity counts -- the answer to "where does this actually come from," which used
+    to require manually querying the database (see get_topic_evidence()'s own docstring)."""
+    from app.gtm_os.content.content_opportunity import get_topic_evidence
+    from app.gtm_os.content.topic import ContentTopic
+
+    tenant_id = _resolve_tenant_id(request)
+    topic = db.get(ContentTopic, content_topic_id)
+    if topic is None or topic.tenant_id != tenant_id:
+        raise HTTPException(status_code=404, detail="Topic not found")
+    return {"content_topic_id": content_topic_id, "topic_name": topic.canonical_name, "evidence": get_topic_evidence(db, tenant_id, content_topic_id)}
+
+
 @router.get("/gtm-os/content-opportunities")
 def list_gtm_os_content_opportunities(request: Request, status: str | None = None, db: Session = Depends(get_db)):
     """Real content opportunities (content_opportunity.py, 2026-08-28), joined with their real

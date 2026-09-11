@@ -93,13 +93,23 @@ def headcount_band_for_icp(icp: dict) -> tuple[int, int]:
     business rule, left exactly as configured) -- it only stops discovery from searching past
     the point that rule can ever satisfy, using the SAME constant icp_matching.py's own
     fallback already uses, so the two can never drift back apart."""
-    from app.gtm_os.icp.icp_matching import REVENUE_PER_EMPLOYEE_USD, SALES_HEADCOUNT_PERCENT_MEDIAN
+    from app.gtm_os.icp.icp_matching import (
+        REVENUE_PER_EMPLOYEE_P25_USD,
+        REVENUE_PER_EMPLOYEE_P75_USD,
+        SALES_HEADCOUNT_PERCENT_P25,
+    )
 
-    lo = int(icp["revenue_min_usd"] // REVENUE_PER_EMPLOYEE_USD)
-    hi = -(-int(icp["revenue_max_usd"]) // REVENUE_PER_EMPLOYEE_USD)  # ceiling
+    # p75 for the floor, p25 for the ceiling -- NOT the median for both (fixed 2026-09-10). The
+    # median assumed every company in an ICP's revenue band earns exactly the median per head, so
+    # icp_1's $3-10M band searched only 37-50 employees when its real span is 23-84. Measured that
+    # day: a full discovery run across all three profiles surfaced 5 qualifying companies against a
+    # target of 25, having structurally never looked at most of the band. See the constants' own
+    # comment in icp_matching.py for why a search range and a point estimate need different figures.
+    lo = int(icp["revenue_min_usd"] // REVENUE_PER_EMPLOYEE_P75_USD)
+    hi = -(-int(icp["revenue_max_usd"]) // REVENUE_PER_EMPLOYEE_P25_USD)  # ceiling
     sales_team_size_max = icp.get("sales_team_size_max")
     if sales_team_size_max is not None:
-        sales_hi = int(sales_team_size_max / (SALES_HEADCOUNT_PERCENT_MEDIAN / 100))
+        sales_hi = int(sales_team_size_max / (SALES_HEADCOUNT_PERCENT_P25 / 100))
         hi = min(hi, sales_hi)
     # employee_max (2026-09-09, icp_3 only so far): a direct, explicit size ceiling independent
     # of the revenue-derived one -- same "take the more restrictive constraint" rule as

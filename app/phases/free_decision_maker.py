@@ -31,6 +31,7 @@ Resonance returned Timothy Gentry, Evan Sloss, and Karan Talati -- not Neal). Ac
 unverified top result risks messaging the wrong person, which is worse than finding nobody."""
 
 import logging
+import time
 
 import httpx
 from sqlalchemy.orm import Session
@@ -51,6 +52,14 @@ logger = logging.getLogger(__name__)
 # 3-result search, only random other employees ranked by the actor's own prominence heuristic,
 # not name relevance. Cheap to widen (~$0.004/extra profile via Apify).
 PEOPLE_SEARCH_MAX_RESULTS = 7
+
+# Jobo throttles a rapid sequence of company lookups with a 429 (confirmed live 2026-09-10 -- a
+# 20-company batch exhausted it, and it was still answering 429 a full minute later). Exponential
+# from 5s: 5s, then 10s. Small enough that a normal 25-company daily run stays well under a minute
+# of added wait even if every call throttles, and the alternative is silently recording a real
+# company as having no reachable decision-maker.
+JOBO_RATE_LIMIT_MAX_ATTEMPTS = 3
+JOBO_RATE_LIMIT_BACKOFF_SECONDS = 5
 
 GOOGLE_LEADER_EXTRACTION_PROMPT = """The following is a Google AI Overview answering a \
 search for the founder/CEO of "{company_name}" ({domain}).
@@ -121,20 +130,34 @@ def _slug_matches(requested_first: str, requested_last: str, profile_url: str) -
 def _jobo_leadership_candidates(db: Session, tenant_id: int, company: Company) -> list[dict]:
     """Returns [] on any failure (no credential, no match, Jobo error) -- this is a
     best-effort free pre-check, never allowed to block or fail the real decision-maker
-    search that follows it."""
+    search that follows it.
+
+    A 429 is retried rather than swallowed (2026-09-10). Jobo rate-limits a rapid sequence of
+    company lookups, and every other failure here is genuinely terminal ("this company isn't in
+    the index"), so the original blanket except returned the identical empty list for both --
+    making a retryable throttle indistinguishable from a real miss. Measured that day: a 20-company
+    batch run returned 0 decision-makers, and a direct call immediately afterwards confirmed the
+    API was answering 429, not empty. Every one of those companies was recorded as "no contact
+    found" and would never have been retried."""
     try:
         api_key = _get_jobo_api_key(db, tenant_id)
     except JoboError:
         return []
-    try:
-        with httpx.Client() as client:
-            company_id = find_company_id_by_name(client, api_key, company.name)
-            if not company_id:
+    for attempt in range(JOBO_RATE_LIMIT_MAX_ATTEMPTS):
+        try:
+            with httpx.Client() as client:
+                company_id = find_company_id_by_name(client, api_key, company.name)
+                if not company_id:
+                    return []
+                profile = get_company_profile(client, company_id)
+                return (profile or {}).get("leadership") or []
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code != 429 or attempt == JOBO_RATE_LIMIT_MAX_ATTEMPTS - 1:
                 return []
-            profile = get_company_profile(client, company_id)
-            return (profile or {}).get("leadership") or []
-    except (httpx.HTTPError, JoboError):
-        return []
+            time.sleep(JOBO_RATE_LIMIT_BACKOFF_SECONDS * (2 ** attempt))
+        except (httpx.HTTPError, JoboError):
+            return []
+    return []
 
 
 def _resolve_linkedin_url(db: Session, tenant_id: int, first_name: str, last_name: str, company_name: str) -> str | None:

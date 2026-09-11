@@ -99,6 +99,11 @@ CONTENT_CHAT_TOOLS = [
         "input_schema": {"type": "object", "properties": {}},
     },
     {
+        "name": "list_topic_evidence",
+        "description": "The real, itemized sources (real URL, title, summary, and which source type -- web_search_trend or competitor_content) behind one topic's observation/entity counts. Use this whenever the user asks 'where does this come from', 'what sources', 'show me the evidence', or anything asking to see the real underlying material behind a topic's numbers -- never answer that question from the counts alone, always call this to cite the real, specific sources.",
+        "input_schema": {"type": "object", "properties": {"content_topic_id": {"type": "integer"}}, "required": ["content_topic_id"]},
+    },
+    {
         "name": "list_content_opportunities",
         "description": "Real content opportunities already generated (why-now, suggested angle, cited URLs, origin trend/competitor, status, any drafts already written).",
         "input_schema": {"type": "object", "properties": {"status": {"type": "string", "enum": ["candidate", "approved", "rejected", "changes_requested"]}}},
@@ -225,6 +230,10 @@ def execute_content_chat_tool(name: str, tool_input: dict, db: Session, tenant_i
         result = get_market_intelligence_overview(db, tenant_id)
         result["configured_topics"] = [t["name"] for t in get_content_topics(db, tenant_id) if t.get("enabled", True)]
         return result
+
+    if name == "list_topic_evidence":
+        from app.gtm_os.content.content_opportunity import get_topic_evidence
+        return {"evidence": get_topic_evidence(db, tenant_id, tool_input["content_topic_id"])}
 
     if name == "list_content_opportunities":
         from app.gtm_os.content.content_opportunity import ContentOpportunity
