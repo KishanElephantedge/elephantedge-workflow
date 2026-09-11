@@ -902,6 +902,38 @@ def _run_apify_autonomous_cycle(batch: Batch, run: AutonomousRun, db: Session, t
         _send_failure_alert(batch, run, result["api_error"], db, tenant_id)
         return {"status": "failed", "batch_id": batch.id, "source": "apify", "error": result["api_error"]}
 
+    # Enforce the ICP's own revenue band before spending anything on decision-makers. The job
+    # search can filter headcount but has no revenue field at all, and headcount understates
+    # revenue badly at the large end -- confirmed live 2026-09-11 across four real partner runs:
+    # Sandy Yu ($25-250M) was returned Alteryx, AlphaSense and Meltwater; Amy Phillips ($20-500M)
+    # was returned Yamaha Motor USA, Daikin and Kia America. Every one passed the headcount band.
+    # run_partner_discovery already enforced this; the engine did not, so the same tenant got a
+    # clean list by one route and an unusable one by the other.
+    #
+    # Runs before the decision-maker loop on purpose: a company about to be dropped should not
+    # cost a contact lookup first. Elephant Edge is unaffected -- its ICPs live in
+    # gtm_os_icp_config with three separate bands and are verified per-company downstream by
+    # icp_matching, so there is no single band to apply here and get_partner_icp returns None.
+    import logging
+
+    from app.phases.partner_icp import get_partner_icp
+    from app.phases.partner_pipeline import enforce_icp_on_companies
+
+    logger = logging.getLogger(__name__)
+    icp_enforcement = None
+    partner_icp = get_partner_icp(db, tenant_id)
+    if partner_icp and (partner_icp.get("revenue_min_usd") or partner_icp.get("revenue_max_usd")):
+        discovered = db.query(Company).filter(Company.batch_id == batch.id).all()
+        icp_enforcement = enforce_icp_on_companies(
+            db, tenant_id, discovered, partner_icp,
+            enrichment_tenant_id=billing_tenant_id(db, tenant_id),
+        )
+        logger.info(
+            "tenant %s ICP enforcement: kept %d, dropped %d, needs_review %d",
+            tenant_id, len(icp_enforcement["kept"]), len(icp_enforcement["dropped"]),
+            len(icp_enforcement["needs_review"]),
+        )
+
     found = 0  # total decision-makers found across all companies, not company count
     companies_with_contact = 0
     paid_fallback_used = 0

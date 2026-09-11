@@ -118,6 +118,90 @@ def _geographies_to_locations(icp: dict) -> list[str]:
     return out
 
 
+def enforce_icp_on_companies(db: Session, tenant_id: int, companies: list, icp: dict,
+                             exclude_locations: list[str] | None = None,
+                             enrich_revenue: bool = True,
+                             enrichment_tenant_id: int = 2) -> dict:
+    """Enrich revenue where it is missing, then DELETE the companies this ICP's own revenue band
+    and location exclusions rule out. Returns {kept, dropped, needs_review, revenue_enrichment}.
+
+    Extracted from run_partner_discovery (2026-09-11) so the shared daily engine enforces a
+    tenant's ICP through exactly this code rather than a second copy. The engine previously had no
+    revenue enforcement at all, and the job search cannot express a revenue band -- confirmed live
+    the same day: a 5-company engine run for Sandy Yu ($25-250M) returned Alteryx, AlphaSense and
+    Meltwater, and one for Amy Phillips ($20-500M) returned Yamaha Motor USA, Daikin and Kia
+    America. Every one of them passed the headcount band and is far outside the stated revenue
+    band, because headcount understates revenue badly at the large end.
+
+    enrichment_tenant_id is who pays for the revenue lookups -- Elephant Edge, whose Apify account
+    every partner run borrows, not the partner tenant the companies belong to.
+
+    FIND the revenue before judging on it: the job actor exposes no revenue field, so without
+    enrichment every company arrives with revenue null and a revenue-banded ICP can only ever pass
+    them on ignorance. estimate_company_revenue tries Google's AI Overview (Apify, ~$0.0085/query)
+    before anything billed to Deepline, and no-ops on a company that already has a figure.
+
+    Only a KNOWN violation removes a company: one we still could not price is kept, because
+    absence of a figure is not evidence of a bad fit and dropping unknowns would discard most of
+    what was just paid for.
+    """
+    revenue_enrichment = {"attempted": 0, "resolved": 0, "not_found": 0}
+    lo, hi = icp.get("revenue_min_usd"), icp.get("revenue_max_usd")
+
+    if enrich_revenue and (isinstance(lo, int) or isinstance(hi, int)):
+        for c in companies:
+            if c.estimated_revenue_lower_usd or c.estimated_revenue_higher_usd:
+                continue
+            revenue_enrichment["attempted"] += 1
+            try:
+                r = estimate_company_revenue(db, enrichment_tenant_id, c)
+                revenue_enrichment["resolved" if r.get("status") == "resolved" else "not_found"] += 1
+            except Exception as e:  # noqa: BLE001 -- one company's lookup must not lose the run
+                db.rollback()
+                revenue_enrichment["not_found"] += 1
+                logger.warning("partner_pipeline: revenue lookup failed for %r -- %s", c.name, e)
+
+    excl = [e.strip().lower() for e in (exclude_locations or []) if e and e.strip()]
+    kept, dropped, dropped_companies, needs_review = [], [], [], []
+    for c in companies:
+        loc = (c.location or "").lower()
+        if excl and any(x in loc for x in excl):
+            dropped.append((c.name, f"location excluded ({c.location})"))
+            dropped_companies.append(c)
+            continue
+        if isinstance(lo, int) and c.estimated_revenue_higher_usd and c.estimated_revenue_higher_usd < lo:
+            dropped.append((c.name, f"revenue below ${lo:,}"))
+            dropped_companies.append(c)
+            continue
+        if isinstance(hi, int) and c.estimated_revenue_lower_usd and c.estimated_revenue_lower_usd > hi:
+            dropped.append((c.name, f"revenue above ${hi:,}"))
+            dropped_companies.append(c)
+            continue
+        # A range that STRADDLES the ceiling is not a pass. Domaine came back as $100-250M against
+        # Isabel's $150M ceiling and was kept, because its lower bound sat inside the band -- so a
+        # company that may be $100M over her limit read as a clean match. Straddling is uncertainty,
+        # and uncertainty about a hard boundary belongs in front of a human, not silently on the
+        # "send" side of the list.
+        if isinstance(hi, int) and c.estimated_revenue_higher_usd and c.estimated_revenue_higher_usd > hi:
+            needs_review.append((c.name, f"revenue range ${(c.estimated_revenue_lower_usd or 0):,}-${c.estimated_revenue_higher_usd:,} straddles the ${hi:,} ceiling"))
+            continue
+        kept.append(c)
+
+    # Real bug fix (2026-09-09): dropped/kept used to be reflected only in the RETURN VALUE -- the
+    # Company rows themselves stayed in the batch regardless, with no field anywhere to mark one
+    # rejected. A partner's dashboard (GET /companies) reads Company rows directly by
+    # tenant_id/batch_id with no other filter, so every "dropped" company kept showing up in their
+    # real Accounts view as if it had passed. Deleting the actual rejected Company objects
+    # (tracked directly, not re-matched by name) is what makes "dropped" actually mean dropped.
+    for c in dropped_companies:
+        db.delete(c)
+    if dropped_companies:
+        db.commit()
+
+    return {"kept": kept, "dropped": dropped, "needs_review": needs_review,
+            "revenue_enrichment": revenue_enrichment}
+
+
 def headcount_band_for_partner_icp(icp: dict) -> tuple[int | None, int | None, str | None]:
     """(employee_min, employee_max, why_derived) for a partner ICP -- its own stated headcount when
     it has one, otherwise derived from its revenue band.
@@ -283,63 +367,15 @@ def run_partner_discovery(db: Session, partner_name: str, icp: dict | None = Non
     # them on ignorance. estimate_company_revenue is the existing waterfall -- Google AI Overview
     # (~$0.0085/query) first, then Deepline's Crustdata identify -- and it no-ops on a company that
     # already has a figure, so this never re-pays for data we hold.
-    revenue_enrichment = {"attempted": 0, "resolved": 0, "not_found": 0}
-    if enrich_revenue and (resolved_icp.get("revenue_min_usd") or resolved_icp.get("revenue_max_usd")):
-        for c in companies:
-            if c.estimated_revenue_lower_usd or c.estimated_revenue_higher_usd:
-                continue
-            revenue_enrichment["attempted"] += 1
-            try:
-                r = estimate_company_revenue(db, ee_tenant_id, c)
-                revenue_enrichment["resolved" if r.get("status") == "resolved" else "not_found"] += 1
-            except Exception as e:  # noqa: BLE001 -- one company's lookup must not lose the run
-                db.rollback()
-                revenue_enrichment["not_found"] += 1
-                logger.warning("partner_pipeline: revenue lookup failed for %r -- %s", c.name, e)
-
-    # Post-filter on what the job search cannot express. Only a KNOWN violation removes a company:
-    # a company we still could not price is kept and flagged, because absence of a figure is not
-    # evidence of a bad fit and dropping unknowns would discard most of what we just paid for.
-    lo, hi = resolved_icp.get("revenue_min_usd"), resolved_icp.get("revenue_max_usd")
-    excl = [e.strip().lower() for e in (exclude_locations or []) if e and e.strip()]
-    kept, dropped, dropped_companies, needs_review = [], [], [], []
-    for c in companies:
-        loc = (c.location or "").lower()
-        if excl and any(x in loc for x in excl):
-            dropped.append((c.name, f"location excluded ({c.location})"))
-            dropped_companies.append(c)
-            continue
-        if isinstance(lo, int) and c.estimated_revenue_higher_usd and c.estimated_revenue_higher_usd < lo:
-            dropped.append((c.name, f"revenue below ${lo:,}"))
-            dropped_companies.append(c)
-            continue
-        if isinstance(hi, int) and c.estimated_revenue_lower_usd and c.estimated_revenue_lower_usd > hi:
-            dropped.append((c.name, f"revenue above ${hi:,}"))
-            dropped_companies.append(c)
-            continue
-        # A range that STRADDLES the ceiling is not a pass. Domaine came back as $100-250M against
-        # Isabel's $150M ceiling and was kept, because its lower bound sat inside the band -- so a
-        # company that may be $100M over her limit read as a clean match. Straddling is uncertainty,
-        # and uncertainty about a hard boundary belongs in front of a human, not silently on the
-        # "send" side of the list.
-        if isinstance(hi, int) and c.estimated_revenue_higher_usd and c.estimated_revenue_higher_usd > hi:
-            needs_review.append((c.name, f"revenue range ${(c.estimated_revenue_lower_usd or 0):,}-${c.estimated_revenue_higher_usd:,} straddles the ${hi:,} ceiling"))
-            continue
-        kept.append(c)
-
-    # Real bug fix (2026-09-09): dropped/kept above used to be reflected only in this function's
-    # RETURN VALUE -- the Company rows themselves stayed in the batch regardless, with no field
-    # anywhere to mark one rejected. A partner's dashboard (GET /companies) reads Company rows
-    # directly by tenant_id/batch_id with no other filter, so every "dropped" company kept
-    # showing up in their real Accounts view as if it had passed -- confirmed live: Sandy Yu's
-    # batch kept two companies ($319M and $800M revenue) against her stated $25-250M ceiling,
-    # both correctly identified by this same filter and then silently left visible anyway.
-    # Deleting the actual rejected Company objects (tracked directly, not re-matched by name) is
-    # what makes "dropped" actually mean dropped.
-    for c in dropped_companies:
-        db.delete(c)
-    if dropped_companies:
-        db.commit()
+    enforced = enforce_icp_on_companies(
+        db, tenant.id, companies, resolved_icp,
+        exclude_locations=exclude_locations, enrich_revenue=enrich_revenue,
+        enrichment_tenant_id=ee_tenant_id,
+    )
+    kept = enforced["kept"]
+    dropped = enforced["dropped"]
+    needs_review = enforced["needs_review"]
+    revenue_enrichment = enforced["revenue_enrichment"]
 
     return {
         "status": "succeeded",

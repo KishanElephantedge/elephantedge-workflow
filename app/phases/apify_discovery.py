@@ -108,6 +108,37 @@ APIFY_EMPLOYEE_MIN = 25
 APIFY_EMPLOYEE_MAX = 50
 APIFY_DISCOVERY_LIMIT_CAP = 150
 
+# Postings bought per company wanted, when a tenant has not set its own. 20 is what the old
+# `target * 20` rule used, kept as the default so no existing tenant's yield changes the day this
+# became configurable -- lowering it is a per-tenant decision backed by that tenant's own measured
+# keep rate, not a global guess applied to everyone at once.
+DEFAULT_DISCOVERY_OVERSAMPLE = 20
+
+# A floor on the fetch itself, not on the fetch-per-company. One posting rarely yields one company
+# (several postings per employer, plus already-seen domains), so a 1-2 company ask still needs a
+# real sample to have anything to choose from. Deliberately small: the old floor was 100, which is
+# what made a 5-company ask cost the same as a 20-company one.
+MIN_DISCOVERY_LIMIT = 25
+
+
+def get_discovery_oversample(db: Session, tenant_id: int) -> int:
+    """Postings this tenant buys per company it wants. Per-tenant because the right number is a
+    property of the ICP being searched: a narrow one returns more duplicate/irrelevant postings per
+    usable company than a broad one, so a single global constant either overpays for the broad
+    tenants or under-fetches for the narrow ones."""
+    from app.db.models import Parameter
+
+    param = (
+        db.query(Parameter)
+        .filter(Parameter.tenant_id == tenant_id, Parameter.key == "discovery_oversample")
+        .first()
+    )
+    if param and param.value and isinstance(param.value.get("postings_per_company"), int):
+        value = param.value["postings_per_company"]
+        if value > 0:
+            return value
+    return DEFAULT_DISCOVERY_OVERSAMPLE
+
 # Location was a hardcoded ["United States"] literal at the three call sites that run a job
 # search. Nothing about the actor requires it -- locationSearch takes any list -- so this was an
 # unstated assumption, not a capability limit, and it made the whole company table US-only: 0 of
@@ -149,10 +180,20 @@ def run_apify_discovery(
     # believed the daily/monthly cap was intact -- and the BudgetGuard passed in by V2's
     # run_v2_discovery_if_due tracks the DEEPLINE balance, not Apify, so it never covered this
     # either. Checked before the call, using the same worst-case estimate the limit implies.
-    # target*20 with a 100 floor is Elephant Edge's own daily-run rule, sized for a 10+ target and
-    # a high duplicate rate. It is wrong for a small one-off ask: a 5-company partner list would
-    # still pay for 100 postings. An explicit limit lets that caller pay for what it actually needs.
-    discovery_limit = min(limit or max(target * 20, 100), APIFY_DISCOVERY_LIMIT_CAP)
+    # How many postings to buy per company wanted. This is the whole unit economics of discovery:
+    # the actor bills per posting RETURNED, and the keep loop below stops the moment it has
+    # `target` companies, so every posting past that point is paid for and thrown away.
+    #
+    # Was `max(target * 20, 100)` -- a flat 100 floor on top of the multiplier, which made a small
+    # ask cost the same as a large one. Measured live 2026-09-11: Elephant Edge's 25-company run
+    # billed 185 postings for 24 companies ($0.04/company), while each 5-company partner run billed
+    # exactly 100 for 5 ($0.10/company) -- 2.5x worse per company purely because the floor, not the
+    # target, decided the fetch. The floor is gone so the fetch scales with what was actually asked
+    # for, and the multiplier is per-tenant config (get_discovery_oversample) because the right
+    # value is a property of the tenant's ICP -- a narrow ICP genuinely needs more postings per
+    # keep than a broad one, and that is measurable per tenant rather than guessable globally.
+    oversample = get_discovery_oversample(db, tenant_id)
+    discovery_limit = min(limit or max(target * oversample, MIN_DISCOVERY_LIMIT), APIFY_DISCOVERY_LIMIT_CAP)
     # The budget is checked against whoever OWNS the Apify account, which is not always the tenant
     # the companies are being written for. Partner discovery writes into a partner's own tenant (a
     # data boundary, deliberately isolated from Elephant Edge's pipeline) while spending Elephant
