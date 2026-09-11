@@ -318,11 +318,15 @@ def build_partner_discovery_profiles(db: Session, tenant_id: int) -> list[dict]:
         "time_range": DEFAULT_TIME_RANGE,
         "offering_names": [],
         "enabled": True,
-        # A partner's ICP says who to sell to, not what hiring signal proves they need it. Until a
-        # partner states their own trigger, this stays on the shared default rather than silently
-        # encoding Elephant Edge's "hiring sellers = has a sales problem" hypothesis as theirs --
-        # see build_discovery_plan's own note on why that assumption is not universal.
-        "title_search": list(APIFY_TITLE_SEARCH),
+        # The hiring signal that actually indicates THIS partner's buyer, when their ICP states
+        # one. Defaulting every partner to APIFY_TITLE_SEARCH encodes Elephant Edge's own
+        # hypothesis -- "a company hiring sellers has a sales problem" -- as if it were universal,
+        # and for most partners it simply is not. Amy Phillips sells to manufacturers with no CMO,
+        # so her buyer shows up hiring a marketing manager, not an SDR; Jeff Ballard fixes
+        # underperforming partner programs, so his shows up hiring a channel/alliances role.
+        # Searching either of them on sales titles finds plausible-looking companies that have
+        # nothing to do with what they sell. See build_discovery_plan's own note on the same point.
+        "title_search": list(icp.get("title_search") or APIFY_TITLE_SEARCH),
         "employee_min": emp_min,
         "employee_max": emp_max,
         "industry_filter": industries or list(APIFY_INDUSTRY_FILTER),
