@@ -80,6 +80,32 @@ def _get_api_key(db: Session, tenant_id: int) -> str:
     raise ApifyError("apify_api_key credential is not set")
 
 
+def billing_tenant_id(db: Session, tenant_id: int) -> int:
+    """The tenant whose Apify account a call for `tenant_id` will actually be billed to.
+
+    Mirrors _get_api_key's own fallback exactly: a tenant with its own apify_api_key is billed to
+    itself, and everyone else is billed to Elephant Edge, whose key they borrow. Budget has to be
+    checked against the account that really pays, not the tenant the companies are being written
+    for -- there is ONE Apify account behind every partner run, so per-partner Apify budgets would
+    be fiction that never protects the real balance.
+
+    Without this, check_apify_budget() runs against a partner tenant that has no apify budget
+    configured and fails closed -- confirmed live 2026-09-11: tenant 9 came back
+    blocked_budget_unknown while Elephant Edge's own real budget had room. run_partner_discovery
+    already worked around it by passing budget_tenant_id explicitly; this makes the same rule
+    available to every caller instead of each one remembering.
+    """
+    cred = (
+        db.query(Credential)
+        .filter(Credential.tenant_id == tenant_id)
+        .filter(Credential.name == "apify_api_key")
+        .first()
+    )
+    if cred and cred.value:
+        return tenant_id
+    return ELEPHANT_EDGE_TENANT_ID
+
+
 def search_linkedin_jobs(
     api_key: str,
     title_search: list[str],

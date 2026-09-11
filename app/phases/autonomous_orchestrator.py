@@ -32,6 +32,7 @@ from app.phases.scoring import run_scoring
 from app.phases.tech_stack import run_tech_stack_check
 from app.phases.jobo_discovery import run_jobo_discovery
 from app.phases.jd_first_discovery import run_jd_first_discovery
+from app.apify_client import billing_tenant_id
 from app.phases.apify_discovery import run_apify_discovery
 from app.phases.decision_maker import find_decision_makers
 from app.jobo_client import JoboError
@@ -89,6 +90,24 @@ def get_autonomous_schedule_utc(db: Session, tenant_id: int) -> tuple[int, int]:
 
 def is_autonomous_enabled(db: Session, tenant_id: int) -> bool:
     param = _get_tenant_param(db, tenant_id, "autonomous_enabled")
+    return bool(param and param.value and param.value.get("enabled") is True)
+
+
+def is_autonomous_outreach_enabled(db: Session, tenant_id: int) -> bool:
+    """Whether a completed cycle for this tenant may push its contacts to an outreach campaign.
+
+    Separate from autonomous_enabled (which decides whether the cycle RUNS at all) because the two
+    are genuinely different permissions once the engine serves more than one tenant: a partner
+    should get companies and decision-makers found for them daily, and should NOT have those
+    contacts pushed into a campaign -- get_outreach_channel() resolves to Elephant Edge's own
+    SalesRobot campaign and LinkedIn seat, so a partner push would go out under our name from our
+    account.
+
+    Defaults to FALSE, including for Elephant Edge, so a tenant added tomorrow cannot start
+    sending on someone else's behalf just because nobody thought to configure it. Elephant Edge
+    carries a real row turning it on rather than relying on a permissive default.
+    """
+    param = _get_tenant_param(db, tenant_id, "autonomous_outreach_enabled")
     return bool(param and param.value and param.value.get("enabled") is True)
 
 
@@ -829,6 +848,13 @@ def _run_apify_discovery_across_offerings(batch: Batch, db: Session, tenant_id: 
             title_search=profile.get("title_search"),
             employee_min=profile.get("employee_min"), employee_max=profile.get("employee_max"),
             industry_filter=profile.get("industry_filter"),
+            # A partner's profile can carry its own geography; Elephant Edge's never has, so this
+            # is None for it and run_apify_discovery keeps its existing default.
+            location_search=profile.get("location_search"),
+            # Bill/check against whoever really owns the Apify account being used. Without this a
+            # partner run checks a budget its own tenant never configured and fails closed --
+            # see apify_client.billing_tenant_id.
+            budget_tenant_id=billing_tenant_id(db, tenant_id),
         )
         merged["companies_discovered"] += result["companies_discovered"]
         merged["postings_checked"] += result["postings_checked"]
@@ -908,18 +934,35 @@ def _run_apify_autonomous_cycle(batch: Batch, run: AutonomousRun, db: Session, t
     run.credits_spent_usd = final_spend
     run.budget_stopped_early = result["budget_stopped_early"]
 
-    if result["budget_stopped_early"] or found == 0:
+    # Stop here when there is nothing to push, OR when this tenant does not do its own outreach.
+    # The second case is what makes one engine safe to run for a partner: everything past this
+    # point generates messages and hands the batch to the approval window, which
+    # resume_pending_approvals then pushes to get_outreach_channel(). That channel resolves to
+    # Elephant Edge's own SalesRobot campaign and LinkedIn seat, so a partner run reaching it
+    # would push the partner's prospects into OUR campaign under our name. A partner's companies
+    # and contacts are theirs to review in their own dashboard; the run is complete once they
+    # exist. Off unless a tenant explicitly turns it on -- see is_autonomous_outreach_enabled.
+    outreach_enabled = is_autonomous_outreach_enabled(db, tenant_id)
+    if result["budget_stopped_early"] or found == 0 or not outreach_enabled:
         batch.current_phase = "autonomous_cycle_done"
         batch.status = "complete"
         run.status = "completed"
         run.contacts_pushed = 0
         run.completed_at = datetime.utcnow()
         db.commit()
-        create_notification(
-            db, tenant_id, "run_completed_empty", f"Run completed — 0 decision-makers found ({batch.name})",
-            f"{result['companies_discovered']} companies discovered (Apify)." + (" Budget cap stopped the run early." if result["budget_stopped_early"] else ""),
-            severity="warning" if result["budget_stopped_early"] else "info", batch_id=batch.id, run_id=run.id,
-        )
+        if found and not outreach_enabled:
+            create_notification(
+                db, tenant_id, "run_completed", f"Run completed — {found} decision-makers found ({batch.name})",
+                f"{result['companies_discovered']} companies discovered (Apify), {companies_with_contact} with a contact. "
+                "Outreach is not enabled for this tenant, so nothing was pushed to a campaign.",
+                severity="info", batch_id=batch.id, run_id=run.id,
+            )
+        else:
+            create_notification(
+                db, tenant_id, "run_completed_empty", f"Run completed — 0 decision-makers found ({batch.name})",
+                f"{result['companies_discovered']} companies discovered (Apify)." + (" Budget cap stopped the run early." if result["budget_stopped_early"] else ""),
+                severity="warning" if result["budget_stopped_early"] else "info", batch_id=batch.id, run_id=run.id,
+            )
         return {
             "status": "completed",
             "batch_id": batch.id,
@@ -929,6 +972,7 @@ def _run_apify_autonomous_cycle(batch: Batch, run: AutonomousRun, db: Session, t
             "discovery_rejection_breakdown": result["rejection_breakdown"],
             "decision_maker_result": decision_maker_result,
             "outreach_result": {"contacts_checked": 0, "pushed": 0, "failed": 0, "skipped": 0},
+            "outreach_enabled": outreach_enabled,
             "credits_spent_usd": final_spend,
             "budget_stopped_early": result["budget_stopped_early"],
             "budget_usd": budget_usd,
