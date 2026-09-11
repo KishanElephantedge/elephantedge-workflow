@@ -240,6 +240,98 @@ def build_icp_discovery_profiles(db: Session, tenant_id: int) -> list[dict]:
     return profiles
 
 
+# Elephant Edge's own tenant id. Declared locally (same pattern as content_business_context.py and
+# meeting_intelligence.py) rather than imported from routes/api.py, which would invert the
+# dependency direction between orchestration and the route layer.
+ELEPHANT_EDGE_TENANT_ID = 2
+
+
+def _has_own_icp_config(db: Session, tenant_id: int) -> bool:
+    """Whether this tenant has a REAL ICP config row, as opposed to inheriting the shared default.
+
+    Deliberately a direct Parameter check and not get_icp_config(), which silently returns
+    Elephant Edge's DEFAULT_ICP_CONFIG for any tenant without one -- the exact behaviour that made
+    every partner look like it had Elephant Edge's ICPs. Same "check for the real row, don't trust
+    the falling-back reader" pattern content topics.py already needed for this reason.
+    """
+    from app.gtm_os.icp.icp_config import ICP_CONFIG_PARAMETER_KEY
+
+    row = (
+        db.query(Parameter)
+        .filter(Parameter.tenant_id == tenant_id, Parameter.key == ICP_CONFIG_PARAMETER_KEY)
+        .first()
+    )
+    return bool(row and row.value)
+
+
+def build_partner_discovery_profiles(db: Session, tenant_id: int) -> list[dict]:
+    """One discovery profile built from a PARTNER tenant's own stated ICP (the `partner_icp`
+    Parameter they edit in their dashboard), so the same daily engine that serves Elephant Edge
+    can serve a partner without a second pipeline.
+
+    Reuses partner_pipeline's existing, already-proven mapping primitives rather than
+    reimplementing them: map_icp_to_linkedin_industries (free-text industry -> the actor's real
+    LinkedIn taxonomy), _geographies_to_locations, and headcount_band_for_partner_icp. Those
+    encode real, expensive lessons about what this actor actually accepts; a second copy here
+    would drift from them silently.
+
+    Returns [] -- never a default profile -- when the partner's ICP cannot be sized into a real
+    search. A partner with no revenue band and no headcount band (Jeff Ballard, Jeff Platt as of
+    2026-09-11) genuinely cannot be searched for on firmographics alone, and inventing a band
+    would spend their budget on companies nobody chose.
+    """
+    from app.phases.partner_icp import get_partner_icp
+    from app.phases.partner_pipeline import (
+        _geographies_to_locations,
+        headcount_band_for_partner_icp,
+        map_icp_to_linkedin_industries,
+    )
+
+    icp = get_partner_icp(db, tenant_id)
+    if not icp:
+        return []
+
+    emp_min, emp_max, _ = headcount_band_for_partner_icp(icp)
+    if emp_min is None and emp_max is None:
+        logger.warning(
+            "tenant %s has a partner ICP with neither a headcount nor a revenue band -- "
+            "cannot build a discovery profile from it", tenant_id,
+        )
+        return []
+
+    # The actor needs both bounds. A one-sided ICP ("under 100 employees", "$20M+") keeps its own
+    # stated bound and takes the shared APIFY_* default for the side it left open -- a documented
+    # floor/ceiling, not a guess at what the partner meant.
+    emp_min = APIFY_EMPLOYEE_MIN if emp_min is None else max(1, int(emp_min))
+    emp_max = APIFY_EMPLOYEE_MAX if emp_max is None else int(emp_max)
+    if emp_min > emp_max:
+        logger.warning("tenant %s ICP produced employee_min %s > employee_max %s", tenant_id, emp_min, emp_max)
+        return []
+
+    # The LLM industry mapping is billed to Elephant Edge, not the partner -- our key, our cost,
+    # same rule run_partner_discovery already follows for this call.
+    industries, _rejected = map_icp_to_linkedin_industries(db, ELEPHANT_EDGE_TENANT_ID, icp)
+    locations = _geographies_to_locations(icp)
+
+    profile = {
+        "id": f"partner_icp_{tenant_id}",
+        "time_range": DEFAULT_TIME_RANGE,
+        "offering_names": [],
+        "enabled": True,
+        # A partner's ICP says who to sell to, not what hiring signal proves they need it. Until a
+        # partner states their own trigger, this stays on the shared default rather than silently
+        # encoding Elephant Edge's "hiring sellers = has a sales problem" hypothesis as theirs --
+        # see build_discovery_plan's own note on why that assumption is not universal.
+        "title_search": list(APIFY_TITLE_SEARCH),
+        "employee_min": emp_min,
+        "employee_max": emp_max,
+        "industry_filter": industries or list(APIFY_INDUSTRY_FILTER),
+    }
+    if locations:
+        profile["location_search"] = locations
+    return [profile]
+
+
 DEFAULT_DISCOVERY_PROFILES: list[dict] = [
     {
         "id": "consulting",
@@ -339,13 +431,45 @@ def get_discovery_profiles(db: Session, tenant_id: int) -> list[dict]:
         except Exception:  # noqa: BLE001 -- a config read failure must not stop discovery
             logger.warning("could not derive ICP headcount bands; using the stored profiles as-is", exc_info=True)
             return param.value
+    # ONLY for a tenant whose ICP config is genuinely its own. get_icp_config() and
+    # get_offering_config() both fall back to Elephant Edge's DEFAULT_* seeds for ANY tenant that
+    # has no row of its own -- and as of 2026-09-11 no tenant has one, Elephant Edge included. So
+    # calling build_icp_discovery_profiles() unconditionally built Elephant Edge's three ICP
+    # profiles for every partner tenant: confirmed live that tenants 5/6/9/10/11/12 and even an
+    # unconfigured tenant 3 all returned the identical icp_1/icp_2/icp_3 profiles, ignoring the
+    # real partner_icp each of them has on file. The defaults ARE Elephant Edge's real config
+    # (icp_config.py transcribes them from its own reference material), so they stay correct for
+    # tenant 2 and are wrong for everyone else.
+    if tenant_id == ELEPHANT_EDGE_TENANT_ID or _has_own_icp_config(db, tenant_id):
+        try:
+            profiles = build_icp_discovery_profiles(db, tenant_id)
+            if profiles:
+                return profiles
+            logger.warning("no ICP has an offering mapped to it; falling back to the static profiles")
+        except Exception:  # noqa: BLE001
+            logger.warning("could not build ICP discovery profiles; falling back to the static ones", exc_info=True)
+
+    # A partner tenant has no gtm_os_icp_config and no offerings, so the branch above always
+    # yields nothing for them -- their ICP lives in `partner_icp` instead.
     try:
-        profiles = build_icp_discovery_profiles(db, tenant_id)
-        if profiles:
-            return profiles
-        logger.warning("no ICP has an offering mapped to it; falling back to the static profiles")
-    except Exception:  # noqa: BLE001
-        logger.warning("could not build ICP discovery profiles; falling back to the static ones", exc_info=True)
+        partner_profiles = build_partner_discovery_profiles(db, tenant_id)
+        if partner_profiles:
+            return partner_profiles
+    except Exception:  # noqa: BLE001 -- same rule as above: a config read failure must not stop discovery
+        logger.warning("could not build partner discovery profiles for tenant %s", tenant_id, exc_info=True)
+
+    # DEFAULT_DISCOVERY_PROFILES is Elephant Edge's OWN static profile set (its titles, its
+    # industries, its bands), so returning it for any other tenant hands that tenant Elephant
+    # Edge's ICP under their own name -- the search would look successful and produce companies
+    # nobody chose for them. Real risk as of 2026-09-11: every partner tenant reaches this line,
+    # because none has an offering-mapped ICP. An empty list makes the caller stop instead, which
+    # is the honest outcome for "we do not know who this tenant sells to".
+    if tenant_id != ELEPHANT_EDGE_TENANT_ID:
+        logger.warning(
+            "tenant %s has no usable discovery profile (no ICP config, no partner_icp) -- "
+            "returning none rather than defaulting to Elephant Edge's own profiles", tenant_id,
+        )
+        return []
     return DEFAULT_DISCOVERY_PROFILES
 
 

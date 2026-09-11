@@ -109,6 +109,34 @@ def get_structured_icp(profile: LinkedinMonitorProfile) -> dict | None:
     return (profile.gtm_university_data or {}).get("_structured_icp")
 
 
+# The per-TENANT partner ICP, distinct from the per-PROFILE structured ICP above. A partner edits
+# this one themselves in their own dashboard (Settings), so it is the authoritative statement of
+# who they sell to; get_structured_icp() above is what we PARSED out of GTM Partners' directory
+# prose on their behalf. Defined here rather than in routes/api.py (which had the only copy) so
+# non-route callers -- discovery profile building, the daily engine -- can read it without
+# importing the route layer.
+PARTNER_ICP_PARAMETER_KEY = "partner_icp"
+
+
+def get_partner_icp(db: Session, tenant_id: int) -> dict | None:
+    """This tenant's own stated ICP, or None if they have not set one.
+
+    Returns None rather than an empty dict for "not set": every caller has to distinguish
+    "this partner told us nothing" (cannot search for them at all) from "told us something
+    empty", and a falsy dict silently collapses those two into the same thing.
+    """
+    from app.db.models import Parameter
+
+    param = (
+        db.query(Parameter)
+        .filter(Parameter.tenant_id == tenant_id, Parameter.key == PARTNER_ICP_PARAMETER_KEY)
+        .first()
+    )
+    if not param or not isinstance(param.value, dict) or not param.value:
+        return None
+    return param.value
+
+
 def store_structured_icp(db: Session, profile: LinkedinMonitorProfile, parsed: dict) -> None:
     data = dict(profile.gtm_university_data or {})
     data["_structured_icp"] = parsed

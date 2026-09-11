@@ -118,6 +118,56 @@ def _geographies_to_locations(icp: dict) -> list[str]:
     return out
 
 
+def headcount_band_for_partner_icp(icp: dict) -> tuple[int | None, int | None, str | None]:
+    """(employee_min, employee_max, why_derived) for a partner ICP -- its own stated headcount when
+    it has one, otherwise derived from its revenue band.
+
+    Extracted from build_discovery_plan (2026-09-11) so the daily discovery engine derives a
+    partner's search band through exactly this logic instead of its own copy. The reasoning below
+    is specific to the PARTNER pipeline and deliberately differs from icp_matching's
+    p25/p75 range check -- see that module's own note. The difference is not an inconsistency: a
+    partner run applies a hard revenue post-filter to what it finds, so admitting under-revenue
+    companies wastes the run, whereas Elephant Edge's own path verifies each company through
+    icp_matching afterwards and can afford a wider net.
+
+    An ICP that states revenue but not headcount is common, and letting the actor fall back to
+    its default 25-50 band is actively harmful: Isabel's ICP is $20-150M, and a 25-50 person
+    company is nowhere near that. The whole search would return companies the revenue filter then
+    discards -- a wasted run, not merely a suboptimal one.
+
+    ASYMMETRIC ON PURPOSE. Halving the floor as well as doubling the ceiling looked even-handed
+    and was wrong: Isabel's $20M floor became 125 employees, and the run came back with three
+    ~176-person companies earning $0.5-2.5M. A VC-funded startup can have 176 people and almost no
+    revenue, so a low headcount floor admits exactly the companies a revenue floor exists to
+    exclude -- 3 of 5 results were wasted on it. So the floor uses the median ratio straight (no
+    widening) and only the ceiling is widened. Missing an unusually efficient company costs one
+    candidate; admitting under-revenue ones costs most of the run.
+
+    Returns (None, None, None) when the ICP states neither headcount nor revenue -- the caller
+    decides what to do with that, because "we cannot size this ICP" is a real answer that must not
+    be silently replaced with a default band belonging to someone else.
+    """
+    emp_min, emp_max = icp.get("employee_min"), icp.get("employee_max")
+    if emp_min is not None or emp_max is not None:
+        return emp_min, emp_max, None
+
+    rev_lo, rev_hi = icp.get("revenue_min_usd"), icp.get("revenue_max_usd")
+    if not isinstance(rev_lo, int) and not isinstance(rev_hi, int):
+        return None, None, None
+
+    if isinstance(rev_lo, int):
+        emp_min = max(1, int(rev_lo / REVENUE_PER_EMPLOYEE_USD))
+    if isinstance(rev_hi, int):
+        emp_max = int(rev_hi / REVENUE_PER_EMPLOYEE_USD * 2)
+    why = (
+        f"ICP states no headcount, so {emp_min}-{emp_max} was derived from its "
+        f"${rev_lo or 0:,}-${rev_hi or 0:,} revenue band at ~${REVENUE_PER_EMPLOYEE_USD:,}/employee "
+        "(ceiling widened 2x for the real spread). Searching the actor's 25-50 default "
+        "instead would have found companies far too small for this ICP."
+    )
+    return emp_min, emp_max, why
+
+
 def build_discovery_plan(db: Session, tenant_id: int, partner_name: str, icp: dict, target: int = 10,
                          exclude_locations: list[str] | None = None,
                          title_search: list[str] | None = None) -> dict:
@@ -135,38 +185,7 @@ def build_discovery_plan(db: Session, tenant_id: int, partner_name: str, icp: di
     companies that have nothing to do with what the partner sells."""
     industries, rejected = map_icp_to_linkedin_industries(db, tenant_id, icp)
     locations = _geographies_to_locations(icp)
-    emp_min, emp_max = icp.get("employee_min"), icp.get("employee_max")
-    derived_headcount = None
-
-    # An ICP that states revenue but not headcount is common, and letting the actor fall back to
-    # its default 25-50 band is actively harmful: Isabel's ICP is $20-150M, and a 25-50 person
-    # company is nowhere near that. The whole search would return companies the revenue filter then
-    # discards -- a wasted run, not merely a suboptimal one.
-    #
-    # The p25-p75 spread behind this ratio is roughly 2.5x, so the band is widened generously in
-    # both directions: this decides what we SEARCH for, and the real revenue check happens after.
-    if emp_min is None and emp_max is None:
-        rev_lo, rev_hi = icp.get("revenue_min_usd"), icp.get("revenue_max_usd")
-        if isinstance(rev_lo, int) or isinstance(rev_hi, int):
-            # ASYMMETRIC ON PURPOSE. Halving the floor as well as doubling the ceiling looked
-            # even-handed and was wrong: Isabel's $20M floor became 125 employees, and the run came
-            # back with three ~176-person companies earning $0.5-2.5M. A VC-funded startup can have
-            # 176 people and almost no revenue, so a low headcount floor admits exactly the
-            # companies a revenue floor exists to exclude -- 3 of 5 results were wasted on it.
-            #
-            # So the floor uses the median ratio straight (no widening) and only the ceiling is
-            # widened. Missing an unusually efficient company costs one candidate; admitting
-            # under-revenue ones costs most of the run.
-            if isinstance(rev_lo, int):
-                emp_min = max(1, int(rev_lo / REVENUE_PER_EMPLOYEE_USD))
-            if isinstance(rev_hi, int):
-                emp_max = int(rev_hi / REVENUE_PER_EMPLOYEE_USD * 2)
-            derived_headcount = (
-                f"ICP states no headcount, so {emp_min}-{emp_max} was derived from its "
-                f"${rev_lo or 0:,}-${rev_hi or 0:,} revenue band at ~${REVENUE_PER_EMPLOYEE_USD:,}/employee "
-                "(widened 2x each way for the real spread). Searching the actor's 25-50 default "
-                "instead would have found companies far too small for this ICP."
-            )
+    emp_min, emp_max, derived_headcount = headcount_band_for_partner_icp(icp)
 
     # Sized to the ask, not to Elephant Edge's daily run. Observed keep rates on real runs: 31
     # postings -> 7 companies over a 7d window, 150 -> 10 over 6m (more duplicates). ~10x the

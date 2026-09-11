@@ -5081,7 +5081,10 @@ def delete_proposal(proposal_id: int, db: Session = Depends(get_db)):
 # wizard, or the partner themselves later) is actually allowed, via X-Tenant-Id. Stored as a
 # Parameter, the same mechanism icp_config.py and discovery_profiles.py already use for
 # tenant-scoped configuration -- no new storage concept for one small JSON blob.
-PARTNER_ICP_PARAMETER_KEY = "partner_icp"
+# Canonical definition lives in partner_icp.py (2026-09-11) so the daily discovery engine can read
+# a partner's ICP without importing the route layer -- re-exported here rather than redeclared,
+# since two copies of a Parameter key silently drift into two different stores.
+from app.phases.partner_icp import PARTNER_ICP_PARAMETER_KEY  # noqa: E402
 
 
 @router.get("/gtm-os/partner/icp")
