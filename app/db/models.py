@@ -125,6 +125,22 @@ class Company(Base):
     # company once it has a real, COMPLETE (no missing_information) verdict -- nothing about it
     # can change through this sweep alone -- while still retrying any company whose last check
     # was incomplete (it may have been enriched since) or that has never been checked at all.
+    # The offering this company was actually matched to (icp_offering_matching.match_offerings_for_
+    # company / offering_tiebreak.break_offering_tie), persisted at match time so a later push can
+    # route it correctly. Real bug found live 2026-09-11: a discovery batch legitimately contains
+    # companies matched to SEVERAL different offerings (confirmed same day: one batch held
+    # Consulting, Digital Playbook, Sales OS and Execution matches together), but
+    # run_campaign_execution routed the entire batch through ONE campaign via Batch.offering_name
+    # -- which was never designed for a mixed batch (its own comment: "a manually-created outbound
+    # campaign... created as its own Batch and tagged here", i.e. one offering per batch by
+    # construction). A batch with no offering_name (every ICP-discovery batch, including two real
+    # ones the same day) fell through to the single salesrobot_campaign_uuid fallback, which
+    # resolved to a dead campaign -- 123 real contacts pushed there over 6+ weeks, 0 replies, 0
+    # follow-ups ever sent, while other campaigns Elephant Edge already has configured per offering
+    # were getting real replies the whole time. Set once by whichever step ran ICP+offering
+    # matching for this company; read by run_campaign_execution per CONTACT instead of once per
+    # batch, so a mixed batch routes each contact correctly.
+    resolved_offering_name = Column(String, nullable=True)
     icp_last_evaluated_at = Column(DateTime, nullable=True)
     icp_last_evaluation_had_missing_information = Column(Boolean, nullable=True)
     # How many times an incomplete ICP verdict has been retried. The retry exists because a

@@ -290,6 +290,10 @@ def ensure_indexes():
         conn.execute(text("ALTER TABLE companies ADD COLUMN IF NOT EXISTS tofu_keyword_found BOOLEAN"))
         conn.execute(text("ALTER TABLE companies ADD COLUMN IF NOT EXISTS hot_lead BOOLEAN"))
         conn.execute(text("ALTER TABLE companies ADD COLUMN IF NOT EXISTS hot_lead_reasoning TEXT"))
+        # 2026-09-11, real fix -- see Company.resolved_offering_name's own comment in models.py:
+        # lets run_campaign_execution() route each contact by its own matched offering instead of
+        # one Batch-level field that a mixed-offering discovery batch cannot correctly express.
+        conn.execute(text("ALTER TABLE companies ADD COLUMN IF NOT EXISTS resolved_offering_name VARCHAR"))
         # 2026-08-26, real fix -- see Company.icp_last_evaluated_at's own comment in models.py:
         # lets run_icp_matching_sweep() skip companies whose last check was already complete.
         conn.execute(text("ALTER TABLE companies ADD COLUMN IF NOT EXISTS icp_last_evaluated_at TIMESTAMP"))

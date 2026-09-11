@@ -33,8 +33,23 @@ def run_campaign_execution(batch_id: int, db: Session, channel: OutreachChannel)
     # to -- previously impossible, this table had no such join key at all. An untagged batch
     # (real ICP-discovery batches, not a named outbound campaign) stamps None, exactly as before.
     batch = db.get(Batch, batch_id)
-    offering_name = batch.offering_name if batch else None
+    batch_offering_name = batch.offering_name if batch else None
     campaign_label = batch.campaign_label if batch else None
+
+    def _offering_for(contact: Contact) -> str | None:
+        """A discovery batch legitimately mixes companies matched to several different offerings
+        -- confirmed live 2026-09-11: one real batch held Consulting, Digital Playbook, Sales OS
+        and Execution matches together. Batch.offering_name is a single value meant for a batch
+        that IS one named outbound campaign (see its own comment); using it here for a mixed batch
+        routed every contact through whichever campaign that one field happened to name, or through
+        the SalesRobotChannel's own tenant-wide fallback when it was unset -- which is how 123 real
+        contacts over 6+ weeks ended up in a campaign with zero follow-up configured while other,
+        working, per-offering campaigns sat unused. Company.resolved_offering_name (set by
+        icp_offering_matching/offering_tiebreak at ICP-match time) is checked first so each contact
+        routes by its OWN match; batch_offering_name remains the answer for a batch that really is
+        one offering end to end, and this only ever narrows or preserves existing behavior -- an
+        untagged batch with no per-company resolution either still returns None, same as before."""
+        return (contact.company.resolved_offering_name if contact.company else None) or batch_offering_name
 
     already_pushed_ids = {
         p.contact_id
@@ -49,6 +64,8 @@ def run_campaign_execution(batch_id: int, db: Session, channel: OutreachChannel)
         if contact.id in already_pushed_ids:
             skipped += 1
             continue
+
+        offering_name = _offering_for(contact)
 
         if contact.excluded_from_push:
             skipped += 1

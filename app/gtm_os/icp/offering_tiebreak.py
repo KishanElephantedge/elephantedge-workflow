@@ -75,6 +75,7 @@ def break_offering_tie(db: Session, tenant_id: int, company_id: int) -> dict:
     resolved by this step."""
     result = match_offerings_for_company(db, tenant_id, company_id)
     if result.get("best_fit") is not None or not result.get("icp_matches"):
+        _persist_resolved_offering(db, company_id, result.get("best_fit"))
         return {**result, "tiebreak": None}
 
     candidate_names = sorted({
@@ -120,9 +121,26 @@ def break_offering_tie(db: Session, tenant_id: int, company_id: int) -> dict:
         else:
             return {**result, "tiebreak": {"status": "invalid_choice", "raw": decision, "candidates": candidate_names}}
 
+    _persist_resolved_offering(db, company_id, {"offering": chosen})
     return {
         **result,
         "best_fit": {"offering": chosen},
         "best_fit_reason": f"LLM tiebreak among {candidate_names}: {decision.get('reasoning')}",
         "tiebreak": {"status": "resolved", "confidence": decision.get("confidence"), "reasoning": decision.get("reasoning"), "candidates": candidate_names},
     }
+
+
+def _persist_resolved_offering(db: Session, company_id: int, best_fit: dict | None) -> None:
+    """Writes the resolved offering onto Company.resolved_offering_name so
+    run_campaign_execution() can route this company's contact by its OWN offering match instead of
+    a single Batch-level field -- see that column's own comment in models.py for the real bug this
+    closes. A None best_fit (no candidate offering at all) is left alone rather than overwritten
+    with null: a real prior resolution must never be erased by a later call that happens to find
+    nothing, e.g. after a config change temporarily removes every candidate."""
+    if not best_fit or not best_fit.get("offering"):
+        return
+    company = db.get(Company, company_id)
+    if company is None:
+        return
+    company.resolved_offering_name = best_fit["offering"]
+    db.commit()
