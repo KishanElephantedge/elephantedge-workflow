@@ -30,12 +30,29 @@ class SalesRobotChannel(OutreachChannel):
         return value.get("value") if isinstance(value, dict) else value
 
     def _resolve_campaign_uuid(self, offering_name: str | None) -> str:
-        if offering_name:
-            configured = get_offering_campaign_id(self.db, self.tenant_id, offering_name, "salesrobot")
-            if not configured:
-                raise SalesRobotError(f"No SalesRobot campaign configured for offering {offering_name!r}")
-            return configured
-        return self._get_param("salesrobot_campaign_uuid")
+        """Real incident, 2026-09-10/11: this used to fall back to the single
+        salesrobot_campaign_uuid tenant default whenever offering_name was None -- which, for a
+        daily discovery batch (which always mixes several offerings, never one Batch-level
+        value), was EVERY contact. 39 real people across two days got silently pushed to that one
+        default campaign, which happened to have zero follow-up configured and zero replies in
+        6+ weeks, while Elephant Edge already has a real, working campaign per offering sitting
+        unused. The fallback existed to make "we genuinely don't know yet" and "here's exactly
+        where this goes" look the same, and that is precisely the failure mode.
+
+        Now refuses outright when no offering is known, rather than guessing a destination. A
+        contact reaching this point with offering_name=None means neither
+        Company.resolved_offering_name nor Batch.offering_name is set -- i.e. this company was
+        never actually run through ICP+offering matching -- which is a real gap to close before
+        push, not something to paper over with a default campaign."""
+        if not offering_name:
+            raise SalesRobotError(
+                "cannot push -- no offering resolved for this contact's company (run ICP + "
+                "offering matching before push_campaigns, or set Company.resolved_offering_name)"
+            )
+        configured = get_offering_campaign_id(self.db, self.tenant_id, offering_name, "salesrobot")
+        if not configured:
+            raise SalesRobotError(f"No SalesRobot campaign configured for offering {offering_name!r}")
+        return configured
 
     def push_lead(self, contact: Contact, offering_name: str | None = None) -> dict:
         if not contact.linkedin_url:
