@@ -981,6 +981,32 @@ def list_companies(request: Request, page: int = 1, page_size: int = 25, search:
 
     states_by_id = list_account_states(db, ELEPHANT_EDGE_TENANT_ID, [c.id for c in page_items])
 
+    # Table redesign (2026-09-12, explicit instruction) -- Majji's own words: "I don't know what
+    # to do with that one... I don't even know why I have to see that one," about the card-list
+    # forcing a click into every row just to see contact count or outreach status. Both are real,
+    # already-computed facts (Contact/CampaignPush already exist); this just surfaces them at the
+    # list level instead of only on the detail page. Bulk-queried once for the whole page (same
+    # discipline list_account_states() already follows), never one query per row.
+    page_ids = [c.id for c in page_items]
+    contact_counts: dict[int, int] = {}
+    outreached_ids: set[int] = set()
+    if page_ids:
+        for company_id, count in (
+            db.query(Contact.company_id, func.count(Contact.id))
+            .filter(Contact.company_id.in_(page_ids))
+            .group_by(Contact.company_id)
+            .all()
+        ):
+            contact_counts[company_id] = count
+        outreached_ids = {
+            row[0]
+            for row in db.query(Contact.company_id)
+            .join(CampaignPush, CampaignPush.contact_id == Contact.id)
+            .filter(Contact.company_id.in_(page_ids), CampaignPush.status == "pushed")
+            .distinct()
+            .all()
+        }
+
     return {
         "page": page,
         "page_size": page_size,
@@ -995,6 +1021,12 @@ def list_companies(request: Request, page: int = 1, page_size: int = 25, search:
                 "source": c.source,
                 "batch_id": c.batch_id,
                 "qualified": _is_company_qualified(c),
+                "employee_count": c.employee_count,
+                "estimated_revenue_lower_usd": c.estimated_revenue_lower_usd,
+                "estimated_revenue_higher_usd": c.estimated_revenue_higher_usd,
+                "resolved_offering_name": c.resolved_offering_name,
+                "contact_count": contact_counts.get(c.id, 0),
+                "outreached": c.id in outreached_ids,
                 "hiring_signal_role": c.hiring_signal_role,
                 "hiring_signal_strength": c.hiring_signal_strength,
                 "team_fit_tier": c.team_fit_tier,
