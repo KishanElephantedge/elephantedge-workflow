@@ -22,7 +22,7 @@ from datetime import datetime, timedelta
 from sqlalchemy import Column, DateTime, ForeignKey, Integer, JSON, String
 from sqlalchemy.orm import Session
 
-from app.db.models import Base, Batch, Company
+from app.db.models import Base, Batch, Company, Contact
 from app.gtm_os.icp.icp_config import get_icp_config
 
 
@@ -371,6 +371,65 @@ def record_icp_match(db: Session, tenant_id: int, company_id: int, result: dict)
     db.add(match)
     db.commit()
     return match
+
+
+def verify_and_reconfirm_matches(db: Session, tenant_id: int, batch_id: int) -> dict:
+    """Real revenue lookup + re-check for every company in this batch that matched an ICP on a
+    DERIVED (headcount-proxy) revenue -- deletes the match (and the company) if the real number
+    contradicts what the proxy allowed. Deliberately separate from run_icp_matching_sweep, which
+    only ever evaluates the proxy; this is the step that checks whether the proxy was actually
+    right, using the same estimate_company_revenue() waterfall (Google AI Overview, free/cheap,
+    no Deepline) already used for partner tenants.
+
+    Real gap this closes (2026-09-12): _needs_real_revenue_check() only ever fires for large
+    IT-services/staffing-shaped companies -- it caught Centraprise, but nothing else. Every other
+    ICP match, for any tenant, was trusted on the proxy alone. Confirmed live by manually
+    auditing 17 companies that already had a contact: ASG matched Sales OS ($10-20M) on a proxy,
+    real revenue is $25-50M, entirely above it; Symmetric Health Solutions matched Digital
+    Playbook ($3-10M) on a proxy, real revenue is $1.7M, below every ICP's floor. Both had
+    already been decision-maker-searched and were sitting live before this ran.
+
+    A company whose revenue could not be found (estimate_company_revenue -> not_found) is left
+    exactly as it was -- absence is not evidence of a bad fit, and this must never turn a real,
+    proxy-consistent match into a false negative just because Google has nothing on a private
+    company."""
+    from app.gtm_os.icp.icp_config import get_icp_config
+    from app.gtm_os.icp.revenue_estimation import estimate_company_revenue
+
+    icp_config = get_icp_config(db, tenant_id)
+    matches = (
+        db.query(ICPMatch)
+        .join(Company, ICPMatch.company_id == Company.id)
+        .filter(Company.batch_id == batch_id, ICPMatch.tenant_id == tenant_id)
+        .all()
+    )
+    checked_company_ids = {m.company_id for m in matches}
+
+    kept, dropped = [], []
+    for company_id in checked_company_ids:
+        company = db.get(Company, company_id)
+        if company is None:
+            continue
+        was_derived = company.estimated_revenue_lower_usd is None
+        if not was_derived:
+            continue  # already a real, reported figure -- nothing to re-check
+
+        estimate_company_revenue(db, tenant_id, company)
+        if company.estimated_revenue_lower_usd is None:
+            continue  # genuinely not_found -- leave the proxy-based match standing, unresolved
+
+        results = evaluate_icp_matches_for_company(company, icp_config)
+        if any(r["matched"] for r in results):
+            kept.append(company.name)
+            continue
+
+        dropped.append((company.name, company.estimated_revenue_lower_usd, company.estimated_revenue_higher_usd))
+        db.query(ICPMatch).filter(ICPMatch.company_id == company_id).delete()
+        db.query(Contact).filter(Contact.company_id == company_id).delete()
+        db.delete(company)
+        db.commit()
+
+    return {"checked": len(checked_company_ids), "kept": kept, "dropped": dropped}
 
 
 def get_icp_context_for_company(db: Session, tenant_id: int, company_id: int | None) -> dict:
