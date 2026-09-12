@@ -1,6 +1,9 @@
 """Jobo API client -- its own separate credit system from Deepline (X-Credits-Balance
 response header, no separate balance-check call needed), so this mirrors deepline_client.py's
 shape but is deliberately its own module, not a Deepline provider."""
+import threading
+import time
+
 import httpx
 from sqlalchemy.orm import Session
 
@@ -9,21 +12,71 @@ from app.db.models import Credential
 BASE_URL = "https://connect.jobo.world"
 USD_PER_CREDIT = 0.001
 
+# Process-wide minimum spacing between real calls to /api/jobs/search -- the endpoint both
+# find_company_id_by_name and search_jobs share, and Jobo rate-limits it (confirmed live
+# 2026-09-11: a real leadership call for Kiteworks, a company with 15 real leaders on file,
+# returned 0 candidates when made as the 5th+ call in a tight per-company loop with no delay,
+# then returned all 15 correctly when the SAME call was made in isolation seconds later).
+#
+# find_decision_makers() calls this once per company with no pacing of its own in
+# autonomous_orchestrator.py's two decision-maker loops (production, not just test scripts) --
+# a batch of even 5 companies was enough to trigger it. free_decision_maker.py's own 429
+# retry/backoff (2026-09-10) only helps AFTER a call already failed; it does not stop the burst
+# from happening in the first place, and a burst tight enough can exhaust several retries in a
+# row too. A proactive minimum interval at the one shared endpoint fixes every caller at once --
+# scripts, the daily engine, both -- rather than requiring each call site to remember to pace
+# itself.
+_last_jobs_search_call: list[float] = [0.0]
+_jobs_search_lock = threading.Lock()
+JOBS_SEARCH_MIN_INTERVAL_SECONDS = 2.0
+
+
+def _throttle_jobs_search() -> None:
+    with _jobs_search_lock:
+        elapsed = time.monotonic() - _last_jobs_search_call[0]
+        if elapsed < JOBS_SEARCH_MIN_INTERVAL_SECONDS:
+            time.sleep(JOBS_SEARCH_MIN_INTERVAL_SECONDS - elapsed)
+        _last_jobs_search_call[0] = time.monotonic()
+
 
 class JoboError(Exception):
     pass
 
 
+ELEPHANT_EDGE_TENANT_ID = 2
+
+
 def _get_api_key(db: Session, tenant_id: int) -> str:
+    """Same shared-key-with-fallback pattern as claude_client.py/gemini_client.py/
+    apify_client.py: a tenant with its own jobo_api_key uses it; otherwise falls back to
+    Elephant Edge's, since the underlying Jobo account is genuinely shared, not separable
+    per tenant.
+
+    Real, confirmed root cause of a wider bug (2026-09-11): no partner tenant has ever had its
+    own jobo_api_key, and this function had no fallback -- every partner decision-maker lookup
+    hit JoboError immediately and was silently swallowed by
+    free_decision_maker._jobo_leadership_candidates() into "0 candidates", indistinguishable
+    from a genuine miss. Confirmed live: Kiteworks (matched to Jeff Ballard, tenant 5) returned 0
+    candidates via the real code path, then 15 real ones (CEO, CRO, CMO, board) when queried with
+    Elephant Edge's own key instead -- Jobo had the data the entire time."""
     cred = (
         db.query(Credential)
         .filter(Credential.tenant_id == tenant_id)
         .filter(Credential.name == "jobo_api_key")
         .first()
     )
-    if not cred or not cred.value:
-        raise JoboError("jobo_api_key credential is not set")
-    return cred.value
+    if cred and cred.value:
+        return cred.value
+    if tenant_id != ELEPHANT_EDGE_TENANT_ID:
+        ee_cred = (
+            db.query(Credential)
+            .filter(Credential.tenant_id == ELEPHANT_EDGE_TENANT_ID)
+            .filter(Credential.name == "jobo_api_key")
+            .first()
+        )
+        if ee_cred and ee_cred.value:
+            return ee_cred.value
+    raise JoboError("jobo_api_key credential is not set")
 
 
 class JoboCreditGuard:
@@ -66,6 +119,7 @@ def search_jobs(client: httpx.Client, api_key: str, queries: list[str], page: in
         body["locations"] = locations
     if include_facets:
         body["include_facets"] = include_facets
+    _throttle_jobs_search()
     response = client.post(
         f"{BASE_URL}/api/jobs/search",
         headers={"X-Api-Key": api_key, "Content-Type": "application/json"},
@@ -92,6 +146,7 @@ def find_company_id_by_name(client: httpx.Client, api_key: str, company_name: st
     whose embedded company summary happens to match. Small, cheap, bounded (page_size=3);
     costs $0 if there's no matching posting (metering is per delivered job, not per request).
     Returns None on no match -- caller falls through to whatever's next in the chain."""
+    _throttle_jobs_search()
     response = client.post(
         f"{BASE_URL}/api/jobs/search",
         headers={"X-Api-Key": api_key, "Content-Type": "application/json"},
