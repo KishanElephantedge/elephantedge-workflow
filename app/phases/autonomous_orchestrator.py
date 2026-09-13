@@ -722,11 +722,35 @@ def _run_jd_first_autonomous_cycle(batch: Batch, run: AutonomousRun, db: Session
     cap = get_daily_company_cap(db, tenant_id)
     result = run_jd_first_discovery(batch.id, db, tenant_id, target=cap, jobs_per_page=min(cap, 10))
 
+    # Tenants on the GTM-OS ICP config (Elephant Edge) had NO gate here at all -- the comment above
+    # assumed icp_matching would catch misfits "downstream", but downstream was after this loop had
+    # already paid for decision-maker lookups on every company. Batch 127 (2026-09-13): 4 of 10
+    # companies were below every ICP's revenue floor, found only after contacts had been sourced for
+    # them. The gate looks up real revenue where only the headcount proxy existed, drops companies
+    # whose real revenue fits no ICP, and limits decision-maker work to ICP-matched companies.
+    icp_gate = None
+    decision_maker_company_ids = None
+    from app.gtm_os.orchestration.discovery_profiles import ELEPHANT_EDGE_TENANT_ID, _has_own_icp_config
+    # Only tenants whose ICPs really live in gtm_os_icp_config. get_icp_config() silently returns
+    # Elephant Edge's defaults for a tenant without its own, which would gate a partner on OUR ICPs.
+    uses_gtm_os_icp = tenant_id == ELEPHANT_EDGE_TENANT_ID or _has_own_icp_config(db, tenant_id)
+    if icp_enforcement is None and uses_gtm_os_icp:
+        from app.gtm_os.icp.icp_matching import gate_batch_before_decision_makers
+        icp_gate = gate_batch_before_decision_makers(db, tenant_id, batch.id)
+        decision_maker_company_ids = set(icp_gate["eligible_company_ids"])
+        logger.info(
+            "tenant %s ICP gate: %d eligible for decision makers, %d dropped on real revenue, %d unmatched kept for review",
+            tenant_id, len(decision_maker_company_ids), len(icp_gate["dropped_on_real_revenue"]),
+            len(icp_gate["unmatched_kept_for_review"]),
+        )
+
     found = 0  # total decision-makers found across all companies, not company count
     companies_with_contact = 0
     paid_fallback_used = 0
     companies = db.query(Company).filter(Company.batch_id == batch.id).all()
     for company in companies:
+        if decision_maker_company_ids is not None and company.id not in decision_maker_company_ids:
+            continue
         allow_paid = paid_fallback_used < PAID_DECISION_MAKER_FALLBACK_CAP
         contacts, used_paid = find_decision_makers(company, db, tenant_id, allow_paid_fallback=allow_paid)
         if used_paid:
@@ -739,6 +763,7 @@ def _run_jd_first_autonomous_cycle(batch: Batch, run: AutonomousRun, db: Session
 
     final_spend = None  # no guard tracking this run -- see docstring above
     decision_maker_result = {
+        "icp_gate": icp_gate,
         "companies_checked": result["companies_discovered"],
         "decision_makers_found": found,
         "companies_with_no_contact": result["companies_discovered"] - companies_with_contact,

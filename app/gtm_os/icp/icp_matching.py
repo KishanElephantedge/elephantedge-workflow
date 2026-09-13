@@ -578,3 +578,73 @@ def run_icp_matching_sweep(db: Session, tenant_id: int, limit: int = 200, dry_ru
             counts["failed"] += 1
 
     return counts
+
+
+def gate_batch_before_decision_makers(db: Session, tenant_id: int, batch_id: int, dry_run: bool = False) -> dict:
+    """Decides which of a freshly discovered batch's companies deserve decision-maker work at all.
+
+    Why: the job search can only filter on headcount, and revenue per employee varies too widely for
+    headcount to predict revenue. Batch 127 (Elephant Edge, 2026-09-13) had 4 of 10 surviving
+    companies below every ICP's revenue floor -- K logix and Pact-One (IT services, ~$21-76K per
+    employee) and Stuut and Pivotal Health (funded startups, under $12K per employee). None of that is
+    visible in anything discovery returns, and the engine searched decision makers for every
+    company, paid lookups included, before any ICP or revenue check ran. The operator then sourced
+    contacts by hand for companies that failed on revenue the moment a real figure arrived.
+
+    For each company: if it matches an ICP (or is blocked only by the revenue proxy) on estimated
+    revenue alone, look up real revenue first (~$0.0085, budget-gated) -- still far cheaper than one
+    decision-maker lookup. A company whose REAL revenue fits no ICP is dropped, same as
+    verify_and_reconfirm_matches. A company with no ICP match is kept in the batch for review but
+    gets no decision-maker work. When no real figure can be found (lookup budget exhausted, nothing
+    published) a proxy match still proceeds -- failing closed there would stop discovery entirely."""
+    from app.gtm_os.icp.icp_config import get_icp_config
+    from app.gtm_os.icp.revenue_estimation import estimate_company_revenue
+
+    icp_config = get_icp_config(db, tenant_id)
+    eligible_ids: list[int] = []
+    dropped: list[tuple[str, int | None, int | None]] = []
+    unmatched: list[str] = []
+    proxy_only: list[str] = []
+
+    for company in db.query(Company).filter(Company.batch_id == batch_id).all():
+        results = evaluate_icp_matches_for_company(company, icp_config)
+        revenue_blocked = any("revenue is a headcount proxy" in m for r in results for m in r["missing_information"])
+        needs_real_revenue = company.estimated_revenue_lower_usd is None and (revenue_blocked or any(r["matched"] for r in results))
+
+        if needs_real_revenue and not dry_run:
+            estimate_company_revenue(db, tenant_id, company)
+            if company.estimated_revenue_lower_usd is not None:
+                results = evaluate_icp_matches_for_company(company, icp_config)
+
+        matched = any(r["matched"] for r in results)
+        has_real_revenue = company.estimated_revenue_lower_usd is not None
+
+        # Dropped only when REVENUE is provably what disqualified it: the same company matches once the
+        # revenue rule is switched off. A company that also lacks a hiring signal (or is out of the
+        # employee band) is merely unmatched and stays in the batch for review.
+        revenue_ignored = [{**icp, "revenue_min_usd": None, "revenue_max_usd": None} for icp in icp_config]
+        fails_on_revenue = (not matched and has_real_revenue
+                            and any(r["matched"] for r in evaluate_icp_matches_for_company(company, revenue_ignored)))
+        if fails_on_revenue:
+            dropped.append((company.name, company.estimated_revenue_lower_usd, company.estimated_revenue_higher_usd))
+            if not dry_run:
+                db.query(ICPMatch).filter(ICPMatch.company_id == company.id).delete()
+                db.query(Contact).filter(Contact.company_id == company.id).delete()
+                db.delete(company)
+                db.commit()
+            continue
+
+        if matched:
+            eligible_ids.append(company.id)
+            if not has_real_revenue:
+                proxy_only.append(company.name)
+        else:
+            unmatched.append(company.name)
+
+    return {
+        "eligible_company_ids": eligible_ids,
+        "dropped_on_real_revenue": dropped,
+        "unmatched_kept_for_review": unmatched,
+        "matched_on_proxy_revenue_only": proxy_only,
+    }
+
