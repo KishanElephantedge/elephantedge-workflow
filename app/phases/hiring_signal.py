@@ -33,7 +33,13 @@ ROLE_KEYWORDS = {
         "outbound sales representative", "outbound sales development representative",
         "lead generation specialist", "lead generation representative",
     ],
-    "ae": ["account executive", " ae "],
+    # "sales executive"/"sales representative" added 2026-09-13: discovery_profiles.py's
+    # REP_LEVEL_TITLES searches (and Apify bills for) both, but nothing here recognised them -- so
+    # Johnson Technology Systems, hiring an "SAP Cloud Managed Services Sales Executive", came
+    # through with no hiring_signal_role and could never match an ICP. Same drift as the
+    # "forward deployed engineer" entry removed from "gtm" the same day. Checked after "sdr", so
+    # "outbound sales representative" still classifies as sdr.
+    "ae": ["account executive", " ae ", "sales executive", "sales representative"],
     "marketing": [
         "head of marketing", "marketing manager", "growth marketing", "performance marketing",
         "digital marketing manager", "field marketing manager", "regional marketing manager",
