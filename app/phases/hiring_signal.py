@@ -48,7 +48,9 @@ ROLE_KEYWORDS = {
     # downstream even though discovery was finding the right companies.
     "gtm": [
         "head of gtm", "gtm engineer", "gtm operations", "revops", "revenue operations",
-        "sales operations", "forward deployed engineer", "sales enablement", "sales systems",
+        # "forward deployed engineer" removed 2026-09-13 with discovery_profiles.py's list -- an
+        # engineering hire, not a GTM one. "gtm engineer" still matches "forward deployed gtm engineer".
+        "sales operations", "sales enablement", "sales systems",
     ],
 }
 

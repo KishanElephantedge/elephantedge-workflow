@@ -25,6 +25,7 @@ company, so that extra lookup isn't needed.
 """
 from sqlalchemy.orm import Session
 
+from app.phases.company_profile_check import fetch_public_company_profile, profile_rejection_reason
 from app.apify_budget_guard import STATUS_ALLOWED as APIFY_BUDGET_ALLOWED, check_apify_budget
 from app.apify_client import ApifyError, estimate_cost_usd, search_linkedin_jobs
 from app.apify_client import _get_api_key as _get_apify_api_key
@@ -293,6 +294,19 @@ def run_apify_discovery(
         product_fit_categories = _detect_product_fit_signals(description)
         if not role and not product_fit_categories:
             rejection_counts["no_local_classification_match"] = rejection_counts.get("no_local_classification_match", 0) + 1
+            continue
+
+        # Free check against the company's own public LinkedIn page, deliberately placed after every
+        # other free filter and before the first paid step (assess_team_composition below). Catches
+        # what the actor's fields cannot show: declared size far above the member count, a non-US
+        # country behind a bare city HQ, recruiting firms posting clients' jobs, and subsidiaries.
+        # See company_profile_check.py for the batch-127 cases each rule came from.
+        profile = fetch_public_company_profile(job.get("organization_url"))
+        if profile is None:
+            rejection_counts["profile_unverified_kept"] = rejection_counts.get("profile_unverified_kept", 0) + 1
+        profile_reason = profile_rejection_reason(profile, effective_emp_min, effective_emp_max)
+        if profile_reason:
+            rejection_counts[profile_reason] = rejection_counts.get(profile_reason, 0) + 1
             continue
 
         company = Company(

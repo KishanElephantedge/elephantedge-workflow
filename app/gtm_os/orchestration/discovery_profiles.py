@@ -170,8 +170,11 @@ def apply_icp_headcount_bands(db: Session, tenant_id: int, profiles: list[dict])
 # ICP it feeds, which raises precision and lowers cost at the same time.
 ROLE_TITLES: dict[str, list[str]] = {
     "gtm": [
+        # "Forward Deployed Engineer" removed 2026-09-13: it found Render and Magical, both hiring
+        # customer-facing ENGINEERS -- not a sales/GTM signal. GTM-flavoured versions still match:
+        # "GTM Engineer" is contained in "Forward Deployed GTM Engineer" (Attio's posting).
         "GTM Engineer", "Head of GTM", "RevOps", "Revenue Operations", "Sales Operations",
-        "Forward Deployed Engineer", "Sales Enablement", "Sales Systems",
+        "Sales Enablement", "Sales Systems",
     ],
     "head_of_sales": [
         "Head of Sales", "VP Sales", "VP of Sales", "Director of Sales", "Sales Director",
