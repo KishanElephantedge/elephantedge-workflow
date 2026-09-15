@@ -342,6 +342,32 @@ def get_batch(batch_id: int, page: int = 1, page_size: int = 50, fresh: bool = F
 # hand-vetted, so Phase 2 (Discovery) and Phase 3 (Qualification) don't apply. Companies
 # are seeded straight in, ready for Phase 6 (Decision Maker) to run against them.
 
+class CompanyRevenueUpdate(BaseModel):
+    estimated_revenue_lower_usd: int
+    estimated_revenue_higher_usd: int
+
+
+@router.post("/companies/{company_id}/revenue")
+def set_company_real_revenue(company_id: int, payload: CompanyRevenueUpdate, db: Session = Depends(get_db)):
+    """Records a real, human-sourced revenue figure (e.g. from Sales Navigator) -- the same
+    real-over-proxy discipline verify_and_reconfirm_matches()/gate_batch_before_decision_makers()
+    apply automatically, exposed here for the case a human found the real number manually
+    (previously only ever done via a one-off scratch script writing the DB column directly)."""
+    company = (
+        db.query(Company)
+        .join(Batch)
+        .filter(Company.id == company_id)
+        .filter(Batch.tenant_id == ELEPHANT_EDGE_TENANT_ID)
+        .first()
+    )
+    if not company:
+        raise HTTPException(status_code=404, detail="Company not found")
+    company.estimated_revenue_lower_usd = payload.estimated_revenue_lower_usd
+    company.estimated_revenue_higher_usd = payload.estimated_revenue_higher_usd
+    db.commit()
+    return {"id": company.id, "estimated_revenue_lower_usd": company.estimated_revenue_lower_usd, "estimated_revenue_higher_usd": company.estimated_revenue_higher_usd}
+
+
 class CompanyImport(BaseModel):
     name: str
     domain: str
