@@ -97,7 +97,7 @@ from datetime import datetime
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from app.budget_guard import BudgetExceededError, BudgetGuard
+from app.budget_guard import BudgetExceededError, check_daily_deepline_budget
 from app.db.models import Company
 from app.deepline_client import DeeplineError, execute_tool, extract_rows
 from app.gtm_os.intelligence.signal import GtmSignal
@@ -171,8 +171,7 @@ def _try_paid_enrichment(db: Session, tenant_id: int, company_name_raw: str) -> 
     from app.phases.jd_first_discovery import _real_firmographics
 
     try:
-        guard = BudgetGuard(budget_usd=1.0)  # small, bounded ceiling for this one resolution attempt
-        guard.check()
+        check_daily_deepline_budget(db, tenant_id, budget_usd=1.0)
     except BudgetExceededError as e:
         return {"status": "unresolved", "method": None, "reason": f"budget_guard_blocked: {e}"}
     except Exception as e:  # noqa: BLE001 -- Deepline CLI/balance-check itself failing must never crash resolution
@@ -373,8 +372,7 @@ def _try_profile_enrichment(db: Session, tenant_id: int, profile_url: str, signa
     _try_paid_enrichment: a provider failure never raises, it just falls through to
     "unresolved" so one signal's failure can never crash a sweep."""
     try:
-        guard = BudgetGuard(budget_usd=1.0)  # same small, bounded ceiling as the existing paid tier
-        guard.check()
+        check_daily_deepline_budget(db, tenant_id, budget_usd=1.0)
     except BudgetExceededError as e:
         return {"status": "unresolved", "method": None, "reason": f"budget_guard_blocked: {e}"}
     except Exception as e:  # noqa: BLE001 -- Deepline CLI/balance-check itself failing must never crash resolution
