@@ -33,7 +33,7 @@ from app.phases.discovery import run_discovery
 from app.phases.jd_first_discovery import run_jd_first_discovery
 from app.phases.jobo_discovery import run_jobo_discovery
 from app.phases.apify_discovery import run_apify_discovery
-from app.apify_client import ApifyError, get_monthly_usage
+from app.apify_client import ApifyError, get_actor_run_costs, get_monthly_usage
 from app.apify_client import _get_api_key as _get_apify_api_key
 from app.apify_budget_guard import _monthly_spend_usd as _apify_monthly_spend_usd
 from app.apify_budget_guard import _today_spend_usd as _apify_today_spend_usd
@@ -3416,6 +3416,19 @@ def apify_usage(db: Session = Depends(get_db)):
         "today_by_service": today_by_service,
         "usage_cycle": usage.get("usageCycle"),
     }
+
+
+@router.get("/apify/usage/by-actor")
+def apify_usage_by_actor(since: str, db: Session = Depends(get_db)):
+    """Real per-actor cost, e.g. `?since=2026-09-15` -- get_monthly_usage() only splits spend
+    by billing model (PAID_ACTORS_PER_EVENT etc.), never by which actor ran, so a real "why did
+    today's run cost this much" question otherwise needs a one-off script with the raw key
+    pasted in by hand (done that way at least twice this session already)."""
+    try:
+        api_key = _get_apify_api_key(db, ELEPHANT_EDGE_TENANT_ID)
+        return {"ok": True, "since": since, "by_actor": get_actor_run_costs(api_key, since)}
+    except ApifyError as e:
+        return {"ok": False, "error": str(e)}
 
 
 @router.get("/linkedin-monitor/profiles")

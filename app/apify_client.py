@@ -300,3 +300,46 @@ def get_monthly_usage(api_key: str) -> dict:
     if response.status_code >= 300:
         raise ApifyError(f"Apify monthly usage fetch failed ({response.status_code}): {response.text[:500]}")
     return response.json().get("data", {})
+
+
+def get_actor_run_costs(api_key: str, since: str) -> list[dict]:
+    """Real per-actor cost breakdown, since get_monthly_usage() only splits by BILLING MODEL
+    (PAID_ACTORS_PER_EVENT, storage, etc.), not by which actor actually ran -- confirmed no
+    other Apify endpoint gives this directly, so this reconstructs it from actor-run history.
+
+    `since` is an ISO date string (e.g. "2026-09-15"); returns every run whose startedAt is on
+    or after that date. Groups by actor id, resolving each id's real name (memo23/linkedin-
+    people-search, fantastic-jobs/advanced-linkedin-job-search-api, apify/google-search-scraper,
+    etc.) via a second real call per distinct actor -- there is no batch actor-lookup endpoint.
+    2026-09-15, built to answer a real question ("why did today's run cost this much") that
+    otherwise needed a one-off script with the raw key pasted in by hand each time."""
+    runs, offset = [], 0
+    while True:
+        response = _get(
+            f"{BASE_URL}/actor-runs",
+            params={"token": api_key, "limit": 1000, "offset": offset, "desc": 1},
+            timeout=30,
+        )
+        if response.status_code >= 300:
+            raise ApifyError(f"Apify actor-runs fetch failed ({response.status_code}): {response.text[:500]}")
+        page = response.json().get("data", {}).get("items", [])
+        runs.extend(page)
+        if len(page) < 1000 or (page and page[-1].get("startedAt", "") < since):
+            break
+        offset += 1000
+
+    since_runs = [r for r in runs if (r.get("startedAt") or "") >= since]
+    actor_names: dict[str, str] = {}
+    totals: dict[str, dict] = {}
+    for run in since_runs:
+        actor_id = run.get("actId")
+        if actor_id not in actor_names:
+            actor_response = _get(f"{BASE_URL}/acts/{actor_id}", params={"token": api_key}, timeout=20)
+            actor_data = actor_response.json().get("data", {}) if actor_response.status_code < 300 else {}
+            actor_names[actor_id] = f"{actor_data.get('username', '?')}/{actor_data.get('name', actor_id)}"
+        name = actor_names[actor_id]
+        entry = totals.setdefault(name, {"actor": name, "runs": 0, "cost_usd": 0.0})
+        entry["runs"] += 1
+        entry["cost_usd"] += run.get("usageTotalUsd") or 0
+
+    return sorted(totals.values(), key=lambda e: -e["cost_usd"])
