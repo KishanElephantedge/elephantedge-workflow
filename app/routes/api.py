@@ -33,7 +33,10 @@ from app.phases.discovery import run_discovery
 from app.phases.jd_first_discovery import run_jd_first_discovery
 from app.phases.jobo_discovery import run_jobo_discovery
 from app.phases.apify_discovery import run_apify_discovery
-from app.apify_client import ApifyError
+from app.apify_client import ApifyError, get_monthly_usage
+from app.apify_client import _get_api_key as _get_apify_api_key
+from app.apify_budget_guard import _monthly_spend_usd as _apify_monthly_spend_usd
+from app.apify_budget_guard import _today_spend_usd as _apify_today_spend_usd
 from app.jobo_client import JoboError
 from app.phases.hubspot_sync import sync_to_hubspot
 from app.phases.calendar_sync import sync_calendar_bookings
@@ -3357,6 +3360,27 @@ def deepline_balance():
         return {"ok": True, "rough_usd_balance": get_credit_balance_usd()}
     except DeeplineError as e:
         return {"ok": False, "error": str(e)}
+
+
+@router.get("/apify/usage")
+def apify_usage(db: Session = Depends(get_db)):
+    """The Apify-side counterpart to /deepline/balance -- previously nothing exposed real
+    Apify spend anywhere in this app, so answering "how much did discovery actually cost" meant
+    a one-off script reading the key by hand each time (2026-09-15). Apify itself has no live
+    balance endpoint (see apify_budget_guard.py's own docstring) -- this is the same
+    GET /v2/users/me/usage/monthly figure that check_apify_budget() already relies on, just
+    surfaced read-only rather than only used internally to gate a call."""
+    try:
+        api_key = _get_apify_api_key(db, ELEPHANT_EDGE_TENANT_ID)
+        usage = get_monthly_usage(api_key)
+    except ApifyError as e:
+        return {"ok": False, "error": str(e)}
+    return {
+        "ok": True,
+        "today_spend_usd": _apify_today_spend_usd(usage),
+        "month_to_date_spend_usd": _apify_monthly_spend_usd(usage),
+        "usage_cycle": usage.get("usageCycle"),
+    }
 
 
 @router.get("/linkedin-monitor/profiles")
