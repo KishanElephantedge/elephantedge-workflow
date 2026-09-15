@@ -3376,6 +3376,25 @@ def manual_resume_check(db: Session = Depends(get_db)):
     return resume_pending_approvals(db, ELEPHANT_EDGE_TENANT_ID)
 
 
+@router.post("/smtp/test-send")
+def smtp_test_send(db: Session = Depends(get_db)):
+    """Real end-to-end verification that smtp_email/smtp_app_password actually work, not just
+    that they're stored -- sends one real email to the configured mailbox itself (never a real
+    prospect), so a wrong app password surfaces immediately instead of on the first real send."""
+    from app.gtm_os.send.channels import _get_smtp_credential
+    from app.smtp_client import SmtpError, send_email
+
+    sender_email = _get_smtp_credential(db, ELEPHANT_EDGE_TENANT_ID, "smtp_email")
+    app_password = _get_smtp_credential(db, ELEPHANT_EDGE_TENANT_ID, "smtp_app_password")
+    if not sender_email or not app_password:
+        return {"ok": False, "error": "smtp_email/smtp_app_password not both configured"}
+    try:
+        send_email(sender_email, app_password, sender_email, "SMTP test", "This confirms SMTP sending is configured correctly.")
+    except SmtpError as e:
+        return {"ok": False, "error": str(e)}
+    return {"ok": True, "sent_to": sender_email}
+
+
 @router.get("/deepline/balance")
 def deepline_balance():
     """Free (no billed call) sanity check for the exact mechanism BudgetGuard depends on --
