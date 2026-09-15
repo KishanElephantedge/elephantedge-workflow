@@ -26,7 +26,8 @@ from app.phases.autonomous_orchestrator import PAID_DECISION_MAKER_FALLBACK_CAP,
 from app.phases.buying_signal import run_buying_signal_check
 from app.phases.campaign_execution import run_campaign_execution
 from app.phases.decision_maker import find_decision_makers, run_decision_maker_id
-from app.gtm_os.icp.icp_matching import gate_batch_before_decision_makers
+from app.gtm_os.icp.icp_matching import gate_batch_before_decision_makers, run_icp_matching_sweep
+from app.gtm_os.icp.offering_tiebreak import break_offering_tie
 from app.phases.discovery import run_discovery
 from app.phases.jd_first_discovery import run_jd_first_discovery
 from app.phases.jobo_discovery import run_jobo_discovery
@@ -543,6 +544,48 @@ def execute_apify_discovery_and_qualify(batch_id: int, target: int = 25, db: Ses
         "decision_makers_found": found,
         "new_company_ids": sorted(before_ids ^ {c.id for c in db.query(Company.id).filter(Company.batch_id == batch_id)}),
     }
+
+
+@router.post("/batches/{batch_id}/phases/icp-and-offering-match")
+def execute_icp_and_offering_match(batch_id: int, db: Session = Depends(get_db)):
+    """Real ICP matching (persisted, via run_icp_matching_sweep) plus per-company offering
+    resolution (break_offering_tie, sets Company.resolved_offering_name) for every company in
+    this batch -- the step between "decision makers found" and "ready to push," previously a
+    one-off scratch script run by hand for batch 127 (2026-09-13). Never pushes anything;
+    that's still a separate, explicit step.
+
+    run_icp_matching_sweep is tenant-wide (not batch-scoped) but only re-evaluates companies
+    genuinely due for a check (see its own docstring's incremental-progress fix), so scoping the
+    limit to this batch's own company count is enough to cover it without re-touching unrelated
+    companies elsewhere in the tenant."""
+    batch = (
+        db.query(Batch)
+        .filter(Batch.id == batch_id)
+        .filter(Batch.tenant_id == ELEPHANT_EDGE_TENANT_ID)
+        .first()
+    )
+    if not batch:
+        raise HTTPException(status_code=404, detail="Batch not found")
+
+    company_ids = [c.id for c in db.query(Company.id).filter(Company.batch_id == batch_id)]
+    icp_result = run_icp_matching_sweep(db, ELEPHANT_EDGE_TENANT_ID, limit=max(len(company_ids), 1))
+
+    offerings = {}
+    for company_id in company_ids:
+        try:
+            result = break_offering_tie(db, ELEPHANT_EDGE_TENANT_ID, company_id)
+        except Exception as e:  # noqa: BLE001 -- one company's failure must never block the rest
+            db.rollback()
+            offerings[company_id] = {"error": str(e)}
+            continue
+        company = db.get(Company, company_id)
+        offerings[company_id] = {
+            "name": company.name if company else None,
+            "resolved_offering_name": company.resolved_offering_name if company else None,
+            "tiebreak": result.get("tiebreak"),
+        }
+
+    return {"icp_matching": icp_result, "offerings": offerings}
 
 
 # ---- Jobo Discovery -- fully independent pipeline, own credit system, own gates ----
