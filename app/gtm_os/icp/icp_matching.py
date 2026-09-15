@@ -554,6 +554,18 @@ def run_icp_matching_sweep(db: Session, tenant_id: int, limit: int = 200, dry_ru
                     continue
                 if not result["matched"]:
                     counts["no_match"] += 1
+                    # Real bug found live (2026-09-15, Orchard): a company that matched once
+                    # (e.g. on a headcount-derived revenue proxy) then got corrected data (a real
+                    # revenue figure) that disqualifies it kept its stale ICPMatch row forever --
+                    # this loop only ever recorded a NEW match, never retracted an old one that
+                    # no longer holds. match_offerings_for_company() reads ICPMatch rows directly,
+                    # so a stale row let a disqualified company still get a real offering
+                    # resolved and pushed. Retract it the moment re-evaluation says no_match.
+                    if not dry_run:
+                        existing = _existing_match(db, tenant_id, company_id, result["icp_id"])
+                        if existing is not None:
+                            db.delete(existing)
+                            db.commit()
                     continue
 
                 existed_before = _existing_match(db, tenant_id, company_id, result["icp_id"]) is not None
