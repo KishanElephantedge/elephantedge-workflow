@@ -26,7 +26,8 @@ from app.phases.autonomous_orchestrator import PAID_DECISION_MAKER_FALLBACK_CAP,
 from app.phases.buying_signal import run_buying_signal_check
 from app.phases.campaign_execution import run_campaign_execution
 from app.phases.decision_maker import find_decision_makers, run_decision_maker_id
-from app.gtm_os.icp.icp_matching import gate_batch_before_decision_makers, run_icp_matching_sweep
+from app.gtm_os.icp.icp_config import get_icp_config
+from app.gtm_os.icp.icp_matching import evaluate_icp_matches_for_company, gate_batch_before_decision_makers, run_icp_matching_sweep
 from app.gtm_os.icp.offering_tiebreak import break_offering_tie
 from app.phases.discovery import run_discovery
 from app.phases.jd_first_discovery import run_jd_first_discovery
@@ -570,6 +571,29 @@ def execute_icp_and_offering_match(batch_id: int, db: Session = Depends(get_db))
     company_ids = [c.id for c in db.query(Company.id).filter(Company.batch_id == batch_id)]
     icp_result = run_icp_matching_sweep(db, ELEPHANT_EDGE_TENANT_ID, limit=max(len(company_ids), 1))
 
+    # run_icp_matching_sweep only returns aggregate counts (see its own docstring) -- re-running
+    # the same read-only evaluation here just to surface WHY each company matched or didn't,
+    # since "no_match" alone left every past no-match a real reverse-engineering exercise
+    # (2026-09-15, batch 128: had to manually cross-check employee_count/hiring_signal_role/
+    # sales_team_size against icp_config by hand for 6 companies to explain a single run).
+    icp_config = get_icp_config(db, ELEPHANT_EDGE_TENANT_ID)
+    icp_reasons = {}
+    for company_id in company_ids:
+        company = db.get(Company, company_id)
+        if company is None:
+            continue
+        results = evaluate_icp_matches_for_company(company, icp_config)
+        icp_reasons[company_id] = {
+            "name": company.name,
+            "per_icp": [
+                {
+                    "icp_id": r["icp_id"], "icp_name": r["icp_name"], "matched": r["matched"],
+                    "reasons": r["reasons"], "missing_information": r["missing_information"],
+                }
+                for r in results
+            ],
+        }
+
     offerings = {}
     for company_id in company_ids:
         try:
@@ -585,7 +609,7 @@ def execute_icp_and_offering_match(batch_id: int, db: Session = Depends(get_db))
             "tiebreak": result.get("tiebreak"),
         }
 
-    return {"icp_matching": icp_result, "offerings": offerings}
+    return {"icp_matching": icp_result, "icp_reasons": icp_reasons, "offerings": offerings}
 
 
 # ---- Jobo Discovery -- fully independent pipeline, own credit system, own gates ----
