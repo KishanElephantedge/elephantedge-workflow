@@ -160,6 +160,20 @@ def _jobo_leadership_candidates(db: Session, tenant_id: int, company: Company) -
     return []
 
 
+def _real_linkedin_url_from_jobo(person: dict) -> str | None:
+    """Jobo's own leadership.linkedin_url field, when it's genuinely a LinkedIn URL.
+
+    Confirmed real (PLATFORM_AND_JOBO_CONTEXT.md, from Jobo's own live data): this field is
+    populated mostly from Crunchbase, not LinkedIn -- ~93% of non-null values are
+    crunchbase.com/person/... links, not linkedin.com/in/.... Only ~91 of 1,694 companies
+    with any leadership data (~5%) have a genuine one. Still worth checking first: it's free,
+    whereas every person this DOES catch is one fewer ~$0.009 Apify people-search call
+    (2026-09-15, explicit instruction to stop paying to re-resolve what Jobo already gave us
+    for free wherever that's genuinely possible)."""
+    url = person.get("linkedin_url") or ""
+    return url if "linkedin.com/in/" in url.lower() else None
+
+
 def _resolve_linkedin_url(db: Session, tenant_id: int, first_name: str, last_name: str, company_name: str) -> str | None:
     try:
         api_key = _get_apify_api_key(db, tenant_id)
@@ -367,7 +381,10 @@ def find_free_decision_makers(db: Session, tenant_id: int, company: Company, max
         key = _dedup_key(first_name, last_name)
         if key in seen:
             continue
-        linkedin_url = _resolve_linkedin_url(db, tenant_id, first_name, last_name, company.name)
+        linkedin_url = _real_linkedin_url_from_jobo(person)
+        via_jobo = linkedin_url is not None
+        if not linkedin_url:
+            linkedin_url = _resolve_linkedin_url(db, tenant_id, first_name, last_name, company.name)
         if not linkedin_url:
             continue
         seen.add(key)
@@ -377,7 +394,11 @@ def find_free_decision_makers(db: Session, tenant_id: int, company: Company, max
             "title": title,
             "linkedin_url": linkedin_url,
             "thread_role": selection["thread_role"],
-            "reasoning": f"Jobo leadership match (title={title!r}), LinkedIn resolved+verified via Apify people-search. {selection['reasoning']}",
+            "reasoning": (
+                f"Jobo leadership match (title={title!r}), LinkedIn URL from Jobo's own data (free). {selection['reasoning']}"
+                if via_jobo else
+                f"Jobo leadership match (title={title!r}), LinkedIn resolved+verified via Apify people-search. {selection['reasoning']}"
+            ),
         })
 
     if len(found) < max_contacts:
