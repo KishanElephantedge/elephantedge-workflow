@@ -3395,6 +3395,25 @@ def smtp_test_send(db: Session = Depends(get_db)):
     return {"ok": True, "sent_to": sender_email}
 
 
+@router.get("/smtp/network-diagnostic")
+def smtp_network_diagnostic():
+    """One-off: is Render blocking outbound SMTP ports entirely, or is this a DNS/routing issue
+    specific to port 587? Tries a raw TCP connect (no SMTP protocol, no credentials) to Gmail's
+    SMTP ports plus one unrelated, definitely-open port (443) as a control -- if 443 opens but
+    every SMTP port times out, that's real evidence of a port-level block, not a general
+    network problem."""
+    import socket
+    results = {}
+    for port in (587, 465, 25, 443):
+        try:
+            addr_info = socket.getaddrinfo("smtp.gmail.com" if port != 443 else "www.google.com", port, socket.AF_INET, socket.SOCK_STREAM)
+            with socket.create_connection(addr_info[0][4], timeout=8):
+                results[port] = "open"
+        except Exception as e:
+            results[port] = f"{type(e).__name__}: {e}"
+    return results
+
+
 @router.get("/deepline/balance")
 def deepline_balance():
     """Free (no billed call) sanity check for the exact mechanism BudgetGuard depends on --
