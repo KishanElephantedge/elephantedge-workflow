@@ -22,10 +22,11 @@ from app.heyreach_client import HeyReachError
 from app.hubspot_client import HubSpotError
 from app.outreach.selector import get_outreach_channel
 from app.gtm_os.send.auto_approval import approve_and_send
-from app.phases.autonomous_orchestrator import cancel_run, get_autonomous_discovery_source, get_autonomous_message_style, get_autonomous_schedule_utc, get_daily_budget_usd, get_daily_company_cap, is_autonomous_enabled, recover_run_to_awaiting_approval, resend_approval_notification, resume_pending_approvals, run_daily_autonomous_cycle
+from app.phases.autonomous_orchestrator import PAID_DECISION_MAKER_FALLBACK_CAP, _run_apify_discovery_across_offerings, cancel_run, get_autonomous_discovery_source, get_autonomous_message_style, get_autonomous_schedule_utc, get_daily_budget_usd, get_daily_company_cap, is_autonomous_enabled, recover_run_to_awaiting_approval, resend_approval_notification, resume_pending_approvals, run_daily_autonomous_cycle
 from app.phases.buying_signal import run_buying_signal_check
 from app.phases.campaign_execution import run_campaign_execution
-from app.phases.decision_maker import run_decision_maker_id
+from app.phases.decision_maker import find_decision_makers, run_decision_maker_id
+from app.gtm_os.icp.icp_matching import gate_batch_before_decision_makers
 from app.phases.discovery import run_discovery
 from app.phases.jd_first_discovery import run_jd_first_discovery
 from app.phases.jobo_discovery import run_jobo_discovery
@@ -478,6 +479,70 @@ def execute_apify_discovery(batch_id: int, target: int = 5, db: Session = Depend
     db.commit()
     bump_batch_version(batch_id)
     return result
+
+
+@router.post("/batches/{batch_id}/phases/discovery-apify-and-qualify")
+def execute_apify_discovery_and_qualify(batch_id: int, target: int = 25, db: Session = Depends(get_db)):
+    """A manual-run version of the exact process used for batch 127 (2026-09-13): discover
+    across every offering profile -> gate on ICP + real revenue -> decision makers for eligible
+    companies only -> STOP, no messages generated, nothing pushed. Wraps what was previously a
+    one-off scratch script (discover_more_ee.py) as a real, reusable endpoint, since this same
+    manual review-before-push flow is the standing process, not a one-time fix.
+
+    Deliberately NOT the full autonomous cycle: that path (see resume_pending_approvals) also
+    generates a personalized message per contact and can auto-push after its own approval
+    window, which the operator has explicitly asked to review manually before any push."""
+    batch = (
+        db.query(Batch)
+        .filter(Batch.id == batch_id)
+        .filter(Batch.tenant_id == ELEPHANT_EDGE_TENANT_ID)
+        .first()
+    )
+    if not batch:
+        raise HTTPException(status_code=404, detail="Batch not found")
+    _require_batch_source(batch, "deepline")
+
+    before_ids = {c.id for c in db.query(Company.id).filter(Company.batch_id == batch_id)}
+
+    try:
+        discovery_result = _run_apify_discovery_across_offerings(batch, db, ELEPHANT_EDGE_TENANT_ID, target)
+    except ApifyError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    if discovery_result.get("api_error") and discovery_result["companies_discovered"] == 0:
+        raise HTTPException(status_code=502, detail=discovery_result["api_error"])
+
+    gate_result = gate_batch_before_decision_makers(db, ELEPHANT_EDGE_TENANT_ID, batch_id)
+    new_eligible_ids = [cid for cid in gate_result["eligible_company_ids"] if cid not in before_ids]
+
+    found = 0
+    paid_fallback_used = 0
+    for company_id in new_eligible_ids:
+        company = db.get(Company, company_id)
+        if company is None:
+            continue
+        allow_paid = paid_fallback_used < PAID_DECISION_MAKER_FALLBACK_CAP
+        contacts, used_paid = find_decision_makers(company, db, ELEPHANT_EDGE_TENANT_ID, allow_paid_fallback=allow_paid)
+        if used_paid:
+            paid_fallback_used += 1
+        company.decision_maker_searched_at = datetime.utcnow()
+        db.commit()
+        found += len(contacts)
+
+    batch.current_phase = "awaiting_review"
+    db.commit()
+    bump_batch_version(batch_id)
+
+    return {
+        "discovery": discovery_result,
+        "icp_gate": {
+            "eligible_for_decision_makers": len(new_eligible_ids),
+            "dropped_on_real_revenue": gate_result["dropped_on_real_revenue"],
+            "unmatched_kept_for_review": gate_result["unmatched_kept_for_review"],
+            "matched_on_proxy_revenue_only": gate_result["matched_on_proxy_revenue_only"],
+        },
+        "decision_makers_found": found,
+        "new_company_ids": sorted(before_ids ^ {c.id for c in db.query(Company.id).filter(Company.batch_id == batch_id)}),
+    }
 
 
 # ---- Jobo Discovery -- fully independent pipeline, own credit system, own gates ----
