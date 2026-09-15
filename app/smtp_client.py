@@ -13,12 +13,35 @@ Gmail's real SMTP endpoint (smtp.gmail.com:587, STARTTLS) is hardcoded since the
 is a fixed, known Gmail address, not a configurable provider -- if a non-Gmail mailbox is ever
 used instead, this would need a real host/port to be added to the credential set at that point,
 not guessed now."""
+import socket
 import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
 SMTP_HOST = "smtp.gmail.com"
 SMTP_PORT = 587
+
+
+class _Ipv4OnlySMTP(smtplib.SMTP):
+    """Forces the IPv4 address family for the connection.
+
+    Found live (2026-09-15, first real send attempt): plain smtplib.SMTP(SMTP_HOST, SMTP_PORT)
+    failed with "[Errno 101] Network is unreachable" on Render -- the container's DNS resolver
+    returns an IPv6 (AAAA) address for smtp.gmail.com as its first/only usable result, but
+    Render's network has no outbound IPv6 route, so the connection attempt fails before ever
+    reaching Gmail. socket.create_connection() (what the base class uses) does not let a caller
+    pin the address family, only the source_address -- so this overrides _get_socket() to
+    resolve via getaddrinfo(..., socket.AF_INET) explicitly, the standard fix for this exact
+    class of container-networking bug."""
+
+    def _get_socket(self, host, port, timeout):
+        # Same shape as the real smtplib.SMTP._get_socket (confirmed via inspect.getsource),
+        # just resolving via AF_INET explicitly instead of letting create_connection() pick
+        # whatever getaddrinfo() returns first.
+        if timeout is not None and not timeout:
+            raise ValueError("Non-blocking socket (timeout=0) is not supported")
+        addr_info = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM)
+        return socket.create_connection(addr_info[0][4], timeout, self.source_address)
 
 
 class SmtpError(Exception):
@@ -36,7 +59,7 @@ def send_email(sender_email: str, app_password: str, to_email: str, subject: str
     message.attach(MIMEText(body, "plain"))
 
     try:
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as server:
+        with _Ipv4OnlySMTP(SMTP_HOST, SMTP_PORT, timeout=30) as server:
             server.starttls()
             server.login(sender_email, app_password)
             server.sendmail(sender_email, [to_email], message.as_string())
