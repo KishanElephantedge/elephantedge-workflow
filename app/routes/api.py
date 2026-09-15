@@ -3401,10 +3401,19 @@ def apify_usage(db: Session = Depends(get_db)):
         usage = get_monthly_usage(api_key)
     except ApifyError as e:
         return {"ok": False, "error": str(e)}
+    from datetime import datetime, timezone
+    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    today_by_service = {}
+    for entry in usage.get("dailyServiceUsages") or []:
+        if (entry.get("date") or "").startswith(today_str):
+            today_by_service = entry.get("serviceUsage") or {}
+            break
+
     return {
         "ok": True,
         "today_spend_usd": _apify_today_spend_usd(usage),
         "month_to_date_spend_usd": _apify_monthly_spend_usd(usage),
+        "today_by_service": today_by_service,
         "usage_cycle": usage.get("usageCycle"),
     }
 
