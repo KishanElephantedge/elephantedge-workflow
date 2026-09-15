@@ -27,6 +27,16 @@ in `gateway/app/main.py` looks up `Tenant.backend_url` from the `tenants` table 
 system at a different backend, update that one DB row — no gateway code or env var change
 needed.**
 
+**`backend_url` MUST include the trailing `/api`** (e.g.
+`https://elephantedge-workflow-1-7k9d.onrender.com/api`, not the bare origin) — the proxy
+builds the outgoing URL as `f"{backend_url.rstrip('/')}/{path}"`, where `path` is everything
+after the tenant slug and does NOT itself contain `/api`; the backend mounts every route under
+that prefix (`app.include_router(api.router, prefix="/api")` in this repo's `app/main.py`).
+Set it to the bare origin during the 2026-09-15 rotation by mistake — every page failed with
+"Not Found" (a real 404 from the backend genuinely not having a route at the un-prefixed
+path), not a connectivity problem, even though `/api/health` and a manually `/api`-prefixed
+curl both worked fine and looked like proof the backend itself was healthy.
+
 ## Services (as of 2026-09-15 — Account 3 active; see "Three-account rotation" below)
 
 | Service | Repo | Render URL | Purpose |
