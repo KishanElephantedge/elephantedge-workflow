@@ -11,12 +11,13 @@ silently fails every ICP's revenue check in icp_matching.py -- confirmed live: R
 Technologies matched icp_3's exact hiring trigger perfectly and still failed to match, purely
 because revenue was null.
 
-FALLBACK CHAIN, cheapest/least-committal first (explicit instruction):
-  1. Google AI Overview search (Apify-backed, already-existing search_google_ai_overview) --
-     cheap (~$0.0085/query), budget-gated via the real Apify guard.
-  2. Deepline's free, exact-domain Crustdata identify call (crustdata_v3_company_identify --
+FALLBACK CHAIN, cheapest/least-committal first (explicit instruction; ORDER FIXED 2026-09-15 --
+see estimate_company_revenue()'s own comment for why steps 1/2 below were previously swapped):
+  1. Deepline's free, exact-domain Crustdata identify call (crustdata_v3_company_identify --
      the SAME free lookup app/phases/jd_first_discovery.py's _real_firmographics() already uses
      for firmographics, reused here, not re-implemented) -- only when a real domain is known.
+  2. Google AI Overview search (Apify-backed, already-existing search_google_ai_overview) --
+     cheap (~$0.0085/query), budget-gated via the real Apify guard.
   3. If neither finds a real number: reports "not_found" honestly. Whether to then fall back to
      headcount as an ICP-matching proxy is a real ICP-configuration policy decision (what
      headcount range should count as which revenue band) that this module does NOT make --
@@ -229,18 +230,13 @@ def estimate_company_revenue(db: Session, tenant_id: int, company: Company) -> d
 
     attempts = []
 
-    google_result = _estimate_via_google(db, tenant_id, company)
-    if google_result.get("status") == "found":
-        why = _implausible_for_headcount(google_result.get("lower_usd"), google_result.get("higher_usd"), company.employee_count)
-        if why:
-            google_result = {"status": "rejected_implausible", "reason": why, "quote": google_result.get("quote")}
-    attempts.append({"source": "google_ai_overview", **google_result})
-    if google_result["status"] == "found":
-        company.estimated_revenue_lower_usd = google_result["lower_usd"]
-        company.estimated_revenue_higher_usd = google_result["higher_usd"]
-        db.commit()
-        return {"status": "resolved", "source": "google_ai_overview", "lower_usd": google_result["lower_usd"], "higher_usd": google_result["higher_usd"], "attempts": attempts}
-
+    # ORDER FIXED 2026-09-15 (explicit instruction, now that Deepline is back on): this used to
+    # try Google (paid, ~$0.0085/query via Apify) BEFORE Deepline's free crustdata_v3_company_identify
+    # -- exactly backwards from the module docstring's own "cheapest/least-committal first" rule.
+    # No real reason was ever documented for that order; it looks like a plain inversion, not a
+    # deliberate quality tradeoff. Every revenue check across gate_batch_before_decision_makers,
+    # verify_and_reconfirm_matches, and the backfill sweep now tries the free source first and
+    # only pays for Google when Deepline's index has no domain match.
     deepline_result = _estimate_via_deepline_identify(db, tenant_id, company)
     if deepline_result.get("status") == "found":
         why = _implausible_for_headcount(deepline_result.get("lower_usd"), deepline_result.get("higher_usd"), company.employee_count)
@@ -252,6 +248,18 @@ def estimate_company_revenue(db: Session, tenant_id: int, company: Company) -> d
         company.estimated_revenue_higher_usd = deepline_result["higher_usd"]
         db.commit()
         return {"status": "resolved", "source": "deepline_crustdata_identify", "lower_usd": deepline_result["lower_usd"], "higher_usd": deepline_result["higher_usd"], "attempts": attempts}
+
+    google_result = _estimate_via_google(db, tenant_id, company)
+    if google_result.get("status") == "found":
+        why = _implausible_for_headcount(google_result.get("lower_usd"), google_result.get("higher_usd"), company.employee_count)
+        if why:
+            google_result = {"status": "rejected_implausible", "reason": why, "quote": google_result.get("quote")}
+    attempts.append({"source": "google_ai_overview", **google_result})
+    if google_result["status"] == "found":
+        company.estimated_revenue_lower_usd = google_result["lower_usd"]
+        company.estimated_revenue_higher_usd = google_result["higher_usd"]
+        db.commit()
+        return {"status": "resolved", "source": "google_ai_overview", "lower_usd": google_result["lower_usd"], "higher_usd": google_result["higher_usd"], "attempts": attempts}
 
     return {"status": "not_found", "attempts": attempts}
 

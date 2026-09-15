@@ -46,6 +46,29 @@ class BudgetGuard:
 
 _DAILY_BASELINE_PARAMETER_KEY = "deepline_daily_baseline"
 
+DEFAULT_DAILY_DEEPLINE_BUDGET_USD = 2.0
+
+
+def get_daily_deepline_budget_usd(db: Session, tenant_id: int) -> float:
+    """ONE real, shared daily Deepline ceiling -- 2026-09-15, explicit instruction ("let it be
+    together"): V2's three check_daily_deepline_budget() call sites (company_resolution.py x2,
+    investigation_execution.py) each passed their OWN hardcoded/config threshold (1.0, 1.0, and
+    discovery.daily_budget_usd=0.6) while all reading the SAME real "spent today" number -- so
+    the effective combined ceiling was whichever threshold happened to be checked, not a genuine
+    total. Reads the same `daily_credit_budget_usd` Parameter V1's now-unused
+    get_daily_budget_usd() reads, so all Deepline-billed V2 activity for a tenant shares one
+    real number."""
+    from app.db.models import Parameter
+
+    row = (
+        db.query(Parameter)
+        .filter(Parameter.tenant_id == tenant_id, Parameter.key == "daily_credit_budget_usd")
+        .first()
+    )
+    if row and isinstance(row.value, dict) and "budget_usd" in row.value:
+        return float(row.value["budget_usd"])
+    return DEFAULT_DAILY_DEEPLINE_BUDGET_USD
+
 
 def check_daily_deepline_budget(db: Session, tenant_id: int, budget_usd: float) -> None:
     """Raises BudgetExceededError if today's (UTC) real Deepline spend already reached

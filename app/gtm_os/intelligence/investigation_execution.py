@@ -54,7 +54,7 @@ from app.apify_client import (
     LINKEDIN_POST_COST_PER_POST_USD, ApifyError, estimate_cost_usd, search_google_organic_results,
 )
 from app.apify_client import _get_api_key as _get_apify_api_key
-from app.budget_guard import BudgetExceededError, check_daily_deepline_budget
+from app.budget_guard import BudgetExceededError, check_daily_deepline_budget, get_daily_deepline_budget_usd
 from app.gtm_os.intelligence.investigation_memory import (
     RESULT_ERROR, RESULT_INCONCLUSIVE, STATUS_STOPPED, InvestigationObjective,
     is_eligible_for_attempt, record_investigation_attempt,
@@ -63,7 +63,7 @@ from app.gtm_os.intelligence.sensing import (
     sense_company_website, sense_linkedin_jobs, sense_linkedin_posts, sense_theirstack_jobs, sense_web_search,
 )
 from app.gtm_os.intelligence.source_capabilities import COST_DEEPLINE_BUDGET_GUARDED, COST_FREE, SOURCE_CAPABILITIES
-from app.gtm_os.orchestration.control import ControlPlaneHalted, check_can_run, get_control_config
+from app.gtm_os.orchestration.control import ControlPlaneHalted, check_can_run
 
 # Real, bounded call shape S5 actually executes per source (matches the execution branch below
 # exactly) -- used only to compute the real estimated cost passed to check_apify_budget(), never
@@ -172,11 +172,13 @@ def _budget_check(db: Session, tenant_id: int, source: str, parameters: dict) ->
         return None  # genuinely nothing to guard against
 
     if cost_category == COST_DEEPLINE_BUDGET_GUARDED:
-        daily_budget = get_control_config(db, tenant_id).get("discovery", {}).get("daily_budget_usd")
-        if daily_budget is None:
-            return "no real discovery.daily_budget_usd configured -- None is not treated as unlimited"
+        # Shared with company_resolution.py's two guards (2026-09-15, "let it be together") --
+        # discovery.daily_budget_usd used to be this call site's OWN separate ceiling ($0.60),
+        # while the other two guards each had their own ($1.00 each) -- all three checking the
+        # SAME real spent-today number against three different thresholds, so the true combined
+        # cap was whichever was smallest, not a real total. One shared number now.
         try:
-            check_daily_deepline_budget(db, tenant_id, budget_usd=daily_budget)
+            check_daily_deepline_budget(db, tenant_id, budget_usd=get_daily_deepline_budget_usd(db, tenant_id))
         except BudgetExceededError as e:
             return f"Deepline budget check failed: {e}"
         return None
