@@ -46,14 +46,38 @@ scheduler = BackgroundScheduler()
 
 
 def _scheduled_autonomous_tick():
-    """Runs every 24h, for Elephant Edge only -- this backend is dedicated to exactly one
-    tenant. Must never loop over every tenant in the shared `tenants` table; each tenant's own
-    dedicated backend schedules its own cycle independently."""
+    """Runs every 24h, now for every tenant this backend serves (2026-09-15, explicit
+    instruction: wire the shared engine's scheduling, keep it off for now).
+
+    Previously Elephant Edge only, with a comment saying this must never loop over the shared
+    `tenants` table because "each tenant's own dedicated backend schedules its own cycle
+    independently" -- that was true once, but every partner tenant's backend_url now points at
+    THIS SAME backend (fixed earlier this session; see partner_pipeline.py's own tenant-creation
+    comment), so nothing else was ever going to run a partner's cycle. This backend genuinely is
+    the shared engine for all of them now.
+
+    Safe to loop unconditionally: run_daily_autonomous_cycle() itself is a no-op for any tenant
+    without its own autonomous_enabled=true Parameter row (is_autonomous_enabled() defaults
+    False, including for a newly added tenant), and even a tenant that IS enabled never has its
+    contacts pushed anywhere unless its own is_autonomous_outreach_enabled is also explicitly
+    turned on. One tenant's failure (a bad ICP config, a provider outage) is isolated and never
+    stops another's tick, matching every other per-tenant sweep in this scheduler."""
+    from app.db.models import Tenant
+
     db = SessionLocal()
     try:
-        run_daily_autonomous_cycle(db, tenant_id=ELEPHANT_EDGE_TENANT_ID)
+        tenant_ids = [t.id for t in db.query(Tenant.id).all()]
     finally:
         db.close()
+
+    for tenant_id in tenant_ids:
+        db = SessionLocal()
+        try:
+            run_daily_autonomous_cycle(db, tenant_id=tenant_id)
+        except Exception:
+            logging.getLogger(__name__).exception("autonomous_daily_cycle: tenant_id=%s failed", tenant_id)
+        finally:
+            db.close()
 
 
 def _scheduled_auto_approval_sweep():
@@ -75,12 +99,28 @@ def _scheduled_auto_approval_sweep():
 def _scheduled_approval_sweep():
     """Runs every few minutes -- resumes any run whose 1-hour approval window has elapsed.
     Deliberately a repeating sweep, not a one-shot delayed callback, so a server restart
-    mid-window doesn't lose the resume (the next tick after restart just picks it up)."""
+    mid-window doesn't lose the resume (the next tick after restart just picks it up).
+
+    Loops every tenant this backend serves, same reasoning as _scheduled_autonomous_tick above --
+    a partner's cycle can only ever reach "awaiting_approval" if its own autonomous_enabled is on,
+    which is off for every tenant today, so this is a genuine no-op for all of them until that
+    changes."""
+    from app.db.models import Tenant
+
     db = SessionLocal()
     try:
-        resume_pending_approvals(db, tenant_id=ELEPHANT_EDGE_TENANT_ID)
+        tenant_ids = [t.id for t in db.query(Tenant.id).all()]
     finally:
         db.close()
+
+    for tenant_id in tenant_ids:
+        db = SessionLocal()
+        try:
+            resume_pending_approvals(db, tenant_id=tenant_id)
+        except Exception:
+            logging.getLogger(__name__).exception("approval_window_sweep: tenant_id=%s failed", tenant_id)
+        finally:
+            db.close()
 
 
 def _scheduled_cache_refresh():
