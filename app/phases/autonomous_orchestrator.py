@@ -19,7 +19,7 @@ from datetime import datetime, timedelta
 from sqlalchemy.orm import Session
 
 from app.budget_guard import BudgetExceededError, BudgetGuard
-from app.db.models import AutonomousRun, Batch, Company, Contact, Parameter, PersonalizedMessage, Score
+from app.db.models import AutonomousRun, Batch, Company, Contact, Parameter, Score
 from app.notifications import create_notification
 from app.slack_client import SlackError, send_slack_message
 from app.phases.buying_signal import run_buying_signal_check
@@ -728,21 +728,19 @@ def _run_jd_first_autonomous_cycle(batch: Batch, run: AutonomousRun, db: Session
     # companies were below every ICP's revenue floor, found only after contacts had been sourced for
     # them. The gate looks up real revenue where only the headcount proxy existed, drops companies
     # whose real revenue fits no ICP, and limits decision-maker work to ICP-matched companies.
-    icp_gate = None
     decision_maker_company_ids = None
     from app.gtm_os.orchestration.discovery_profiles import ELEPHANT_EDGE_TENANT_ID, _has_own_icp_config
     # Only tenants whose ICPs really live in gtm_os_icp_config. get_icp_config() silently returns
     # Elephant Edge's defaults for a tenant without its own, which would gate a partner on OUR ICPs.
+    # jd_first has no partner-ICP-enforcement path (that only exists in the Apify branch, above),
+    # so this is unconditional on uses_gtm_os_icp -- unlike that branch there is no separate
+    # icp_enforcement result to defer to here.
     uses_gtm_os_icp = tenant_id == ELEPHANT_EDGE_TENANT_ID or _has_own_icp_config(db, tenant_id)
-    if icp_enforcement is None and uses_gtm_os_icp:
+    icp_gate = None
+    if uses_gtm_os_icp:
         from app.gtm_os.icp.icp_matching import gate_batch_before_decision_makers
         icp_gate = gate_batch_before_decision_makers(db, tenant_id, batch.id)
         decision_maker_company_ids = set(icp_gate["eligible_company_ids"])
-        logger.info(
-            "tenant %s ICP gate: %d eligible for decision makers, %d dropped on real revenue, %d unmatched kept for review",
-            tenant_id, len(decision_maker_company_ids), len(icp_gate["dropped_on_real_revenue"]),
-            len(icp_gate["unmatched_kept_for_review"]),
-        )
 
     found = 0  # total decision-makers found across all companies, not company count
     companies_with_contact = 0
@@ -1180,25 +1178,15 @@ def resume_pending_approvals(db: Session, tenant_id: int) -> dict:
     for run in due_runs:
         batch = run.batch
         try:
-            # Auto-approve is intentional (explicit product decision, 2026-08-11): no review
-            # within the window means "approve by default," not "send a bare, unpersonalized
-            # connection request forever." Without this, a message left in "draft" past the
-            # deadline would get pushed to LinkedIn with no personalization AND would never
-            # trigger the Smartlead email (push_email requires pm.status == "approved") --
-            # confirmed live as the real, silent cause of 5 of 6 contacts in a batch missing
-            # both their personalized note and their email the first time this ran for real.
-            draft_messages = (
-                db.query(PersonalizedMessage)
-                .join(Contact)
-                .join(Company)
-                .filter(Company.batch_id == batch.id)
-                .filter(PersonalizedMessage.status == "draft")
-                .all()
-            )
-            for pm in draft_messages:
-                pm.status = "approved"
-            db.commit()
-
+            # REVERSED 2026-09-15 (explicit instruction) -- the previous behavior here
+            # auto-approved every still-"draft" message the moment the review window elapsed,
+            # so an unreviewed run silently sent full personalized messages and Smartlead
+            # emails exactly as if a human had approved them. That defeats the point of having
+            # a review window at all. No auto-approve now: a draft simply stays a draft.
+            # push_lead() (see its own docstring) already handles this correctly on its
+            # own -- a contact with no APPROVED message still gets pushed (a bare connection
+            # request), it just never gets the personalized note or the email. Nothing here
+            # needs to duplicate that gate; removing the forced approval is the whole fix.
             channel = get_outreach_channel(db, tenant_id)
             outreach_result = run_campaign_execution(batch.id, db, channel)
 
