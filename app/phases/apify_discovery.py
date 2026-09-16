@@ -27,7 +27,7 @@ from sqlalchemy.orm import Session
 
 from app.phases.company_profile_check import fetch_public_company_profile, profile_rejection_reason
 from app.apify_budget_guard import STATUS_ALLOWED as APIFY_BUDGET_ALLOWED, check_apify_budget
-from app.apify_client import ApifyError, estimate_cost_usd, search_linkedin_jobs
+from app.apify_client import COST_PER_JOB_USD, ApifyError, estimate_cost_usd, search_linkedin_jobs
 from app.apify_client import _get_api_key as _get_apify_api_key
 from app.db.models import Company
 from app.phases.discovery import _existing_domains
@@ -253,6 +253,40 @@ def run_apify_discovery(
         if _classify_role(job.get("title") or "") or _detect_product_fit_signals(job.get("description_text") or ""):
             domain_posting_counts[domain] = domain_posting_counts.get(domain, 0) + 1
 
+    # WHAT WE ACTUALLY PAID FOR (added 2026-09-16). Every posting in `jobs` is already billed
+    # ($0.005 each) before a single line below runs -- the actor bills per posting RETURNED, and
+    # the `break` in the keep loop below saves nothing, it just stops us looking at postings we
+    # already own. So the only lever on discovery cost is raising the share of returned postings
+    # that can become a NEW company, and until now that share was unmeasurable: the keep loop's
+    # already-seen skip (`domain in seen_domains`) `continue`d WITHOUT recording anything, so a
+    # run that re-bought a whole week of postings it already had reported an empty
+    # rejection_breakdown and looked identical to a run that genuinely found nothing new.
+    #
+    # This pre-pass is free (pure in-memory arithmetic over postings already fetched and paid
+    # for) and deliberately walks EVERY posting, not just the ones before the keep loop's break,
+    # because the denominator we need is "what did we pay for", not "what did we look at". It
+    # only counts -- no paid call is made or moved here, so instrumenting a run cannot itself
+    # cost anything or change which companies get kept.
+    paid_postings = len(jobs)
+    postings_no_domain = 0
+    postings_already_owned = 0
+    postings_duplicate_in_run = 0
+    domains_new: set[str] = set()
+    _domains_seen_in_prepass: set[str] = set()
+    for job in jobs:
+        domain = _normalize_domain(job.get("org_linkedin_website") or "")
+        if not domain:
+            postings_no_domain += 1
+            continue
+        if domain in seen_domains:
+            postings_already_owned += 1
+            continue
+        if domain in _domains_seen_in_prepass:
+            postings_duplicate_in_run += 1
+            continue
+        _domains_seen_in_prepass.add(domain)
+        domains_new.add(domain)
+
     seen_this_run: set[str] = set()
     kept: list[Company] = []
     rejection_counts: dict[str, int] = {}
@@ -360,4 +394,24 @@ def run_apify_discovery(
         "budget_stopped_early": False,
         "estimated_cost_usd": estimate_cost_usd(len(jobs)),
         "api_error": None,
+        # The real unit economics of this call, so a run can be judged on what it bought rather
+        # than only on what it kept (see the pre-pass above). `wasted_cost_usd` is the money spent
+        # on postings that could never have produced a new company no matter how good the filters
+        # below are -- companies we already own, duplicate postings from the same employer, and
+        # postings with no resolvable company domain at all.
+        "cost_efficiency": {
+            "paid_postings": paid_postings,
+            "requested_limit": discovery_limit,
+            "postings_already_owned": postings_already_owned,
+            "postings_duplicate_in_run": postings_duplicate_in_run,
+            "postings_no_domain": postings_no_domain,
+            "new_domains_available": len(domains_new),
+            "companies_kept": len(kept),
+            "wasted_cost_usd": round(
+                (postings_already_owned + postings_duplicate_in_run + postings_no_domain) * COST_PER_JOB_USD, 4
+            ),
+            "cost_per_company_usd": (
+                round(estimate_cost_usd(paid_postings) / len(kept), 4) if kept else None
+            ),
+        },
     }

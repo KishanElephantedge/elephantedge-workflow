@@ -3442,6 +3442,18 @@ def smtp_network_diagnostic():
     return results
 
 
+@router.get("/linkedin-guest/diagnostic")
+def linkedin_guest_diagnostic_route():
+    """Answers the one open question blocking the free LinkedIn job-scraping replacement for
+    the paid fantastic-jobs Apify actor (TODO.md Section 5): does LinkedIn's public guest job
+    search respond normally from THIS deployment's real outbound IP (Render, Singapore region),
+    or is the datacenter IP range blocked/rate-limited the way a home connection wasn't when
+    this was tested manually on 2026-09-13? Zero cost -- one real, unauthenticated HTTP request,
+    no Apify call, no LinkedIn login."""
+    from app.linkedin_guest_jobs import linkedin_guest_diagnostic
+    return linkedin_guest_diagnostic()
+
+
 @router.get("/deepline/balance")
 def deepline_balance():
     """Free (no billed call) sanity check for the exact mechanism BudgetGuard depends on --
