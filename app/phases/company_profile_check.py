@@ -33,9 +33,13 @@ _UA = {
     "Accept-Language": "en-US,en;q=0.9",
 }
 _TIMEOUT_SECONDS = 20
-# Spacing between page fetches within one run. Discovery keeps at most ~25 companies a run, so
-# this adds well under a minute and keeps the request pattern unremarkable.
-PACING_SECONDS = 1.5
+# Spacing between page fetches within one run. Was 1.5s -- real 429s hit live on 2026-09-16
+# during a burst of Jobo-discovered companies checked back-to-back (Docker, Marmon both rate-
+# limited mid-run). Raised to slow the request pattern down; a 429 here silently falls through
+# as "unverified" (fetch_public_company_profile returns None), which looks identical to a
+# genuinely unreadable page, so a too-fast pace doesn't error loudly -- it just quietly loses
+# the free verification step it exists to provide.
+PACING_SECONDS = 4.0
 
 _US_COUNTRY_CODES = {"US", "USA"}
 
