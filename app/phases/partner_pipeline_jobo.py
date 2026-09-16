@@ -71,7 +71,7 @@ from datetime import datetime
 import httpx
 from sqlalchemy.orm import Session
 
-from app.db.models import Batch, Company, Contact
+from app.db.models import Batch, Company, Contact, Parameter
 from app.jobo_client import _get_api_key, get_company_profile, search_jobs
 from app.phases.decision_maker import is_board_only_title
 from app.phases.jobo_discovery import _existing_domains
@@ -410,7 +410,7 @@ def run_tenant_discovery_jobo(batch_id: int, db: Session, tenant_id: int, icp: d
     rev_min, rev_max = icp.get("revenue_min_usd"), icp.get("revenue_max_usd")
 
     api_key = _get_api_key(db, tenant_id)
-    excluded_domains = _existing_domains(tenant_id, db)
+    excluded_domains = _existing_domains(tenant_id, db) | get_rejected_domains(db, tenant_id)
 
     seen: set[str] = set()
     seen_identity: set[str] = set()
@@ -498,6 +498,42 @@ def run_tenant_discovery_jobo(batch_id: int, db: Session, tenant_id: int, icp: d
     }
 
 
+REJECTED_DOMAINS_PARAMETER_KEY = "rejected_discovery_domains"
+
+
+def get_rejected_domains(db: Session, tenant_id: int) -> set[str]:
+    """Domains already proven, by a real check, NOT to fit this tenant's ICP -- persisted
+    separately from Company rows because `_existing_domains()` (discovery.py) only counts
+    companies that still EXIST. Real bug found live 2026-09-16: verify_jobo_companies() (and every
+    earlier manual pass this session) hard-deleted a rejected company, which removed it from
+    `_existing_domains` too -- so the very next discovery run for the same tenant paid Jobo AGAIN
+    to rediscover Docker/Black Box/Scribe, all three already proven bad, and paid AGAIN for a free
+    profile check and a revenue lookup on top. This list is the fix: checked BEFORE a newly
+    discovered company is even created, so a known-bad domain is skipped for free, not re-bought."""
+    param = db.query(Parameter).filter(Parameter.tenant_id == tenant_id, Parameter.key == REJECTED_DOMAINS_PARAMETER_KEY).first()
+    return set(param.value) if param and isinstance(param.value, list) else set()
+
+
+def _add_rejected_domain(db: Session, tenant_id: int, domain: str) -> None:
+    if not domain:
+        return
+    domain = domain.lower().replace("www.", "")
+    param = db.query(Parameter).filter(Parameter.tenant_id == tenant_id, Parameter.key == REJECTED_DOMAINS_PARAMETER_KEY).first()
+    if param:
+        domains = set(param.value) if isinstance(param.value, list) else set()
+        domains.add(domain)
+        param.value = sorted(domains)
+    else:
+        param = Parameter(
+            tenant_id=tenant_id, key=REJECTED_DOMAINS_PARAMETER_KEY, value=[domain],
+            description="Domains already proven (free profile check or real revenue check) not to "
+            "fit this tenant's ICP -- checked before discovery re-creates them. See "
+            "verify_jobo_companies()'s own docstring for the real bug this fixes.",
+        )
+        db.add(param)
+    db.commit()
+
+
 def verify_jobo_companies(db: Session, tenant_id: int, company_ids: list[int],
                           revenue_min_usd: int | None, revenue_max_usd: int | None,
                           employee_min: int | None, employee_max: int | None,
@@ -542,6 +578,7 @@ def verify_jobo_companies(db: Session, tenant_id: int, company_ids: list[int],
                 reason = profile_rejection_reason(profile, employee_min, employee_max)
                 if reason:
                     result["dropped"].append({"name": company.name, "reason": f"free_profile_check:{reason}"})
+                    _add_rejected_domain(db, tenant_id, company.domain)
                     db.delete(company)
                     db.commit()
                     continue
@@ -558,6 +595,7 @@ def verify_jobo_companies(db: Session, tenant_id: int, company_ids: list[int],
             above = isinstance(revenue_max_usd, int) and lo is not None and lo > revenue_max_usd
             if below or above:
                 result["dropped"].append({"name": company.name, "reason": f"real_revenue_out_of_band [{lo}, {hi}] (Jobo had said [{jobo_lo}, {jobo_hi}])"})
+                _add_rejected_domain(db, tenant_id, company.domain)
                 db.delete(company)
             elif (lo, hi) != (jobo_lo, jobo_hi):
                 result["corrected"].append({"name": company.name, "jobo_said": [jobo_lo, jobo_hi], "real": [lo, hi]})
