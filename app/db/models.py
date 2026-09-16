@@ -67,6 +67,14 @@ class Batch(Base):
     offering_name = Column(String, nullable=True)
     campaign_label = Column(String, nullable=True)
 
+    # 2026-09-16 -- POST /gtm-os/partner/discover runs in a background thread (see that route's
+    # own docstring for why: a synchronous discovery+verification run outlives Render's own
+    # connection window). `status` becomes "in_progress" -> "completed"/"failed"; discovery_result
+    # holds the same JSON shape the route used to return directly; discovery_error holds a real
+    # exception message when the background thread itself dies (never silently swallowed).
+    discovery_result = Column(JSON, nullable=True)
+    discovery_error = Column(Text, nullable=True)
+
     companies = relationship("Company", back_populates="batch", cascade="all, delete-orphan")
 
 

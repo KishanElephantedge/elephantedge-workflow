@@ -2,6 +2,7 @@ import base64
 import csv
 import io
 import json
+import logging
 from collections import Counter
 from datetime import datetime, timedelta
 
@@ -51,6 +52,7 @@ from app.smartlead_client import list_campaigns as smartlead_list_campaigns
 from app.smartlead_client import get_campaign_leads as smartlead_get_campaign_leads
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 # Elephant Edge's tenant_id in the shared tenants table (see synefi's Tenant row for
 # slug="elephant-edge"). Hardcoded here deliberately: this backend only ever serves this one
@@ -5455,19 +5457,92 @@ def put_partner_icp(request: Request, body: dict = Body(...), db: Session = Depe
 # Jobo path + verify_jobo_companies for its own revenue/industry distrust, see
 # partner_pipeline_jobo.py's own corrected docstring) -- exposed as one real, callable route, so
 # it works the same way for every partner and is not tied to any one person's terminal.
+#
+# ASYNC, 2026-09-16 (real bug, not a design preference): the first version of this route ran the
+# whole discovery+verification pass synchronously inside the request. Confirmed live: Render's
+# proxy killed the HTTP connection around ~150s while the backend process kept working
+# underneath, so the client saw a dead connection while the server finished anyway -- and a
+# retried call created duplicate/overlapping batches (Alteva RCM, HSG Advisors, The Skin Center
+# all appeared twice this way). The route now returns immediately with a batch_id; the actual
+# work runs in a background thread against its OWN db session (a request-scoped session cannot
+# safely be used after the request that created it returns), and GET .../{batch_id} polls the
+# real status/result stored on the Batch row itself.
 class PartnerDiscoveryRequest(BaseModel):
     source: str = "apify"  # "apify" | "jobo"
     target: int = 5
     title_search: list[str] | None = None  # overrides the hiring signal this partner is searched on
 
 
+def _run_partner_discovery_background(batch_id: int, tenant_id: int, source: str, target: int, title_search: list[str] | None) -> None:
+    """Runs entirely on its own db session/thread -- see the route's own docstring for why. Every
+    outcome (success, a real ICP block, or a real exception) is written onto the Batch row, never
+    lost silently, since nothing is left to return an HTTP response to."""
+    from app.db.session import SessionLocal
+
+    db = SessionLocal()
+    try:
+        batch = db.get(Batch, batch_id)
+        icp_param = db.query(Parameter).filter(Parameter.tenant_id == tenant_id, Parameter.key == PARTNER_ICP_PARAMETER_KEY).first()
+        icp = dict(icp_param.value)
+
+        if source == "jobo":
+            from app.phases.partner_pipeline_jobo import run_tenant_discovery_jobo, verify_jobo_companies
+
+            discovery_result = run_tenant_discovery_jobo(batch.id, db, tenant_id, icp, title_search, target=target)
+            new_ids = [c.id for c in db.query(Company).filter(Company.batch_id == batch.id).all()]
+            verify_result = verify_jobo_companies(
+                db, tenant_id, new_ids, icp.get("revenue_min_usd"), icp.get("revenue_max_usd"),
+                icp.get("employee_min"), icp.get("employee_max"), enrichment_tenant_id=ELEPHANT_EDGE_TENANT_ID,
+            )
+            batch.discovery_result = {"source": "jobo", "discovery": {k: v for k, v in discovery_result.items() if k != "kept"}, "verification": verify_result}
+        else:
+            from app.phases.partner_pipeline import build_discovery_plan, enforce_icp_on_companies
+            from app.apify_budget_guard import STATUS_ALLOWED as _APIFY_BUDGET_ALLOWED, check_apify_budget as _check_apify_budget
+
+            plan = build_discovery_plan(db, ELEPHANT_EDGE_TENANT_ID, f"tenant_{tenant_id}", icp, target=target, title_search=title_search)
+            budget = _check_apify_budget(db, ELEPHANT_EDGE_TENANT_ID, plan["estimated_max_cost_usd"])
+            if budget["status"] != _APIFY_BUDGET_ALLOWED:
+                batch.status = "blocked"
+                batch.discovery_result = {"source": "apify", "status": "blocked", "reason": budget["reason"], "plan": plan}
+                db.commit()
+                return
+
+            s = plan["search"]
+            discovery_result = run_apify_discovery(
+                batch.id, db, tenant_id, target=target, time_range=s["time_range"],
+                location_search=s["location_search"], title_search=s["title_search"],
+                employee_min=s["employee_min"], employee_max=s["employee_max"],
+                industry_filter=s["industry_filter"], limit=s["limit"], budget_tenant_id=ELEPHANT_EDGE_TENANT_ID,
+            )
+            new_companies = db.query(Company).filter(Company.batch_id == batch.id).all()
+            enforced = enforce_icp_on_companies(db, tenant_id, new_companies, icp, enrich_revenue=True, enrichment_tenant_id=ELEPHANT_EDGE_TENANT_ID)
+            batch.discovery_result = {
+                "source": "apify", "plan": plan, "discovery": discovery_result,
+                "kept": [c.name for c in enforced["kept"]], "dropped": enforced["dropped"],
+                "revenue_enrichment": enforced["revenue_enrichment"],
+            }
+        batch.status = "completed"
+        db.commit()
+    except Exception as e:  # noqa: BLE001 -- nothing left to raise TO; record it, never lose it
+        db.rollback()
+        batch = db.get(Batch, batch_id)
+        if batch:
+            batch.status = "failed"
+            batch.discovery_error = f"{type(e).__name__}: {e}"
+            db.commit()
+        logger.exception("partner discovery background run failed for batch %s", batch_id)
+    finally:
+        db.close()
+
+
 @router.post("/gtm-os/partner/discover")
 def run_partner_discovery_route(request: Request, payload: PartnerDiscoveryRequest, db: Session = Depends(get_db)):
-    """Runs real discovery for the CALLING tenant (via X-Tenant-Id, same as every other
-    /gtm-os/partner/* route) -- never Elephant Edge's own tenant, since this route only exists
-    under a partner's own dashboard/admin action. Returns exactly what got kept/dropped/
-    unverified and why, same shape the FDE's own local runs already print, just now a real,
-    reusable product action instead of a script only one person can run."""
+    """Starts real discovery for the CALLING tenant (via X-Tenant-Id, same as every other
+    /gtm-os/partner/* route) -- never Elephant Edge's own tenant. Returns immediately with a
+    batch_id and status "in_progress" -- poll GET /gtm-os/partner/discover/{batch_id} for the
+    real result. See the module-level comment above for why this is async."""
+    import threading
+
     tenant_id = _resolve_tenant_id(request)
     if tenant_id == ELEPHANT_EDGE_TENANT_ID:
         raise HTTPException(status_code=400, detail="This route is for partner tenants only -- Elephant Edge's own discovery runs through the V2 sweep, not this.")
@@ -5475,52 +5550,37 @@ def run_partner_discovery_route(request: Request, payload: PartnerDiscoveryReque
     icp_param = db.query(Parameter).filter(Parameter.tenant_id == tenant_id, Parameter.key == PARTNER_ICP_PARAMETER_KEY).first()
     if not icp_param or not icp_param.value:
         raise HTTPException(status_code=400, detail="No ICP configured for this tenant yet -- set one via PUT /gtm-os/partner/icp first.")
-    icp = dict(icp_param.value)
+    if payload.source == "jobo" and not payload.title_search:
+        raise HTTPException(status_code=400, detail="title_search is required for the jobo source -- it is the buying signal for this partner.")
 
-    if payload.source == "jobo":
-        from app.phases.partner_pipeline_jobo import run_tenant_discovery_jobo, verify_jobo_companies
-
-        if not payload.title_search:
-            raise HTTPException(status_code=400, detail="title_search is required for the jobo source -- it is the buying signal for this partner.")
-        batch = Batch(tenant_id=tenant_id, name=f"Partner discovery (jobo) — {datetime.utcnow():%Y-%m-%d %H:%M}",
-                      source="partner_discovery", current_phase="signal_discovery")
-        db.add(batch)
-        db.commit()
-        db.refresh(batch)
-        discovery_result = run_tenant_discovery_jobo(batch.id, db, tenant_id, icp, payload.title_search, target=payload.target)
-        new_ids = [c.id for c in db.query(Company).filter(Company.batch_id == batch.id).all()]
-        verify_result = verify_jobo_companies(
-            db, tenant_id, new_ids, icp.get("revenue_min_usd"), icp.get("revenue_max_usd"),
-            icp.get("employee_min"), icp.get("employee_max"), enrichment_tenant_id=ELEPHANT_EDGE_TENANT_ID,
-        )
-        return {"source": "jobo", "batch_id": batch.id, "discovery": {k: v for k, v in discovery_result.items() if k not in ("kept",)}, "verification": verify_result}
-
-    from app.phases.partner_pipeline import build_discovery_plan, enforce_icp_on_companies
-    from app.apify_budget_guard import STATUS_ALLOWED as _APIFY_BUDGET_ALLOWED, check_apify_budget as _check_apify_budget
-
-    plan = build_discovery_plan(db, ELEPHANT_EDGE_TENANT_ID, f"tenant_{tenant_id}", icp, target=payload.target, title_search=payload.title_search)
-    budget = _check_apify_budget(db, ELEPHANT_EDGE_TENANT_ID, plan["estimated_max_cost_usd"])
-    if budget["status"] != _APIFY_BUDGET_ALLOWED:
-        return {"status": "blocked", "reason": budget["reason"], "plan": plan}
-
-    batch = Batch(tenant_id=tenant_id, name=f"Partner discovery (apify) — {datetime.utcnow():%Y-%m-%d %H:%M}",
-                  source="partner_discovery", current_phase="signal_discovery")
+    batch = Batch(tenant_id=tenant_id, name=f"Partner discovery ({payload.source}) — {datetime.utcnow():%Y-%m-%d %H:%M}",
+                  source="partner_discovery", current_phase="signal_discovery", status="in_progress")
     db.add(batch)
     db.commit()
     db.refresh(batch)
-    s = plan["search"]
-    discovery_result = run_apify_discovery(
-        batch.id, db, tenant_id, target=payload.target, time_range=s["time_range"],
-        location_search=s["location_search"], title_search=s["title_search"],
-        employee_min=s["employee_min"], employee_max=s["employee_max"],
-        industry_filter=s["industry_filter"], limit=s["limit"], budget_tenant_id=ELEPHANT_EDGE_TENANT_ID,
+
+    thread = threading.Thread(
+        target=_run_partner_discovery_background,
+        args=(batch.id, tenant_id, payload.source, payload.target, payload.title_search),
+        daemon=True,
     )
-    new_companies = db.query(Company).filter(Company.batch_id == batch.id).all()
-    enforced = enforce_icp_on_companies(db, tenant_id, new_companies, icp, enrich_revenue=True, enrichment_tenant_id=ELEPHANT_EDGE_TENANT_ID)
+    thread.start()
+
+    return {"batch_id": batch.id, "status": "in_progress", "poll": f"/api/gtm-os/partner/discover/{batch.id}"}
+
+
+@router.get("/gtm-os/partner/discover/{batch_id}")
+def get_partner_discovery_status(batch_id: int, request: Request, db: Session = Depends(get_db)):
+    """Poll target for the async route above. Scoped to the calling tenant -- a batch id from a
+    different tenant reads as not found, not another tenant's real data."""
+    tenant_id = _resolve_tenant_id(request)
+    batch = db.get(Batch, batch_id)
+    if not batch or batch.tenant_id != tenant_id:
+        raise HTTPException(status_code=404, detail="No discovery batch with that id for this tenant.")
+    company_count = db.query(Company).filter(Company.batch_id == batch_id).count()
     return {
-        "source": "apify", "batch_id": batch.id, "plan": plan, "discovery": discovery_result,
-        "kept": [c.name for c in enforced["kept"]], "dropped": enforced["dropped"],
-        "revenue_enrichment": enforced["revenue_enrichment"],
+        "batch_id": batch.id, "status": batch.status, "company_count": company_count,
+        "result": batch.discovery_result, "error": batch.discovery_error,
     }
 
 

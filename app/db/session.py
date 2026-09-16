@@ -871,3 +871,12 @@ def ensure_indexes():
         """))
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_investigation_objectives_tenant_icp_company ON investigation_objectives (tenant_id, icp_id, target_company_id)"))
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_investigation_objectives_tenant_status ON investigation_objectives (tenant_id, status)"))
+
+        # 2026-09-16 -- POST /gtm-os/partner/discover used to hold the HTTP connection open for
+        # the whole discovery+verification run (real, confirmed live: Render's proxy killed the
+        # connection around ~150s while the server kept working underneath, leaving duplicate/
+        # unverified companies behind from overlapping retried calls). Made async: the route now
+        # returns immediately and a background thread does the work, reporting progress/result
+        # here instead of over the now-closed HTTP response.
+        conn.execute(text("ALTER TABLE batches ADD COLUMN IF NOT EXISTS discovery_result JSON"))
+        conn.execute(text("ALTER TABLE batches ADD COLUMN IF NOT EXISTS discovery_error TEXT"))
