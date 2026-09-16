@@ -74,7 +74,14 @@ from sqlalchemy.orm import Session
 from app.db.models import Batch, Company, Contact
 from app.jobo_client import _get_api_key, get_company_profile, search_jobs
 from app.phases.decision_maker import is_board_only_title
-from app.phases.jobo_discovery import _existing_domains
+# Real bug, 2026-09-16: this used to import a SEPARATE, duplicate _existing_domains() defined
+# locally in jobo_discovery.py -- a near-identical copy that never got the rejected-domains merge
+# (see discovery.py's own _existing_domains for why that merge exists). Cytek Biosciences and
+# FormFactor, both already recorded as rejected, kept getting rediscovered through THIS import
+# specifically because it pointed at the un-fixed copy. jobo_discovery.py's own copy is now
+# deleted and re-exports this same one, so there is exactly one _existing_domains() in the
+# codebase, not two silently drifting apart.
+from app.phases.discovery import _existing_domains
 from app.phases.partner_pipeline import PARTNER_BATCH_SOURCE, get_or_create_partner_tenant
 
 # Jobo bills per DELIVERED job, measured live at 3 credits each (1,000,015 -> 1,000,000 for 5).

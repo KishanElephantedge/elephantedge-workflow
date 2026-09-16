@@ -16,9 +16,10 @@ from datetime import datetime
 import httpx
 from sqlalchemy.orm import Session
 
-from app.db.models import Batch, Company, Contact, Score
+from app.db.models import Company, Contact, Score
 from app.jobo_client import JoboError, JoboCreditGuard, get_company_profile, search_jobs, _get_api_key
 from app.phases.decision_maker import CEO_TITLE_KEYWORDS, CEO_TITLE_PRESIDENT_EXCLUSIONS, SALES_LEADER_TITLE_KEYWORDS
+from app.phases.discovery import _existing_domains
 from app.phases.hiring_signal import ROLE_KEYWORDS, _detect_product_fit_signals
 from app.phases.tech_stack import AI_SDR_TOOL_KEYWORDS, OUTBOUND_TOOL_KEYWORDS
 
@@ -158,11 +159,6 @@ def _score(profile: dict, has_primary_contact: bool, signal_strength: str, produ
         "product_fit": product_fit, "buying_intent": buying_intent, "total_score": total, "tier": tier,
         "has_outbound_tooling": has_outbound_tooling, "has_ai_sdr_tool": has_ai_sdr_tool,
     }
-
-
-def _existing_domains(tenant_id: int, db: Session) -> set[str]:
-    rows = db.query(Company.domain).join(Batch).filter(Batch.tenant_id == tenant_id).filter(Company.domain.isnot(None)).all()
-    return {r[0].lower() for r in rows if r[0]}
 
 
 def run_jobo_discovery(batch_id: int, db: Session, tenant_id: int, target: int = 5, budget_usd: float = 1.5, start_page: int = 1, max_pages: int = 50) -> dict:
