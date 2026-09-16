@@ -198,6 +198,21 @@ def _geo_matches(profile: dict, geographies: list[str]) -> bool:
     return False
 
 
+# Real bug, confirmed live 2026-09-16: the single-word fallback below matched Amdrodd's
+# "Industrial Machinery Manufacturing" against FormFactor and Cytek Biosciences (semiconductor
+# equipment / lab instruments) purely because their profile said bare "Manufacturing" -- and
+# matched "Wellness and Fitness Services" against Sikich, Couchbase, and CrossCountry Consulting
+# purely because they're labeled generic "Business Services". A category word this broad tells
+# you almost nothing about fit; treating it as a specific-enough token to match on is exactly the
+# false-positive machine. Every one of these words appears across dozens of unrelated real
+# industries in Jobo's own taxonomy -- never safe as a lone match signal.
+_GENERIC_INDUSTRY_WORDS = {
+    "manufacturing", "services", "research", "health", "care", "technology", "solutions",
+    "systems", "group", "industry", "products", "consulting", "development", "software",
+    "business", "management", "science", "sciences", "equipment", "industries",
+}
+
+
 def _industry_matches(profile: dict, industries: list[str]) -> bool:
     if not industries:
         return True
@@ -207,12 +222,15 @@ def _industry_matches(profile: dict, industries: list[str]) -> bool:
     # Substring both ways: an ICP saying "Manufacturing" should match "Industrial Machinery
     # Manufacturing", and an ICP saying "Industrial Machinery Manufacturing" should match
     # "Manufacturing". Requiring exact equality against Jobo's own taxonomy would reject almost
-    # everything on wording alone.
+    # everything on wording alone -- but the fallback token must be a real, SPECIFIC word (not a
+    # generic category buzzword every industry shares) or it stops meaning anything.
     for want in industries:
         w = want.strip().lower()
         if not w:
             continue
-        if w in hay or any(tok in hay for tok in w.split() if len(tok) > 4):
+        if w in hay:
+            return True
+        if any(tok in hay for tok in w.split() if len(tok) > 4 and tok not in _GENERIC_INDUSTRY_WORDS):
             return True
     return False
 
