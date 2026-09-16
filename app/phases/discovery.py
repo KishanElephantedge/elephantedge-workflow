@@ -19,8 +19,44 @@ from datetime import datetime
 from sqlalchemy.orm import Session
 
 from app.budget_guard import BudgetExceededError, BudgetGuard
-from app.db.models import Batch, Company
+from app.db.models import Batch, Company, Parameter
 from app.deepline_client import execute_tool, extract_rows
+
+REJECTED_DOMAINS_PARAMETER_KEY = "rejected_discovery_domains"
+
+
+def get_rejected_domains(db: Session, tenant_id: int) -> set[str]:
+    """Domains already proven, by a real check, NOT to fit this tenant's ICP -- persisted
+    separately from Company rows because `_existing_domains()` below only counts companies that
+    still EXIST. Real bug found live 2026-09-16 (originally in partner_pipeline_jobo.py, moved
+    here so every discovery path shares one exclusion set, not just Jobo's): hard-deleting a
+    rejected company removed it from `_existing_domains` too, so the very next discovery run for
+    the same tenant re-fetched and re-paid for a company already proven bad (Docker, Black Box,
+    Scribe, Geneoscopy all recurred this way across both the Jobo AND Apify discovery paths).
+    Checked by _existing_domains() itself now, so every one of the 5 real call sites gets this
+    fix automatically, not just whichever one happened to import it directly."""
+    param = db.query(Parameter).filter(Parameter.tenant_id == tenant_id, Parameter.key == REJECTED_DOMAINS_PARAMETER_KEY).first()
+    return set(param.value) if param and isinstance(param.value, list) else set()
+
+
+def add_rejected_domain(db: Session, tenant_id: int, domain: str) -> None:
+    if not domain:
+        return
+    domain = domain.lower().replace("www.", "")
+    param = db.query(Parameter).filter(Parameter.tenant_id == tenant_id, Parameter.key == REJECTED_DOMAINS_PARAMETER_KEY).first()
+    if param:
+        domains = set(param.value) if isinstance(param.value, list) else set()
+        domains.add(domain)
+        param.value = sorted(domains)
+    else:
+        param = Parameter(
+            tenant_id=tenant_id, key=REJECTED_DOMAINS_PARAMETER_KEY, value=[domain],
+            description="Domains already proven (free profile check or real revenue check) not to "
+            "fit this tenant's ICP -- checked by _existing_domains() before discovery re-creates "
+            "them. See get_rejected_domains()'s own docstring for the real bug this fixes.",
+        )
+        db.add(param)
+    db.commit()
 
 
 def _parse_date(value) -> datetime | None:
@@ -65,7 +101,13 @@ def _existing_domains(tenant_id: int, db: Session) -> set[str]:
     its batches (not just the current one). Necessary even within a single manual Discovery
     call: each call starts its own cursor from scratch, so re-running Discovery (e.g. across
     two separate requests, as happened live) would otherwise re-fetch and re-save the same
-    leading companies every time."""
+    leading companies every time.
+
+    Also merges in get_rejected_domains() (2026-09-16 fix) -- a company that EXISTED and got
+    correctly deleted for a real, proven reason (wrong industry/size, real revenue outside the
+    ICP band) must stay excluded forever, not just while its row happened to still exist. Every
+    one of this function's 5 real call sites gets this for free by merging it here, rather than
+    each discovery path needing to remember to add it itself."""
     rows = (
         db.query(Company.domain)
         .join(Batch)
@@ -73,7 +115,7 @@ def _existing_domains(tenant_id: int, db: Session) -> set[str]:
         .filter(Company.domain.isnot(None))
         .all()
     )
-    return {r[0].lower() for r in rows if r[0]}
+    return {r[0].lower() for r in rows if r[0]} | get_rejected_domains(db, tenant_id)
 
 
 def _geography_tier(hq_location: str | None) -> str:
