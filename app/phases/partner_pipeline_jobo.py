@@ -11,6 +11,25 @@ company profile lookup behind it is FREE and unmetered -- carrying company_size,
 industries, headquarters, funding AND a leadership list. So one paid call yields the firmographics
 that Apify needs a paid enrichment pass to approximate, plus decision makers at no cost.
 
+CORRECTION, 2026-09-16 (real, repeated finding -- this claim is wrong for revenue and industry,
+right only for cost and leads): Jobo's own bundled revenue/industry fields are NOT reliable enough
+to qualify a company on. Already documented once (provider-cost-accuracy-tracker.md, 2026-09-08:
+39% of a real 18-company batch had wildly wrong Jobo revenue, e.g. Fireworks AI -- Jobo said
+$1-10M, real is $1B) and reconfirmed live again today on a real Amdrodd batch: Docker showed as
+501 employees/$50-100M when it is really 1,000+/$500M-1B; Black Box showed as "Business Services"
+when it is really IT Services and Consulting, 4,500+ employees; Scribe showed as $10-50M revenue
+when it is really a $1.3B-valuation company at $100M+ ARR. All three would have been silently
+qualified and shown to a partner as real, confirmed accounts.
+
+Jobo is still the cheapest genuinely good tool for the JOB SEARCH itself ($0.003/job delivered,
+$0 for non-matches, real leadership leads bundled free) -- keep using it for that. Never trust its
+own revenue/industry/size fields as qualification fact. See run_tenant_discovery_jobo_verified()
+below -- the real, permanent fix: run Jobo for discovery + leads, then the SAME free public-
+LinkedIn-page check and the SAME Deepline-free/Google-cheap revenue waterfall the Apify path
+already uses (company_profile_check.py, revenue_estimation.py) BEFORE trusting a single number
+Jobo itself reported. One real verification path, reused, not a second one invented for this
+source.
+
 WHAT JOBO DOES NOT GIVE. Its leadership entries carry Crunchbase person URLs, not LinkedIn ones,
 and no email addresses. Verified against the live API, not assumed: /api/people, /api/contacts,
 /api/persons and /api/companies/{id}/people all 404, and a job record exposes only an apply_url.
@@ -477,3 +496,81 @@ def run_tenant_discovery_jobo(batch_id: int, db: Session, tenant_id: int, icp: d
         "credits_used": jobs_seen * CREDITS_PER_JOB,
         "credits_balance": credits_end,
     }
+
+
+def verify_jobo_companies(db: Session, tenant_id: int, company_ids: list[int],
+                          revenue_min_usd: int | None, revenue_max_usd: int | None,
+                          employee_min: int | None, employee_max: int | None,
+                          enrichment_tenant_id: int = 2) -> dict:
+    """THE REAL FIX for Jobo's own unreliable revenue/industry fields (see this module's
+    docstring correction above) -- runs every Jobo-discovered company through the SAME two free/
+    cheap verification steps the Apify path already trusts, instead of qualifying on Jobo's own
+    word. Reused, not reinvented:
+
+    1. fetch_public_company_profile() + profile_rejection_reason() (company_profile_check.py) --
+       free (one public HTTP fetch), catches a wrong industry/country/declared-size-band
+       mismatch. This alone caught Marmon Foodservice Technologies (real 1,001-5,000 employees
+       and Food and Beverage Services, not the 251/'Manufacturing' Jobo reported) at zero cost.
+    2. estimate_company_revenue() (revenue_estimation.py) -- Deepline's free identify call first,
+       then Google AI Overview (~$0.0085/company) only if that misses. Jobo's own revenue is
+       cleared first so this never no-ops on a number we now know cannot be trusted.
+
+    A company that fails the free profile check is deleted immediately, before any paid call --
+    same "free filters before paid ones" discipline as apify_discovery.py's own keep loop. A
+    company whose real revenue cannot be independently confirmed (both sources miss, or Google's
+    actor is unavailable -- e.g. a real monthly platform quota, not a budget block) keeps Jobo's
+    own number but the caller must treat it as UNVERIFIED, never as confirmed.
+
+    Returns {verified, corrected, dropped, unverified} -- every company ends up in exactly one
+    bucket, never silently skipped."""
+    from app.phases.company_profile_check import fetch_public_company_profile, profile_rejection_reason
+    from app.gtm_os.icp.revenue_estimation import estimate_company_revenue
+
+    result = {"verified": [], "corrected": [], "dropped": [], "unverified": []}
+
+    for company_id in company_ids:
+        company = db.get(Company, company_id)
+        if company is None:
+            continue
+        batch = db.get(Batch, company.batch_id)
+        if batch is None or batch.tenant_id != tenant_id:
+            continue  # safety: never verify/delete a company outside the caller's own tenant
+
+        if company.linkedin_url:
+            profile = fetch_public_company_profile(company.linkedin_url)
+            if profile is not None:
+                reason = profile_rejection_reason(profile, employee_min, employee_max)
+                if reason:
+                    result["dropped"].append({"name": company.name, "reason": f"free_profile_check:{reason}"})
+                    db.delete(company)
+                    db.commit()
+                    continue
+
+        jobo_lo, jobo_hi = company.estimated_revenue_lower_usd, company.estimated_revenue_higher_usd
+        company.estimated_revenue_lower_usd = None
+        company.estimated_revenue_higher_usd = None
+        db.commit()
+        revenue_result = estimate_company_revenue(db, enrichment_tenant_id, company)
+
+        if revenue_result["status"] == "resolved":
+            lo, hi = revenue_result["lower_usd"], revenue_result["higher_usd"]
+            below = isinstance(revenue_min_usd, int) and hi is not None and hi < revenue_min_usd
+            above = isinstance(revenue_max_usd, int) and lo is not None and lo > revenue_max_usd
+            if below or above:
+                result["dropped"].append({"name": company.name, "reason": f"real_revenue_out_of_band [{lo}, {hi}] (Jobo had said [{jobo_lo}, {jobo_hi}])"})
+                db.delete(company)
+            elif (lo, hi) != (jobo_lo, jobo_hi):
+                result["corrected"].append({"name": company.name, "jobo_said": [jobo_lo, jobo_hi], "real": [lo, hi]})
+            else:
+                result["verified"].append({"name": company.name, "revenue": [lo, hi]})
+        else:
+            # Could not independently confirm -- restore Jobo's own number rather than leave the
+            # company unpriced, but this bucket is the caller's signal to never present it as
+            # confirmed. See estimate_company_revenue's own "attempts" list for exactly why it
+            # missed (e.g. a real Apify monthly quota, not a bug).
+            company.estimated_revenue_lower_usd = jobo_lo
+            company.estimated_revenue_higher_usd = jobo_hi
+            result["unverified"].append({"name": company.name, "jobo_said": [jobo_lo, jobo_hi], "why": revenue_result["attempts"]})
+        db.commit()
+
+    return result
