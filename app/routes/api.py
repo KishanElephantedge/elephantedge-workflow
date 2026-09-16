@@ -5447,6 +5447,83 @@ def put_partner_icp(request: Request, body: dict = Body(...), db: Session = Depe
     return param.value
 
 
+# ---- Partner discovery (2026-09-16) -- the real gap this closes: every partner's companies so
+# far were fetched by an FDE running app/phases/partner_pipeline.py's functions by hand, once, in
+# a local script. That is not a feature of this app, it's a workaround for one not existing. This
+# is the same real business logic (build_discovery_plan's LLM-derived industry mapping,
+# run_apify_discovery, enforce_icp_on_companies for real revenue/geography enforcement; or the
+# Jobo path + verify_jobo_companies for its own revenue/industry distrust, see
+# partner_pipeline_jobo.py's own corrected docstring) -- exposed as one real, callable route, so
+# it works the same way for every partner and is not tied to any one person's terminal.
+class PartnerDiscoveryRequest(BaseModel):
+    source: str = "apify"  # "apify" | "jobo"
+    target: int = 5
+    title_search: list[str] | None = None  # overrides the hiring signal this partner is searched on
+
+
+@router.post("/gtm-os/partner/discover")
+def run_partner_discovery_route(request: Request, payload: PartnerDiscoveryRequest, db: Session = Depends(get_db)):
+    """Runs real discovery for the CALLING tenant (via X-Tenant-Id, same as every other
+    /gtm-os/partner/* route) -- never Elephant Edge's own tenant, since this route only exists
+    under a partner's own dashboard/admin action. Returns exactly what got kept/dropped/
+    unverified and why, same shape the FDE's own local runs already print, just now a real,
+    reusable product action instead of a script only one person can run."""
+    tenant_id = _resolve_tenant_id(request)
+    if tenant_id == ELEPHANT_EDGE_TENANT_ID:
+        raise HTTPException(status_code=400, detail="This route is for partner tenants only -- Elephant Edge's own discovery runs through the V2 sweep, not this.")
+
+    icp_param = db.query(Parameter).filter(Parameter.tenant_id == tenant_id, Parameter.key == PARTNER_ICP_PARAMETER_KEY).first()
+    if not icp_param or not icp_param.value:
+        raise HTTPException(status_code=400, detail="No ICP configured for this tenant yet -- set one via PUT /gtm-os/partner/icp first.")
+    icp = dict(icp_param.value)
+
+    if payload.source == "jobo":
+        from app.phases.partner_pipeline_jobo import run_tenant_discovery_jobo, verify_jobo_companies
+
+        if not payload.title_search:
+            raise HTTPException(status_code=400, detail="title_search is required for the jobo source -- it is the buying signal for this partner.")
+        batch = Batch(tenant_id=tenant_id, name=f"Partner discovery (jobo) — {datetime.utcnow():%Y-%m-%d %H:%M}",
+                      source="partner_discovery", current_phase="signal_discovery")
+        db.add(batch)
+        db.commit()
+        db.refresh(batch)
+        discovery_result = run_tenant_discovery_jobo(batch.id, db, tenant_id, icp, payload.title_search, target=payload.target)
+        new_ids = [c.id for c in db.query(Company).filter(Company.batch_id == batch.id).all()]
+        verify_result = verify_jobo_companies(
+            db, tenant_id, new_ids, icp.get("revenue_min_usd"), icp.get("revenue_max_usd"),
+            icp.get("employee_min"), icp.get("employee_max"), enrichment_tenant_id=ELEPHANT_EDGE_TENANT_ID,
+        )
+        return {"source": "jobo", "batch_id": batch.id, "discovery": {k: v for k, v in discovery_result.items() if k not in ("kept",)}, "verification": verify_result}
+
+    from app.phases.partner_pipeline import build_discovery_plan, enforce_icp_on_companies
+    from app.apify_budget_guard import STATUS_ALLOWED as _APIFY_BUDGET_ALLOWED, check_apify_budget as _check_apify_budget
+
+    plan = build_discovery_plan(db, ELEPHANT_EDGE_TENANT_ID, f"tenant_{tenant_id}", icp, target=payload.target, title_search=payload.title_search)
+    budget = _check_apify_budget(db, ELEPHANT_EDGE_TENANT_ID, plan["estimated_max_cost_usd"])
+    if budget["status"] != _APIFY_BUDGET_ALLOWED:
+        return {"status": "blocked", "reason": budget["reason"], "plan": plan}
+
+    batch = Batch(tenant_id=tenant_id, name=f"Partner discovery (apify) — {datetime.utcnow():%Y-%m-%d %H:%M}",
+                  source="partner_discovery", current_phase="signal_discovery")
+    db.add(batch)
+    db.commit()
+    db.refresh(batch)
+    s = plan["search"]
+    discovery_result = run_apify_discovery(
+        batch.id, db, tenant_id, target=payload.target, time_range=s["time_range"],
+        location_search=s["location_search"], title_search=s["title_search"],
+        employee_min=s["employee_min"], employee_max=s["employee_max"],
+        industry_filter=s["industry_filter"], limit=s["limit"], budget_tenant_id=ELEPHANT_EDGE_TENANT_ID,
+    )
+    new_companies = db.query(Company).filter(Company.batch_id == batch.id).all()
+    enforced = enforce_icp_on_companies(db, tenant_id, new_companies, icp, enrich_revenue=True, enrichment_tenant_id=ELEPHANT_EDGE_TENANT_ID)
+    return {
+        "source": "apify", "batch_id": batch.id, "plan": plan, "discovery": discovery_result,
+        "kept": [c.name for c in enforced["kept"]], "dropped": enforced["dropped"],
+        "revenue_enrichment": enforced["revenue_enrichment"],
+    }
+
+
 # ---- Partner content context (stage 2 -- Content feature, 2026-09-09) ----
 # Same Parameter-backed pattern as PARTNER_ICP_PARAMETER_KEY above -- one small JSON blob, no new
 # storage concept. Holds what a partner's content prompts need to write AS them instead of as
