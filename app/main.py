@@ -434,4 +434,12 @@ def on_shutdown():
 
 @app.get("/api/health")
 def health():
-    return {"status": "ok", "service": "elephant-edge-backend"}
+    """RENDER_GIT_COMMIT is set automatically by Render on every deploy -- exposed here because
+    health checks alone are a real, confirmed-live-2026-09-16 false signal for "the new code is
+    live": Render keeps the OUTGOING instance answering health checks throughout a rolling
+    deploy, so a health check passing right after a push proves nothing about which commit is
+    actually serving requests. A caller that needs to know a specific fix has landed should poll
+    this for the expected commit sha, not just for status "ok"."""
+    import os
+
+    return {"status": "ok", "service": "elephant-edge-backend", "git_commit": os.environ.get("RENDER_GIT_COMMIT", "unknown")}
