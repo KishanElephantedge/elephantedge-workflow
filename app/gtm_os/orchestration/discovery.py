@@ -1,12 +1,21 @@
 """V2-owned discovery -- Phase 1 of the Autonomous GTM Flow build-out (see progress-log.md).
 
-Calls V1's proven run_discovery() (Crustdata-based Company discovery, app/phases/discovery.py)
-directly -- the capability's result returns straight into this function's own control flow.
-This module never triggers, waits on, or inspects the V1 daily cron
-(app/phases/autonomous_orchestrator.py::run_daily_autonomous_cycle); it is a second, independent
-caller of the same underlying discovery capability, exactly the "Good" reuse pattern from the
-approved architecture (V2 stage -> shared/proven V1 capability -> result returns directly into
-V2 -> V2 continues).
+SOURCE SWITCHED 2026-09-16 (real incident, not a preference): this used to call V1's
+app.phases.discovery.run_discovery() (Crustdata-based Company discovery) directly. That exact
+function was already flagged unsafe in TODO.md on 2026-09-10 -- "confirmed live that its raw
+data includes person names as company_name, foreign companies labelled hq_country USA, and $0
+revenue bounds that pass any revenue filter... 20 of 20 companies it produced had to be
+deleted" -- and this module kept calling it anyway, because the flag was written down but this
+call site was never updated. Ran for real on 2026-09-16 (batch 129, target 15): every single
+company was an Indian SMB with no US ICP relevance (Cosmetic Surgery India, Rockford Fosgate
+(India), Axiom BPM Services PVT LTD, ...), all 15 deleted.
+
+Now calls _run_apify_discovery_across_offerings() (app/phases/autonomous_orchestrator.py) --
+the SAME per-offering-profile Apify pipeline this week's real work fixed and verified for V1
+(the free public-LinkedIn-page check, the real ICP + revenue gate, Jobo-first decision-maker
+resolution). One capability, two callers, same "Good" reuse pattern the module already followed
+-- just pointed at the source that has actually been proven this week, not the one flagged
+unsafe and never fixed.
 
 V2 decides WHEN discovery runs (cadence/daily_target, both configured through the Phase 0
 control plane -- app/gtm_os/orchestration/control.py) and enforces the existing BudgetGuard
@@ -25,10 +34,9 @@ from datetime import datetime
 
 from sqlalchemy.orm import Session
 
-from app.budget_guard import BudgetGuard
 from app.db.models import Batch
 from app.gtm_os.orchestration.control import ControlPlaneHalted, check_can_run, get_control_config
-from app.phases.discovery import run_discovery
+from app.phases.autonomous_orchestrator import _run_apify_discovery_across_offerings
 
 # Tags every Batch this module creates -- V1's own batches are always "deepline" or "jobo"
 # (app/phases/autonomous_orchestrator.py::run_daily_autonomous_cycle), never this value, so
@@ -89,7 +97,11 @@ def run_v2_discovery_if_due(db: Session, tenant_id: int) -> dict:
 
     config = get_control_config(db, tenant_id)
     daily_target = config["discovery"]["daily_target"]
-    daily_budget_usd = config["discovery"]["daily_budget_usd"]
+    # daily_budget_usd (V2's own discovery.daily_budget_usd) is no longer read here -- Apify
+    # spend for this call is already gated by the real, tested check_apify_budget guard inside
+    # run_apify_discovery() (control_config's own apify.daily_budget_usd), so a second,
+    # differently-sourced budget number for the same spend would just be redundant/confusing,
+    # not a real second layer of protection.
 
     batch = Batch(tenant_id=tenant_id, name=f"v2-discovery-{datetime.utcnow().isoformat()}", source=V2_DISCOVERY_BATCH_SOURCE)
     db.add(batch)
@@ -97,8 +109,8 @@ def run_v2_discovery_if_due(db: Session, tenant_id: int) -> dict:
     db.refresh(batch)
 
     try:
-        guard = BudgetGuard(daily_budget_usd)
-        result = run_discovery(batch.id, db, tenant_id, target=daily_target, budget_guard=guard)
-        return {"status": "succeeded", "batch_id": batch.id, "reason": reason, **result}
+        result = _run_apify_discovery_across_offerings(batch, db, tenant_id, daily_target)
+        status = "failed" if result.get("api_error") and result.get("companies_discovered") == 0 else "succeeded"
+        return {"status": status, "batch_id": batch.id, "reason": reason, **result}
     except Exception as e:  # noqa: BLE001 -- a provider failure must not crash the sweep; see module docstring
         return {"status": "failed", "batch_id": batch.id, "error": str(e)}
