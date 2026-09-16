@@ -576,6 +576,34 @@ def execute_apify_discovery_and_qualify(batch_id: int, target: int = 25, db: Ses
     }
 
 
+@router.delete("/batches/{batch_id}/companies")
+def delete_batch_companies(batch_id: int, db: Session = Depends(get_db)):
+    """Deletes every company in a batch (and their ICPMatch/Contact rows) -- for a batch whose
+    discovery source turned out to be wrong-fit garbage wholesale (2026-09-16: V2's own
+    discovery step used the Crustdata-based app.phases.discovery.run_discovery, already flagged
+    unsafe in TODO.md on 2026-09-10 -- "foreign companies labelled hq_country USA" -- and
+    produced 15 Indian SMBs with no US ICP relevance). Never partial; if you need to keep some
+    companies from a batch, exclude them from push individually instead."""
+    from app.gtm_os.icp.icp_matching import ICPMatch
+
+    batch = (
+        db.query(Batch)
+        .filter(Batch.id == batch_id)
+        .filter(Batch.tenant_id == ELEPHANT_EDGE_TENANT_ID)
+        .first()
+    )
+    if not batch:
+        raise HTTPException(status_code=404, detail="Batch not found")
+
+    company_ids = [c.id for c in db.query(Company.id).filter(Company.batch_id == batch_id)]
+    deleted_names = [c.name for c in db.query(Company).filter(Company.id.in_(company_ids)).all()]
+    db.query(ICPMatch).filter(ICPMatch.company_id.in_(company_ids)).delete(synchronize_session=False)
+    db.query(Contact).filter(Contact.company_id.in_(company_ids)).delete(synchronize_session=False)
+    db.query(Company).filter(Company.id.in_(company_ids)).delete(synchronize_session=False)
+    db.commit()
+    return {"deleted_count": len(company_ids), "deleted_names": deleted_names}
+
+
 @router.post("/batches/{batch_id}/phases/icp-and-offering-match")
 def execute_icp_and_offering_match(batch_id: int, db: Session = Depends(get_db)):
     """Real ICP matching (persisted, via run_icp_matching_sweep) plus per-company offering
