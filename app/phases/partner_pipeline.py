@@ -193,7 +193,17 @@ def enforce_icp_on_companies(db: Session, tenant_id: int, companies: list, icp: 
     # tenant_id/batch_id with no other filter, so every "dropped" company kept showing up in their
     # real Accounts view as if it had passed. Deleting the actual rejected Company objects
     # (tracked directly, not re-matched by name) is what makes "dropped" actually mean dropped.
+    #
+    # Second real bug fix (2026-09-16): deleting here without recording WHY meant the next
+    # discovery run had no memory of it -- Utron/Burro/Vertech, all already proven below
+    # Amdrodd's revenue floor, kept reappearing across repeated Apify runs the same way Docker/
+    # Cytek/FormFactor did on the Jobo side before that got fixed. Same fix, applied here too:
+    # record the domain as rejected before deleting, so _existing_domains() (discovery.py)
+    # excludes it from every future run, not just this one.
+    from app.phases.discovery import add_rejected_domain
+
     for c in dropped_companies:
+        add_rejected_domain(db, tenant_id, c.domain)
         db.delete(c)
     if dropped_companies:
         db.commit()
