@@ -15,15 +15,23 @@ CONFIG. One Parameter per tenant (PARTNER_DAILY_RUN_PARAMETER_KEY), shape:
         "schedule_hour_utc": int,      # 0-23, which hour this tenant's run fires
         "daily_target": int,           # how many companies to aim for per day
         "source": "apify" | "jobo",    # which discovery source this tenant's daily run uses
-        "title_search": [str, ...],    # the hiring-signal titles searched (required to run)
         "pages": int,                  # jobo only, same meaning as elsewhere
         "last_run_date": "YYYY-MM-DD", # UTC date of the last real trigger, prevents double-firing
     }
 
-No default is invented for schedule_hour_utc/daily_target/source/title_search -- same "None until
-an operator sets a real value" discipline as discovery.py's own cadence config. `enabled` defaults
-False explicitly, matching V1's is_autonomous_enabled() default and every other autonomous-spend
-toggle in this codebase: a brand-new tenant's daily run must never fire before someone deliberately
+REAL FIX, 2026-09-16 (was wrong before this): title_search does NOT live here. It is a property
+of the PARTNER'S OWN ICP (partner_icp Parameter, app/routes/api.py's PUT /gtm-os/partner/icp) --
+Amdrodd's hiring-signal titles are literally their own documented "Salesforce job posting"
+trigger, an ICP attribute, not a generic scheduling setting every partner would separately
+configure the same way. Explicit correction after being told directly: "why we have to give this
+separately job titles to search... everyone's ICPs varies based on that we fetch right." The
+daily tick reads title_search from get_daily_run_title_search() below (the tenant's own ICP),
+never from this config.
+
+No default is invented for schedule_hour_utc/daily_target/source -- same "None until an operator
+sets a real value" discipline as discovery.py's own cadence config. `enabled` defaults False
+explicitly, matching V1's is_autonomous_enabled() default and every other autonomous-spend toggle
+in this codebase: a brand-new tenant's daily run must never fire before someone deliberately
 turns it on.
 
 SCHEDULING MODEL. main.py's scheduler ticks this module's check function once an hour (not once a
@@ -50,10 +58,20 @@ DEFAULT_CONFIG = {
     "schedule_hour_utc": None,
     "daily_target": None,
     "source": None,
-    "title_search": None,
     "pages": 2,
     "last_run_date": None,
 }
+
+
+def get_daily_run_title_search(db: Session, tenant_id: int) -> list[str] | None:
+    """title_search lives on the partner's own ICP, not on the daily-run config -- see this
+    module's docstring correction. Returns None (not an empty list) when the ICP has none set,
+    so callers can distinguish "no ICP-level signal configured" from "configured as empty"."""
+    icp_param = db.query(Parameter).filter(Parameter.tenant_id == tenant_id, Parameter.key == PARTNER_ICP_PARAMETER_KEY).first()
+    if not icp_param or not isinstance(icp_param.value, dict):
+        return None
+    titles = icp_param.value.get("title_search")
+    return titles if isinstance(titles, list) and titles else None
 
 
 class DailyRunConfigError(ValueError):
@@ -83,12 +101,8 @@ def _validate_config(config: dict) -> None:
     if source is not None and source not in ("apify", "jobo"):
         raise DailyRunConfigError("source must be 'apify', 'jobo', or null")
 
-    titles = config.get("title_search")
-    if titles is not None and (not isinstance(titles, list) or not all(isinstance(t, str) and t.strip() for t in titles)):
-        raise DailyRunConfigError("title_search must be a list of non-empty strings, or null")
-
-    if config.get("enabled") and (hour is None or target is None or source is None or not titles):
-        raise DailyRunConfigError("enabled=true requires schedule_hour_utc, daily_target, source, and title_search to all be set")
+    if config.get("enabled") and (hour is None or target is None or source is None):
+        raise DailyRunConfigError("enabled=true requires schedule_hour_utc, daily_target, and source to all be set")
 
 
 def set_daily_run_config(db: Session, tenant_id: int, updates: dict) -> dict:
@@ -97,6 +111,13 @@ def set_daily_run_config(db: Session, tenant_id: int, updates: dict) -> dict:
     current = get_daily_run_config(db, tenant_id)
     merged = {**current, **updates}
     _validate_config(merged)
+
+    if merged.get("enabled") and not get_daily_run_title_search(db, tenant_id):
+        raise DailyRunConfigError(
+            "enabled=true requires this tenant's own ICP (PUT /gtm-os/partner/icp) to have a "
+            "title_search set -- that's the hiring/buying signal driving discovery, and it "
+            "belongs on the ICP, not here."
+        )
 
     param = db.query(Parameter).filter(Parameter.tenant_id == tenant_id, Parameter.key == PARTNER_DAILY_RUN_PARAMETER_KEY).first()
     if param:
@@ -163,10 +184,29 @@ def run_partner_discovery_now(batch_id: int, tenant_id: int, source: str, target
             )
             new_companies = db.query(Company).filter(Company.batch_id == batch.id).all()
             enforced = enforce_icp_on_companies(db, tenant_id, new_companies, icp, enrich_revenue=True, enrichment_tenant_id=ELEPHANT_EDGE_TENANT_ID)
+
+            # REAL FIX, 2026-09-16: this used to stop at discovery -- Jobo's own path bundles
+            # free leadership automatically, but the Apify path never found decision-makers at
+            # all. find_decision_makers() is the SAME free-first cascade (Jobo leadership ->
+            # Apify people-search resolve -> Google AI Overview) already proven live all session.
+            # allow_paid_fallback=False here deliberately: this runs unattended and daily, so it
+            # never silently reaches Deepline's paid search_contact (~$0.17-0.57/company) on its
+            # own -- a company that misses every free layer just gets fewer contacts, not a
+            # bigger bill nobody approved.
+            from app.phases.decision_maker import find_decision_makers
+
+            contacts_found = 0
+            for company in enforced["kept"]:
+                try:
+                    new_contacts, _ = find_decision_makers(company, db, tenant_id, allow_paid_fallback=False)
+                    contacts_found += len(new_contacts)
+                except Exception:
+                    logger.exception("decision-maker resolution failed for company_id=%s in batch %s", company.id, batch_id)
+
             batch.discovery_result = {
                 "source": "apify", "plan": plan, "discovery": discovery_result,
                 "kept": [c.name for c in enforced["kept"]], "dropped": enforced["dropped"],
-                "revenue_enrichment": enforced["revenue_enrichment"],
+                "revenue_enrichment": enforced["revenue_enrichment"], "contacts_found": contacts_found,
             }
         batch.status = "completed"
         db.commit()
@@ -207,6 +247,10 @@ def run_partner_daily_tick_for_tenant(db: Session, tenant_id: int, now: datetime
     if config.get("last_run_date") == today_str:
         return {"status": "skipped", "reason": "already ran today"}
 
+    title_search = get_daily_run_title_search(db, tenant_id)
+    if not title_search:
+        return {"status": "skipped", "reason": "enabled, but this tenant's ICP has no title_search set -- fix the ICP, not this config"}
+
     batch = Batch(
         tenant_id=tenant_id, name=f"Partner daily run ({config['source']}) — {now:%Y-%m-%d %H:%M} UTC",
         source="partner_discovery", current_phase="signal_discovery", status="in_progress",
@@ -222,7 +266,7 @@ def run_partner_daily_tick_for_tenant(db: Session, tenant_id: int, now: datetime
 
     thread = threading.Thread(
         target=run_partner_discovery_now,
-        args=(batch.id, tenant_id, config["source"], config["daily_target"], config["title_search"], config["pages"]),
+        args=(batch.id, tenant_id, config["source"], config["daily_target"], title_search, config["pages"]),
         daemon=True,
     )
     thread.start()

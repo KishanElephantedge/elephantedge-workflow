@@ -5498,8 +5498,12 @@ def run_partner_discovery_route(request: Request, payload: PartnerDiscoveryReque
     icp_param = db.query(Parameter).filter(Parameter.tenant_id == tenant_id, Parameter.key == PARTNER_ICP_PARAMETER_KEY).first()
     if not icp_param or not icp_param.value:
         raise HTTPException(status_code=400, detail="No ICP configured for this tenant yet -- set one via PUT /gtm-os/partner/icp first.")
-    if payload.source == "jobo" and not payload.title_search:
-        raise HTTPException(status_code=400, detail="title_search is required for the jobo source -- it is the buying signal for this partner.")
+    # title_search is an ICP attribute (the partner's own hiring/buying signal), not something a
+    # caller should have to resupply every time -- falls back to the ICP's own title_search when
+    # the request doesn't explicitly override it (e.g. to test a different signal ad hoc).
+    effective_title_search = payload.title_search or icp_param.value.get("title_search")
+    if payload.source == "jobo" and not effective_title_search:
+        raise HTTPException(status_code=400, detail="title_search is required for the jobo source -- set one on this tenant's ICP (PUT /gtm-os/partner/icp) or pass it explicitly.")
 
     batch = Batch(tenant_id=tenant_id, name=f"Partner discovery ({payload.source}) — {datetime.utcnow():%Y-%m-%d %H:%M}",
                   source="partner_discovery", current_phase="signal_discovery", status="in_progress")
@@ -5509,7 +5513,7 @@ def run_partner_discovery_route(request: Request, payload: PartnerDiscoveryReque
 
     thread = threading.Thread(
         target=_run_partner_discovery_background,
-        args=(batch.id, tenant_id, payload.source, payload.target, payload.title_search, payload.pages),
+        args=(batch.id, tenant_id, payload.source, payload.target, effective_title_search, payload.pages),
         daemon=True,
     )
     thread.start()
