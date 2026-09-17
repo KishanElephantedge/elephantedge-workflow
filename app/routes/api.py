@@ -1134,8 +1134,14 @@ def list_companies(request: Request, page: int = 1, page_size: int = 25, search:
 
     companies = query.order_by(Company.created_at.desc()).all()
     # Hot leads float to the top of this same list -- no separate tab/filter (per explicit
-    # instruction). Stable sort keeps created_at-desc ordering within each group.
-    companies.sort(key=lambda c: not c.hot_lead)
+    # instruction). Stable sort keeps created_at-desc ordering within each group. SKIPPED when a
+    # period filter is selected (2026-09-16, explicit correction -- "the list should be filtered
+    # by latest date"): a hot lead from a week ago floating above a non-hot company from
+    # yesterday makes the dates in a period-filtered view look random/non-monotonic, which
+    # defeats the point of asking "what happened in this window" -- that view needs a real,
+    # readable date order, not a relevance re-rank.
+    if not (period_days or period_date_from or period_date_to):
+        companies.sort(key=lambda c: not c.hot_lead)
 
     if qualified == "true":
         companies = [c for c in companies if _is_company_qualified(c)]
