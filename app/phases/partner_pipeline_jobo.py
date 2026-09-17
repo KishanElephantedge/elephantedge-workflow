@@ -365,7 +365,11 @@ def run_partner_discovery_jobo(db: Session, partner_name: str, icp: dict, target
 
                 website = profile.get("website") or ""
                 domain = website.replace("https://", "").replace("http://", "").strip("/").split("/")[0] or None
-                identity = (domain or "").lower().replace("www.", "") or _fold_name(name)
+                # Same normalize-once fix as run_tenant_discovery_jobo's own copy of this block --
+                # Jobo's website field is inconsistently "www."-prefixed across calls for the same
+                # real company, so the stored domain must be normalized here too, for consistency.
+                domain = (domain or "").lower().replace("www.", "") or None
+                identity = domain or _fold_name(name)
                 if identity in seen_identity:
                     dropped.append((name, "duplicate of a company already kept (different Jobo id)"))
                     continue
@@ -440,7 +444,6 @@ def run_tenant_discovery_jobo(batch_id: int, db: Session, tenant_id: int, icp: d
     seen: set[str] = set()
     seen_identity: set[str] = set()
     kept, dropped = [], []
-    domain_diagnostics = []  # TEMP, see the diagnostic append below
     jobs_seen = 0
     credits_end = None
 
@@ -484,20 +487,18 @@ def run_tenant_discovery_jobo(batch_id: int, db: Session, tenant_id: int, icp: d
 
                 website = profile.get("website") or ""
                 domain = website.replace("https://", "").replace("http://", "").strip("/").split("/")[0] or None
-                identity = (domain or "").lower().replace("www.", "") or _fold_name(name)
-                # TEMP DIAGNOSTIC 2026-09-16 -- FormFactor/Cytek kept recurring across three
-                # separate fix attempts despite excluded_domains provably containing their
-                # domains in isolated checks made before/after the run. Recording the exact
-                # runtime values at the point of decision (returned in the result, since Render's
-                # own logs aren't reachable from here) to catch what those isolated checks
-                # couldn't see -- e.g. a domain variant, a stale read, a case mismatch.
-                domain_diagnostics.append({
-                    "name": name, "raw_website": website, "domain": domain,
-                    "in_excluded_domains": bool(domain and domain.lower() in excluded_domains),
-                    "excluded_domains_sample": sorted(excluded_domains)[:5],
-                    "excluded_domains_size": len(excluded_domains),
-                })
-                if identity in seen_identity or (domain and domain.lower() in excluded_domains):
+                # REAL BUG, confirmed live 2026-09-16 via the diagnostic below (now removed):
+                # Jobo's own `website` field is inconsistent across calls for the SAME real
+                # company -- FormFactor came back as "https://formfactor.com" once and
+                # "http://www.formfactor.com" another time. `identity` was already www-stripped
+                # for the seen_identity/dedup-within-this-run check, but `domain` itself (used for
+                # BOTH the excluded_domains check AND the value stored on Company.domain) never
+                # was -- so a "www."-prefixed variant silently bypassed exclusion and created a
+                # second, differently-shaped domain string for a company already proven bad.
+                # Now normalized once, used everywhere domain identity matters.
+                domain = (domain or "").lower().replace("www.", "") or None
+                identity = domain or _fold_name(name)
+                if identity in seen_identity or (domain and domain in excluded_domains):
                     dropped.append((name, "duplicate (already kept this run, or already known to this tenant)"))
                     continue
                 seen_identity.add(identity)
@@ -533,7 +534,6 @@ def run_tenant_discovery_jobo(batch_id: int, db: Session, tenant_id: int, icp: d
         "kept": kept, "dropped": dropped,
         "credits_used": jobs_seen * CREDITS_PER_JOB,
         "credits_balance": credits_end,
-        "domain_diagnostics": domain_diagnostics,  # TEMP, see the diagnostic append above
     }
 
 
