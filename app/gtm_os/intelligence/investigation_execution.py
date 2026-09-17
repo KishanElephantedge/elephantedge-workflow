@@ -300,9 +300,18 @@ def execute_investigation_action(db: Session, tenant_id: int, action: dict) -> d
             # source_capabilities.py), so it is blocked here directly rather than left to the
             # Deepline budget guard, which only stops it AFTER credits are configured/available --
             # explicit instruction: never call this source again, regardless of budget state.
+            # 2026-09-17 fix: this branch used to return without calling _record(), so
+            # objective.attempts never advanced -- combined with S3's rotation being keyed purely
+            # on objective.attempts, any objective that landed here was stuck retrying this exact
+            # disabled source forever, never rotating to linkedin_job. theirstack_job has now also
+            # been removed from S3's candidate list entirely (sensing_strategy.py), so this branch
+            # should be unreachable going forward -- kept only as a defensive backstop, but now
+            # records the attempt like every other path so a future disabled source can never get
+            # stuck the same way again.
+            attempt = _record(db, tenant_id, objective, RESULT_ERROR, source)
             return _result(objective_id, source, action_type, EXEC_BLOCKED_BY_DISABLED_SOURCE,
                            error_reason="theirstack_job is permanently disabled -- use linkedin_job (Apify) instead",
-                           started_at=started_at)
+                           started_at=started_at, investigation_attempt=attempt)
         elif source == "linkedin_job":
             # Real fix (2026-08-24) -- reuses V1's own proven sense_linkedin_jobs() adapter and
             # S4's deterministic parameters (see investigation_generation.py), bounded to

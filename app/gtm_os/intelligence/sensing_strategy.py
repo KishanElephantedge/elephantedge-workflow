@@ -91,14 +91,19 @@ def _candidates_for_shape(db: Session, tenant_id: int, objective: InvestigationO
     """Ordered by capability fit for the shape, per the principles in the module docstring --
     never by icp_id directly. See each shape's own comment for the real principle applied."""
     if shape == SHAPE_HIRING_TRIGGER:
-        # "hiring-trigger evidence -> prefer a real hiring/job source" -- both are real structured
-        # job sources; theirstack_job is wired into the hourly sweep AND budget-guarded today,
-        # linkedin_job now has a real S5 execution path too (2026-08-24 fix, reuses V1's own
-        # proven parameters) so it's ranked second, a real fallback rather than a dead end.
-        # web_search is filtered out by
-        # _evidence_capable() below -- it's executable but never interpreted into Problem/Demand
-        # evidence, so offering it as a "last resort" would just spend real money for nothing.
-        base = ["theirstack_job", "linkedin_job", "web_search"]
+        # "hiring-trigger evidence -> prefer a real hiring/job source". theirstack_job REMOVED
+        # entirely (2026-09-17, explicit instruction) -- it is permanently disabled at execution
+        # (investigation_execution.py), and merely deprioritizing it via SOURCE_CAPABILITIES'
+        # fallback_allowed=False was proven live NOT to work: _candidates_for_shape never actually
+        # filtered on that flag, so it kept getting selected first every tick, got blocked every
+        # time, and (a separate bug, also fixed) never advanced objective.attempts either -- so
+        # affected objectives were stuck retrying a disabled source forever, never reaching
+        # linkedin_job at all. linkedin_job (Apify) is the real, working, budget-guarded
+        # alternative (2026-08-24 fix, reuses V1's own proven parameters) -- now the first
+        # candidate outright, not a fallback. web_search is filtered out by _evidence_capable()
+        # below -- it's executable but never interpreted into Problem/Demand evidence, so offering
+        # it as a "last resort" would just spend real money for nothing.
+        base = ["linkedin_job", "web_search"]
         return _evidence_capable(base)
 
     if shape == SHAPE_IDENTITY_RESOLUTION:
