@@ -247,6 +247,52 @@ def finish_gtm_intelligence_run(db: Session, run: GtmIntelligenceRun, result: di
     return run
 
 
+def _run_stage_with_timeout(stage_fn, tenant_id: int, timeout_seconds: int) -> dict:
+    """Real fix, 2026-09-17: confirmed live that a full sweep (run 128, triggered 08:18 UTC)
+    finished sensing (58 GtmSignal rows) and discovery (9 companies) by ~08:27, then produced
+    ZERO further writes to ANY downstream table for 36+ minutes while the run row still read
+    "running" -- no timeout anywhere in this pipeline meant one slow/hung external call inside a
+    single stage silently froze the entire sweep, indefinitely, with nothing surfacing until the
+    120-minute stale-run recovery eventually marked it failed. investigation_cycle
+    (app/gtm_os/intelligence/investigation_cycle.py) is the stage immediately after discovery and
+    the most likely candidate (a real, previously-documented hang in this exact stage) -- this
+    wrapper is applied there first, and is written generically so any other stage can get the
+    same protection.
+
+    Runs `stage_fn(db, tenant_id)` in its OWN thread with its OWN fresh db session (never the
+    caller's -- a SQLAlchemy Session is not thread-safe, and the calling sweep must keep using
+    its own session immediately after this returns, timeout or not). If the stage doesn't finish
+    within timeout_seconds, this returns a real "timed_out" status and the sweep MOVES ON --
+    the abandoned thread is a daemon and either finishes harmlessly in the background (its own
+    session's writes still land for whichever objects it manages to reach) or dies when the
+    process eventually restarts. Never blocks the rest of the sweep again."""
+    import queue
+    import threading
+
+    from app.db.session import SessionLocal
+
+    result_queue: queue.Queue = queue.Queue(maxsize=1)
+
+    def _target():
+        stage_db = SessionLocal()
+        try:
+            result_queue.put(("ok", stage_fn(stage_db, tenant_id)))
+        except Exception as e:  # noqa: BLE001 -- report it through the queue, never crash the thread silently
+            result_queue.put(("error", str(e)))
+        finally:
+            stage_db.close()
+
+    thread = threading.Thread(target=_target, daemon=True)
+    thread.start()
+    try:
+        status, value = result_queue.get(timeout=timeout_seconds)
+    except queue.Empty:
+        return {"status": "timed_out", "reason": f"exceeded {timeout_seconds}s -- abandoned, sweep continuing"}
+    if status == "error":
+        return {"status": "failed", "error": value}
+    return value
+
+
 def recover_stale_gtm_intelligence_runs(db: Session, tenant_id: int, stale_after_minutes: int = 120) -> int:
     """Mirrors V1's _clear_stale_running_flags() concurrency-safety pattern (autonomous_orchestrator.py):
     a run that's been "running" for longer than any real sweep could plausibly take (a crashed
@@ -891,11 +937,15 @@ def run_gtm_intelligence_sweep(
     # (free/local), S3-S6 are skipped with an explicit configuration_required status while that
     # cap is unconfigured. Never raises -- same per-stage error isolation as every other stage here.
     try:
-        investigation_result = run_investigation_cycle(db, tenant_id)
+        # Real, bounded timeout (2026-09-17) -- see _run_stage_with_timeout's own docstring for
+        # the exact live hang this fixes. 300s comfortably covers a real worst case (2 objectives
+        # x a few ~60s Google/Apify calls each, per investigation.max_objectives_per_tick) while
+        # still guaranteeing the sweep can never again freeze here indefinitely.
+        investigation_result = _run_stage_with_timeout(run_investigation_cycle, tenant_id, timeout_seconds=300)
         result["investigation_cycle"] = investigation_result
         if investigation_result.get("status") in ("succeeded", "partial"):
             any_succeeded = True
-        if investigation_result.get("status") == "partial":
+        if investigation_result.get("status") in ("partial", "timed_out"):
             any_failed = True
         logger.info("gtm_intelligence_sweep: investigation_cycle %s", investigation_result.get("status"))
     except Exception as e:  # noqa: BLE001 -- see module docstring
