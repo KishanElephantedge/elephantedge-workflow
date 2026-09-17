@@ -973,7 +973,14 @@ def run_gtm_intelligence_sweep(
             promotion = promote_concurrent_hiring_across_sweeps(stage_db, stage_tenant_id)
             return {"status": "succeeded", "created": len(interpreted), "concurrent_hiring_promotion": promotion}
 
-        interpretation_result = _run_stage_with_timeout(_run_interpretation_stage, tenant_id, timeout_seconds=180)
+        # Real, confirmed live in run 130 (2026-09-17): this is not a hang -- there is a genuine
+        # 237-signal backlog (linkedin_post/linkedin_job/linkedin_reply) that has been building up
+        # because past runs kept getting cut off before finishing. Each signal costs one LLM call,
+        # so 180s wasn't enough to clear even one run's worth. Widened to 600s (10min) as a one-time
+        # catch-up budget so a single run can actually drain the backlog instead of perpetually
+        # timing out on the same signals every day. Safe to run this long: it's a fresh background
+        # thread on its own session, not something blocking an HTTP connection.
+        interpretation_result = _run_stage_with_timeout(_run_interpretation_stage, tenant_id, timeout_seconds=600)
         result["interpretation"] = interpretation_result
         if interpretation_result.get("status") == "succeeded":
             any_succeeded = True
@@ -987,10 +994,20 @@ def run_gtm_intelligence_sweep(
         logger.error("gtm_intelligence_sweep: interpretation failed -- %s", e)
 
     try:
-        problems = run_problem_hypothesis_sweep(db, tenant_id, sources=ALL_INTERPRETED_SOURCES)
-        result["problem_detection"] = {"status": "succeeded", "hypotheses_touched": len(problems)}
-        any_succeeded = True
-        logger.info("gtm_intelligence_sweep: problem detection succeeded (%d hypotheses touched)", len(problems))
+        # Same fresh-session fix as interpretation above -- confirmed live in run 130: this exact
+        # stage hit "SSL connection has been closed unexpectedly" on the sweep's long-lived `db`
+        # session (stale after sensing + investigation_cycle + interpretation's own time window).
+        def _run_problem_detection_stage(stage_db, stage_tenant_id):
+            problems = run_problem_hypothesis_sweep(stage_db, stage_tenant_id, sources=ALL_INTERPRETED_SOURCES)
+            return {"status": "succeeded", "hypotheses_touched": len(problems)}
+
+        problem_result = _run_stage_with_timeout(_run_problem_detection_stage, tenant_id, timeout_seconds=180)
+        result["problem_detection"] = problem_result
+        if problem_result.get("status") == "succeeded":
+            any_succeeded = True
+        else:
+            any_failed = True
+        logger.info("gtm_intelligence_sweep: problem detection %s", problem_result.get("status"))
     except Exception as e:  # noqa: BLE001 -- see module docstring
         db.rollback()  # 2026-08-26, real fix -- see the ACCOUNT_STRATEGY_STAGES loop's own comment for the full explanation
         result["problem_detection"] = {"status": "failed", "error": str(e)}
@@ -998,10 +1015,18 @@ def run_gtm_intelligence_sweep(
         logger.error("gtm_intelligence_sweep: problem detection failed -- %s", e)
 
     try:
-        demands = run_demand_hypothesis_sweep(db, tenant_id, sources=ALL_INTERPRETED_SOURCES)
-        result["demand_detection"] = {"status": "succeeded", "hypotheses_touched": len(demands)}
-        any_succeeded = True
-        logger.info("gtm_intelligence_sweep: demand detection succeeded (%d hypotheses touched)", len(demands))
+        # Same fresh-session fix -- same staleness risk applies here by the time this stage runs.
+        def _run_demand_detection_stage(stage_db, stage_tenant_id):
+            demands = run_demand_hypothesis_sweep(stage_db, stage_tenant_id, sources=ALL_INTERPRETED_SOURCES)
+            return {"status": "succeeded", "hypotheses_touched": len(demands)}
+
+        demand_result = _run_stage_with_timeout(_run_demand_detection_stage, tenant_id, timeout_seconds=180)
+        result["demand_detection"] = demand_result
+        if demand_result.get("status") == "succeeded":
+            any_succeeded = True
+        else:
+            any_failed = True
+        logger.info("gtm_intelligence_sweep: demand detection %s", demand_result.get("status"))
     except Exception as e:  # noqa: BLE001 -- see module docstring
         db.rollback()  # 2026-08-26, real fix -- see the ACCOUNT_STRATEGY_STAGES loop's own comment for the full explanation
         result["demand_detection"] = {"status": "failed", "error": str(e)}
