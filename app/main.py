@@ -80,6 +80,36 @@ def _scheduled_autonomous_tick():
             db.close()
 
 
+def _scheduled_partner_daily_run_tick():
+    """Ticks once an hour, checking every PARTNER tenant's own daily-run config (2026-09-16,
+    explicit instruction: partners need the same kind of scheduled daily run Elephant Edge's own
+    engine has). Hourly, not daily, because each partner picks their own hour -- see
+    app/gtm_os/orchestration/partner_daily_run.py's own docstring for the full contract
+    (disabled by default, one real trigger per UTC day per tenant). Elephant Edge's own tenant is
+    skipped -- its discovery runs through the V2 sweep, not this. One tenant's failure (a bad
+    config, a provider outage) is isolated and never stops another's check, same discipline as
+    every other per-tenant sweep in this scheduler."""
+    from app.db.models import Tenant
+    from app.gtm_os.orchestration.partner_daily_run import run_partner_daily_tick_for_tenant
+
+    db = SessionLocal()
+    try:
+        tenant_ids = [t.id for t in db.query(Tenant.id).filter(Tenant.id != ELEPHANT_EDGE_TENANT_ID).all()]
+    finally:
+        db.close()
+
+    for tenant_id in tenant_ids:
+        db = SessionLocal()
+        try:
+            result = run_partner_daily_tick_for_tenant(db, tenant_id)
+            if result.get("status") == "started":
+                logging.getLogger(__name__).info("partner_daily_run_tick: tenant_id=%s started batch_id=%s", tenant_id, result.get("batch_id"))
+        except Exception:
+            logging.getLogger(__name__).exception("partner_daily_run_tick: tenant_id=%s failed", tenant_id)
+        finally:
+            db.close()
+
+
 def _scheduled_auto_approval_sweep():
     """Approves and sends drafts left unreviewed past the window -- see
     app/gtm_os/send/auto_approval.py. Never raises: a provider failure must not kill the tick."""
@@ -392,6 +422,9 @@ def on_startup():
         misfire_grace_time=AUTONOMOUS_MISFIRE_GRACE_SECONDS,
     )
     scheduler.add_job(_scheduled_approval_sweep, "interval", minutes=5, id="approval_window_sweep")
+    # Hourly, not daily -- each partner tenant picks its own trigger hour (partner_daily_run.py),
+    # so this just checks "is anyone due this hour" rather than firing once at one fixed time.
+    scheduler.add_job(_scheduled_partner_daily_run_tick, "interval", minutes=60, id="partner_daily_run_tick")
     # Unattended approval window (2026-08-31): a draft nobody reviews within AUTO_APPROVAL_HOURS
     # is approved and pushed on its own, so human review is a chance to intervene rather than a
     # requirement to proceed. Every 15 minutes rather than every 5 -- a 2-hour window does not

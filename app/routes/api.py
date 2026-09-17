@@ -5475,66 +5475,12 @@ class PartnerDiscoveryRequest(BaseModel):
     # $0.003/job, $0 for a non-match), useful when a narrow ICP genuinely has thin volume
 
 
-def _run_partner_discovery_background(batch_id: int, tenant_id: int, source: str, target: int, title_search: list[str] | None, pages: int = 2) -> None:
-    """Runs entirely on its own db session/thread -- see the route's own docstring for why. Every
-    outcome (success, a real ICP block, or a real exception) is written onto the Batch row, never
-    lost silently, since nothing is left to return an HTTP response to."""
-    from app.db.session import SessionLocal
-
-    db = SessionLocal()
-    try:
-        batch = db.get(Batch, batch_id)
-        icp_param = db.query(Parameter).filter(Parameter.tenant_id == tenant_id, Parameter.key == PARTNER_ICP_PARAMETER_KEY).first()
-        icp = dict(icp_param.value)
-
-        if source == "jobo":
-            from app.phases.partner_pipeline_jobo import run_tenant_discovery_jobo, verify_jobo_companies
-
-            discovery_result = run_tenant_discovery_jobo(batch.id, db, tenant_id, icp, title_search, target=target, pages=pages)
-            new_ids = [c.id for c in db.query(Company).filter(Company.batch_id == batch.id).all()]
-            verify_result = verify_jobo_companies(
-                db, tenant_id, new_ids, icp.get("revenue_min_usd"), icp.get("revenue_max_usd"),
-                icp.get("employee_min"), icp.get("employee_max"), enrichment_tenant_id=ELEPHANT_EDGE_TENANT_ID,
-            )
-            batch.discovery_result = {"source": "jobo", "discovery": {k: v for k, v in discovery_result.items() if k != "kept"}, "verification": verify_result}
-        else:
-            from app.phases.partner_pipeline import build_discovery_plan, enforce_icp_on_companies
-            from app.apify_budget_guard import STATUS_ALLOWED as _APIFY_BUDGET_ALLOWED, check_apify_budget as _check_apify_budget
-
-            plan = build_discovery_plan(db, ELEPHANT_EDGE_TENANT_ID, f"tenant_{tenant_id}", icp, target=target, title_search=title_search)
-            budget = _check_apify_budget(db, ELEPHANT_EDGE_TENANT_ID, plan["estimated_max_cost_usd"])
-            if budget["status"] != _APIFY_BUDGET_ALLOWED:
-                batch.status = "blocked"
-                batch.discovery_result = {"source": "apify", "status": "blocked", "reason": budget["reason"], "plan": plan}
-                db.commit()
-                return
-
-            s = plan["search"]
-            discovery_result = run_apify_discovery(
-                batch.id, db, tenant_id, target=target, time_range=s["time_range"],
-                location_search=s["location_search"], title_search=s["title_search"],
-                employee_min=s["employee_min"], employee_max=s["employee_max"],
-                industry_filter=s["industry_filter"], limit=s["limit"], budget_tenant_id=ELEPHANT_EDGE_TENANT_ID,
-            )
-            new_companies = db.query(Company).filter(Company.batch_id == batch.id).all()
-            enforced = enforce_icp_on_companies(db, tenant_id, new_companies, icp, enrich_revenue=True, enrichment_tenant_id=ELEPHANT_EDGE_TENANT_ID)
-            batch.discovery_result = {
-                "source": "apify", "plan": plan, "discovery": discovery_result,
-                "kept": [c.name for c in enforced["kept"]], "dropped": enforced["dropped"],
-                "revenue_enrichment": enforced["revenue_enrichment"],
-            }
-        batch.status = "completed"
-        db.commit()
-    except Exception as e:  # noqa: BLE001 -- nothing left to raise TO; record it, never lose it
-        db.rollback()
-        batch = db.get(Batch, batch_id)
-        if batch:
-            batch.status = "failed"
-            batch.discovery_error = f"{type(e).__name__}: {e}"
-            db.commit()
-        logger.exception("partner discovery background run failed for batch %s", batch_id)
-    finally:
-        db.close()
+# MOVED to app/gtm_os/orchestration/partner_daily_run.py, 2026-09-16 -- the daily autonomous
+# scheduler needs to fire the exact same discovery+verification logic this manual route uses, so
+# it now lives in one shared place (run_partner_discovery_now) instead of two copies that could
+# silently drift apart. Imported here under its old name so the thread-start call below is
+# unchanged.
+from app.gtm_os.orchestration.partner_daily_run import run_partner_discovery_now as _run_partner_discovery_background
 
 
 @router.post("/gtm-os/partner/discover")
@@ -5584,6 +5530,34 @@ def get_partner_discovery_status(batch_id: int, request: Request, db: Session = 
         "batch_id": batch.id, "status": batch.status, "company_count": company_count,
         "result": batch.discovery_result, "error": batch.discovery_error,
     }
+
+
+# ---- Partner autonomous daily run (2026-09-16, explicit instruction: "we need full autonomous
+# daily [run], same for partners as well" -- mirroring Elephant Edge's own scheduled engine, but
+# each partner configures their own on/off, time, and target. See
+# app/gtm_os/orchestration/partner_daily_run.py for the real contract and why this is a NEW,
+# separate mechanism from V1's run_daily_autonomous_cycle (V1 stays retired). Defaults to
+# disabled for every tenant -- turning this on is a real, standing autonomous-spend decision, not
+# something this route (or any deploy) ever flips on its own.
+@router.get("/gtm-os/partner/daily-run")
+def get_partner_daily_run_route(request: Request, db: Session = Depends(get_db)):
+    from app.gtm_os.orchestration.partner_daily_run import get_daily_run_config
+
+    tenant_id = _resolve_tenant_id(request)
+    return get_daily_run_config(db, tenant_id)
+
+
+@router.put("/gtm-os/partner/daily-run")
+def put_partner_daily_run_route(request: Request, updates: dict = Body(...), db: Session = Depends(get_db)):
+    from app.gtm_os.orchestration.partner_daily_run import DailyRunConfigError, set_daily_run_config
+
+    tenant_id = _resolve_tenant_id(request)
+    if tenant_id == ELEPHANT_EDGE_TENANT_ID:
+        raise HTTPException(status_code=400, detail="This route is for partner tenants only.")
+    try:
+        return set_daily_run_config(db, tenant_id, updates)
+    except DailyRunConfigError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 # ---- Partner content context (stage 2 -- Content feature, 2026-09-09) ----
