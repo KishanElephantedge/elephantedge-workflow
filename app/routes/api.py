@@ -5471,9 +5471,11 @@ class PartnerDiscoveryRequest(BaseModel):
     source: str = "apify"  # "apify" | "jobo"
     target: int = 5
     title_search: list[str] | None = None  # overrides the hiring signal this partner is searched on
+    pages: int = 2  # jobo only -- more pages means more real postings checked (each cheap,
+    # $0.003/job, $0 for a non-match), useful when a narrow ICP genuinely has thin volume
 
 
-def _run_partner_discovery_background(batch_id: int, tenant_id: int, source: str, target: int, title_search: list[str] | None) -> None:
+def _run_partner_discovery_background(batch_id: int, tenant_id: int, source: str, target: int, title_search: list[str] | None, pages: int = 2) -> None:
     """Runs entirely on its own db session/thread -- see the route's own docstring for why. Every
     outcome (success, a real ICP block, or a real exception) is written onto the Batch row, never
     lost silently, since nothing is left to return an HTTP response to."""
@@ -5488,7 +5490,7 @@ def _run_partner_discovery_background(batch_id: int, tenant_id: int, source: str
         if source == "jobo":
             from app.phases.partner_pipeline_jobo import run_tenant_discovery_jobo, verify_jobo_companies
 
-            discovery_result = run_tenant_discovery_jobo(batch.id, db, tenant_id, icp, title_search, target=target)
+            discovery_result = run_tenant_discovery_jobo(batch.id, db, tenant_id, icp, title_search, target=target, pages=pages)
             new_ids = [c.id for c in db.query(Company).filter(Company.batch_id == batch.id).all()]
             verify_result = verify_jobo_companies(
                 db, tenant_id, new_ids, icp.get("revenue_min_usd"), icp.get("revenue_max_usd"),
@@ -5561,7 +5563,7 @@ def run_partner_discovery_route(request: Request, payload: PartnerDiscoveryReque
 
     thread = threading.Thread(
         target=_run_partner_discovery_background,
-        args=(batch.id, tenant_id, payload.source, payload.target, payload.title_search),
+        args=(batch.id, tenant_id, payload.source, payload.target, payload.title_search, payload.pages),
         daemon=True,
     )
     thread.start()
