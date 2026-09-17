@@ -5037,10 +5037,20 @@ def trigger_gtm_intelligence_run(dry_run: bool = False, db: Session = Depends(ge
     """Manual trigger -- the scheduled cycle runs automatically once daily, at a fixed configurable
     UTC time (control.py's get_intelligence_schedule_utc); this lets a run be checked immediately
     instead of waiting for the next scheduled occurrence -- same exact path as the scheduled tick,
-    no separate "test run" implementation (see body below: identical run_gtm_intelligence_sweep()
-    call, identical concurrency/stale-run/control-plane guards). Same persisted run-record as the
-    scheduled path (unless dry_run=True, which persists nothing, matching
-    run_gtm_intelligence_sweep's own dry_run contract).
+    no separate "test run" implementation.
+
+    Real bug fix (2026-09-17, confirmed live): this route called run_gtm_intelligence_sweep()
+    directly -- a single inner pass -- while app/main.py's actual scheduled tick calls
+    run_gtm_daily_flow_cycle(), the outer target-seeking loop that re-invokes the sweep until
+    flow_target.daily_flow_target real flows exist for the day (or max_iterations_per_run/no
+    eligible work stops it first). Every manual "Run Now" today was silently testing a different,
+    weaker path than what actually runs on schedule. run_gtm_daily_flow_cycle() is backward
+    compatible by construction (runs the sweep exactly once and returns unchanged when
+    flow_target is unconfigured), so this is a pure fix, not a behavior change for any tenant
+    that hasn't set flow_target. Same persisted run-record as the scheduled path (unless
+    dry_run=True, which persists nothing, matching run_gtm_intelligence_sweep's own dry_run
+    contract -- dry_run intentionally still calls the single-pass sweep directly, since it's pure
+    introspection and the outer loop's iteration/spend semantics don't apply to it).
 
     V2 CONTROL PLANE (Phase 0): dry_run is always allowed (introspection only, no writes/external
     calls -- useful for checking what a sweep WOULD do while paused). A real run is blocked when
@@ -5054,7 +5064,7 @@ def trigger_gtm_intelligence_run(dry_run: bool = False, db: Session = Depends(ge
     from app.gtm_os.orchestration.control import ControlPlaneHalted, check_can_run
     from app.gtm_os.orchestration.sweep import (
         GtmIntelligenceRun, finish_gtm_intelligence_run, recover_stale_gtm_intelligence_runs,
-        run_gtm_intelligence_sweep, start_gtm_intelligence_run,
+        run_gtm_daily_flow_cycle, run_gtm_intelligence_sweep, start_gtm_intelligence_run,
     )
 
     if dry_run:
@@ -5075,7 +5085,7 @@ def trigger_gtm_intelligence_run(dry_run: bool = False, db: Session = Depends(ge
         raise HTTPException(status_code=409, detail=f"a run ({already_running.id}) is already in progress since {already_running.started_at}")
 
     run = start_gtm_intelligence_run(db, ELEPHANT_EDGE_TENANT_ID)
-    result = run_gtm_intelligence_sweep(db, ELEPHANT_EDGE_TENANT_ID)
+    result = run_gtm_daily_flow_cycle(db, ELEPHANT_EDGE_TENANT_ID)
     finish_gtm_intelligence_run(db, run, result)
     return {"run_id": run.id, "status": run.status, "result": result}
 
