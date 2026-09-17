@@ -955,16 +955,31 @@ def run_gtm_intelligence_sweep(
         logger.error("gtm_intelligence_sweep: investigation_cycle failed -- %s", e)
 
     try:
-        interpreted = run_interpretation_sweep(db, tenant_id, sources=ALL_INTERPRETED_SOURCES)
-        # Cross-sweep concurrent-hiring promotion (2026-08-31): interpretation's own promotion
-        # only ever counted postings within one batch, so a company whose concurrent postings
-        # arrived on different days stayed at dead-end "hiring_activity". Measured against real
-        # data this recovered 14 companies / 32 signals on first run. Runs inside the same
-        # try/except -- it is part of interpreting job signals, not a separate stage.
-        promotion = promote_concurrent_hiring_across_sweeps(db, tenant_id)
-        result["interpretation"] = {"status": "succeeded", "created": len(interpreted), "concurrent_hiring_promotion": promotion}
-        any_succeeded = True
-        logger.info("gtm_intelligence_sweep: interpretation succeeded (%d created, promotion=%s)", len(interpreted), promotion)
+        # Real, confirmed live bug (2026-09-17, run 129): "SSL connection has been closed
+        # unexpectedly" -- by the time this stage runs, the sweep's own long-lived `db` session
+        # has usually already been idle through sensing's real network calls plus
+        # investigation_cycle's own up-to-300s window, long enough for Neon's pooled endpoint to
+        # drop it mid-query. pool_pre_ping only re-validates a connection at CHECKOUT, not while
+        # a query is actively running against one that goes stale in between -- so it does not
+        # catch this. Same fix as investigation_cycle: give this stage its own FRESH session via
+        # _run_stage_with_timeout (a new session is never stale), instead of reusing the sweep's.
+        def _run_interpretation_stage(stage_db, stage_tenant_id):
+            interpreted = run_interpretation_sweep(stage_db, stage_tenant_id, sources=ALL_INTERPRETED_SOURCES)
+            # Cross-sweep concurrent-hiring promotion (2026-08-31): interpretation's own promotion
+            # only ever counted postings within one batch, so a company whose concurrent postings
+            # arrived on different days stayed at dead-end "hiring_activity". Measured against real
+            # data this recovered 14 companies / 32 signals on first run. Runs in the same stage --
+            # it is part of interpreting job signals, not a separate one.
+            promotion = promote_concurrent_hiring_across_sweeps(stage_db, stage_tenant_id)
+            return {"status": "succeeded", "created": len(interpreted), "concurrent_hiring_promotion": promotion}
+
+        interpretation_result = _run_stage_with_timeout(_run_interpretation_stage, tenant_id, timeout_seconds=180)
+        result["interpretation"] = interpretation_result
+        if interpretation_result.get("status") == "succeeded":
+            any_succeeded = True
+        else:
+            any_failed = True
+        logger.info("gtm_intelligence_sweep: interpretation %s", interpretation_result.get("status"))
     except Exception as e:  # noqa: BLE001 -- see module docstring
         db.rollback()  # 2026-08-26, real fix -- see the ACCOUNT_STRATEGY_STAGES loop's own comment for the full explanation
         result["interpretation"] = {"status": "failed", "error": str(e)}
