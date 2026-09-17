@@ -293,6 +293,28 @@ def _run_stage_with_timeout(stage_fn, tenant_id: int, timeout_seconds: int) -> d
     return value
 
 
+def _run_stage_with_retry(runner, db: Session, tenant_id: int) -> dict:
+    """Real fix, 2026-09-17: confirmed live in run 131 that whichever stage happens to run right
+    after a long stretch of the sweep's shared `db` session sitting idle (e.g. interpretation's
+    up-to-600s backlog-drain window) hits "SSL connection has been closed unexpectedly" on its
+    first query -- Neon dropped the pooled connection mid-idle, and pool_pre_ping only validates
+    at checkout, not mid-session. Every stage already isolates failures with its own
+    try/except+rollback(), and that rollback() causes SQLAlchemy to discard the dead connection
+    and check out a fresh one on the NEXT query -- which is exactly why every stage AFTER the
+    failing one already succeeds. This wrapper just gives the unlucky first stage that same
+    recovery within its own turn: on failure, roll back once and retry the same stage once before
+    giving up, instead of sacrificing whichever stage happens to land first."""
+    try:
+        return {"status": "succeeded", **runner(db, tenant_id)}
+    except Exception as e:  # noqa: BLE001 -- retried once below; a second failure is reported like any other stage failure
+        db.rollback()
+        try:
+            return {"status": "succeeded", **runner(db, tenant_id)}
+        except Exception as e2:  # noqa: BLE001 -- see module docstring; caller still wraps this call too
+            db.rollback()
+            return {"status": "failed", "error": str(e2), "first_attempt_error": str(e)}
+
+
 def recover_stale_gtm_intelligence_runs(db: Session, tenant_id: int, stale_after_minutes: int = 120) -> int:
     """Mirrors V1's _clear_stale_running_flags() concurrency-safety pattern (autonomous_orchestrator.py):
     a run that's been "running" for longer than any real sweep could plausibly take (a crashed
@@ -1040,19 +1062,17 @@ def run_gtm_intelligence_sweep(
     # prerequisites are still valid (e.g. candidate_promotion simply finds no new eligible
     # clusters that run produced, not an error) -- same reasoning gpt.txt's own examples give.
     for stage_key, runner in CONTENT_INTELLIGENCE_STAGES:
-        try:
-            stage_result = runner(db, tenant_id)
-            result[stage_key] = {"status": "succeeded", **stage_result}
+        # 2026-09-17: _run_stage_with_retry (rollback + one retry) replaces the old bare
+        # try/except here -- confirmed live in run 131 that whichever stage runs right after the
+        # sweep's shared session goes stale on a long idle gap eats an avoidable failure otherwise.
+        stage_result = _run_stage_with_retry(runner, db, tenant_id)
+        result[stage_key] = stage_result
+        if stage_result.get("status") == "succeeded":
             any_succeeded = True
             logger.info("gtm_intelligence_sweep: %s succeeded -- %s", stage_key, stage_result)
-        except Exception as e:  # noqa: BLE001 -- one stage's failure must never block the others; see module docstring
-            # 2026-08-26, real fix (same class of bug as the contact_discovery.py crash fixed
-            # earlier -- confirmed live): an uncaught DB-level exception here leaves the shared
-            # session's transaction invalid for every stage still to come in this same sweep.
-            db.rollback()
-            result[stage_key] = {"status": "failed", "error": str(e)}
+        else:
             any_failed = True
-            logger.error("gtm_intelligence_sweep: %s failed -- %s", stage_key, e)
+            logger.error("gtm_intelligence_sweep: %s failed -- %s", stage_key, stage_result.get("error"))
 
     # Account/Strategy/Sales branch (Batch 6) -- reads DemandHypothesis (produced above), but its
     # own failure never touches Problem/Demand or Content Intelligence, and vice versa. Each
@@ -1072,19 +1092,14 @@ def run_gtm_intelligence_sweep(
         if stage_key == "gtm_strategy" and not outbound_due:
             result[stage_key] = {"status": "skipped", "reason": outbound_reason}
             continue
-        try:
-            stage_result = runner(db, tenant_id)
-            result[stage_key] = {"status": "succeeded", **stage_result}
+        stage_result = _run_stage_with_retry(runner, db, tenant_id)
+        result[stage_key] = stage_result
+        if stage_result.get("status") == "succeeded":
             any_succeeded = True
             logger.info("gtm_intelligence_sweep: %s succeeded -- %s", stage_key, stage_result)
-        except Exception as e:  # noqa: BLE001 -- one stage's failure must never block the others; see module docstring
-            # 2026-08-26, real fix (same class of bug as the contact_discovery.py crash fixed
-            # earlier -- confirmed live): an uncaught DB-level exception here leaves the shared
-            # session's transaction invalid for every stage still to come in this same sweep.
-            db.rollback()
-            result[stage_key] = {"status": "failed", "error": str(e)}
+        else:
             any_failed = True
-            logger.error("gtm_intelligence_sweep: %s failed -- %s", stage_key, e)
+            logger.error("gtm_intelligence_sweep: %s failed -- %s", stage_key, stage_result.get("error"))
 
     # V2-owned contact discovery (Phase 3/4, app/gtm_os/sales/contact_discovery.py) -- see
     # ACCOUNT_STRATEGY_STAGES_POST_CONTACT's own comment above for why this sits here, outside
@@ -1105,8 +1120,15 @@ def run_gtm_intelligence_sweep(
             # docstring promise. rollback() first since an uncaught DB-level exception can leave
             # this shared session invalid for every stage still to come.
             db.rollback()
-            contact_discovery_result = {"status": "failed", "error": str(e)}
-            logger.error("gtm_intelligence_sweep: contact_discovery raised unexpectedly -- %s", e)
+            # 2026-09-17: one retry after rollback -- same stale-connection class as
+            # _run_stage_with_retry's own docstring; a raise here is very likely the dead-connection
+            # from a long idle gap, which rollback() clears for the very next query.
+            try:
+                contact_discovery_result = run_v2_contact_discovery_sweep(db, tenant_id, limit=50)
+            except Exception as e2:  # noqa: BLE001
+                db.rollback()
+                contact_discovery_result = {"status": "failed", "error": str(e2), "first_attempt_error": str(e)}
+                logger.error("gtm_intelligence_sweep: contact_discovery raised unexpectedly (after retry) -- %s", e2)
     result["contact_discovery"] = contact_discovery_result
     if contact_discovery_result.get("status") == "succeeded":
         any_succeeded = True
@@ -1118,19 +1140,14 @@ def run_gtm_intelligence_sweep(
         if not outbound_due:
             result[stage_key] = {"status": "skipped", "reason": outbound_reason}
             continue
-        try:
-            stage_result = runner(db, tenant_id)
-            result[stage_key] = {"status": "succeeded", **stage_result}
+        stage_result = _run_stage_with_retry(runner, db, tenant_id)
+        result[stage_key] = stage_result
+        if stage_result.get("status") == "succeeded":
             any_succeeded = True
             logger.info("gtm_intelligence_sweep: %s succeeded -- %s", stage_key, stage_result)
-        except Exception as e:  # noqa: BLE001 -- one stage's failure must never block the others; see module docstring
-            # 2026-08-26, real fix (same class of bug as the contact_discovery.py crash fixed
-            # earlier -- confirmed live): an uncaught DB-level exception here leaves the shared
-            # session's transaction invalid for every stage still to come in this same sweep.
-            db.rollback()
-            result[stage_key] = {"status": "failed", "error": str(e)}
+        else:
             any_failed = True
-            logger.error("gtm_intelligence_sweep: %s failed -- %s", stage_key, e)
+            logger.error("gtm_intelligence_sweep: %s failed -- %s", stage_key, stage_result.get("error"))
 
     # V2-owned send (Phase 7, app/gtm_os/send/send.py) -- see ACCOUNT_STRATEGY_STAGES_POST_SEND's
     # own comment above for why this sits here, outside the generic loop, with its own explicit
@@ -1138,7 +1155,16 @@ def run_gtm_intelligence_sweep(
     if not outbound_due:
         send_result = {"status": "skipped", "reason": outbound_reason}
     else:
-        send_result = run_v2_send_sweep(db, tenant_id, limit=50)
+        try:
+            send_result = run_v2_send_sweep(db, tenant_id, limit=50)
+        except Exception as e:  # noqa: BLE001 -- same stale-connection retry as contact_discovery above
+            db.rollback()
+            try:
+                send_result = run_v2_send_sweep(db, tenant_id, limit=50)
+            except Exception as e2:  # noqa: BLE001
+                db.rollback()
+                send_result = {"status": "failed", "error": str(e2), "first_attempt_error": str(e)}
+                logger.error("gtm_intelligence_sweep: send raised unexpectedly (after retry) -- %s", e2)
     result["send"] = send_result
     if send_result.get("status") == "succeeded":
         any_succeeded = True
@@ -1147,19 +1173,14 @@ def run_gtm_intelligence_sweep(
         logger.error("gtm_intelligence_sweep: send failed -- %s", send_result.get("error"))
 
     for stage_key, runner in ACCOUNT_STRATEGY_STAGES_POST_SEND:
-        try:
-            stage_result = runner(db, tenant_id)
-            result[stage_key] = {"status": "succeeded", **stage_result}
+        stage_result = _run_stage_with_retry(runner, db, tenant_id)
+        result[stage_key] = stage_result
+        if stage_result.get("status") == "succeeded":
             any_succeeded = True
             logger.info("gtm_intelligence_sweep: %s succeeded -- %s", stage_key, stage_result)
-        except Exception as e:  # noqa: BLE001 -- one stage's failure must never block the others; see module docstring
-            # 2026-08-26, real fix (same class of bug as the contact_discovery.py crash fixed
-            # earlier -- confirmed live): an uncaught DB-level exception here leaves the shared
-            # session's transaction invalid for every stage still to come in this same sweep.
-            db.rollback()
-            result[stage_key] = {"status": "failed", "error": str(e)}
+        else:
             any_failed = True
-            logger.error("gtm_intelligence_sweep: %s failed -- %s", stage_key, e)
+            logger.error("gtm_intelligence_sweep: %s failed -- %s", stage_key, stage_result.get("error"))
 
     # V2-owned multi-contact outreach sequencing (Phase 8, app/gtm_os/sales/outreach_sequencing.py)
     # -- runs LAST, after outcome_detection, so it sees this same tick's freshest SalesOutcome
