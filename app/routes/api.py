@@ -1105,7 +1105,8 @@ def _fetch_our_salesrobot_prospects(db: Session) -> dict[str, dict]:
 
 
 @router.get("/companies")
-def list_companies(request: Request, page: int = 1, page_size: int = 25, search: str = "", qualified: str = "", account_filter: str = "", db: Session = Depends(get_db)):
+def list_companies(request: Request, page: int = 1, page_size: int = 25, search: str = "", qualified: str = "", account_filter: str = "",
+                   period_days: int = 0, period_date_from: str = "", period_date_to: str = "", db: Session = Depends(get_db)):
     """Cross-batch company list -- previously the only way to see companies at all was per-
     batch (BatchDetail), with no single "everything we've researched" view. `qualified`
     ("true"/"false") filters by the exact same has_qualifying_hiring_signal check that's the
@@ -1141,6 +1142,29 @@ def list_companies(request: Request, page: int = 1, page_size: int = 25, search:
     elif qualified == "false":
         companies = [c for c in companies if not _is_company_qualified(c)]
 
+    # Period filter (2026-09-16, real redesign after explicit correction -- "it's not about sent
+    # or something, we show all the list of that particular period and we show the stats").
+    # Filters on Company.created_at -- when a company was actually FETCHED/discovered -- not
+    # CampaignPush.pushed_at. This is what makes the filter meaningful for a partner tenant too
+    # (partners never get pushed to a campaign at all, so a "sent" filter would always show zero
+    # for them; "fetched" is real for every tenant). period_days is a plain day count
+    # (1/7/30/anything), not a fixed preset; the two date params cover an exact custom range
+    # instead. period_stats (companies fetched, decision-makers fetched, pushed to campaigns --
+    # all for this SAME window) is computed below and returned alongside the filtered list, not
+    # just the list on its own.
+    period_start = period_end = None
+    if period_days or period_date_from or period_date_to:
+        from datetime import date as _date
+
+        if period_date_from or period_date_to:
+            period_start = datetime.fromisoformat(period_date_from) if period_date_from else datetime.min
+            period_end = datetime.fromisoformat(period_date_to) + timedelta(days=1) if period_date_to else datetime.max
+        else:
+            period_start = datetime.combine(_date.today(), datetime.min.time()) - timedelta(days=period_days - 1)
+            period_end = datetime.utcnow()
+
+        companies = [c for c in companies if c.created_at and period_start <= c.created_at <= period_end]
+
     if account_filter == "hot_leads":
         companies = [c for c in companies if c.hot_lead]
     elif account_filter in ("no_contact", "missing_email"):
@@ -1164,6 +1188,38 @@ def list_companies(request: Request, page: int = 1, page_size: int = 25, search:
     page_size = max(1, min(page_size, 100))
     page_items = companies[(page - 1) * page_size: page * page_size]
 
+    # Real, objective stats for the selected period -- deliberately a SEPARATE query from the
+    # (possibly search/qualified/account_filter-narrowed) `companies` list above, scoped only by
+    # tenant + date range, so "how many did we fetch yesterday" always means the same real number
+    # regardless of what else is typed into search. Zero cost when no period is selected.
+    period_stats = None
+    if period_start is not None:
+        this_tenant_id = _resolve_tenant_id(request)
+        period_company_ids = [
+            row[0]
+            for row in db.query(Company.id)
+            .join(Batch, Company.batch_id == Batch.id)
+            .filter(Batch.tenant_id == this_tenant_id, Company.created_at >= period_start, Company.created_at <= period_end)
+            .all()
+        ]
+        decision_makers_fetched = (
+            db.query(func.count(Contact.id))
+            .filter(Contact.company_id.in_(period_company_ids), Contact.created_at >= period_start, Contact.created_at <= period_end)
+            .scalar() if period_company_ids else 0
+        )
+        pushed_to_campaigns = (
+            db.query(func.count(func.distinct(Contact.company_id)))
+            .join(CampaignPush, CampaignPush.contact_id == Contact.id)
+            .filter(Contact.company_id.in_(period_company_ids), CampaignPush.status == "pushed",
+                    CampaignPush.pushed_at >= period_start, CampaignPush.pushed_at <= period_end)
+            .scalar() if period_company_ids else 0
+        )
+        period_stats = {
+            "companies_fetched": len(period_company_ids),
+            "decision_makers_fetched": decision_makers_fetched or 0,
+            "pushed_to_campaigns": pushed_to_campaigns or 0,
+        }
+
     # V2 Accounts list enrichment (2026-08-19) -- real GTM-OS state per row (account_status,
     # signal_count, opportunity_count), scoped to only this page's companies via
     # list_account_states()'s bulk-query pattern (six fixed queries, not one per company). See
@@ -1181,6 +1237,7 @@ def list_companies(request: Request, page: int = 1, page_size: int = 25, search:
     page_ids = [c.id for c in page_items]
     contact_counts: dict[int, int] = {}
     outreached_ids: set[int] = set()
+    outreached_at: dict[int, datetime] = {}  # real "when was this actually sent" -- see the outreach_days filter above
     if page_ids:
         for company_id, count in (
             db.query(Contact.company_id, func.count(Contact.id))
@@ -1197,12 +1254,21 @@ def list_companies(request: Request, page: int = 1, page_size: int = 25, search:
             .distinct()
             .all()
         }
+        outreached_at = {
+            row[0]: row[1]
+            for row in db.query(Contact.company_id, func.max(CampaignPush.pushed_at))
+            .join(CampaignPush, CampaignPush.contact_id == Contact.id)
+            .filter(Contact.company_id.in_(page_ids), CampaignPush.status == "pushed")
+            .group_by(Contact.company_id)
+            .all()
+        }
 
     return {
         "page": page,
         "page_size": page_size,
         "total": total,
         "total_pages": (total + page_size - 1) // page_size if total else 0,
+        "period_stats": period_stats,
         "companies": [
             {
                 "id": c.id,
@@ -1218,6 +1284,7 @@ def list_companies(request: Request, page: int = 1, page_size: int = 25, search:
                 "resolved_offering_name": c.resolved_offering_name,
                 "contact_count": contact_counts.get(c.id, 0),
                 "outreached": c.id in outreached_ids,
+                "outreached_at": outreached_at.get(c.id),
                 "hiring_signal_role": c.hiring_signal_role,
                 "hiring_signal_strength": c.hiring_signal_strength,
                 "team_fit_tier": c.team_fit_tier,
