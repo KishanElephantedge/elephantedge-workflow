@@ -312,6 +312,20 @@ def resolve_fallback_email(db: Session, tenant_id: int, company: Company, first_
     # and that the guesses were actively wrong (Immuta's CEO is mcarroll@, we were guessing
     # matthew@, which would bounce). Deepline bills these per RESULT, so the whole chain costs
     # nothing on a miss and $0.014-$0.034 on a hit. See app/phases/email_finder.py.
+    #
+    # REAL FIX, 2026-09-16: this had NO Deepline budget check at all, unlike every other Deepline
+    # call site in this codebase -- confirmed live by reading the code, not assumed. Fine for a
+    # human-watched manual run, but a real, unbounded risk once this fires from the unattended
+    # daily partner run (partner_daily_run.py) -- exactly the class of "didn't notice it kept
+    # spending" problem this project has hit before. Guarded the same way every other Deepline
+    # spend already is: the one shared daily ceiling, checked before the call, not after.
+    from app.budget_guard import BudgetExceededError, check_daily_deepline_budget, get_daily_deepline_budget_usd
+
+    try:
+        check_daily_deepline_budget(db, tenant_id, get_daily_deepline_budget_usd(db, tenant_id))
+    except BudgetExceededError:
+        return None  # today's shared Deepline budget is already spent -- skip, don't raise
+
     try:
         from app.phases.email_finder import find_verified_email
         found = find_verified_email(db, tenant_id, first_name, last_name, company.domain or "", company.name)
