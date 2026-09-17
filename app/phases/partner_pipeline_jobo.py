@@ -440,6 +440,7 @@ def run_tenant_discovery_jobo(batch_id: int, db: Session, tenant_id: int, icp: d
     seen: set[str] = set()
     seen_identity: set[str] = set()
     kept, dropped = [], []
+    domain_diagnostics = []  # TEMP, see the diagnostic append below
     jobs_seen = 0
     credits_end = None
 
@@ -484,6 +485,18 @@ def run_tenant_discovery_jobo(batch_id: int, db: Session, tenant_id: int, icp: d
                 website = profile.get("website") or ""
                 domain = website.replace("https://", "").replace("http://", "").strip("/").split("/")[0] or None
                 identity = (domain or "").lower().replace("www.", "") or _fold_name(name)
+                # TEMP DIAGNOSTIC 2026-09-16 -- FormFactor/Cytek kept recurring across three
+                # separate fix attempts despite excluded_domains provably containing their
+                # domains in isolated checks made before/after the run. Recording the exact
+                # runtime values at the point of decision (returned in the result, since Render's
+                # own logs aren't reachable from here) to catch what those isolated checks
+                # couldn't see -- e.g. a domain variant, a stale read, a case mismatch.
+                domain_diagnostics.append({
+                    "name": name, "raw_website": website, "domain": domain,
+                    "in_excluded_domains": bool(domain and domain.lower() in excluded_domains),
+                    "excluded_domains_sample": sorted(excluded_domains)[:5],
+                    "excluded_domains_size": len(excluded_domains),
+                })
                 if identity in seen_identity or (domain and domain.lower() in excluded_domains):
                     dropped.append((name, "duplicate (already kept this run, or already known to this tenant)"))
                     continue
@@ -520,6 +533,7 @@ def run_tenant_discovery_jobo(batch_id: int, db: Session, tenant_id: int, icp: d
         "kept": kept, "dropped": dropped,
         "credits_used": jobs_seen * CREDITS_PER_JOB,
         "credits_balance": credits_end,
+        "domain_diagnostics": domain_diagnostics,  # TEMP, see the diagnostic append above
     }
 
 
