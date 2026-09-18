@@ -425,9 +425,13 @@ class CalendarBooking(Base):
     synced_at = Column(DateTime, default=datetime.utcnow)
 
     # Meeting outcome (added for V2 Revenue Pace) -- human-recorded, not derived. `outcome_status`
-    # is the only new vocabulary this introduces (won | lost, null = pending/unset). See
-    # app/gtm_os/revenue/revenue_pace.py for validation and the ICP-snapshot capture logic.
-    outcome_status = Column(String, nullable=True)  # won | lost | null (pending)
+    # is the only new vocabulary this introduces (won | lost | in_progress, null = pending/unset).
+    # in_progress (2026-09-18) tracks a real, live relationship that hasn't closed either way yet
+    # -- distinct from null, which means the outcome was never even looked at. It never drives
+    # revenue numbers (get_revenue_pace only counts won/lost), it just means "we know what
+    # happened here and it's still open" rather than leaving a real conversation looking blank.
+    # See app/gtm_os/revenue/revenue_pace.py for validation and the ICP-snapshot capture logic.
+    outcome_status = Column(String, nullable=True)  # won | lost | in_progress | null (pending)
     outcome_company_id = Column(Integer, ForeignKey("companies.id"), nullable=True)
     # V2 Overrides & Evals attribution link -- optional, human-supplied at outcome-recording
     # time (never inferred). Lets a won/lost meeting be traced back to the Opportunity/

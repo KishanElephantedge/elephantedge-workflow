@@ -20,7 +20,7 @@ from datetime import datetime
 
 from sqlalchemy.orm import Session
 
-from app.db.models import Batch, CalendarBooking, CampaignPush, Company, Contact
+from app.db.models import Batch, CalendarBooking, CampaignPush, Company, Contact, Parameter
 from app.gtm_os.context.business_context import get_business_context
 from app.gtm_os.icp.icp_config import get_icp_config
 from app.gtm_os.icp.icp_matching import ICPMatch
@@ -29,7 +29,7 @@ from app.gtm_os.opportunity.offering_config import get_offering_config
 from app.gtm_os.opportunity.opportunity import Opportunity
 from app.gtm_os.send.send_state import MessageSendAttempt
 
-VALID_OUTCOME_STATUSES = {"won", "lost", None}
+VALID_OUTCOME_STATUSES = {"won", "lost", "in_progress", None}
 
 # 2026-08-27, explicit instruction -- real revenue-by-channel attribution ("Channels
 # Intelligence"). Only "outbound" has a real, automatic detection path (see
@@ -80,6 +80,66 @@ def detect_real_outbound_activity(db: Session, tenant_id: int, company_id: int) 
     return has_message_send
 
 
+# 2026-09-18 -- inbound(website) auto-detection. Confirmed live: every real booking made through
+# Google's public "Book Your Strategy Call" Appointment Schedule on elephantedge.ai/contact
+# carries the SAME extendedProperties.shared["goo.createdByAvailId"] value on the synced Google
+# Calendar event, regardless of who the external booker is (confirmed against 3 real, different
+# bookers -- Sriranjini/Ownpath, Swetha Sirupa, Teja Jonnalagadda -- all sharing
+# "ds2pecf3pumkhqg52n05nbcqbc"). A DIFFERENT appointment schedule (one Majji shares 1:1, e.g. a
+# personal link sent directly to a known contact) produces a different avail_id on the same
+# event shape -- confirmed against booking #15 (Alex/Apero Advisors), which Majji booked himself
+# via a distinct schedule. So the avail_id, not the mere presence of a "Booked by" description,
+# is the real signal -- store the specific one(s) that are actually the public website page as a
+# Parameter, never hardcoded, since a schedule could be recreated/replaced later.
+INBOUND_WEBSITE_AVAIL_ID_PARAMETER_KEY = "inbound_website_booking_avail_ids"
+
+
+def get_inbound_website_avail_ids(db: Session, tenant_id: int) -> list[str]:
+    param = (
+        db.query(Parameter)
+        .filter(Parameter.tenant_id == tenant_id)
+        .filter(Parameter.key == INBOUND_WEBSITE_AVAIL_ID_PARAMETER_KEY)
+        .first()
+    )
+    value = param.value if param else None
+    return list(value) if isinstance(value, list) else []
+
+
+def set_inbound_website_avail_ids(db: Session, tenant_id: int, avail_ids: list[str]) -> None:
+    cleaned = [a.strip() for a in avail_ids if isinstance(a, str) and a.strip()]
+    param = (
+        db.query(Parameter)
+        .filter(Parameter.tenant_id == tenant_id)
+        .filter(Parameter.key == INBOUND_WEBSITE_AVAIL_ID_PARAMETER_KEY)
+        .first()
+    )
+    if param:
+        param.value = cleaned
+    else:
+        param = Parameter(
+            tenant_id=tenant_id, key=INBOUND_WEBSITE_AVAIL_ID_PARAMETER_KEY, value=cleaned,
+            description="Google Calendar Appointment Schedule avail_id(s) that are the real "
+                        "public website booking page, for inbound(website) channel auto-detection",
+        )
+        db.add(param)
+    db.commit()
+
+
+def _booking_avail_id(booking: CalendarBooking) -> str | None:
+    payload = booking.raw_payload or {}
+    return (payload.get("extendedProperties") or {}).get("shared", {}).get("goo.createdByAvailId")
+
+
+def detect_real_inbound_website_activity(db: Session, tenant_id: int, booking: CalendarBooking) -> bool:
+    """True only if this specific booking's Google Calendar event was made through one of the
+    real, configured public-website avail_id(s) -- a suggestion for the human recording the
+    outcome, same "never silently auto-set" discipline as detect_real_outbound_activity()."""
+    avail_id = _booking_avail_id(booking)
+    if not avail_id:
+        return False
+    return avail_id in set(get_inbound_website_avail_ids(db, tenant_id))
+
+
 def record_meeting_outcome(
     db: Session,
     tenant_id: int,
@@ -99,7 +159,7 @@ def record_meeting_outcome(
         raise LookupError(f"Booking {booking_id} not found")
 
     if status not in VALID_OUTCOME_STATUSES:
-        raise ValueError(f"status must be 'won', 'lost', or null, got {status!r}")
+        raise ValueError(f"status must be 'won', 'lost', 'in_progress', or null, got {status!r}")
 
     if channel not in OUTCOME_CHANNELS:
         raise ValueError(f"channel must be one of {sorted(c for c in OUTCOME_CHANNELS if c)}, or null, got {channel!r}")

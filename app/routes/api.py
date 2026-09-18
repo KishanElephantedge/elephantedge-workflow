@@ -2011,6 +2011,39 @@ def get_gtm_os_detected_outbound_activity(company_id: int, db: Session = Depends
     return {"company_id": company_id, "detected_outbound_activity": detect_real_outbound_activity(db, ELEPHANT_EDGE_TENANT_ID, company_id)}
 
 
+@router.get("/gtm-os/bookings/{booking_id}/detected-inbound-website-activity")
+def get_gtm_os_detected_inbound_website_activity(booking_id: int, db: Session = Depends(get_db)):
+    """2026-09-18 -- same suggestion-only discipline as detected-outbound-activity above, but for
+    inbound(website): tells a human recording a meeting outcome whether THIS booking's Google
+    Calendar event was made through the real, configured public-website Appointment Schedule
+    avail_id(s). See detect_real_inbound_website_activity()'s own docstring."""
+    from app.db.models import CalendarBooking
+    from app.gtm_os.revenue.revenue_pace import detect_real_inbound_website_activity
+
+    booking = db.get(CalendarBooking, booking_id)
+    if booking is None:
+        raise HTTPException(status_code=404, detail=f"Booking {booking_id} not found")
+    return {"booking_id": booking_id, "detected_inbound_website_activity": detect_real_inbound_website_activity(db, ELEPHANT_EDGE_TENANT_ID, booking)}
+
+
+@router.get("/gtm-os/inbound-website-avail-ids")
+def get_gtm_os_inbound_website_avail_ids(db: Session = Depends(get_db)):
+    from app.gtm_os.revenue.revenue_pace import get_inbound_website_avail_ids
+
+    return {"avail_ids": get_inbound_website_avail_ids(db, ELEPHANT_EDGE_TENANT_ID)}
+
+
+@router.put("/gtm-os/inbound-website-avail-ids")
+def put_gtm_os_inbound_website_avail_ids(body: dict = Body(...), db: Session = Depends(get_db)):
+    from app.gtm_os.revenue.revenue_pace import set_inbound_website_avail_ids
+
+    avail_ids = body.get("avail_ids")
+    if not isinstance(avail_ids, list):
+        raise HTTPException(status_code=400, detail="avail_ids must be a list of strings")
+    set_inbound_website_avail_ids(db, ELEPHANT_EDGE_TENANT_ID, avail_ids)
+    return {"avail_ids": avail_ids}
+
+
 @router.get("/gtm-os/revenue-pace")
 def get_gtm_os_revenue_pace(month: str | None = None, db: Session = Depends(get_db)):
     """V2 Revenue Pace page -- read-only wrapper over get_revenue_pace()

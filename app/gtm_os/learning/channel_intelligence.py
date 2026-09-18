@@ -40,7 +40,9 @@ def get_channel_performance(db: Session, tenant_id: int) -> dict:
     scoped via outcome_company_id -> Company.batch_id -> Batch.tenant_id, the same real chain
     revenue_pace.py/offering_performance.py already use."""
     channels = [c for c in OUTCOME_CHANNELS if c]  # drop the None sentinel -- not a real channel to report on
-    performance = {c: {"meetings_with_recorded_outcome": 0, "deals_won": 0, "deals_lost": 0, "revenue_won_usd": 0.0} for c in channels}
+    # deals_in_progress (2026-09-18): a real, live relationship that hasn't closed either way --
+    # distinct from won/lost, and distinct from not being counted at all. Never part of revenue.
+    performance = {c: {"meetings_with_recorded_outcome": 0, "deals_won": 0, "deals_lost": 0, "deals_in_progress": 0, "revenue_won_usd": 0.0} for c in channels}
 
     bookings = (
         db.query(CalendarBooking)
@@ -68,6 +70,8 @@ def get_channel_performance(db: Session, tenant_id: int) -> dict:
             performance[channel]["revenue_won_usd"] += float(booking.outcome_amount_usd or 0)
         elif booking.outcome_status == "lost":
             performance[channel]["deals_lost"] += 1
+        elif booking.outcome_status == "in_progress":
+            performance[channel]["deals_in_progress"] += 1
 
     return {"by_channel": performance, "unattributed_outcomes_count": unattributed_count}
 
