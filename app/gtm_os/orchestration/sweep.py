@@ -290,6 +290,19 @@ def _run_stage_with_timeout(stage_fn, tenant_id: int, timeout_seconds: int) -> d
         return {"status": "timed_out", "reason": f"exceeded {timeout_seconds}s -- abandoned, sweep continuing"}
     if status == "error":
         return {"status": "failed", "error": value}
+    # Real regression fix, 2026-09-18: confirmed live -- not every stage_fn's own return dict
+    # sets "status" itself (company_enrichment does; opportunity/revenue_backfill/icp_matching
+    # and others don't, they just return their raw metric dict). Every caller here checks
+    # `.get("status") == "succeeded"` to decide success -- for a dict with no "status" key at
+    # all, that's neither "succeeded" nor "timed_out", so _run_stage_with_retry's own check
+    # (`first.get("status") in ("succeeded", "timed_out")`) fell through and ran the ENTIRE
+    # stage a second time for no reason on every single one of these, then still logged
+    # "failed -- None" at the end since the second attempt has the exact same shape. A real,
+    # confirmed live-observed bug (opportunity/revenue_backfill/icp_matching all doubled and
+    # misreported today) -- normalized here, once, for every caller, rather than requiring every
+    # stage_fn to remember to self-report a status it was never designed to include.
+    if isinstance(value, dict) and "status" not in value:
+        value = {"status": "succeeded", **value}
     return value
 
 
