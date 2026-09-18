@@ -964,10 +964,16 @@ def run_gtm_intelligence_sweep(
     # (free/local), S3-S6 are skipped with an explicit configuration_required status while that
     # cap is unconfigured. Never raises -- same per-stage error isolation as every other stage here.
     try:
-        # Real, bounded timeout (2026-09-17) -- see _run_stage_with_timeout's own docstring for
-        # the exact live hang this fixes. 300s comfortably covers a real worst case (2 objectives
-        # x a few ~60s Google/Apify calls each, per investigation.max_objectives_per_tick) while
-        # still guaranteeing the sweep can never again freeze here indefinitely.
+        # Real, bounded timeout (2026-09-17), recalibrated 2026-09-18: originally sized for
+        # max_objectives_per_tick=2 (2 objectives x ~60s Apify calls each). That cap was raised
+        # to 10 the same day to fix a real queue-starvation bug (budget-blocked objectives never
+        # aged, permanently jamming the front of the queue) -- but this timeout was never
+        # recalculated against the new cap, so a genuinely busy tick (10 real Apify calls) could
+        # need up to 600s, not fit in 300s. Confirmed live today's total sweep latency stacks
+        # every stage's timeout sequentially, so a larger max_objectives_per_tick multiplies
+        # straight into total run time. Rebalanced together: cap lowered to 5 (still 2.5x the
+        # original crippling 2) so this 300s budget is proportionate again, instead of raising
+        # the timeout further and making total run time even longer.
         investigation_result = _run_stage_with_timeout(run_investigation_cycle, tenant_id, timeout_seconds=300)
         result["investigation_cycle"] = investigation_result
         if investigation_result.get("status") in ("succeeded", "partial"):
@@ -1007,7 +1013,17 @@ def run_gtm_intelligence_sweep(
         # catch-up budget so a single run can actually drain the backlog instead of perpetually
         # timing out on the same signals every day. Safe to run this long: it's a fresh background
         # thread on its own session, not something blocking an HTTP connection.
-        interpretation_result = _run_stage_with_timeout(_run_interpretation_stage, tenant_id, timeout_seconds=600)
+        #
+        # Recalibrated 2026-09-18: the 600s figure was sized when EVERY linkedin_job signal also
+        # cost one unconditional LLM call (since fixed with a deterministic classifier -- see
+        # linkedin_job_interpretation.py) and Gemini was quota-exhausted, forcing slow Claude
+        # fallback calls. Neither is true anymore: job signals are now free/instant, and a live
+        # test today confirmed Gemini responds in ~1-2s per call. Confirmed live that stacking
+        # every stage's generous timeout is the actual reason full runs take 60-100+ minutes even
+        # when nothing is actually stuck -- lowering this is a direct fix for that, not just a
+        # guess; if 240s genuinely isn't enough some day, that's itself a signal something is
+        # newly slow and worth investigating, not a reason to keep a blanket 600s "just in case."
+        interpretation_result = _run_stage_with_timeout(_run_interpretation_stage, tenant_id, timeout_seconds=240)
         result["interpretation"] = interpretation_result
         if interpretation_result.get("status") == "succeeded":
             any_succeeded = True
