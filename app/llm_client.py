@@ -16,21 +16,26 @@ second retry. The consequences went well beyond slowness:
 So the free tier was not actually free -- it cost a day's output. Haiku is paid but has no such
 limit: roughly $0.0013 per call, about $0.70 for a full sweep.
 
-SWITCHED TO CLAUDE (2026-09-18, confirmed live): the Anthropic account now has real credit --
-confirmed by real, successful call_claude_json invocations during today's offering-tiebreak work
-(cost logged, e.g. $0.0011/call). Flipped because Gemini's free daily quota (500/call/model) was
-confirmed exhausted today, and every redeploy resets the in-memory _EXHAUSTED tracking below (it's
-a plain module dict, not persisted) -- so after any redeploy, every call has to re-discover the
-exhaustion itself, including the real 20s rate-limit sleep-and-retry this module does before
-falling back. Across the hundreds of LLM calls one sweep makes, that turned into the exact
-233-minute-runaway failure mode this module's own history already warned about (see the 2026-09-03
-incident below), just triggered by a redeploy instead of the original quota-timing cause.
+FLIPPED BACK TO GEMINI (2026-09-18, same day, confirmed live): briefly set to "claude" a few
+hours earlier today because Gemini's free daily quota was confirmed exhausted -- but that quota
+is per-CALENDAR-DAY and resets at UTC midnight, which has since passed. Confirmed live: a direct
+test call against gemini-3.1-flash-lite and gemini-3.6-flash both returned real 200 responses
+again. Meanwhile Claude has a real, separate blocker that does NOT self-resolve on a day
+boundary: the Anthropic account is out of credit ("Your credit balance is too low"), confirmed by
+a real 400 from the API. With PRIMARY left on "claude", every single call would guarantee-fail
+against Claude first before ever reaching the now-working Gemini -- strictly worse than just
+using Gemini directly. Flip back to "claude" only once Anthropic credit is actually topped up
+AND Gemini's quota is exhausted again -- check both live (a real API call each, not an assumption)
+before touching this again, same discipline this whole docstring's history already established.
+
+The real remaining gap from the flip-to-claude incident is still unfixed: _EXHAUSTED (the
+in-memory per-model daily-quota tracking below) is a plain dict, cleared by every redeploy, so a
+redeploy on a day when quota truly is exhausted still reproduces the 233-minute-runaway failure
+mode from 2026-09-03. Worth persisting in a Parameter instead of an in-process dict -- flagged,
+not fixed here.
 
 Whichever is primary, the other is the fallback, so an outage or an exhausted balance on either
-side degrades to a working model instead of failing the run. Revisit going back to Gemini-primary
-once its quota resets AND the redeploy-clears-exhausted-tracking gap is fixed (e.g. persisting
-_EXHAUSTED in a Parameter instead of an in-process dict) -- otherwise this same failure mode
-recurs on the next redeploy.
+side degrades to a working model instead of failing the run.
 """
 import logging
 
@@ -46,7 +51,7 @@ logger = logging.getLogger("llm_client")
 # "Your credit balance is too low to access the Anthropic API" (400) on every call, so making
 # Claude primary would add a guaranteed failed request before each Gemini one: strictly worse than
 # the rate limiting it was meant to fix.
-PRIMARY = "claude"  # "claude" | "gemini"
+PRIMARY = "gemini"  # "claude" | "gemini"
 
 
 # Models known to be quota-dead, and the UTC date that knowledge belongs to. Gemini's free quota
