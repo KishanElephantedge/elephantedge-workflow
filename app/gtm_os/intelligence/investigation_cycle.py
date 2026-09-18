@@ -25,6 +25,7 @@ from app.gtm_os.intelligence.investigation_feedback import process_investigation
 from app.gtm_os.intelligence.investigation_generation import generate_investigation_action
 from app.gtm_os.intelligence.investigation_memory import InvestigationObjective, STATUS_STOPPED, is_eligible_for_attempt
 from app.gtm_os.intelligence.sensing_strategy import select_sensing_strategy
+from app.gtm_os.icp.icp_config import get_icp_config
 from app.gtm_os.orchestration.control import get_control_config
 
 # Categorical closeness-to-Opportunity-eligibility, per gap_identification.py's own already-named
@@ -74,14 +75,25 @@ def _select_bounded_objectives(db: Session, tenant_id: int, limit: int) -> list[
     Ordered by _objective_priority_key() -- a real company-specific investigation (backed by an
     actual ICPMatch) now genuinely outranks a company-agnostic one, rather than an arbitrary id
     ordering always favoring whichever objective happened to be created first. Still a
-    deterministic tuple sort over existing real fields only -- no numeric/weighted score."""
+    deterministic tuple sort over existing real fields only -- no numeric/weighted score.
+
+    2026-09-18, explicit instruction: also excludes any objective whose icp_id maps to an ICP
+    with "enabled": False (same real per-ICP switch gap_identification.py's own loop respects) --
+    without this, an already-existing objective for a disabled ICP would still get selected and
+    executed here even though no NEW gap/objective is being created for it anymore, defeating the
+    whole point of being able to isolate and test one objective shape (icp_1 ->
+    linkedin_post_search vs icp_2/icp_3 -> linkedin_job) at a time."""
+    disabled_icp_ids = {icp["id"] for icp in get_icp_config(db, tenant_id) if not icp.get("enabled", True)}
     candidates = (
         db.query(InvestigationObjective)
         .filter(InvestigationObjective.tenant_id == tenant_id)
         .filter(InvestigationObjective.status != STATUS_STOPPED)
         .all()
     )
-    eligible = [o for o in candidates if is_eligible_for_attempt(o)]
+    eligible = [
+        o for o in candidates
+        if is_eligible_for_attempt(o) and o.icp_id not in disabled_icp_ids
+    ]
     eligible.sort(key=_objective_priority_key)
     return eligible[:limit]
 

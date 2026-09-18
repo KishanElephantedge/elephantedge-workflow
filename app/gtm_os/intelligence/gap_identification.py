@@ -108,6 +108,15 @@ def identify_investigation_gaps(db: Session, tenant_id: int) -> dict:
 
     for icp in icp_configs:
         icp_id = icp["id"]
+        # 2026-09-18, explicit instruction: a real per-ICP on/off switch so the two real objective
+        # shapes (icp_1 -> SHAPE_GENERAL_PROBLEM -> linkedin_post_search; icp_2/icp_3 ->
+        # SHAPE_HIRING_TRIGGER -> linkedin_job) can be tested one at a time instead of always
+        # competing for the same limited per-tick slots and shared Apify/Google budget. Defaults
+        # True via .get() -- an ICP with no "enabled" key at all (every ICP before this field
+        # existed) behaves exactly as before, no migration needed. Disabled here means gap
+        # identification never creates or reuses a gap for this ICP at all, not just deprioritized.
+        if not icp.get("enabled", True):
+            continue
         matches = (
             db.query(ICPMatch)
             .filter(ICPMatch.tenant_id == tenant_id, ICPMatch.icp_id == icp_id)
