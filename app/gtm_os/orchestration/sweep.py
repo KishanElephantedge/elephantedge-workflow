@@ -243,7 +243,20 @@ def finish_gtm_intelligence_run(db: Session, run: GtmIntelligenceRun, result: di
     run.stage_results = result
     run.error_summary = "; ".join(failure_summaries) if failure_summaries else None
     run.completed_at = datetime.utcnow()
-    db.commit()
+    # 2026-09-18, real fix: confirmed live that this exact commit can hit the same
+    # stale-connection error every other long-lived use of this session risks -- losing the
+    # FINAL status write after a real, successful, possibly hour-long sweep would be the worst
+    # possible place for that bug to land (a genuinely completed run stuck reading "running"
+    # forever). One retry after rollback, same discipline as every other fix today.
+    try:
+        db.commit()
+    except Exception:  # noqa: BLE001
+        db.rollback()
+        run.status = result.get("status", "completed")
+        run.stage_results = result
+        run.error_summary = "; ".join(failure_summaries) if failure_summaries else None
+        run.completed_at = datetime.utcnow()
+        db.commit()
     return run
 
 
@@ -825,7 +838,21 @@ def _report_progress(db: Session, run, result: dict, current_stage: str) -> None
     snapshot["current_stage"] = current_stage
     run.stage_results = snapshot
     db.add(run)
-    db.commit()
+    try:
+        db.commit()
+    except Exception:  # noqa: BLE001 -- confirmed live: the sweep's own long-lived `db` session
+        # can go stale on Neon after sitting idle through a stage's real API calls, the exact
+        # same class of bug already fixed for every OTHER call site that touches this session --
+        # this one was missed because it's brand new. A progress-reporting commit failing must
+        # never crash the whole sweep -- rollback and retry once; if it fails twice, silently
+        # skip this one snapshot rather than losing the run entirely over a visibility feature.
+        db.rollback()
+        try:
+            run.stage_results = snapshot
+            db.add(run)
+            db.commit()
+        except Exception:  # noqa: BLE001
+            db.rollback()
 
 
 def run_gtm_intelligence_sweep(
@@ -1378,12 +1405,22 @@ def run_gtm_daily_flow_cycle(db: Session, tenant_id: int, run=None) -> dict:
         if run is not None:
             # 2026-09-18: also surface which flow-cycle iteration this is, not just which stage
             # within it -- a live GET now shows both "iteration 3 of 5" and "currently on
-            # interpretation" instead of only the latter.
+            # interpretation" instead of only the latter. Same stale-connection retry as
+            # _report_progress -- a visibility-only commit must never crash the whole cycle.
             snapshot = dict(result)
             snapshot["flow_cycle_iteration"] = iterations_run
-            run.stage_results = snapshot
-            db.add(run)
-            db.commit()
+            try:
+                run.stage_results = snapshot
+                db.add(run)
+                db.commit()
+            except Exception:  # noqa: BLE001
+                db.rollback()
+                try:
+                    run.stage_results = snapshot
+                    db.add(run)
+                    db.commit()
+                except Exception:  # noqa: BLE001
+                    db.rollback()
         iteration_history.append({
             "iteration": iterations_run,
             "investigation_cycle": result.get("investigation_cycle"),
