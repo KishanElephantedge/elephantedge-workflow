@@ -62,6 +62,16 @@ from app.rss_client import fetch_feed_entries
 SYNCED_INBOX_PAGE_SIZE = 20
 SYNCED_INBOX_MAX_PAGES = 60
 
+# Real fix, 2026-09-18: confirmed live -- this loop had NO page cap at all, unlike
+# SYNCED_INBOX_MAX_PAGES below it, which was already bounded. Isolated and reproduced directly
+# (bypassing the sweep's thread pool entirely): sense_linkedin_replies genuinely took 80s+ and,
+# on the live server, appeared to block the entire sweep well past every other stage's own
+# timeout -- across up to 9 real campaign_uuids, each with its own unbounded while-True loop
+# fetching 100 real prospects per page. 50 pages (5,000 prospects/campaign) is already far more
+# than any real campaign has ever had; this bounds worst-case runtime without changing behavior
+# for any real campaign size seen so far.
+CAMPAIGN_PROSPECTS_MAX_PAGES = 50
+
 
 def _synced_total_pages(raw_response: dict) -> int | None:
     """totalPages off the real (second) pagination wrapper -- see _extract_thread_pages for why
@@ -476,7 +486,7 @@ def sense_linkedin_replies(
     connected_prospects: list[dict] = []
     for campaign_uuid in campaign_uuids:
         page = 0
-        while True:
+        while page < CAMPAIGN_PROSPECTS_MAX_PAGES:
             try:
                 result = get_campaign_prospects(campaign_uuid, linkedin_account_uuid, db, tenant_id, page=page, size=100)
             except SalesRobotError:
