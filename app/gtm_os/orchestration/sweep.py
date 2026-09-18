@@ -797,11 +797,30 @@ def _dry_run_source_status(db: Session, tenant_id: int, name: str) -> dict:
     return {"status": "would_run"}
 
 
+def _report_progress(db: Session, run, result: dict, current_stage: str) -> None:
+    """Real fix, 2026-09-18: GtmIntelligenceRun.stage_results was only ever written once, at the
+    very end of the whole (potentially 60-100+ minute) sweep -- so a live GET on the run while it
+    was still in progress showed nothing but "running", with no way to see which stage it was
+    actually on. Confirmed live: this was the direct reason a stalled/slow stage looked identical
+    to a genuinely hung one from the outside, and the only way to tell them apart was ad-hoc
+    manual DB queries against unrelated tables. `run` is optional (None for any caller that
+    doesn't have a persisted run row, e.g. a future direct unit-test call) so this is purely
+    additive -- never required, never changes what the function returns."""
+    if run is None:
+        return
+    snapshot = dict(result)
+    snapshot["current_stage"] = current_stage
+    run.stage_results = snapshot
+    db.add(run)
+    db.commit()
+
+
 def run_gtm_intelligence_sweep(
     db: Session,
     tenant_id: int,
     sources: list[str] | None = None,
     dry_run: bool = False,
+    run=None,
 ) -> dict:
     """Runs the first GTM Intelligence Sweep for one tenant: sensing (the sources currently
     registered in SWEEPABLE_SOURCES, optionally narrowed via `sources`), then interpretation,
@@ -956,6 +975,7 @@ def run_gtm_intelligence_sweep(
             logger.error("gtm_intelligence_sweep: sensing %s timed out (overall deadline)", pending_name)
     finally:
         pool.shutdown(wait=False)
+    _report_progress(db, run, result, "sensing")
 
     # Autonomous Sensing Phase S7 (app/gtm_os/intelligence/investigation_cycle.py) -- runs BEFORE
     # interpretation/problem/demand below so any GtmSignal rows S5 execution created this same
@@ -976,6 +996,7 @@ def run_gtm_intelligence_sweep(
         # the timeout further and making total run time even longer.
         investigation_result = _run_stage_with_timeout(run_investigation_cycle, tenant_id, timeout_seconds=300)
         result["investigation_cycle"] = investigation_result
+        _report_progress(db, run, result, "investigation_cycle")
         if investigation_result.get("status") in ("succeeded", "partial"):
             any_succeeded = True
         if investigation_result.get("status") in ("partial", "timed_out"):
@@ -1025,6 +1046,7 @@ def run_gtm_intelligence_sweep(
         # newly slow and worth investigating, not a reason to keep a blanket 600s "just in case."
         interpretation_result = _run_stage_with_timeout(_run_interpretation_stage, tenant_id, timeout_seconds=240)
         result["interpretation"] = interpretation_result
+        _report_progress(db, run, result, "interpretation")
         if interpretation_result.get("status") == "succeeded":
             any_succeeded = True
         else:
@@ -1046,6 +1068,7 @@ def run_gtm_intelligence_sweep(
 
         problem_result = _run_stage_with_timeout(_run_problem_detection_stage, tenant_id, timeout_seconds=180)
         result["problem_detection"] = problem_result
+        _report_progress(db, run, result, "problem_detection")
         if problem_result.get("status") == "succeeded":
             any_succeeded = True
         else:
@@ -1065,6 +1088,7 @@ def run_gtm_intelligence_sweep(
 
         demand_result = _run_stage_with_timeout(_run_demand_detection_stage, tenant_id, timeout_seconds=180)
         result["demand_detection"] = demand_result
+        _report_progress(db, run, result, "demand_detection")
         if demand_result.get("status") == "succeeded":
             any_succeeded = True
         else:
@@ -1088,6 +1112,7 @@ def run_gtm_intelligence_sweep(
         # sweep's shared session goes stale on a long idle gap eats an avoidable failure otherwise.
         stage_result = _run_stage_with_retry(runner, db, tenant_id)
         result[stage_key] = stage_result
+        _report_progress(db, run, result, stage_key)
         if stage_result.get("status") == "succeeded":
             any_succeeded = True
             logger.info("gtm_intelligence_sweep: %s succeeded -- %s", stage_key, stage_result)
@@ -1115,6 +1140,7 @@ def run_gtm_intelligence_sweep(
             continue
         stage_result = _run_stage_with_retry(runner, db, tenant_id)
         result[stage_key] = stage_result
+        _report_progress(db, run, result, stage_key)
         if stage_result.get("status") == "succeeded":
             any_succeeded = True
             logger.info("gtm_intelligence_sweep: %s succeeded -- %s", stage_key, stage_result)
@@ -1139,6 +1165,7 @@ def run_gtm_intelligence_sweep(
             db, tenant_id,
         )
     result["contact_discovery"] = contact_discovery_result
+    _report_progress(db, run, result, "contact_discovery")
     if contact_discovery_result.get("status") == "succeeded":
         any_succeeded = True
     elif contact_discovery_result.get("status") == "failed":
@@ -1151,6 +1178,7 @@ def run_gtm_intelligence_sweep(
             continue
         stage_result = _run_stage_with_retry(runner, db, tenant_id)
         result[stage_key] = stage_result
+        _report_progress(db, run, result, stage_key)
         if stage_result.get("status") == "succeeded":
             any_succeeded = True
             logger.info("gtm_intelligence_sweep: %s succeeded -- %s", stage_key, stage_result)
@@ -1172,6 +1200,7 @@ def run_gtm_intelligence_sweep(
             db, tenant_id,
         )
     result["send"] = send_result
+    _report_progress(db, run, result, "send")
     if send_result.get("status") == "succeeded":
         any_succeeded = True
     elif send_result.get("status") == "failed":
@@ -1181,6 +1210,7 @@ def run_gtm_intelligence_sweep(
     for stage_key, runner in ACCOUNT_STRATEGY_STAGES_POST_SEND:
         stage_result = _run_stage_with_retry(runner, db, tenant_id)
         result[stage_key] = stage_result
+        _report_progress(db, run, result, stage_key)
         if stage_result.get("status") == "succeeded":
             any_succeeded = True
             logger.info("gtm_intelligence_sweep: %s succeeded -- %s", stage_key, stage_result)
@@ -1198,6 +1228,7 @@ def run_gtm_intelligence_sweep(
     else:
         outreach_sequencing_result = run_v2_outreach_sequencing_sweep(db, tenant_id, limit=50)
     result["outreach_sequencing"] = outreach_sequencing_result
+    _report_progress(db, run, result, "outreach_sequencing")
     if outreach_sequencing_result.get("status") == "succeeded":
         any_succeeded = True
     elif outreach_sequencing_result.get("status") == "failed":
@@ -1280,7 +1311,7 @@ def _no_eligible_work_remaining(result: dict) -> bool:
     return total_new_signals == 0 and objectives_processed == 0 and interpretation_created == 0
 
 
-def run_gtm_daily_flow_cycle(db: Session, tenant_id: int) -> dict:
+def run_gtm_daily_flow_cycle(db: Session, tenant_id: int, run=None) -> dict:
     """Wraps the existing, UNMODIFIED run_gtm_intelligence_sweep() in an outer target-seeking
     loop -- per the approved 2026-08-24 design, adds daily_flow_target/max_iterations_per_run
     WITHOUT rewriting any of the five independent batch stages into a serial per-company/per-flow
@@ -1304,7 +1335,7 @@ def run_gtm_daily_flow_cycle(db: Session, tenant_id: int) -> dict:
     max_iterations_per_run = flow_target_config.get("max_iterations_per_run")
 
     if not daily_flow_target or not max_iterations_per_run:
-        return run_gtm_intelligence_sweep(db, tenant_id)
+        return run_gtm_intelligence_sweep(db, tenant_id, run=run)
 
     now = datetime.utcnow()
     count_at_run_start = count_completed_flows_today(db, tenant_id, now)
@@ -1329,8 +1360,17 @@ def run_gtm_daily_flow_cycle(db: Session, tenant_id: int) -> dict:
                 result = {"status": "skipped", "reason": str(e)}
             break
 
-        result = run_gtm_intelligence_sweep(db, tenant_id)
+        result = run_gtm_intelligence_sweep(db, tenant_id, run=run)
         iterations_run += 1
+        if run is not None:
+            # 2026-09-18: also surface which flow-cycle iteration this is, not just which stage
+            # within it -- a live GET now shows both "iteration 3 of 5" and "currently on
+            # interpretation" instead of only the latter.
+            snapshot = dict(result)
+            snapshot["flow_cycle_iteration"] = iterations_run
+            run.stage_results = snapshot
+            db.add(run)
+            db.commit()
         iteration_history.append({
             "iteration": iterations_run,
             "investigation_cycle": result.get("investigation_cycle"),

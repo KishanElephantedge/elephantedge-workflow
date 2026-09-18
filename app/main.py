@@ -319,7 +319,9 @@ def _scheduled_gtm_intelligence_cycle():
             return
 
         run = start_gtm_intelligence_run(db, ELEPHANT_EDGE_TENANT_ID)
-        result = run_gtm_daily_flow_cycle(db, tenant_id=ELEPHANT_EDGE_TENANT_ID)
+        # 2026-09-18: `run` threaded through so a live GET on this run shows real per-stage
+        # progress while the scheduled cycle is still executing, same fix as the manual trigger.
+        result = run_gtm_daily_flow_cycle(db, tenant_id=ELEPHANT_EDGE_TENANT_ID, run=run)
         finish_gtm_intelligence_run(db, run, result)
         logging.getLogger(__name__).info("gtm_intelligence_cycle: %s", result)
     finally:

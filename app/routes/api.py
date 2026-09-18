@@ -5118,7 +5118,10 @@ def trigger_gtm_intelligence_run(dry_run: bool = False, db: Session = Depends(ge
         raise HTTPException(status_code=409, detail=f"a run ({already_running.id}) is already in progress since {already_running.started_at}")
 
     run = start_gtm_intelligence_run(db, ELEPHANT_EDGE_TENANT_ID)
-    result = run_gtm_daily_flow_cycle(db, ELEPHANT_EDGE_TENANT_ID)
+    # 2026-09-18 real fix: `run` is now threaded through so GET /gtm-os/intelligence-runs/{id}
+    # shows real, live per-stage progress (current_stage, flow_cycle_iteration) while this is
+    # still executing, instead of only "running" until the whole thing finishes or fails.
+    result = run_gtm_daily_flow_cycle(db, ELEPHANT_EDGE_TENANT_ID, run=run)
     finish_gtm_intelligence_run(db, run, result)
     return {"run_id": run.id, "status": run.status, "result": result}
 
