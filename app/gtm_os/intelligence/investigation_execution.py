@@ -238,7 +238,18 @@ def execute_investigation_action(db: Session, tenant_id: int, action: dict) -> d
     parameters = action.get("parameters") or {}
     budget_block_reason = _budget_check(db, tenant_id, source, parameters)
     if budget_block_reason:
-        return _result(objective_id, source, action_type, EXEC_BLOCKED_BY_BUDGET, error_reason=budget_block_reason, started_at=started_at)
+        # 2026-09-18 fix -- confirmed live at scale: 160 real objectives sitting permanently
+        # stuck at attempts=0 because a budget block never recorded an attempt (same
+        # "no attempt recorded" reasoning as the old theirstack_job branch, but budget
+        # exhaustion is a routine, EXPECTED, daily condition -- not a permanent disablement).
+        # _objective_priority_key() sorts by attempts then id, so an objective that never ages
+        # permanently squats at the front of the queue on every future tick, blocking every
+        # objective behind it (including hiring-trigger objectives 52/53) from ever being
+        # selected again, even long after the budget itself has recovered. Recording the
+        # attempt lets the queue actually rotate; the objective still gets retried later via
+        # the normal cooldown/backoff path, same as any other attempted-but-inconclusive result.
+        attempt = _record(db, tenant_id, objective, RESULT_INCONCLUSIVE, source)
+        return _result(objective_id, source, action_type, EXEC_BLOCKED_BY_BUDGET, error_reason=budget_block_reason, started_at=started_at, investigation_attempt=attempt)
 
     try:
         if source == "linkedin_post_search":
@@ -270,13 +281,14 @@ def execute_investigation_action(db: Session, tenant_id: int, action: dict) -> d
                         retrieval_urls.append(profile_url)
 
                 # Second, separate budget check -- sized to the REAL (bounded) retrieval volume
-                # just discovered, not a blind pre-flight guess. Mid-execution budget block is
-                # reported the same way a pre-flight block is (EXEC_BLOCKED_BY_BUDGET, no attempt
-                # recorded) -- retrieval was never actually attempted, so nothing to record.
+                # just discovered, not a blind pre-flight guess. 2026-09-18 fix: this mid-
+                # execution block now also records the attempt, same reasoning and same real
+                # queue-starvation bug as the pre-flight budget check above.
                 retrieval_cost = len(retrieval_urls) * LINKEDIN_POSTS_PER_AUTHOR * LINKEDIN_POST_COST_PER_POST_USD
                 retrieval_budget = check_apify_budget(db, tenant_id, retrieval_cost)
                 if retrieval_budget["status"] != APIFY_BUDGET_ALLOWED:
-                    return _result(objective_id, source, action_type, EXEC_BLOCKED_BY_BUDGET, error_reason=retrieval_budget["reason"], started_at=started_at)
+                    attempt = _record(db, tenant_id, objective, RESULT_INCONCLUSIVE, source)
+                    return _result(objective_id, source, action_type, EXEC_BLOCKED_BY_BUDGET, error_reason=retrieval_budget["reason"], started_at=started_at, investigation_attempt=attempt)
                 signals = sense_linkedin_posts(db, tenant_id, retrieval_urls, limit_per_source=LINKEDIN_POSTS_PER_AUTHOR)
             else:
                 # No real post URLs discovered -- a genuine attempt was still made (the Google
