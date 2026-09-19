@@ -880,3 +880,24 @@ def ensure_indexes():
         # here instead of over the now-closed HTTP response.
         conn.execute(text("ALTER TABLE batches ADD COLUMN IF NOT EXISTS discovery_result JSON"))
         conn.execute(text("ALTER TABLE batches ADD COLUMN IF NOT EXISTS discovery_error TEXT"))
+
+        # 2026-09-19 -- cross-instance scheduler leases (app/scheduler_lease.py). Three Render
+        # accounts are deliberately kept deployed as a free-tier cost rotation and ALL of them
+        # auto-deploy from this repo, so every live instance runs the full in-process scheduler
+        # (app/main.py) with nothing coordinating them. Every provider account behind those runs
+        # is a SINGLE shared account ($5/month Apify, one Deepline balance, 500 Gemini calls/day),
+        # so a duplicated daily sweep spends one budget twice and races its own read-then-act
+        # budget checks. The unique index is what makes acquisition safe: it guarantees exactly
+        # one row per (tenant, job) for the conditional UPDATE to contend over.
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS scheduler_leases (
+                id SERIAL PRIMARY KEY,
+                tenant_id INTEGER NOT NULL,
+                job_key VARCHAR NOT NULL,
+                owner_instance VARCHAR,
+                acquired_at TIMESTAMP,
+                heartbeat_at TIMESTAMP,
+                expires_at TIMESTAMP
+            )
+        """))
+        conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ux_scheduler_leases_tenant_job ON scheduler_leases (tenant_id, job_key)"))

@@ -8,6 +8,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.db.session import SessionLocal, ensure_indexes
+from app.scheduler_lease import job_lease
 from app.google_calendar_client import GoogleCalendarError
 from app.gtm_os.governance.governance import compute_and_store_governance_snapshot
 from app.gtm_os.orchestration.control import ControlPlaneHalted, check_can_run, get_intelligence_schedule_utc
@@ -71,13 +72,20 @@ def _scheduled_autonomous_tick():
         db.close()
 
     for tenant_id in tenant_ids:
-        db = SessionLocal()
-        try:
-            run_daily_autonomous_cycle(db, tenant_id=tenant_id)
-        except Exception:
-            logging.getLogger(__name__).exception("autonomous_daily_cycle: tenant_id=%s failed", tenant_id)
-        finally:
-            db.close()
+        # Leased PER TENANT, not once for the whole loop: one tenant's long cycle must not stop
+        # another instance from running a different tenant's, which is the whole point of
+        # looping tenants here. See app/scheduler_lease.py for why a DB lease and not an
+        # advisory lock (this codebase drops DB connections mid-run routinely).
+        with job_lease(tenant_id, "autonomous_daily_cycle") as acquired:
+            if not acquired:
+                continue
+            db = SessionLocal()
+            try:
+                run_daily_autonomous_cycle(db, tenant_id=tenant_id)
+            except Exception:
+                logging.getLogger(__name__).exception("autonomous_daily_cycle: tenant_id=%s failed", tenant_id)
+            finally:
+                db.close()
 
 
 def _scheduled_partner_daily_run_tick():
@@ -99,15 +107,21 @@ def _scheduled_partner_daily_run_tick():
         db.close()
 
     for tenant_id in tenant_ids:
-        db = SessionLocal()
-        try:
-            result = run_partner_daily_tick_for_tenant(db, tenant_id)
-            if result.get("status") == "started":
-                logging.getLogger(__name__).info("partner_daily_run_tick: tenant_id=%s started batch_id=%s", tenant_id, result.get("batch_id"))
-        except Exception:
-            logging.getLogger(__name__).exception("partner_daily_run_tick: tenant_id=%s failed", tenant_id)
-        finally:
-            db.close()
+        # Leased per tenant -- this tick fires hourly and starts real, Apify-billed partner
+        # discovery, so two instances ticking the same hour would double-spend one shared
+        # Apify account against the same partner's daily allowance.
+        with job_lease(tenant_id, "partner_daily_run_tick") as acquired:
+            if not acquired:
+                continue
+            db = SessionLocal()
+            try:
+                result = run_partner_daily_tick_for_tenant(db, tenant_id)
+                if result.get("status") == "started":
+                    logging.getLogger(__name__).info("partner_daily_run_tick: tenant_id=%s started batch_id=%s", tenant_id, result.get("batch_id"))
+            except Exception:
+                logging.getLogger(__name__).exception("partner_daily_run_tick: tenant_id=%s failed", tenant_id)
+            finally:
+                db.close()
 
 
 def _scheduled_auto_approval_sweep():
@@ -296,7 +310,23 @@ def _scheduled_gtm_intelligence_cycle():
     V2 CONTROL PLANE (Phase 0): check_can_run() gates this before anything else -- when the
     control plane's state is "paused"/"stopped", this tick no-ops entirely (no GtmIntelligenceRun
     row is even created) rather than running and only skipping the write-side stages, per the
-    approved "paused/stopped must prevent new autonomous actions" decision."""
+    approved "paused/stopped must prevent new autonomous actions" decision.
+
+    CROSS-INSTANCE LEASE (2026-09-19): the in-progress check below is necessary but NOT
+    sufficient. It is a read-then-act check with no locking, and three Render deployments run
+    this identical scheduler against one shared set of provider accounts -- so two instances can
+    both read "nothing running" and both start. Worse, recover_stale_gtm_intelligence_runs()
+    above flips a genuinely-running sweep to "failed" purely on elapsed time (120 min), which
+    actively clears the guard for a second overlapping run on exactly the long runs that cost
+    most. The lease is what actually makes this single-lane; see app/scheduler_lease.py."""
+    with job_lease(ELEPHANT_EDGE_TENANT_ID, "gtm_intelligence_cycle") as acquired:
+        if not acquired:
+            return
+        _run_gtm_intelligence_cycle_locked()
+
+
+def _run_gtm_intelligence_cycle_locked():
+    """The real body, run only by the instance holding the lease."""
     db = SessionLocal()
     try:
         try:
@@ -422,16 +452,23 @@ def on_startup():
         CronTrigger(hour=hour, minute=minute, timezone="UTC"),
         id="autonomous_daily_cycle",
         misfire_grace_time=AUTONOMOUS_MISFIRE_GRACE_SECONDS,
+        # coalesce collapses a backlog of missed fires into ONE run. It matters specifically
+        # because of the 2-hour misfire grace above: on Render's free tier a restart is routine,
+        # and without coalesce a process that comes back inside that window can fire the daily
+        # cycle more than once. max_instances stops a long run overlapping the next fire within
+        # this process; the lease in the job body stops it across instances.
+        coalesce=True,
+        max_instances=1,
     )
-    scheduler.add_job(_scheduled_approval_sweep, "interval", minutes=5, id="approval_window_sweep")
+    scheduler.add_job(_scheduled_approval_sweep, "interval", minutes=5, max_instances=1, coalesce=True, id="approval_window_sweep")
     # Hourly, not daily -- each partner tenant picks its own trigger hour (partner_daily_run.py),
     # so this just checks "is anyone due this hour" rather than firing once at one fixed time.
-    scheduler.add_job(_scheduled_partner_daily_run_tick, "interval", minutes=60, id="partner_daily_run_tick")
+    scheduler.add_job(_scheduled_partner_daily_run_tick, "interval", minutes=60, max_instances=1, coalesce=True, id="partner_daily_run_tick")
     # Unattended approval window (2026-08-31): a draft nobody reviews within AUTO_APPROVAL_HOURS
     # is approved and pushed on its own, so human review is a chance to intervene rather than a
     # requirement to proceed. Every 15 minutes rather than every 5 -- a 2-hour window does not
     # need finer resolution, and each tick touches only drafts already past the deadline.
-    scheduler.add_job(_scheduled_auto_approval_sweep, "interval", minutes=15, id="auto_approval_sweep")
+    scheduler.add_job(_scheduled_auto_approval_sweep, "interval", minutes=15, max_instances=1, coalesce=True, id="auto_approval_sweep")
     # Widened from 3/15 minutes (2026-08-21) -- a 3-minute cache warmer and a 15-minute calendar
     # sync individually cost little, but together with every other job on this scheduler they
     # kept the DB compute effectively always-on, never idle long enough for the host's
@@ -440,15 +477,15 @@ def on_startup():
     # Both are pure convenience/freshness jobs (a warm cache for whoever's actively viewing a
     # batch page; a periodic pull of calendar bookings) -- correctness never depends on this
     # cadence, only how fresh a background view can be, so widening costs nothing but staleness.
-    scheduler.add_job(_scheduled_cache_refresh, "interval", minutes=15, id="batch_cache_refresh")
-    scheduler.add_job(_scheduled_calendar_sync, "interval", minutes=300, id="calendar_booking_sync")
-    scheduler.add_job(_scheduled_granola_sync, "interval", hours=12, id="granola_meeting_sync")
+    scheduler.add_job(_scheduled_cache_refresh, "interval", minutes=15, max_instances=1, coalesce=True, id="batch_cache_refresh")
+    scheduler.add_job(_scheduled_calendar_sync, "interval", minutes=300, max_instances=1, coalesce=True, id="calendar_booking_sync")
+    scheduler.add_job(_scheduled_granola_sync, "interval", hours=12, max_instances=1, coalesce=True, id="granola_meeting_sync")
     # Interval read from real, editable config (Targets > Settings) -- was hardcoded
     # minutes=45 until 2026-08-18, with no way to change it without a code change/redeploy.
-    scheduler.add_job(_scheduled_linkedin_monitor_sweep, "interval", minutes=linkedin_monitor_interval_minutes, id="linkedin_monitor_sweep")
+    scheduler.add_job(_scheduled_linkedin_monitor_sweep, "interval", minutes=linkedin_monitor_interval_minutes, max_instances=1, coalesce=True, id="linkedin_monitor_sweep")
     # Interval read from real, editable config (Targets > Settings), default daily -- see
     # app/phases/gtm_partner_matching.py.
-    scheduler.add_job(_scheduled_partner_matching_sweep, "interval", minutes=partner_matching_interval_minutes, id="partner_matching_sweep")
+    scheduler.add_job(_scheduled_partner_matching_sweep, "interval", minutes=partner_matching_interval_minutes, max_instances=1, coalesce=True, id="partner_matching_sweep")
     # Once daily, fixed UTC time -- matches V1's own daily autonomous cycle cadence/pattern
     # (CronTrigger at a configured hour/minute, not an interval timer whose "next fire" drifts on
     # every deploy). Was IntervalTrigger(minutes=60) until 2026-08-23.
@@ -457,8 +494,12 @@ def on_startup():
         CronTrigger(hour=intelligence_hour, minute=intelligence_minute, timezone="UTC"),
         id="gtm_intelligence_cycle",
         misfire_grace_time=INTELLIGENCE_CYCLE_MISFIRE_GRACE_SECONDS,
+        # Same reasoning as autonomous_daily_cycle above -- and it matters more here, since this
+        # is the sweep that spends the shared Apify/Deepline/Gemini budget.
+        coalesce=True,
+        max_instances=1,
     )
-    scheduler.add_job(_scheduled_governance_snapshot, "interval", minutes=60, id="governance_snapshot")
+    scheduler.add_job(_scheduled_governance_snapshot, "interval", minutes=60, max_instances=1, coalesce=True, id="governance_snapshot")
     scheduler.start()
 
 
