@@ -23,8 +23,17 @@ No separate Crustdata company_identify call here (unlike jd_first) -- Apify's ow
 org_linkedin_website/org_linkedin_headcount are already real, LinkedIn-sourced values per
 company, so that extra lookup isn't needed.
 """
+import logging
+from datetime import datetime
+
 from sqlalchemy.orm import Session
 
+# Signal persistence reuses V2's own model and helpers rather than duplicating them, so the row
+# discovery writes is byte-identical in shape to the one sense_linkedin_jobs() writes -- see
+# _persist_posting_as_signal() below. app/phases/ already imports app/gtm_os/ in several places
+# (partner_pipeline, autonomous_orchestrator, calendar_sync), so this crosses no new boundary.
+from app.gtm_os.intelligence.sensing import _dedup_key, _parse_dt
+from app.gtm_os.intelligence.signal import GtmSignal
 from app.phases.company_profile_check import fetch_public_company_profile, profile_rejection_reason
 from app.apify_budget_guard import STATUS_ALLOWED as APIFY_BUDGET_ALLOWED, check_apify_budget
 from app.apify_client import COST_PER_JOB_USD, ApifyError, estimate_cost_usd, search_linkedin_jobs
@@ -154,6 +163,88 @@ def _normalize_domain(website: str) -> str:
     domain = domain.replace("https://", "").replace("http://", "")
     domain = domain.split("/")[0]
     return domain.replace("www.", "")
+
+
+def _persist_posting_as_signal(db: Session, tenant_id: int, company: Company, job: dict) -> GtmSignal | None:
+    """Keep the posting we just paid for, linked to the company it just created.
+
+    WHY THIS EXISTS (measured on production 2026-09-19, before this was added):
+    1,066 of 1,175 companies had NO gtm_signal at all, and 352 of 506 linkedin_job signals had
+    no company_id. Discovery bought a posting, created a Company from it, wrote the V1-shaped
+    Company.hiring_signal_* columns, and discarded the posting itself. But V2's whole chain
+    (interpretation -> problem -> demand -> opportunity) reads GtmSignal, never those columns --
+    so every company discovered this way was structurally incapable of producing an opportunity.
+    That is why runs 147/149/150 completed "cleanly" with signals_created: 0 and 0 opportunities.
+
+    The company_id is the expensive half. Discovery creates the Company FROM this exact posting,
+    so the link is known here, for free. Leaving it NULL is what pushed the signal into
+    company_resolution.py's PAID Deepline path to re-derive a link we already had -- and when
+    that spend is budget-blocked, resolution records "unresolved" and the evidence is stranded
+    permanently. 352 production signals are in exactly that state.
+
+    Shape is deliberately IDENTICAL to sense_linkedin_jobs() in
+    app/gtm_os/intelligence/sensing.py (same source/signal_type/source_ref/extracted_info keys,
+    same _dedup_key), so interpretation.py, problem_detection.py and demand_detection.py consume
+    it with no changes at all. A near-miss variant would be silently ignored downstream.
+
+    Returns None (never raises) when the posting carries no usable identifier, or when this
+    posting was already sensed -- the same "already_sensed" guard sense_linkedin_jobs() uses,
+    since a repeat observation of one posting must not become a second signal (a real
+    2026-08-24 bug: the same Codeable BDR posting stored twice)."""
+    source_ref = str(job.get("id") or job.get("jobUrl") or job.get("url") or "")
+    if not source_ref:
+        return None
+
+    already_sensed = (
+        db.query(GtmSignal)
+        .filter(GtmSignal.tenant_id == tenant_id, GtmSignal.source == "linkedin_job", GtmSignal.source_ref == source_ref)
+        .first()
+    )
+    if already_sensed:
+        # Backfill the link if this posting was sensed earlier WITHOUT a company (the 352-signal
+        # case above) and we now know the company for certain. Never overwrite an existing link.
+        if already_sensed.company_id is None:
+            already_sensed.company_id = company.id
+            already_sensed.company_resolution_status = "resolved"
+            already_sensed.company_resolution_method = "explicit"
+            already_sensed.company_resolved_at = datetime.utcnow()
+            db.commit()
+        return None
+
+    signal = GtmSignal(
+        tenant_id=tenant_id,
+        source="linkedin_job",
+        source_ref=source_ref,
+        signal_type="job_posting",
+        observed_at=_parse_dt(job.get("date_posted") or job.get("postedAt") or job.get("datePosted")),
+        company_id=company.id,
+        company_name_raw=job.get("organization") or job.get("organizationName") or job.get("companyName"),
+        raw_evidence=job,
+        extracted_info={
+            "title": job.get("title"),
+            "location": job.get("location"),
+            "organization_domain": job.get("org_linkedin_website"),
+            "organization_headcount": job.get("org_linkedin_headcount"),
+            "description_text": job.get("description_text"),
+            "seniority": job.get("seniority"),
+            "ai_experience_level": job.get("ai_experience_level"),
+            "ai_core_responsibilities": job.get("ai_core_responsibilities"),
+            "ai_requirements_summary": job.get("ai_requirements_summary"),
+            "organization_industry": job.get("org_linkedin_industry"),
+            "organization_founded_date": job.get("org_linkedin_founded_date"),
+            "organization_description": job.get("org_linkedin_description"),
+        },
+        dedup_key=_dedup_key("linkedin_job", source_ref),
+        # Resolved by construction, not by a paid lookup -- "explicit" is the same method
+        # company_resolution.py records when the source itself already names the company.
+        company_resolution_status="resolved",
+        company_resolution_method="explicit",
+        company_resolution_reason="linked at discovery: this posting created this company row",
+        company_resolved_at=datetime.utcnow(),
+    )
+    db.add(signal)
+    db.commit()
+    return signal
 
 
 def run_apify_discovery(
@@ -383,6 +474,19 @@ def run_apify_discovery(
             company.hiring_signal_strength = strength
             company.hiring_signal_reasoning = reasoning
             db.commit()
+
+        # Keep the evidence we already paid for, linked to the company it produced. Placed
+        # after the team-composition gate above so a company that gets deleted never leaves an
+        # orphaned signal behind, and after the hiring_signal_* writes so the Company row is
+        # complete first. Never allowed to break discovery: a signal-write failure must not
+        # discard a company that was otherwise successfully found and paid for.
+        try:
+            _persist_posting_as_signal(db, tenant_id, company, job)
+        except Exception:  # noqa: BLE001 -- evidence persistence is additive, never fatal to discovery
+            db.rollback()
+            logging.getLogger(__name__).exception(
+                "failed to persist linkedin_job signal for company_id=%s; company kept", company.id
+            )
 
         seen_domains.add(domain)
         kept.append(company)

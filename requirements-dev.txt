@@ -1,0 +1,4 @@
+# Test-only dependencies. Deliberately separate from requirements.txt so the Render
+# deploy image is unchanged by adding tests.
+-r requirements.txt
+pytest
