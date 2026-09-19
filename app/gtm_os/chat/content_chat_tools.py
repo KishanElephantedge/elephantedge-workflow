@@ -21,14 +21,22 @@ recommendation you make has one real objective behind it: which content actually
 
 You have real access to: real trending topics (from live Google Search sensing, standing in for \
 Reddit/X/Perplexity until those API keys exist), real competitor content (from this tenant's \
-configured competitors' own sites), the real Content Opportunities already generated from that \
-evidence (each with a why-now and a suggested angle, citing real URLs), this tenant's own \
-configured topic list (real topics derived from their real positioning/audience, even before any \
-trend evidence exists for them), and -- ONLY when the user explicitly wants something grounded in \
-real customer language, objections, or "what my customers are saying" -- real meeting \
-notes/transcripts, if this tenant has any synced. Do NOT check meetings by default for every \
-request; check them only when the request is actually about customer meetings/calls. If asked and \
-no meetings are synced, say so honestly rather than guessing at what customers might be saying.
+configured competitors' own sites), real account-intelligence topics (aggregate, anonymized \
+patterns across the actual company pipeline being fetched daily -- what the real ICP base is \
+genuinely facing right now, never a single company's specifics), the real Content Opportunities \
+already generated from that evidence (each with a why-now and a suggested angle, citing real \
+URLs or the real aggregate pattern), this tenant's own configured topic list (real topics derived \
+from their real positioning/audience, even before any trend evidence exists for them), and -- \
+ONLY when the user explicitly wants something grounded in real customer language, objections, or \
+"what my customers are saying" -- real meeting notes/transcripts, if this tenant has any synced. \
+Do NOT check meetings by default for every request; check them only when the request is actually \
+about customer meetings/calls. If asked and no meetings are synced, say so honestly rather than \
+guessing at what customers might be saying.
+
+Two long-form platforms exist alongside the short "linkedin"/"twitter" formats: "blog" and \
+"linkedin_article" (LinkedIn's own long-form publishing format, 900-1400 words, distinct from a \
+short feed post) -- both follow the Expedition Framework's narrative arc (never expose the \
+framework itself in the output -- the reader should feel a journey, not a structure).
 
 {business_name}'s real positioning: {positioning}. Every suggestion you make should connect back \
 to this positioning, grounded in real evidence -- never a generic content idea. Writing for: \
@@ -128,15 +136,30 @@ CONTENT_CHAT_TOOLS = [
     },
     {
         "name": "generate_platform_draft",
-        "description": "Write a real, platform-specific draft (blog, linkedin, or twitter) for an already-approved content opportunity -- each platform gets its own real length/voice, never the same draft reused.",
+        "description": "Write a real, platform-specific draft (blog, linkedin, linkedin_article, or twitter) for an already-approved content opportunity -- each platform gets its own real length/voice, never the same draft reused. linkedin_article is LinkedIn's long-form publishing format (900-1400 words), distinct from the short 'linkedin' feed post.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "content_opportunity_id": {"type": "integer"},
-                "platform": {"type": "string", "enum": ["blog", "linkedin", "twitter"]},
+                "platform": {"type": "string", "enum": ["blog", "linkedin", "linkedin_article", "twitter"]},
             },
             "required": ["content_opportunity_id", "platform"],
         },
+    },
+    {
+        "name": "generate_account_intelligence_topics",
+        "description": (
+            "Generate real content topics grounded in patterns across the ACTUAL company "
+            "pipeline being fetched daily -- not external trends, not competitor content. "
+            "Reasons over already-detected, evidence-backed ProblemHypothesis/DemandHypothesis "
+            "rows in aggregate (never a single company's specifics) to find what the real ICP "
+            "base is genuinely facing right now. Use this whenever the user asks for topics "
+            "'based on our accounts/companies/pipeline' rather than trending or competitor "
+            "topics. Creates real ContentOpportunity rows (origin='account_intelligence') the "
+            "same way list_content_opportunities/review_content_opportunity/generate_platform_draft "
+            "already handle -- no new review flow to learn."
+        ),
+        "input_schema": {"type": "object", "properties": {}},
     },
     {
         "name": "run_fresh_sensing",
@@ -173,7 +196,7 @@ CONTENT_CHAT_TOOLS = [
             "type": "object",
             "properties": {
                 "angle": {"type": "string", "description": "The topic/angle to write about, in plain language"},
-                "platform": {"type": "string", "enum": ["blog", "linkedin", "twitter"]},
+                "platform": {"type": "string", "enum": ["blog", "linkedin", "linkedin_article", "twitter"]},
             },
             "required": ["angle"],
         },
@@ -195,7 +218,7 @@ CONTENT_CHAT_TOOLS = [
             "type": "object",
             "properties": {
                 "user_request": {"type": "string", "description": "What the user asked to write about, in their own words"},
-                "platform": {"type": "string", "enum": ["blog", "linkedin", "twitter"]},
+                "platform": {"type": "string", "enum": ["blog", "linkedin", "linkedin_article", "twitter"]},
             },
             "required": ["user_request"],
         },
@@ -269,6 +292,10 @@ def execute_content_chat_tool(name: str, tool_input: dict, db: Session, tenant_i
     if name == "generate_platform_draft":
         from app.gtm_os.content.content_opportunity import generate_content_draft
         return generate_content_draft(db, tenant_id, tool_input["content_opportunity_id"], platform=tool_input["platform"])
+
+    if name == "generate_account_intelligence_topics":
+        from app.gtm_os.content.account_intelligence_topics import generate_account_intelligence_topics
+        return generate_account_intelligence_topics(db, tenant_id)
 
     if name == "run_fresh_sensing":
         from app.apify_client import GOOGLE_SEARCH_COST_PER_QUERY_NO_AI_OVERVIEW_USD

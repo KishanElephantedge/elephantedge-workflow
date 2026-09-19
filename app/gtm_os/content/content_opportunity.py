@@ -276,13 +276,22 @@ def request_content_opportunity_changes(db: Session, tenant_id: int, content_opp
     return opportunity
 
 
-VALID_PLATFORMS = {"blog", "linkedin", "twitter"}
+VALID_PLATFORMS = {"blog", "linkedin", "linkedin_article", "twitter"}
 
 # Real, distinct voice/length per platform -- never the same generic draft reused everywhere
 # (2026-08-28 explicit instruction). Grounded in how these platforms actually differ, not
 # invented style rules.
 PLATFORM_BRIEF = {
     "blog": "A blog post (500-700 words): structured with a clear opening hook, 2-3 body sections, and a real conclusion. Can go deeper into the evidence and reasoning than a social post would.",
+    "linkedin_article": (
+        "A LinkedIn Article (LinkedIn's long-form publishing format, 900-1400 words) -- NOT a "
+        "short feed post. Has a real title and can use a few plain subheadings, but the body "
+        "itself must follow the Expedition Framework's narrative arc (see the writing-style "
+        "rules above) rather than reading as a listicle or a report with headers stacked for "
+        "their own sake. Written for someone who clicked in because the title promised a real "
+        "answer to something they're stuck on -- longer than a feed post, but still a story, "
+        "never a whitepaper."
+    ),
     "linkedin": (
         "A LinkedIn post (120-200 words): short paragraphs or line breaks, no headers, "
         "conversational but substantive -- written to be read on a phone in a feed, not a formal "
@@ -303,6 +312,36 @@ PLATFORM_BRIEF = {
     ),
 }
 
+# The Expedition Framework (2026-09-19, from the team's own Blog Architecture doc) -- the real
+# writing engine behind blog/linkedin_article drafts specifically. A thinking scaffold, never a
+# visible outline: the reader should feel they're following a journey, not reading a framework.
+# Kept out of the short "linkedin"/"twitter" briefs above, which have their own proven hook
+# formulas better suited to a feed-scroll read.
+EXPEDITION_FRAMEWORK_GUIDANCE = """Writing style -- follow this exactly, it is not optional:
+- Narrative first, explanation second. Write like a curious storyteller trying to understand \
+the business problem, not a consultant delivering a report.
+- Avoid generic advice-column phrasing. Build real tension before giving the answer.
+- Simple language, short paragraphs. Use analogies, real scenarios, and buyer psychology instead \
+of stating conclusions directly.
+- Never make it sound like a consulting report, and never force a visible framework/outline into \
+the piece -- what follows is a thinking tool behind the writing, not a structure to expose.
+
+Use this arc as your internal thinking tool (never label these sections in the output):
+1. The Kingdom -- what everyone in this situation wants; the dream/ambition/promised outcome.
+2. The Guard -- the real obstacle preventing it (usually a trust problem, buying complexity, \
+operational reality, or a market misunderstanding) -- show it through a scenario, don't just \
+state it.
+3. The Old Journey -- how people used to solve this, and why that approach made sense at the \
+time. Never attack the old way.
+4. The New Discovery -- what changed. The best version of this insight follows the shape \
+"previously it was X, today it is Y."
+5. Marketplace/Gatekeepers -- who actually controls access here: the market segment, buyer \
+maturity, the buying committee, the real decision-makers and influencers.
+6. The Ride -- practical, real advice for how to move forward now that the world has changed.
+
+The piece should end by answering, implicitly: "now that the world changed, how should companies \
+adapt?" -- never a generic call-to-action tacked onto a report."""
+
 DRAFT_PROMPT = """Write a real, publishable {platform_label} for {business_name} on the topic \
 below, grounded ONLY in the real evidence and angle already established -- never invent a \
 statistic, quote, or claim not present below.
@@ -315,10 +354,57 @@ Real evidence this is grounded in:
 {evidence_block}
 
 Format for this platform specifically: {platform_brief}
+{expedition_guidance}
 
 Write in {business_name}'s real voice: direct, no fluff, grounded in real evidence, consistent \
 with this positioning: {positioning}. Return JSON exactly:
 {{"draft_text": "<the full draft, formatted for this exact platform>"}}"""
+
+# Only blog/linkedin_article use the Expedition Framework's narrative arc -- linkedin/twitter
+# already have their own proven, feed-native hook formulas (see PLATFORM_BRIEF above) that suit a
+# scroll-read better than a 6-part journey.
+_EXPEDITION_PLATFORMS = {"blog", "linkedin_article"}
+
+
+EDITOR_RUBRIC_PROMPT = """You are a strong, honest editor reviewing a draft against the \
+Expedition Framework -- your job is to push back where it's weak, not to rubber-stamp it.
+
+Topic: {topic_name}
+Draft:
+{draft_text}
+
+Evaluate honestly:
+- Is the story actually moving, or does it stall?
+- Is the tension real, or does it jump straight to the answer?
+- Would a real reader stay curious enough to keep reading?
+- Does each section open a natural door into the next, or do the transitions feel bolted on?
+- Is the business logic actually correct, not just plausible-sounding?
+- Is there a genuinely valuable insight here, or is this generic advice dressed up in a story?
+
+Return JSON exactly:
+{{"framework_score": <1-10, does it follow the Kingdom->Guard->Old Journey->New Discovery->\
+Marketplace->Ride arc without exposing it as a visible outline>,
+"reader_score": <1-10, would a real reader stay engaged start to finish>,
+"business_depth_score": <1-10, is the insight genuinely valuable and correct, not generic>,
+"real_issues": ["<a specific problem with THIS draft, or empty if none>"],
+"verdict": "ready" | "needs_revision"}}
+
+Do not soften this to be polite. A draft with real problems should score low and say so."""
+
+
+def review_draft_with_editor_rubric(db: Session, tenant_id: int, topic_name: str, draft_text: str) -> dict:
+    """The Blog Architecture doc's own editorial discipline: "don't just fix grammar, act as a
+    strong editor... push back when required... do not blindly agree." A real, separate review
+    pass -- never folded into the generation call itself, so a weak draft can't grade its own
+    homework. Returns {"status": "llm_unavailable", ...} or {"status": "ok", "review": {...}}."""
+    prompt = EDITOR_RUBRIC_PROMPT.format(topic_name=topic_name, draft_text=draft_text)
+    try:
+        response = generate_json(prompt, db, tenant_id, max_tokens=600)
+    except Exception as e:  # noqa: BLE001
+        return {"status": "llm_unavailable", "error": str(e)}
+    if not isinstance(response, dict) or "verdict" not in response:
+        return {"status": "discarded", "reason": "malformed editor response"}
+    return {"status": "ok", "review": response}
 
 
 def generate_content_draft(db: Session, tenant_id: int, content_opportunity_id: int, platform: str = "blog") -> dict:
@@ -340,15 +426,26 @@ def generate_content_draft(db: Session, tenant_id: int, content_opportunity_id: 
     topic = db.get(ContentTopic, opportunity.content_topic_id)
     evidence = get_topic_evidence(db, tenant_id, opportunity.content_topic_id)
     evidence_block = "\n".join(f"- {e['title'] or '(no title)'} -- {e['summary'] or '(no summary)'} ({e['url']})" for e in evidence)
+    if not evidence_block:
+        # account_intelligence-origin opportunities have no ContentTopicEvidence rows (their
+        # grounding is the anonymized aggregate pattern, not a citable external URL) -- why_now
+        # already IS that real grounding (see account_intelligence_topics.py), so fall back to it
+        # rather than sending the LLM an empty evidence block.
+        evidence_block = f"- {opportunity.why_now}"
     prompt = DRAFT_PROMPT.format(
         business_name=business_context["business_name"], positioning=business_context["positioning"],
-        platform_label={"blog": "blog post", "linkedin": "LinkedIn post", "twitter": "X/Twitter thread"}[platform],
+        platform_label={"blog": "blog post", "linkedin": "LinkedIn post", "linkedin_article": "LinkedIn Article", "twitter": "X/Twitter thread"}[platform],
         topic_name=topic.canonical_name, why_now=opportunity.why_now, suggested_angle=opportunity.suggested_angle,
         evidence_block=evidence_block, platform_brief=PLATFORM_BRIEF[platform],
+        expedition_guidance=("\n\n" + EXPEDITION_FRAMEWORK_GUIDANCE) if platform in _EXPEDITION_PLATFORMS else "",
     )
 
+    # linkedin_article runs 900-1400 words -- 900 tokens was tuned for the shorter formats and
+    # measured truncating mid-string on the long-form one (same class of bug already found and
+    # fixed in get_open_commitments's own max_tokens), so give the long formats real headroom.
+    max_tokens = 2500 if platform in ("blog", "linkedin_article") else 900
     try:
-        response = generate_json(prompt, db, tenant_id, max_tokens=900)
+        response = generate_json(prompt, db, tenant_id, max_tokens=max_tokens)
     except Exception as e:  # noqa: BLE001
         return {"status": "llm_unavailable", "error": str(e)}
 
@@ -405,12 +502,15 @@ def generate_direct_draft(db: Session, tenant_id: int, user_request: str, platfo
     prompt = DIRECT_DRAFT_PROMPT.format(
         business_name=business_context["business_name"], positioning=business_context["positioning"],
         audience=business_context["audience"],
-        platform_label={"blog": "blog post", "linkedin": "LinkedIn post", "twitter": "X/Twitter thread"}[platform],
+        platform_label={"blog": "blog post", "linkedin": "LinkedIn post", "linkedin_article": "LinkedIn Article", "twitter": "X/Twitter thread"}[platform],
         user_request=user_request, platform_brief=PLATFORM_BRIEF[platform],
     )
+    if platform in _EXPEDITION_PLATFORMS:
+        prompt += "\n\n" + EXPEDITION_FRAMEWORK_GUIDANCE
 
+    max_tokens = 2500 if platform in ("blog", "linkedin_article") else 900
     try:
-        response = generate_json(prompt, db, tenant_id, max_tokens=900)
+        response = generate_json(prompt, db, tenant_id, max_tokens=max_tokens)
     except Exception as e:  # noqa: BLE001
         return {"status": "llm_unavailable", "error": str(e)}
 

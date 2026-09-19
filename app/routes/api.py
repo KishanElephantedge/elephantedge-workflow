@@ -4276,6 +4276,17 @@ def get_gtm_os_content_topic_evidence(content_topic_id: int, request: Request, d
     return {"content_topic_id": content_topic_id, "topic_name": topic.canonical_name, "evidence": get_topic_evidence(db, tenant_id, content_topic_id)}
 
 
+@router.post("/gtm-os/content-opportunities/account-intelligence/generate")
+def post_gtm_os_account_intelligence_topics(request: Request, db: Session = Depends(get_db)):
+    """Real, on-demand generation of content topics grounded in aggregate patterns across the
+    actual company pipeline (ProblemHypothesis/DemandHypothesis), not external trends/competitor
+    content. See account_intelligence_topics.py's own docstring for the anonymization/grounding
+    discipline. Zero external cost -- reasons only over already-fetched, already-stored data."""
+    from app.gtm_os.content.account_intelligence_topics import generate_account_intelligence_topics
+
+    return generate_account_intelligence_topics(db, _resolve_tenant_id(request))
+
+
 @router.get("/gtm-os/content-opportunities")
 def list_gtm_os_content_opportunities(request: Request, status: str | None = None, db: Session = Depends(get_db)):
     """Real content opportunities (content_opportunity.py, 2026-08-28), joined with their real
