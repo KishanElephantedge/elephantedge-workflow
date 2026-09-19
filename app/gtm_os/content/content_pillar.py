@@ -12,11 +12,15 @@ written while individual clusters are still being reviewed one at a time, and a 
 draft generation only makes sense once ITS OWN row is approved, not merely because its parent
 pillar was.
 
-GROUNDING: the pillar's own structure proposal (H2 sections, cluster stubs) is not grounded in
-external evidence the way Quick Drafts is -- this is the business's own content strategy/thought
-leadership, same "no external evidence needed" category as content_opportunity.py's
-generate_direct_draft(). What IS real and checked: every cluster CTA links to an ACTUALLY
-configured offering (get_offering_config), never an invented product name."""
+GROUNDING (2026-09-19, corrected -- explicit instruction: a pillar theme grounded only in offering
+names, with no real company/account context, is "not the right topic" -- same complaint as Quick
+Drafts was built to fix): the pillar's structure proposal (H2 sections, cluster stubs) must now be
+grounded in the SAME real, anonymized aggregate of ProblemHypothesis/DemandHypothesis patterns that
+account_intelligence_topics.py already uses for Quick Drafts -- reused here via
+_aggregate_account_patterns, never duplicated. A pillar is generated FROM one real pattern (picked
+by the LLM, steered by an optional user theme_hint), not from an arbitrary free-typed theme with
+only offering names as grounding. What is still checked the same way as before: every cluster CTA
+links to an ACTUALLY configured offering (get_offering_config), never an invented product name."""
 
 from datetime import datetime
 
@@ -24,6 +28,7 @@ from sqlalchemy import Column, DateTime, ForeignKey, Integer, JSON, String, Text
 from sqlalchemy.orm import Session
 
 from app.db.models import Base
+from app.gtm_os.content.account_intelligence_topics import MIN_COMPANIES_FOR_A_PATTERN, _aggregate_account_patterns
 from app.gtm_os.content.content_business_context import get_content_business_context
 from app.gtm_os.content.content_opportunity import EXPEDITION_FRAMEWORK_GUIDANCE
 from app.gtm_os.opportunity.offering_config import get_offering_config
@@ -41,13 +46,15 @@ class ContentPillar(Base):
     id = Column(Integer, primary_key=True)
     tenant_id = Column(Integer, nullable=False)
 
-    theme = Column(String, nullable=False)  # the input theme/pillar name this was generated for
+    theme = Column(String, nullable=False)  # user's theme_hint if given, else the generated title (display label)
     title = Column(String, nullable=False)
     primary_keyword = Column(String, nullable=False)
     secondary_keywords = Column(JSON, nullable=True)  # list[str]
     commercial_goal = Column(String, nullable=True)  # which real offering this is meant to drive toward
     search_intent = Column(Text, nullable=True)
     core_narrative = Column(Text, nullable=True)
+    grounded_function = Column(String, nullable=True)  # the real affected_function pattern (from ProblemHypothesis/DemandHypothesis) this pillar is grounded in
+    why_now = Column(Text, nullable=True)  # the real aggregate pattern (company_count + a real statement) that grounds this pillar -- same discipline as ContentOpportunity.why_now
     sections = Column(JSON, nullable=False)  # list[str] -- the real H2 outline, generated once, never silently regenerated
 
     status = Column(String, nullable=False, default="candidate")
@@ -89,43 +96,59 @@ class ContentCluster(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
-PILLAR_STRUCTURE_PROMPT = """You are planning a real SEO content pillar for {business_name}.
+PILLAR_STRUCTURE_PROMPT = """You are planning a real SEO content pillar for {business_name}, \
+grounded in REAL patterns from its own current pipeline of target companies -- not a generic \
+theme picked out of thin air.
 
 {business_name}'s real positioning: {positioning}
 Real audience: {audience}
 Really configured offerings this content can point toward: {offerings_block}
 
-Content theme/pillar to plan: {theme}
+Below is a REAL, AGGREGATED, ANONYMIZED summary of patterns across multiple companies currently \
+in {business_name}'s pipeline, grouped by which business function is affected. No company name, \
+domain, or any other identifying detail is included anywhere below -- only the pattern itself:
 
-Design a Master Pillar Page + {cluster_size} linked sub-blogs, following this real structure:
+{patterns_block}
+
+{theme_line}
+
+Design a Master Pillar Page + {cluster_size} linked sub-blogs that is GROUNDED in exactly ONE of \
+the real patterns above -- every section, cluster, and the core narrative must trace back to that \
+one real pattern. Never invent a statistic, company detail, or claim not present in the real data \
+above.
 
 MASTER PILLAR PAGE:
+- grounded_function: the function key from the patterns above this whole pillar is grounded in
+- why_now: 2-3 sentences citing the real company_count and a real problem/demand statement from \
+that pattern -- the real reason this pillar is worth building now
 - title: a real, specific title for the pillar page (not a generic category name)
 - primary_keyword / secondary_keywords: real search terms this page should target
 - commercial_goal: which ONE of the real configured offerings above this pillar should drive \
 toward -- must be one of the real offering names given, never invented
 - search_intent: the real question a founder/buyer is asking when they'd land on this page
-- core_narrative: the one-line arc this pillar tells, start to end
+- core_narrative: the one-line arc this pillar tells, start to end, tying back to the real pattern
 - sections: exactly 10 real H2 section titles that build the pillar page's own argument in order
 
 CLUSTER SUB-BLOGS (exactly {cluster_size}):
-Each one attacks ONE specific failure point/question related to the pillar, links back to the \
-pillar, and ends with a CTA toward the same real commercial_goal offering (or another real \
+Each one attacks ONE specific failure point/question within the same grounded pattern, links back \
+to the pillar, and ends with a CTA toward the same real commercial_goal offering (or another real \
 configured offering if a different one genuinely fits that specific sub-blog better -- never an \
 invented offering name).
 For each: title, keyword, intent (one short phrase: what search intent this serves), angle \
-(1-2 sentences: the specific take this sub-blog takes), cta (the closing hook/question), \
-offering_name (must be one of the real offerings given).
+(1-2 sentences: the specific take this sub-blog takes, grounded in the real pattern), cta (the \
+closing hook/question), offering_name (must be one of the real offerings given).
 
 Return JSON exactly:
-{{"title": "...", "primary_keyword": "...", "secondary_keywords": ["...", ...], \
+{{"grounded_function": "<the function key from the data above this pillar is grounded in>", \
+"why_now": "...", \
+"title": "...", "primary_keyword": "...", "secondary_keywords": ["...", ...], \
 "commercial_goal": "<real offering name>", "search_intent": "...", "core_narrative": "...", \
 "sections": ["...", ... exactly {cluster_size}+1 items], \
 "clusters": [{{"title": "...", "keyword": "...", "intent": "...", "angle": "...", "cta": "...", \
 "offering_name": "<real offering name>"}}, ... exactly {cluster_size} items]}}
 
-Never invent an offering name not in the real list above. Never pad -- every section and cluster \
-must genuinely serve the pillar's own narrative."""
+Never invent an offering name, function, or statistic not given above. Never pad -- every section \
+and cluster must genuinely serve the pillar's own grounded narrative."""
 
 
 def _offerings_block(db: Session, tenant_id: int) -> tuple[str, set[str]]:
@@ -142,11 +165,17 @@ def _offerings_block(db: Session, tenant_id: int) -> tuple[str, set[str]]:
     return block or "(no offerings configured)", names
 
 
-def generate_content_pillar(db: Session, tenant_id: int, theme: str) -> dict:
-    """Layer 1: real offering names are the only hard grounding check here (this is the
-    business's own content strategy, not evidence-backed like Quick Drafts -- see module
-    docstring). Layer 2: LLM proposes the real structure; any cited offering name never in the
-    real configured list is discarded, never trusted blind."""
+def generate_content_pillar(db: Session, tenant_id: int, theme_hint: str | None = None) -> dict:
+    """Layer 1 (2026-09-19, corrected): real account patterns are now a hard gate, same as Quick
+    Drafts -- no patterns, no pillar, regardless of theme_hint. Layer 2: real offering names are
+    still checked the same way as before. Layer 3: LLM proposes the real structure, grounded in
+    exactly one real pattern; any cited function/offering name never in the real data is
+    discarded, never trusted blind. theme_hint is now optional -- a directional nudge only, never
+    the sole grounding (that complaint is exactly what this rewrite fixes)."""
+    patterns = _aggregate_account_patterns(db, tenant_id)
+    if not patterns:
+        return {"status": "insufficient_data", "reason": f"no affected_function has >= {MIN_COMPANIES_FOR_A_PATTERN} real companies with a hypothesis in the last 60 days -- a content pillar needs a real pattern across accounts, not just a typed theme"}
+
     business_context = get_content_business_context(db, tenant_id)
     if not business_context.get("business_name"):
         return {"status": "no_business_context", "reason": "this tenant hasn't set business_name/positioning/audience yet (PUT /gtm-os/partner/content-context)"}
@@ -155,10 +184,22 @@ def generate_content_pillar(db: Session, tenant_id: int, theme: str) -> dict:
     if not valid_offerings:
         return {"status": "no_offerings_configured", "reason": "no real offerings configured for this tenant -- a pillar's commercial_goal and every cluster CTA need a real offering to point to"}
 
+    patterns_block = "\n\n".join(
+        f"FUNCTION: {function} ({data['company_count']} real companies, industries: {data['industries'] or 'not recorded'})\n"
+        + ("Problem patterns:\n" + "\n".join(f"  - {s}" for s in data["problem_statements"]) if data["problem_statements"] else "")
+        + ("\nDemand patterns:\n" + "\n".join(f"  - {s}" for s in data["demand_statements"]) if data["demand_statements"] else "")
+        for function, data in patterns.items()
+    )
+    theme_line = (
+        f'The user wants this pillar to relate to: "{theme_hint}" -- pick whichever real pattern above best fits that direction.'
+        if theme_hint else
+        "No specific theme was requested -- pick whichever real pattern above is strongest (highest company_count with genuine, specific statements)."
+    )
+
     prompt = PILLAR_STRUCTURE_PROMPT.format(
         business_name=business_context["business_name"], positioning=business_context["positioning"],
         audience=business_context.get("audience") or "not specified", offerings_block=offerings_block,
-        theme=theme, cluster_size=CLUSTER_SIZE,
+        patterns_block=patterns_block, theme_line=theme_line, cluster_size=CLUSTER_SIZE,
     )
 
     try:
@@ -168,6 +209,8 @@ def generate_content_pillar(db: Session, tenant_id: int, theme: str) -> dict:
 
     if not isinstance(response, dict) or not response.get("sections") or not response.get("clusters"):
         return {"status": "discarded", "reason": "malformed response -- missing sections or clusters"}
+    if response.get("grounded_function") not in patterns:
+        return {"status": "discarded", "reason": f"grounded_function {response.get('grounded_function')!r} references a pattern never actually given"}
     if response.get("commercial_goal") not in valid_offerings:
         return {"status": "discarded", "reason": f"commercial_goal {response.get('commercial_goal')!r} is not a real configured offering"}
 
@@ -179,10 +222,11 @@ def generate_content_pillar(db: Session, tenant_id: int, theme: str) -> dict:
             return {"status": "discarded", "reason": f"cluster {c.get('title')!r} cites offering {c.get('offering_name')!r}, not a real configured offering"}
 
     pillar = ContentPillar(
-        tenant_id=tenant_id, theme=theme, title=response["title"],
+        tenant_id=tenant_id, theme=theme_hint or response["title"], title=response["title"],
         primary_keyword=response["primary_keyword"], secondary_keywords=response.get("secondary_keywords") or [],
         commercial_goal=response["commercial_goal"], search_intent=response.get("search_intent"),
         core_narrative=response.get("core_narrative"), sections=response["sections"],
+        grounded_function=response["grounded_function"], why_now=response.get("why_now"),
     )
     db.add(pillar)
     db.commit()
@@ -200,7 +244,7 @@ def generate_content_pillar(db: Session, tenant_id: int, theme: str) -> dict:
         db.refresh(cluster)
         cluster_ids.append(cluster.id)
 
-    return {"status": "ok", "content_pillar_id": pillar.id, "cluster_ids": cluster_ids}
+    return {"status": "ok", "content_pillar_id": pillar.id, "cluster_ids": cluster_ids, "grounded_function": pillar.grounded_function}
 
 
 def _get_owned_pillar(db: Session, tenant_id: int, content_pillar_id: int) -> ContentPillar:

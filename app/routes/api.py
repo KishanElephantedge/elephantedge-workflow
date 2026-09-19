@@ -4283,10 +4283,8 @@ def post_gtm_os_content_pillar_generate(request: Request, payload: dict = Body(.
     must be a real configured one)."""
     from app.gtm_os.content.content_pillar import generate_content_pillar
 
-    theme = payload.get("theme")
-    if not theme:
-        raise HTTPException(status_code=400, detail="theme is required")
-    return generate_content_pillar(db, _resolve_tenant_id(request), theme)
+    theme_hint = payload.get("theme") or None
+    return generate_content_pillar(db, _resolve_tenant_id(request), theme_hint)
 
 
 @router.get("/gtm-os/content-pillars")
@@ -4296,7 +4294,8 @@ def get_gtm_os_content_pillars(request: Request, db: Session = Depends(get_db)):
     pillars = db.query(ContentPillar).filter(ContentPillar.tenant_id == _resolve_tenant_id(request)).order_by(ContentPillar.created_at.desc()).all()
     return {"pillars": [
         {"id": p.id, "theme": p.theme, "title": p.title, "primary_keyword": p.primary_keyword,
-         "commercial_goal": p.commercial_goal, "status": p.status, "draft_generated_at": p.draft_generated_at, "created_at": p.created_at}
+         "commercial_goal": p.commercial_goal, "grounded_function": p.grounded_function,
+         "status": p.status, "draft_generated_at": p.draft_generated_at, "created_at": p.created_at}
         for p in pillars
     ]}
 
@@ -4314,6 +4313,7 @@ def get_gtm_os_content_pillar_detail(content_pillar_id: int, request: Request, d
         "id": pillar.id, "theme": pillar.theme, "title": pillar.title, "primary_keyword": pillar.primary_keyword,
         "secondary_keywords": pillar.secondary_keywords, "commercial_goal": pillar.commercial_goal,
         "search_intent": pillar.search_intent, "core_narrative": pillar.core_narrative, "sections": pillar.sections,
+        "grounded_function": pillar.grounded_function, "why_now": pillar.why_now,
         "status": pillar.status, "review_note": pillar.review_note, "draft_text": pillar.draft_text, "draft_generated_at": pillar.draft_generated_at,
         "clusters": [
             {"id": c.id, "order_index": c.order_index, "title": c.title, "keyword": c.keyword, "intent": c.intent,

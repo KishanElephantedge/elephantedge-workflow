@@ -149,16 +149,19 @@ CONTENT_CHAT_TOOLS = [
     {
         "name": "generate_content_pillar",
         "description": (
-            "Content Clusters mode: plan a full SEO content pillar for a given theme -- a "
-            "Master Pillar Page (title, keywords, 10-section outline) plus 9 linked sub-blogs "
-            "(each with its own keyword/intent/angle/CTA), all tied to a real configured "
-            "offering. This is the bigger, structured content-planning mode -- use it when the "
-            "user wants a real content system/cluster for a theme, not a single quick post "
-            "(that's generate_opportunity_for_topic/draft_from_own_expertise instead). Creates "
-            "candidate rows the user must review (review_content_pillar/review_content_cluster) "
-            "before any draft gets written."
+            "Content Clusters mode: plan a full SEO content pillar grounded in a REAL pattern "
+            "across the account pipeline (the same ProblemHypothesis/DemandHypothesis account "
+            "intelligence Quick Drafts uses) -- a Master Pillar Page (title, keywords, "
+            "10-section outline) plus 9 linked sub-blogs (each with its own "
+            "keyword/intent/angle/CTA), all tied to a real configured offering. Fails with "
+            "status='insufficient_data' if no real pattern exists yet (needs >= 3 real "
+            "companies with a hypothesis for some function). This is the bigger, structured "
+            "content-planning mode -- use it when the user wants a real content system/cluster, "
+            "not a single quick post (that's generate_opportunity_for_topic/"
+            "draft_from_own_expertise instead). Creates candidate rows the user must review "
+            "(review_content_pillar/review_content_cluster) before any draft gets written."
         ),
-        "input_schema": {"type": "object", "properties": {"theme": {"type": "string", "description": "The content pillar/theme to plan, in plain language"}}, "required": ["theme"]},
+        "input_schema": {"type": "object", "properties": {"theme": {"type": "string", "description": "Optional directional nudge for which real account pattern to build around, in plain language -- never the sole grounding, the pillar is always built from a real pattern"}}},
     },
     {
         "name": "list_content_pillars",
@@ -350,7 +353,7 @@ def execute_content_chat_tool(name: str, tool_input: dict, db: Session, tenant_i
 
     if name == "generate_content_pillar":
         from app.gtm_os.content.content_pillar import generate_content_pillar
-        return generate_content_pillar(db, tenant_id, tool_input["theme"])
+        return generate_content_pillar(db, tenant_id, tool_input.get("theme") or None)
 
     if name == "list_content_pillars":
         from app.gtm_os.content.content_pillar import ContentCluster, ContentPillar
