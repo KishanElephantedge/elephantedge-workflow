@@ -35,6 +35,7 @@ from datetime import datetime
 from sqlalchemy.orm import Session
 
 from app.db.models import Company
+from app.gtm_os.intelligence.interpreted_signal import InterpretedSignal
 from app.gtm_os.intelligence.signal import GtmSignal
 
 
@@ -71,6 +72,34 @@ def plan_backfill(db: Session, source: str | None = None) -> dict:
             unmatched += 1
 
     return {"linkable": linkable, "ambiguous": ambiguous, "unmatched": unmatched}
+
+
+def cascade_links_to_interpretations(db: Session, apply: bool = False) -> int:
+    """Propagate a signal's company_id onto its already-created InterpretedSignal row.
+
+    WHY THIS IS NOT OPTIONAL. interpretation.py copies signal.company_id onto the
+    InterpretedSignal at the moment it interprets (interpretation.py:123,166). Most of the
+    backlog was ALREADY interpreted while its signal was still orphaned, so those rows carry
+    company_id = NULL permanently -- and problem_detection.py and demand_detection.py both read
+    company_id off the INTERPRETATION, not off the raw signal. Linking only the raw signal would
+    therefore change nothing downstream: the evidence would look connected while the chain that
+    consumes it still saw an unattributed row. Measured on production 2026-09-19 immediately
+    after the signal-level backfill: 85 interpretations were in exactly that state.
+
+    Only ever fills a NULL from its own source signal -- never overwrites, never infers."""
+    rows = (
+        db.query(InterpretedSignal, GtmSignal)
+        .join(GtmSignal, InterpretedSignal.source_signal_id == GtmSignal.id)
+        .filter(InterpretedSignal.company_id.is_(None), GtmSignal.company_id.isnot(None))
+        .all()
+    )
+    if apply:
+        for interpreted, signal in rows:
+            interpreted.company_id = signal.company_id
+            if not interpreted.company_name_raw:
+                interpreted.company_name_raw = signal.company_name_raw
+        db.commit()
+    return len(rows)
 
 
 def apply_backfill(db: Session, plan: dict) -> dict:
@@ -129,11 +158,16 @@ def main() -> int:
         print(f"unmatched (no owned company with that name): {plan['unmatched']}")
 
         if not args.apply:
+            pending_cascade = cascade_links_to_interpretations(db, apply=False)
+            print(f"interpretations needing the same link cascaded: {pending_cascade}")
             print("\nDRY RUN -- nothing written. Re-run with --apply to perform the writes.")
             return 0
 
         result = apply_backfill(db, plan)
-        print(f"\nAPPLIED: linked={result['linked']} marked_ambiguous={result['marked_ambiguous']}")
+        # Must run AFTER the signal-level links land, so newly-linked signals cascade too.
+        cascaded = cascade_links_to_interpretations(db, apply=True)
+        print(f"\nAPPLIED: linked={result['linked']} marked_ambiguous={result['marked_ambiguous']} "
+              f"interpretations_cascaded={cascaded}")
         return 0
     finally:
         db.close()
