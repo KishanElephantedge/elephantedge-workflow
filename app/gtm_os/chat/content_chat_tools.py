@@ -147,6 +147,61 @@ CONTENT_CHAT_TOOLS = [
         },
     },
     {
+        "name": "generate_content_pillar",
+        "description": (
+            "Content Clusters mode: plan a full SEO content pillar for a given theme -- a "
+            "Master Pillar Page (title, keywords, 10-section outline) plus 9 linked sub-blogs "
+            "(each with its own keyword/intent/angle/CTA), all tied to a real configured "
+            "offering. This is the bigger, structured content-planning mode -- use it when the "
+            "user wants a real content system/cluster for a theme, not a single quick post "
+            "(that's generate_opportunity_for_topic/draft_from_own_expertise instead). Creates "
+            "candidate rows the user must review (review_content_pillar/review_content_cluster) "
+            "before any draft gets written."
+        ),
+        "input_schema": {"type": "object", "properties": {"theme": {"type": "string", "description": "The content pillar/theme to plan, in plain language"}}, "required": ["theme"]},
+    },
+    {
+        "name": "list_content_pillars",
+        "description": "Real content pillars already planned, with their status and (if generated) their 9 linked clusters.",
+        "input_schema": {"type": "object", "properties": {"content_pillar_id": {"type": "integer", "description": "Optional -- pass to get one pillar's full detail including its clusters"}}},
+    },
+    {
+        "name": "review_content_pillar",
+        "description": "Approve, reject, or request changes on a content pillar's proposed structure so its master page can be drafted.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "content_pillar_id": {"type": "integer"},
+                "action": {"type": "string", "enum": ["approve", "reject", "request_changes"]},
+                "note": {"type": "string"},
+            },
+            "required": ["content_pillar_id", "action"],
+        },
+    },
+    {
+        "name": "review_content_cluster",
+        "description": "Approve, reject, or request changes on ONE sub-blog within a pillar (independent of the pillar's own review/the other clusters).",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "content_cluster_id": {"type": "integer"},
+                "action": {"type": "string", "enum": ["approve", "reject", "request_changes"]},
+                "note": {"type": "string"},
+            },
+            "required": ["content_cluster_id", "action"],
+        },
+    },
+    {
+        "name": "generate_pillar_draft",
+        "description": "Write the full Master Pillar Page (all 10 sections, 1500-2500 words) for an already-approved content pillar.",
+        "input_schema": {"type": "object", "properties": {"content_pillar_id": {"type": "integer"}}, "required": ["content_pillar_id"]},
+    },
+    {
+        "name": "generate_cluster_draft",
+        "description": "Write one sub-blog (500-700 words) for an already-approved content cluster -- independent of whether the parent pillar's own master-page draft exists yet.",
+        "input_schema": {"type": "object", "properties": {"content_cluster_id": {"type": "integer"}}, "required": ["content_cluster_id"]},
+    },
+    {
         "name": "generate_account_intelligence_topics",
         "description": (
             "Generate real content topics grounded in patterns across the ACTUAL company "
@@ -292,6 +347,51 @@ def execute_content_chat_tool(name: str, tool_input: dict, db: Session, tenant_i
     if name == "generate_platform_draft":
         from app.gtm_os.content.content_opportunity import generate_content_draft
         return generate_content_draft(db, tenant_id, tool_input["content_opportunity_id"], platform=tool_input["platform"])
+
+    if name == "generate_content_pillar":
+        from app.gtm_os.content.content_pillar import generate_content_pillar
+        return generate_content_pillar(db, tenant_id, tool_input["theme"])
+
+    if name == "list_content_pillars":
+        from app.gtm_os.content.content_pillar import ContentCluster, ContentPillar
+
+        if tool_input.get("content_pillar_id"):
+            pillar = db.get(ContentPillar, tool_input["content_pillar_id"])
+            if pillar is None or pillar.tenant_id != tenant_id:
+                return {"error": "pillar not found"}
+            clusters = db.query(ContentCluster).filter(ContentCluster.content_pillar_id == pillar.id).order_by(ContentCluster.order_index).all()
+            return {
+                "id": pillar.id, "theme": pillar.theme, "title": pillar.title, "primary_keyword": pillar.primary_keyword,
+                "secondary_keywords": pillar.secondary_keywords, "commercial_goal": pillar.commercial_goal,
+                "search_intent": pillar.search_intent, "core_narrative": pillar.core_narrative, "sections": pillar.sections,
+                "status": pillar.status, "draft_text": pillar.draft_text,
+                "clusters": [
+                    {"id": c.id, "order_index": c.order_index, "title": c.title, "keyword": c.keyword, "intent": c.intent,
+                     "angle": c.angle, "cta": c.cta, "offering_name": c.offering_name, "status": c.status, "draft_text": c.draft_text}
+                    for c in clusters
+                ],
+            }
+
+        pillars = db.query(ContentPillar).filter(ContentPillar.tenant_id == tenant_id).order_by(ContentPillar.created_at.desc()).all()
+        return {"pillars": [{"id": p.id, "theme": p.theme, "title": p.title, "status": p.status, "commercial_goal": p.commercial_goal} for p in pillars]}
+
+    if name == "review_content_pillar":
+        from app.gtm_os.content.content_pillar import review_content_pillar
+        pillar = review_content_pillar(db, tenant_id, tool_input["content_pillar_id"], tool_input["action"], reviewed_by=ACTED_BY, note=tool_input.get("note"))
+        return {"id": pillar.id, "status": pillar.status}
+
+    if name == "review_content_cluster":
+        from app.gtm_os.content.content_pillar import review_content_cluster
+        cluster = review_content_cluster(db, tenant_id, tool_input["content_cluster_id"], tool_input["action"], reviewed_by=ACTED_BY, note=tool_input.get("note"))
+        return {"id": cluster.id, "status": cluster.status}
+
+    if name == "generate_pillar_draft":
+        from app.gtm_os.content.content_pillar import generate_pillar_draft
+        return generate_pillar_draft(db, tenant_id, tool_input["content_pillar_id"])
+
+    if name == "generate_cluster_draft":
+        from app.gtm_os.content.content_pillar import generate_cluster_draft
+        return generate_cluster_draft(db, tenant_id, tool_input["content_cluster_id"])
 
     if name == "generate_account_intelligence_topics":
         from app.gtm_os.content.account_intelligence_topics import generate_account_intelligence_topics

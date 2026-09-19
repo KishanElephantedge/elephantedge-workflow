@@ -4276,6 +4276,96 @@ def get_gtm_os_content_topic_evidence(content_topic_id: int, request: Request, d
     return {"content_topic_id": content_topic_id, "topic_name": topic.canonical_name, "evidence": get_topic_evidence(db, tenant_id, content_topic_id)}
 
 
+@router.post("/gtm-os/content-pillars/generate")
+def post_gtm_os_content_pillar_generate(request: Request, payload: dict = Body(...), db: Session = Depends(get_db)):
+    """Content Clusters mode: plan a Master Pillar Page + 9 linked sub-blogs for one theme. See
+    content_pillar.py's own module docstring for the grounding discipline (every offering cited
+    must be a real configured one)."""
+    from app.gtm_os.content.content_pillar import generate_content_pillar
+
+    theme = payload.get("theme")
+    if not theme:
+        raise HTTPException(status_code=400, detail="theme is required")
+    return generate_content_pillar(db, _resolve_tenant_id(request), theme)
+
+
+@router.get("/gtm-os/content-pillars")
+def get_gtm_os_content_pillars(request: Request, db: Session = Depends(get_db)):
+    from app.gtm_os.content.content_pillar import ContentPillar
+
+    pillars = db.query(ContentPillar).filter(ContentPillar.tenant_id == _resolve_tenant_id(request)).order_by(ContentPillar.created_at.desc()).all()
+    return {"pillars": [
+        {"id": p.id, "theme": p.theme, "title": p.title, "primary_keyword": p.primary_keyword,
+         "commercial_goal": p.commercial_goal, "status": p.status, "draft_generated_at": p.draft_generated_at, "created_at": p.created_at}
+        for p in pillars
+    ]}
+
+
+@router.get("/gtm-os/content-pillars/{content_pillar_id}")
+def get_gtm_os_content_pillar_detail(content_pillar_id: int, request: Request, db: Session = Depends(get_db)):
+    from app.gtm_os.content.content_pillar import ContentCluster, ContentPillar
+
+    tenant_id = _resolve_tenant_id(request)
+    pillar = db.get(ContentPillar, content_pillar_id)
+    if pillar is None or pillar.tenant_id != tenant_id:
+        raise HTTPException(status_code=404, detail="Content pillar not found")
+    clusters = db.query(ContentCluster).filter(ContentCluster.content_pillar_id == pillar.id).order_by(ContentCluster.order_index).all()
+    return {
+        "id": pillar.id, "theme": pillar.theme, "title": pillar.title, "primary_keyword": pillar.primary_keyword,
+        "secondary_keywords": pillar.secondary_keywords, "commercial_goal": pillar.commercial_goal,
+        "search_intent": pillar.search_intent, "core_narrative": pillar.core_narrative, "sections": pillar.sections,
+        "status": pillar.status, "review_note": pillar.review_note, "draft_text": pillar.draft_text, "draft_generated_at": pillar.draft_generated_at,
+        "clusters": [
+            {"id": c.id, "order_index": c.order_index, "title": c.title, "keyword": c.keyword, "intent": c.intent,
+             "angle": c.angle, "cta": c.cta, "offering_name": c.offering_name, "status": c.status,
+             "draft_text": c.draft_text, "draft_generated_at": c.draft_generated_at}
+            for c in clusters
+        ],
+    }
+
+
+@router.post("/gtm-os/content-pillars/{content_pillar_id}/review")
+def post_gtm_os_content_pillar_review(content_pillar_id: int, request: Request, payload: dict = Body(...), db: Session = Depends(get_db)):
+    from app.gtm_os.content.content_pillar import review_content_pillar
+
+    tenant_id = _resolve_tenant_id(request)
+    action = payload.get("action")
+    if action not in ("approve", "reject", "request_changes"):
+        raise HTTPException(status_code=400, detail="action must be approve/reject/request_changes")
+    try:
+        pillar = review_content_pillar(db, tenant_id, content_pillar_id, action, reviewed_by=payload.get("reviewed_by", "unknown"), note=payload.get("note"))
+    except (LookupError, ValueError) as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"id": pillar.id, "status": pillar.status}
+
+
+@router.post("/gtm-os/content-pillars/{content_pillar_id}/generate-draft")
+def post_gtm_os_content_pillar_generate_draft(content_pillar_id: int, request: Request, db: Session = Depends(get_db)):
+    from app.gtm_os.content.content_pillar import generate_pillar_draft
+    return generate_pillar_draft(db, _resolve_tenant_id(request), content_pillar_id)
+
+
+@router.post("/gtm-os/content-clusters/{content_cluster_id}/review")
+def post_gtm_os_content_cluster_review(content_cluster_id: int, request: Request, payload: dict = Body(...), db: Session = Depends(get_db)):
+    from app.gtm_os.content.content_pillar import review_content_cluster
+
+    tenant_id = _resolve_tenant_id(request)
+    action = payload.get("action")
+    if action not in ("approve", "reject", "request_changes"):
+        raise HTTPException(status_code=400, detail="action must be approve/reject/request_changes")
+    try:
+        cluster = review_content_cluster(db, tenant_id, content_cluster_id, action, reviewed_by=payload.get("reviewed_by", "unknown"), note=payload.get("note"))
+    except (LookupError, ValueError) as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"id": cluster.id, "status": cluster.status}
+
+
+@router.post("/gtm-os/content-clusters/{content_cluster_id}/generate-draft")
+def post_gtm_os_content_cluster_generate_draft(content_cluster_id: int, request: Request, db: Session = Depends(get_db)):
+    from app.gtm_os.content.content_pillar import generate_cluster_draft
+    return generate_cluster_draft(db, _resolve_tenant_id(request), content_cluster_id)
+
+
 @router.post("/gtm-os/content-opportunities/account-intelligence/generate")
 def post_gtm_os_account_intelligence_topics(request: Request, db: Session = Depends(get_db)):
     """Real, on-demand generation of content topics grounded in aggregate patterns across the
