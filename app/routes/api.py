@@ -4398,7 +4398,7 @@ def list_gtm_os_content_opportunities(request: Request, status: str | None = Non
             {
                 "id": o.id,
                 "content_topic_id": o.content_topic_id,
-                "topic_name": topics_by_id[o.content_topic_id].canonical_name if o.content_topic_id in topics_by_id else None,
+                "topic_name": o.headline or (topics_by_id[o.content_topic_id].canonical_name if o.content_topic_id in topics_by_id else None),
                 "origin": o.origin,
                 "trend_state": o.trend_state,
                 "why_now": o.why_now,

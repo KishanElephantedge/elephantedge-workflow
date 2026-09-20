@@ -61,6 +61,15 @@ class ContentOpportunity(Base):
     origin = Column(String, nullable=False)  # "trend" | "competitor" -- see module docstring
     trend_state = Column(String, nullable=False)  # the real state (evaluate_topic_trend) at generation time, never re-derived later
 
+    # ContentTopic.canonical_name is a raw SEO/discovery keyword (e.g. "sales os") -- fine for
+    # topic matching/dedup, but not a real content title (2026-09-20, explicit correction: showing
+    # the bare keyword as "the topic" reads exactly like the offering-heading problem this same
+    # feedback flagged for Content Clusters). headline is a real, specific, compelling title
+    # grounded in the same real evidence as why_now/suggested_angle -- nullable because
+    # account_intelligence-origin opportunities already invent a real topic_name at creation
+    # (account_intelligence_topics.py), so ContentTopic.canonical_name IS already a real title there.
+    headline = Column(Text, nullable=True)
+
     why_now = Column(Text, nullable=False)
     suggested_angle = Column(Text, nullable=False)
     cited_urls = Column(JSON, nullable=False)  # real evidence URLs the LLM actually cited -- verified, never invented
@@ -128,14 +137,17 @@ Real evidence for this topic (nothing below is invented -- if a fact isn't here,
 {evidence_block}
 
 Based ONLY on the real evidence above, write:
-1. why_now -- 2-3 sentences on why this topic is worth writing about right now, grounded in the \
+1. headline -- a real, specific, compelling title for the actual piece of content (a real headline \
+a reader would click), never the bare topic/keyword itself and never a generic category name.
+2. why_now -- 2-3 sentences on why this topic is worth writing about right now, grounded in the \
 specific real evidence above (cite what's actually happening, not a generic claim).
-2. suggested_angle -- 1-2 sentences on the specific angle {business_name} should take, consistent \
+3. suggested_angle -- 1-2 sentences on the specific angle {business_name} should take, consistent \
 with its real positioning above.
 
 Return JSON exactly:
-{{"why_now": "<2-3 sentences>", "suggested_angle": "<1-2 sentences>", "cited_urls": ["<url from \
-the evidence above that you actually grounded your reasoning in>", ...]}}
+{{"headline": "<real, specific, compelling title>", "why_now": "<2-3 sentences>", \
+"suggested_angle": "<1-2 sentences>", "cited_urls": ["<url from the evidence above that you \
+actually grounded your reasoning in>", ...]}}
 
 Only cite a URL that appears in the evidence above. Never invent a URL, a statistic, or a claim \
 not grounded in the real evidence given."""
@@ -190,8 +202,8 @@ def generate_content_opportunity(db: Session, tenant_id: int, content_topic_id: 
     cited = response.get("cited_urls") if isinstance(response, dict) else None
     if not cited or not isinstance(cited, list) or not all(u in valid_urls for u in cited):
         return {"status": "discarded", "reason": "cited a URL never actually given as real evidence -- discarded, never trusted blind"}
-    if not response.get("why_now") or not response.get("suggested_angle"):
-        return {"status": "discarded", "reason": "missing why_now or suggested_angle"}
+    if not response.get("headline") or not response.get("why_now") or not response.get("suggested_angle"):
+        return {"status": "discarded", "reason": "missing headline, why_now, or suggested_angle"}
 
     origin = "competitor" if any(e["source"] == "competitor_content" for e in evidence) else "trend"
 
@@ -200,6 +212,7 @@ def generate_content_opportunity(db: Session, tenant_id: int, content_topic_id: 
         content_topic_id=content_topic_id,
         origin=origin,
         trend_state=trend["state"],
+        headline=response["headline"],
         why_now=response["why_now"],
         suggested_angle=response["suggested_angle"],
         cited_urls=cited,
@@ -435,7 +448,7 @@ def generate_content_draft(db: Session, tenant_id: int, content_opportunity_id: 
     prompt = DRAFT_PROMPT.format(
         business_name=business_context["business_name"], positioning=business_context["positioning"],
         platform_label={"blog": "blog post", "linkedin": "LinkedIn post", "linkedin_article": "LinkedIn Article", "twitter": "X/Twitter thread"}[platform],
-        topic_name=topic.canonical_name, why_now=opportunity.why_now, suggested_angle=opportunity.suggested_angle,
+        topic_name=opportunity.headline or topic.canonical_name, why_now=opportunity.why_now, suggested_angle=opportunity.suggested_angle,
         evidence_block=evidence_block, platform_brief=PLATFORM_BRIEF[platform],
         expedition_guidance=("\n\n" + EXPEDITION_FRAMEWORK_GUIDANCE) if platform in _EXPEDITION_PLATFORMS else "",
     )
