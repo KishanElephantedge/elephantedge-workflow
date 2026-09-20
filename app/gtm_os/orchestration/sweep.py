@@ -1326,6 +1326,31 @@ def count_completed_flows_today(db: Session, tenant_id: int, now: datetime | Non
     )
 
 
+def _budget_exhausted(result: dict) -> bool:
+    """True when this iteration was stopped by a spend ceiling rather than by a lack of work.
+
+    Distinguishing the two matters: "no work left" is a satisfied pipeline, "budget gone" is a
+    stalled one, and they need different responses (stop for today vs. raise the cap or wait for
+    the reset). Reported separately so a run's stop_reason names the real cause instead of every
+    unproductive day looking identical.
+
+    Deliberately broad about WHERE the block came from -- an investigation objective refused for
+    budget, or a sensing source raising SourceBudgetBlocked -- because from the loop's point of
+    view they mean the same thing: another iteration cannot buy anything."""
+    cycle = result.get("investigation_cycle") or {}
+    objectives = cycle.get("results") or []
+    if objectives and all(
+        str(r.get("exec_status") or "") == "blocked_by_budget" for r in objectives if r.get("exec_status")
+    ):
+        return True
+
+    for source in (result.get("sources") or {}).values():
+        if isinstance(source, dict) and "budget" in str(source.get("reason") or "").lower():
+            if source.get("status") not in ("succeeded",):
+                return True
+    return False
+
+
 def _no_eligible_work_remaining(result: dict) -> bool:
     """True only when literally nothing new could have entered ANY flow's lineage this
     iteration -- checked at the origin of the pipeline (sensing + investigation + interpretation),
@@ -1346,9 +1371,21 @@ def _no_eligible_work_remaining(result: dict) -> bool:
         for source in (result.get("sources") or {}).values()
         if isinstance(source, dict) and source.get("status") == "succeeded"
     )
-    objectives_processed = (result.get("investigation_cycle") or {}).get("objectives_processed", 0)
+    cycle = result.get("investigation_cycle") or {}
+    # Real fix 2026-09-19: this used to read objectives_PROCESSED, which counts an objective that
+    # was refused outright (budget gone, source disabled, credentials missing, control plane
+    # halted) exactly the same as one that did real work. A fully budget-blocked tick therefore
+    # reported "work happened", this returned False, and run_gtm_daily_flow_cycle started another
+    # full iteration -- re-running every stage and re-paying for whatever was not blocked -- until
+    # the iteration ceiling. That is the mechanism behind "we set a target, never reach it, and
+    # keep spending". Confirmed live in run 150: its single objective came back blocked_by_budget
+    # and the run still completed 2 iterations producing nothing.
+    #
+    # objectives_advanced is blocked-exclusive. .get() with a fallback to objectives_processed
+    # keeps this correct against an older cycle result that predates the new key.
+    objectives_advanced = cycle.get("objectives_advanced", cycle.get("objectives_processed", 0))
     interpretation_created = (result.get("interpretation") or {}).get("created", 0)
-    return total_new_signals == 0 and objectives_processed == 0 and interpretation_created == 0
+    return total_new_signals == 0 and objectives_advanced == 0 and interpretation_created == 0
 
 
 def run_gtm_daily_flow_cycle(db: Session, tenant_id: int, run=None) -> dict:
@@ -1375,7 +1412,32 @@ def run_gtm_daily_flow_cycle(db: Session, tenant_id: int, run=None) -> dict:
     max_iterations_per_run = flow_target_config.get("max_iterations_per_run")
 
     if not daily_flow_target or not max_iterations_per_run:
-        return run_gtm_intelligence_sweep(db, tenant_id, run=run)
+        # Silent degradation is the problem here, not the fallback itself. "None never means
+        # unlimited" is the right discipline, but the CONSEQUENCE was invisible: an unset
+        # flow_target quietly turned a target-seeking daily run into a single pass, and an unset
+        # investigation.max_objectives_per_tick separately skips S3-S6 entirely -- so a run could
+        # complete "successfully" having done almost nothing, look identical to a healthy run,
+        # and leave the target unexplained. Runs 147/149/150 all presented exactly that way.
+        #
+        # Behavior is unchanged (still one pass); it now says so in the result, so a run that did
+        # not even try to reach a target is distinguishable from one that tried and failed.
+        missing = [
+            f"flow_target.{key}" for key, value in
+            (("daily_flow_target", daily_flow_target), ("max_iterations_per_run", max_iterations_per_run))
+            if not value
+        ]
+        logger.warning(
+            "run_gtm_daily_flow_cycle: no target loop for tenant %s -- unconfigured: %s. "
+            "Running a single sweep pass.", tenant_id, ", ".join(missing),
+        )
+        single = run_gtm_intelligence_sweep(db, tenant_id, run=run)
+        single["flow_target"] = {
+            "status": "not_configured",
+            "unconfigured_keys": missing,
+            "iterations_run": 1,
+            "stop_reason": "flow_target_not_configured",
+        }
+        return single
 
     now = datetime.utcnow()
     count_at_run_start = count_completed_flows_today(db, tenant_id, now)
@@ -1433,13 +1495,28 @@ def run_gtm_daily_flow_cycle(db: Session, tenant_id: int, run=None) -> dict:
         # daily_flow_target is a DAY-cumulative total (count_at_run_start already includes any
         # flows completed earlier today, e.g. from an earlier manual "Run Now") -- not "10 new
         # flows produced by this particular invocation."
-        current_count = count_completed_flows_today(db, tenant_id)
+        # `now` pinned, matching the count_at_run_start call above and the final count below.
+        # Unpinned, this re-derived "today" on every iteration against the tenant's local
+        # business-hours timezone: a run crossing local midnight would compare its progress
+        # against a freshly reset window, so current_count collapsed to ~0, the target became
+        # unreachable, and the loop ran to iteration_ceiling_reached instead of stopping. The
+        # daily sweep fires at a fixed UTC hour and iterations can each run to ~89 minutes, so
+        # crossing local midnight is an ordinary occurrence, not an edge case.
+        current_count = count_completed_flows_today(db, tenant_id, now)
 
         if current_count >= daily_flow_target:
             stop_reason = "target_reached"
             break
         if iterations_run >= max_iterations_per_run:
             stop_reason = "iteration_ceiling_reached"
+            break
+        if _budget_exhausted(result):
+            # Checked BEFORE _no_eligible_work_remaining so the stop reason names the real
+            # cause. Another iteration under an exhausted provider budget cannot produce a flow
+            # -- every paid step is refused -- but it still re-runs every unpaid stage and
+            # re-pays for anything not covered by the exhausted budget. Stopping here is what
+            # turns "kept burning to the iteration ceiling" into a single legible outcome.
+            stop_reason = "budget_exhausted"
             break
         if _no_eligible_work_remaining(result):
             stop_reason = "no_eligible_work_remaining"

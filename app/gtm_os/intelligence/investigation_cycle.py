@@ -148,10 +148,26 @@ def run_investigation_cycle(db: Session, tenant_id: int) -> dict:
             any_failed = True
             results.append({"objective_id": objective.id, "error": str(e)})
 
+    # Blocked is NOT progress, and reporting it as such is what made the daily flow loop spin.
+    # run_gtm_daily_flow_cycle's _no_eligible_work_remaining() treats objectives_processed > 0 as
+    # "work happened", so a tick where every objective was refused (budget gone, source disabled,
+    # credentials missing, control plane halted) still read as progress and the loop started
+    # another full iteration -- re-running every stage, re-paying for whatever was not blocked,
+    # until the iteration ceiling. Confirmed live in run 150, whose only objective came back
+    # blocked_by_budget ("today's real Apify spend $3.0388 + estimated $0.1100 would exceed daily
+    # budget $3.00") while the run still completed 2 iterations and produced nothing.
+    #
+    # Counted from the objectives' own execution status rather than inferred, so a new block
+    # reason added to investigation_execution.py is included automatically.
+    blocked = sum(1 for r in results if str(r.get("exec_status") or "").startswith("blocked_by_"))
+
     return {
         "status": "partial" if any_failed else "succeeded",
         "gap_identification": gap_summary,
         "objectives_processed": len(objectives),
+        "objectives_blocked": blocked,
+        # What actually got done. This is the number the flow loop must look at.
+        "objectives_advanced": len(objectives) - blocked,
         "results": results,
         "started_at": started_at,
         "completed_at": datetime.utcnow().isoformat(),
