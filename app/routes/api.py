@@ -3574,6 +3574,24 @@ def deepline_balance():
         return {"ok": False, "error": str(e)}
 
 
+@router.get("/llm/usage")
+def llm_usage(db: Session = Depends(get_db)):
+    """Today's real LLM call volume per model, against the configured daily cap.
+
+    The third provider-spend view alongside /deepline/balance and /apify/usage, and the one
+    that was missing entirely. LLM volume is not mainly a cash cost here (Gemini's free tier is
+    $0) -- it is the stall mechanism: the free tier allows 500 requests/model/day, a sweep still
+    makes ~325-375, and once the allowance is gone every further call walks the fallback list
+    collecting 429s at timeout speed, so the run reads as hung rather than as out of quota.
+    Counts ATTEMPTS, because a rejected request still consumes the quota.
+
+    `quota_exhausted_at` being set on a model means the provider itself said its daily quota is
+    gone; that now survives a redeploy (it used to live in a dict cleared on every restart)."""
+    from app.llm_budget import usage_summary
+
+    return {"ok": True, **usage_summary(db, ELEPHANT_EDGE_TENANT_ID)}
+
+
 @router.get("/apify/usage")
 def apify_usage(db: Session = Depends(get_db)):
     """The Apify-side counterpart to /deepline/balance -- previously nothing exposed real

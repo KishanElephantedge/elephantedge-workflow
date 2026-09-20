@@ -87,14 +87,48 @@ def _is_daily_quota(message: str) -> bool:
     return "PerDay" in message
 
 
-def _is_exhausted(model: str) -> bool:
+def _is_exhausted(model: str, db=None, tenant_id: int | None = None) -> bool:
+    """DB-backed first, in-process dict as a same-process fast path.
+
+    The dict alone was the unfixed gap this module's own docstring flagged: it is cleared by
+    every redeploy, and with ~40 redeploys in 3 days each deploy erased which models were dead,
+    so the next run spent its allowance re-discovering them ("run 124: 368 quota-rejected
+    requests for 1 useful answer"). It is also per-process, while three deployed instances share
+    ONE Gemini project -- so each could believe it was within budget while together they were
+    well past it. The table in app/llm_budget.py fixes both."""
     from datetime import datetime
-    return _EXHAUSTED.get(model) == datetime.utcnow().strftime("%Y-%m-%d")
+
+    if _EXHAUSTED.get(model) == datetime.utcnow().strftime("%Y-%m-%d"):
+        return True
+    if db is None or tenant_id is None:
+        return False
+    from app.llm_budget import is_exhausted as _db_is_exhausted
+
+    return _db_is_exhausted(db, tenant_id, model)
 
 
-def _mark_exhausted(model: str) -> None:
+def _mark_exhausted(model: str, db=None, tenant_id: int | None = None) -> None:
     from datetime import datetime
+
     _EXHAUSTED[model] = datetime.utcnow().strftime("%Y-%m-%d")
+    if db is None or tenant_id is None:
+        return
+    from app.llm_budget import mark_exhausted as _db_mark_exhausted
+
+    _db_mark_exhausted(db, tenant_id, model)
+
+
+def _record_attempt(db, tenant_id: int | None, model: str) -> None:
+    """Never lets accounting break a real call -- the provider's own quota is the hard wall
+    behind this, so a bookkeeping failure must degrade to 'uncounted', never to 'blocked'."""
+    if db is None or tenant_id is None:
+        return
+    try:
+        from app.llm_budget import record_call
+
+        record_call(db, tenant_id, model)
+    except Exception:  # noqa: BLE001
+        logger.exception("llm_budget: could not record an attempt for model=%s", model)
 
 
 def _try_models(fn, prompt, db, tenant_id, max_tokens):
@@ -106,9 +140,14 @@ def _try_models(fn, prompt, db, tenant_id, max_tokens):
     tried = False
     minute_limited = False
     for model in [DEFAULT_MODEL, *FALLBACK_MODELS]:
-        if _is_exhausted(model):
+        if _is_exhausted(model, db, tenant_id):
             continue  # daily allowance provably gone -- asking again only burns more quota
         tried = True
+        # Counted BEFORE the call and regardless of outcome: a 429-rejected request still
+        # counts against Google's daily quota, which is precisely why the retry storm this
+        # module documents was self-defeating. A budget that only counted successful answers
+        # would be blind to the failure mode it exists to prevent.
+        _record_attempt(db, tenant_id, model)
         try:
             return fn(prompt, db, tenant_id, max_tokens=max_tokens, model=model), True, None, False
         except GeminiError as e:
@@ -117,7 +156,7 @@ def _try_models(fn, prompt, db, tenant_id, max_tokens):
             if "429" not in message:
                 raise  # a real error, not a quota wall -- do not burn the other models on it
             if _is_daily_quota(message):
-                _mark_exhausted(model)
+                _mark_exhausted(model, db, tenant_id)
                 logger.warning("Gemini model %s is out of its DAILY quota, skipping it until UTC midnight", model)
             else:
                 minute_limited = True
@@ -150,7 +189,20 @@ def _gemini_with_model_fallback(fn, prompt, db, tenant_id, max_tokens):
     raise last
 
 
+def _gate(db: Session, tenant_id: int) -> None:
+    """The single chokepoint every LLM call in this codebase passes through.
+
+    Placed here rather than at the 78 individual call sites across 27 modules, for the same
+    reason the spend guards belong in the provider clients: a call site added later is covered
+    by default. The two paid paths that had no budget guard at all got that way precisely
+    because someone added a call site and nobody remembered to wrap it."""
+    from app.llm_budget import check_daily_llm_budget
+
+    check_daily_llm_budget(db, tenant_id)
+
+
 def generate_text(prompt: str, db: Session, tenant_id: int, max_tokens: int = 2000) -> str:
+    _gate(db, tenant_id)
     if PRIMARY == "gemini":
         try:
             return _gemini_with_model_fallback(call_gemini, prompt, db, tenant_id, max_tokens)
@@ -165,6 +217,7 @@ def generate_text(prompt: str, db: Session, tenant_id: int, max_tokens: int = 20
 
 
 def generate_json(prompt: str, db: Session, tenant_id: int, max_tokens: int = 2000) -> dict:
+    _gate(db, tenant_id)
     if PRIMARY == "gemini":
         try:
             return _gemini_with_model_fallback(call_gemini_json, prompt, db, tenant_id, max_tokens)

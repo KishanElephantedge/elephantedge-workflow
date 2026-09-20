@@ -901,3 +901,24 @@ def ensure_indexes():
             )
         """))
         conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ux_scheduler_leases_tenant_job ON scheduler_leases (tenant_id, job_key)"))
+
+        # 2026-09-19 -- durable, cross-instance LLM call accounting (app/llm_budget.py). Gemini's
+        # free tier is 500 requests/model/day and a single sweep still makes ~325-375 calls, so
+        # one run can consume the day; afterwards every call walks the fallback list collecting
+        # 429s until stages blow their timeouts and the run reads as hung. The knowledge of which
+        # models are dead used to live in a plain dict (llm_client._EXHAUSTED) that every redeploy
+        # cleared -- with ~40 redeploys in 3 days, each deploy erased it and the next run spent
+        # its allowance rediscovering it ("run 124: 368 quota-rejected requests for 1 useful
+        # answer"). It was also per-process, while three deployed instances share ONE Gemini
+        # project. Both facts belong in the database.
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS llm_daily_usage (
+                id SERIAL PRIMARY KEY,
+                tenant_id INTEGER NOT NULL,
+                usage_date DATE NOT NULL,
+                model VARCHAR NOT NULL,
+                call_count INTEGER NOT NULL DEFAULT 0,
+                quota_exhausted_at TIMESTAMP
+            )
+        """))
+        conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ux_llm_daily_usage_tenant_date_model ON llm_daily_usage (tenant_id, usage_date, model)"))
