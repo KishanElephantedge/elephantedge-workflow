@@ -692,6 +692,32 @@ def _run_linkedin_post_search(db: Session, tenant_id: int):
     # overrides, same "empty config is a valid state" reasoning as HN/RSS above. Rate-limited
     # internally (select_due_phrases) -- may legitimately return [] on a tick where every
     # configured phrase was searched too recently to search again.
+    #
+    # BUDGET GATE ADDED 2026-09-19. This is a real paid Apify path (Google organic search per
+    # phrase, then supreme_coder/linkedin-post per author) and it was the one paid sensing
+    # source with NO budget check at all, while _run_linkedin_jobs, _run_web_search_trends and
+    # _run_competitor_content all had one. It therefore spent against the shared Apify account
+    # on every tick while every other source believed the daily cap was intact -- which is
+    # exactly the accounting hole that makes spend unpredictable.
+    #
+    # Worst case is bounded by the same config the sensing call uses, so the estimate matches
+    # what will actually be bought rather than being a guess.
+    from app.apify_budget_guard import STATUS_ALLOWED, check_apify_budget
+    from app.apify_client import GOOGLE_SEARCH_COST_PER_QUERY_NO_AI_OVERVIEW_USD, LINKEDIN_POST_COST_PER_POST_USD
+    from app.gtm_os.intelligence.linkedin_search_config import get_linkedin_search_config
+
+    search_config = get_linkedin_search_config(db, tenant_id)
+    max_phrases = int(search_config.get("max_phrases_per_cycle") or 8)
+    posts_per_phrase = int(search_config.get("posts_per_phrase") or 10)
+    worst_case_usd = (
+        max_phrases * GOOGLE_SEARCH_COST_PER_QUERY_NO_AI_OVERVIEW_USD
+        + max_phrases * posts_per_phrase * LINKEDIN_POST_COST_PER_POST_USD
+    )
+
+    budget_result = check_apify_budget(db, tenant_id, worst_case_usd, operation="linkedin_post_search")
+    if budget_result["status"] != STATUS_ALLOWED:
+        raise SourceBudgetBlocked(budget_result["reason"])
+
     return sense_linkedin_post_search(db, tenant_id)
 
 

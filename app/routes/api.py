@@ -3574,6 +3574,46 @@ def deepline_balance():
         return {"ok": False, "error": str(e)}
 
 
+@router.get("/spend/today")
+def spend_today_route(db: Session = Depends(get_db)):
+    """What this system believes it committed today, per provider and per JOB, plus the drift
+    against the provider's own billing figure.
+
+    The missing piece in "we don't know how much it is costing". Two things it answers that
+    nothing did before:
+
+    `by_operation` attributes spend to the job that incurred it, so cost-per-company is judged
+    against what was actually bought for companies. A real instance of that confusion: 38% of
+    one day's spend was a weekly content-marketing job that produced zero companies and zero
+    contacts, and it was averaged into cost-per-company anyway.
+
+    `drift` compares our local estimate against Apify's own figure. Estimates come from local
+    per-unit constants (COST_PER_JOB_USD and friends) and what gets STORED as spend has never
+    been reconciled against the provider. A persistent gap is a real defect to go fix, not a
+    number to paper over -- so it is reported, never silently corrected."""
+    from app.apify_budget_guard import _today_spend_usd
+    from app.apify_client import _get_api_key as _get_apify_key
+    from app.apify_client import get_monthly_usage
+    from app.spend_ledger import PROVIDER_APIFY, reconcile_drift, spend_today, spend_today_by_operation
+
+    provider_today = None
+    provider_error = None
+    try:
+        provider_today = _today_spend_usd(get_monthly_usage(_get_apify_key(db, ELEPHANT_EDGE_TENANT_ID)))
+    except Exception as e:  # noqa: BLE001 -- the ledger is still useful without the provider
+        provider_error = str(e)
+
+    return {
+        "ok": True,
+        "apify": {
+            "ledger_usd": round(spend_today(db, ELEPHANT_EDGE_TENANT_ID, PROVIDER_APIFY), 4),
+            "by_operation": spend_today_by_operation(db, ELEPHANT_EDGE_TENANT_ID, PROVIDER_APIFY),
+            "drift": reconcile_drift(db, ELEPHANT_EDGE_TENANT_ID, PROVIDER_APIFY, provider_today),
+            "provider_error": provider_error,
+        },
+    }
+
+
 @router.get("/llm/usage")
 def llm_usage(db: Session = Depends(get_db)):
     """Today's real LLM call volume per model, against the configured daily cap.

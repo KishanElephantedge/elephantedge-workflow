@@ -922,3 +922,26 @@ def ensure_indexes():
             )
         """))
         conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ux_llm_daily_usage_tenant_date_model ON llm_daily_usage (tenant_id, usage_date, model)"))
+
+        # 2026-09-19 -- immediate local record of committed provider spend (app/spend_ledger.py).
+        # The Apify guard decides affordability from Apify's own dailyServiceUsages, which is
+        # real but is an aggregated BILLING figure that lags: inside one sweep many calls read
+        # the SAME stale "spent today" value, each concludes it has room, and the daily cap is
+        # passed several times over before the provider's number catches up. The ledger records
+        # spend the instant it is committed, so the next check in the same sweep sees it;
+        # effective spend is max(provider, ledger). `operation` exists so cost can be attributed
+        # to the job that incurred it rather than averaged across unrelated jobs.
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS provider_spend_ledger (
+                id SERIAL PRIMARY KEY,
+                tenant_id INTEGER NOT NULL,
+                provider VARCHAR NOT NULL,
+                operation VARCHAR,
+                entity_key VARCHAR,
+                estimated_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
+                actual_usd DOUBLE PRECISION,
+                spend_date DATE NOT NULL,
+                created_at TIMESTAMP
+            )
+        """))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_provider_spend_tenant_provider_date ON provider_spend_ledger (tenant_id, provider, spend_date)"))

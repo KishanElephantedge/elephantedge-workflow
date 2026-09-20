@@ -372,6 +372,37 @@ def find_free_decision_makers(db: Session, tenant_id: int, company: Company, max
     2. Google's AI Overview (~$0.0085/query) for whatever's still unfilled after Jobo --
        validated live 2026-08-11 as a real, meaningful lift (found DAKCS and GovEase's real
        founders, both companies absent from Jobo's index)."""
+    # BUDGET GATE ADDED 2026-09-19. "Free" names the Jobo leadership LOOKUP, not this function:
+    # resolving those names calls Apify people-search (up to PEOPLE_SEARCH_MAX_RESULTS profiles)
+    # and Google AI Overview, both real paid Apify calls, and this file had no budget check
+    # anywhere. It runs for EVERY company in find_decision_makers() before any paid-fallback gate
+    # is consulted, so at scale it was one of the two largest unmetered spend paths in the system.
+    #
+    # Gated per company rather than per sub-call so one company's resolution is all-or-nothing --
+    # a half-resolved contact is not useful, and paying for the first half then stopping is the
+    # "spend money, keep nothing" failure this codebase has already hit. A block is a normal
+    # empty result, exactly like finding nobody; the caller already handles that.
+    from app.apify_budget_guard import STATUS_ALLOWED, check_apify_budget
+    from app.apify_client import (
+        GOOGLE_SEARCH_COST_PER_QUERY_USD, PEOPLE_SEARCH_COST_PER_PROFILE_USD,
+        PEOPLE_SEARCH_COST_PER_START_USD,
+    )
+
+    worst_case_usd = max_contacts * (
+        PEOPLE_SEARCH_COST_PER_START_USD
+        + PEOPLE_SEARCH_MAX_RESULTS * PEOPLE_SEARCH_COST_PER_PROFILE_USD
+    ) + 2 * GOOGLE_SEARCH_COST_PER_QUERY_USD
+
+    budget_result = check_apify_budget(
+        db, tenant_id, worst_case_usd,
+        operation="free_decision_maker", entity_key=company.domain,
+    )
+    if budget_result["status"] != STATUS_ALLOWED:
+        logging.getLogger(__name__).info(
+            "free_decision_maker: skipping %s -- %s", company.domain, budget_result["reason"],
+        )
+        return []
+
     found: list[dict] = []
     seen: set[tuple[str, str]] = set()
 
