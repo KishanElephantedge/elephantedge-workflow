@@ -46,12 +46,34 @@ def _norm(name: str | None) -> str | None:
 
 
 def plan_backfill(db: Session, source: str | None = None) -> dict:
-    """Pure analysis -- performs no writes. Returns the linkable / ambiguous / unmatched split."""
-    companies_by_name: dict[str, list[Company]] = defaultdict(list)
+    """Pure analysis -- performs no writes. Returns the linkable / ambiguous / unmatched split.
+
+    MATCHED WITHIN THE SIGNAL'S OWN TENANT. companies has no tenant_id column; a company belongs
+    to a tenant through its batch (companies.batch_id -> batches.tenant_id). Ignoring that was
+    wrong in two different ways:
+
+      * It manufactured false ambiguity. Production has 91 duplicate-domain groups and ALL of
+        them are cross-tenant -- a partner and Elephant Edge legitimately each hold their own
+        copy of the same company. ATALNT and Infisical were each "ambiguous" purely because a
+        tenant-9 copy existed; scoped properly they resolve to exactly one row.
+      * It risked a cross-tenant link, which would breach the data boundary partner tenants
+        exist to enforce -- attributing one tenant's buying evidence to another tenant's account.
+
+    Genuine same-tenant duplicates do still exist and must still refuse to guess: Lumion appears
+    twice inside tenant 2 (lumion.ai and hi.switchy.io), created by the link-shortener domain bug
+    that _normalize_domain now rejects at the source.
+    """
+    from app.db.models import Batch
+
+    tenant_by_batch = dict(db.query(Batch.id, Batch.tenant_id).all())
+
+    # (tenant_id, normalized_name) -> companies
+    companies_by_key: dict[tuple[int | None, str], list[Company]] = defaultdict(list)
     for company in db.query(Company).all():
         key = _norm(company.name)
-        if key:
-            companies_by_name[key].append(company)
+        if not key:
+            continue
+        companies_by_key[(tenant_by_batch.get(company.batch_id), key)].append(company)
 
     q = db.query(GtmSignal).filter(GtmSignal.company_id.is_(None), GtmSignal.company_name_raw.isnot(None))
     if source:
@@ -63,7 +85,7 @@ def plan_backfill(db: Session, source: str | None = None) -> dict:
 
     for signal in q.all():
         key = _norm(signal.company_name_raw)
-        matches = companies_by_name.get(key, []) if key else []
+        matches = companies_by_key.get((signal.tenant_id, key), []) if key else []
         if len(matches) == 1:
             linkable.append((signal, matches[0]))
         elif len(matches) > 1:

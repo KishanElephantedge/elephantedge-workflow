@@ -54,16 +54,17 @@ def test_matching_is_insensitive_to_case_and_whitespace(db_factory):
     assert len(plan_backfill(db)["linkable"]) == 1
 
 
-def test_duplicate_company_rows_are_ambiguous_and_link_nothing(db_factory):
-    """THE SAFETY CASE. Two rows named ATALNT exist in production; guessing between them
-    would attribute real evidence to the wrong account."""
+def test_duplicate_company_rows_in_the_SAME_tenant_are_ambiguous_and_link_nothing(db_factory):
+    """THE SAFETY CASE. Lumion genuinely appears twice inside tenant 2 in production
+    (lumion.ai and hi.switchy.io, created by the link-shortener domain bug). Guessing between
+    them would attribute real buying evidence to the wrong row."""
     db = db_factory([Company, Batch, GtmSignal])
     batch = Batch(tenant_id=TENANT, name="b")
     db.add(batch)
     db.commit()
-    db.add(Company(batch_id=batch.id, name="ATALNT", domain="atalnt.ai"))
-    db.add(Company(batch_id=batch.id, name="ATALNT", domain="atalnt.com"))
-    db.add(_signal(source_ref="j1", dedup_key="k1", company_name_raw="ATALNT"))
+    db.add(Company(batch_id=batch.id, name="Lumion", domain="lumion.ai"))
+    db.add(Company(batch_id=batch.id, name="Lumion", domain="hi.switchy.io"))
+    db.add(_signal(source_ref="j1", dedup_key="k1", company_name_raw="Lumion"))
     db.commit()
 
     plan = plan_backfill(db)
@@ -75,6 +76,48 @@ def test_duplicate_company_rows_are_ambiguous_and_link_nothing(db_factory):
     assert signal.company_id is None, "must not guess between duplicate company rows"
     assert signal.company_resolution_status == "ambiguous"
     assert "duplicates must be merged" in signal.company_resolution_reason
+
+
+def test_a_copy_in_ANOTHER_tenant_is_not_ambiguity(db_factory):
+    """Production has 91 duplicate-domain groups and ALL of them are cross-tenant -- a partner
+    and Elephant Edge legitimately each hold their own copy of the same company. ATALNT and
+    Infisical were each blocked as 'ambiguous' purely because a tenant-9 copy existed. Matching
+    must be scoped to the signal's own tenant, which also prevents a cross-tenant link that
+    would breach the boundary partner tenants exist to enforce."""
+    db = db_factory([Company, Batch, GtmSignal])
+    mine = Batch(tenant_id=TENANT, name="mine")
+    theirs = Batch(tenant_id=9, name="theirs")
+    db.add_all([mine, theirs])
+    db.commit()
+
+    ours = Company(batch_id=mine.id, name="ATALNT", domain="atalnt.ai")
+    db.add(ours)
+    db.add(Company(batch_id=theirs.id, name="ATALNT", domain="atalnt.ai"))
+    db.add(_signal(source_ref="j1", dedup_key="k1", company_name_raw="ATALNT"))
+    db.commit()
+
+    plan = plan_backfill(db)
+    assert plan["ambiguous"] == []
+    assert len(plan["linkable"]) == 1
+
+    apply_backfill(db, plan)
+    assert db.query(GtmSignal).one().company_id == ours.id
+
+
+def test_a_signal_never_links_to_another_tenants_company(db_factory):
+    """The data-boundary case: the only matching company belongs to a different tenant, so
+    there is no correct link to make."""
+    db = db_factory([Company, Batch, GtmSignal])
+    theirs = Batch(tenant_id=9, name="theirs")
+    db.add(theirs)
+    db.commit()
+    db.add(Company(batch_id=theirs.id, name="ATALNT", domain="atalnt.ai"))
+    db.add(_signal(source_ref="j1", dedup_key="k1", company_name_raw="ATALNT"))
+    db.commit()
+
+    plan = plan_backfill(db)
+    assert plan["linkable"] == []
+    assert plan["unmatched"] == 1
 
 
 def test_never_overwrites_an_existing_link(db_factory):

@@ -158,11 +158,46 @@ def get_discovery_oversample(db: Session, tenant_id: int) -> int:
 APIFY_DEFAULT_LOCATION_SEARCH = ["United States"]
 
 
+# Link shorteners and marketing redirectors. A company's LinkedIn "website" field is often a
+# tracked/shortened link rather than its real site, and the shortener host is NOT an identity:
+# every company using HubSpot resolves to hubs.li, so storing it makes unrelated companies look
+# identical and makes the real one look new.
+#
+# This is not hypothetical. Production 2026-09-19: Lumion existed TWICE in the same tenant --
+# once as lumion.ai and once as hi.switchy.io -- because the shortener host did not match the
+# real domain, so the already-seen-domain dedup could not tell they were the same company and
+# discovery paid to "find" it again. Asseta was stored as hubs.li and PUSHED TO A CAMPAIGN on
+# that domain, which makes any email inference or enrichment against it worthless.
+#
+# Rejecting is strictly better than keeping: a company with no usable domain is skipped and can
+# be rediscovered later from a posting that carries a real one, whereas a wrong domain is
+# actively harmful downstream and silently corrupts dedup.
+_LINK_SHORTENER_HOSTS = frozenset({
+    "hubs.li", "hubs.ly", "switchy.io", "bit.ly", "lnkd.in", "ow.ly", "buff.ly", "rb.gy",
+    "t.co", "tinyurl.com", "shorturl.at", "cutt.ly", "trib.al", "goo.gl", "linktr.ee",
+    "bl.ink", "s.id", "rebrand.ly", "sho.rt", "lnk.to", "msha.ke",
+})
+
+
+def is_link_shortener(domain: str) -> bool:
+    """True for a shortener/redirector host, including any subdomain of one (hi.switchy.io)."""
+    d = (domain or "").lower().strip()
+    if not d:
+        return False
+    return any(d == host or d.endswith("." + host) for host in _LINK_SHORTENER_HOSTS)
+
+
 def _normalize_domain(website: str) -> str:
     domain = (website or "").lower().strip()
     domain = domain.replace("https://", "").replace("http://", "")
     domain = domain.split("/")[0]
-    return domain.replace("www.", "")
+    domain = domain.replace("www.", "")
+    # A shortener host is not an identity -- see _LINK_SHORTENER_HOSTS above. Returning "" makes
+    # this behave exactly like a posting with no website at all, which the keep loop already
+    # handles (skipped, counted as postings_no_domain).
+    if is_link_shortener(domain):
+        return ""
+    return domain
 
 
 def _persist_posting_as_signal(db: Session, tenant_id: int, company: Company, job: dict) -> GtmSignal | None:
