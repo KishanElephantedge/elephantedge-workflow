@@ -549,3 +549,36 @@ def health():
     import os
 
     return {"status": "ok", "service": "elephant-edge-backend", "git_commit": os.environ.get("RENDER_GIT_COMMIT", "unknown")}
+
+
+@app.get("/api/health/db")
+def health_db():
+    """TEMPORARY (2026-09-21) -- diagnosing production data that doesn't match what direct psql
+    access shows against the DATABASE_URL documented as this service's own: real, deleted rows
+    are still being served, and the two GET content-* routes intermittently 500 on the live
+    server but never locally against that same connection string. Confirms, from inside the
+    actual running process, which database and rows this instance really sees. Revert once
+    root-caused."""
+    from sqlalchemy import text
+
+    from app.db.session import SessionLocal
+
+    db = SessionLocal()
+    try:
+        host = db.execute(text("SELECT inet_server_addr()::text, inet_server_port(), current_database()")).fetchone()
+        opp_count = db.execute(text("SELECT count(*) FROM content_opportunities")).scalar()
+        opp_ids = [row[0] for row in db.execute(text("SELECT id FROM content_opportunities ORDER BY id")).fetchall()]
+        pillar_count = db.execute(text("SELECT count(*) FROM content_pillars")).scalar()
+        return {
+            "server_addr": host[0] if host else None,
+            "server_port": host[1] if host else None,
+            "current_database": host[2] if host else None,
+            "content_opportunities_count": opp_count,
+            "content_opportunities_ids": opp_ids,
+            "content_pillars_count": pillar_count,
+        }
+    except Exception as e:  # noqa: BLE001 -- TEMPORARY debug-only capture, see docstring
+        import traceback
+        return {"debug_error": str(e), "debug_type": type(e).__name__, "debug_traceback": traceback.format_exc()}
+    finally:
+        db.close()
