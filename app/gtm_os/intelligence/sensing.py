@@ -394,6 +394,12 @@ def sense_linkedin_post_engagement(
                 "intent_qualified": intent["qualified"],
                 "intent_categories": intent["categories"],
                 "matched_intent_phrases": intent["matched_phrases"],
+                # Same key name company_resolution.py's resolve_company_for_signal() already
+                # reads for linkedin_post signals (author_profile_url) -- reusing it here,
+                # rather than inventing a second name, is what lets that existing, already-
+                # budget-guarded resolution cascade run on an engagement lead completely
+                # unmodified (see enrich_engagement_lead() in company_resolution.py).
+                "author_profile_url": source_ref,
             },
             dedup_key=_dedup_key("linkedin_engagement", source_ref),
         )

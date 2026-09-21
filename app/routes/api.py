@@ -6090,6 +6090,27 @@ def get_partner_account_detail(account_id: str, request: Request, db: Session = 
     raise HTTPException(status_code=404, detail="Not found")
 
 
+@router.post("/gtm-os/partner/accounts/{account_id}/enrich")
+def enrich_partner_account(account_id: str, request: Request, db: Session = Depends(get_db)):
+    """On-demand company+email enrichment for ONE engagement-mining lead -- ready to use, not
+    run automatically (see enrich_engagement_lead's own docstring for why). Company-kind rows
+    already go through this at discovery time (enforce_icp_on_companies/find_decision_makers in
+    partner_daily_run.py) -- this route exists only for the "engagement:" side, where no
+    equivalent step runs yet. Every provider call inside is already Deepline-budget-guarded, so
+    calling this with today's real balance low simply returns whatever the free tiers found."""
+    from app.gtm_os.intelligence.company_resolution import enrich_engagement_lead
+
+    tenant_id = _resolve_tenant_id(request)
+    kind, _, raw_id = account_id.partition(":")
+    if kind != "engagement" or not raw_id.isdigit():
+        raise HTTPException(status_code=400, detail="Only an engagement-mining lead can be enriched through this route.")
+    result = enrich_engagement_lead(db, tenant_id, int(raw_id))
+    if result["status"] == "not_found":
+        raise HTTPException(status_code=404, detail="Not found")
+    return result
+    raise HTTPException(status_code=404, detail="Not found")
+
+
 # Real, documented LinkedIn URL pattern (the same one LinkedIn's own "Copy link to comment"
 # produces) built from postId + commentId -- both already present in every engagement signal's
 # raw_evidence (the ParseForge actor returns them separately but never combines them). Computed

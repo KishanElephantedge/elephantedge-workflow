@@ -98,7 +98,7 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.budget_guard import BudgetExceededError, check_daily_deepline_budget, get_daily_deepline_budget_usd
-from app.db.models import Company
+from app.db.models import Company, Contact
 from app.deepline_client import DeeplineError, execute_tool, extract_rows
 from app.gtm_os.intelligence.signal import GtmSignal
 from app.gtm_os.intelligence.interpreted_signal import InterpretedSignal
@@ -650,3 +650,72 @@ def ensure_company_resolved_if_needed(
         except Exception:  # noqa: BLE001
             db.rollback()
             logger.warning("apply_job_posting_facts failed for company_id=%s", result["company_id"], exc_info=True)
+
+
+def enrich_engagement_lead(db: Session, tenant_id: int, signal_id: int, allow_paid_enrichment: bool = True) -> dict:
+    """Company + email enrichment for ONE engagement-mining lead -- built 2026-09-22, ready to
+    use, deliberately NOT wired to run automatically yet (Deepline's real balance is low right
+    now; this is meant to be triggered per-lead, on demand, once there's budget to spend). Reuses
+    the exact machinery already proven for linkedin_post signals rather than inventing a second
+    resolution path:
+
+    1. resolve_company_for_signal() (this same module) -- the same free-exact-name /
+       Apify-profile / Deepline-profile / paid-name-guess cascade a linkedin_post signal already
+       goes through. Works unmodified here because sensing.py writes this signal's profile URL
+       under the SAME extracted_info["author_profile_url"] key that function already reads.
+    2. Once a company is resolved, resolve_fallback_email() (free_decision_maker.py) -- the same
+       Deepline-first, pattern-guess-fallback email lookup find_decision_makers() already uses
+       for every other contact in this codebase, given the person's own real name (not a title
+       search -- we already know exactly who this is).
+
+    Both steps are ALREADY budget-guarded internally (check_daily_deepline_budget) -- calling
+    this with today's real balance low will run the free tiers, skip the paid ones cleanly, and
+    return whatever it honestly got, never raise and never overspend. Idempotent the same way
+    resolve_company_for_signal already is: a signal already resolved is not re-attempted.
+
+    Persists a real Contact row once both a company AND a name are available, so an enriched
+    engagement lead becomes a normal, reusable contact -- not a second, parallel record shape."""
+    signal = db.get(GtmSignal, signal_id)
+    if signal is None or signal.tenant_id != tenant_id or signal.source != "linkedin_engagement":
+        return {"status": "not_found"}
+
+    company_result = resolve_company_for_signal(db, tenant_id, signal, allow_paid_enrichment=allow_paid_enrichment)
+    if company_result["status"] != "resolved" or not company_result.get("company_id"):
+        return {"status": "company_unresolved", "reason": company_result.get("reason"), "contact_id": None}
+
+    company = db.get(Company, company_result["company_id"])
+    if company is None:
+        return {"status": "company_unresolved", "reason": "resolved company_id no longer exists", "contact_id": None}
+
+    # Already enriched into a contact on a previous call -- don't create a duplicate.
+    existing = (
+        db.query(Contact)
+        .filter(Contact.company_id == company.id, Contact.linkedin_url == signal.source_ref)
+        .first()
+    )
+    if existing:
+        return {"status": "resolved", "company_id": company.id, "contact_id": existing.id, "email": existing.email}
+
+    raw_name = (signal.person_name_raw or "").strip()
+    first_name, _, last_name = raw_name.partition(" ")
+    contact = Contact(
+        company_id=company.id,
+        first_name=first_name or raw_name or None,
+        last_name=last_name or None,
+        linkedin_url=signal.source_ref,
+        thread_role="engagement_lead",
+        matched_title_reasoning=f"Found via engagement mining -- commented on {(signal.extracted_info or {}).get('post_author_name') or 'a'}'s post",
+    )
+    db.add(contact)
+    db.commit()
+    db.refresh(contact)
+
+    if first_name:
+        from app.phases.free_decision_maker import resolve_fallback_email
+
+        fallback = resolve_fallback_email(db, tenant_id, company, first_name, last_name)
+        if fallback:
+            contact.email, contact.email_source = fallback
+            db.commit()
+
+    return {"status": "resolved", "company_id": company.id, "contact_id": contact.id, "email": contact.email}
