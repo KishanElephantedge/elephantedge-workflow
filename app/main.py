@@ -138,7 +138,11 @@ def _scheduled_partner_daily_run_tick():
                     from app.gtm_os.orchestration.sweep import SourceBudgetBlocked, _run_linkedin_post_search
 
                     try:
-                        engagement_result = _run_linkedin_post_search(db, tenant_id)
+                        # budget_tenant_id=ELEPHANT_EDGE_TENANT_ID: "our key, our cost, not the
+                        # partner's" -- a partner tenant has no gtm_os_control_config of its own,
+                        # so checking against its own tenant_id would read None/None and fail
+                        # closed forever (see _run_linkedin_post_search's own comment on this).
+                        engagement_result = _run_linkedin_post_search(db, tenant_id, budget_tenant_id=ELEPHANT_EDGE_TENANT_ID)
                         logging.getLogger(__name__).info(
                             "partner_engagement_tick: tenant_id=%s signals=%s", tenant_id, len(engagement_result or []),
                         )

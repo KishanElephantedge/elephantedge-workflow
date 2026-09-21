@@ -686,7 +686,7 @@ def _run_rss(db: Session, tenant_id: int):
     return sense_rss_articles(db, tenant_id)
 
 
-def _run_linkedin_post_search(db: Session, tenant_id: int):
+def _run_linkedin_post_search(db: Session, tenant_id: int, budget_tenant_id: int | None = None):
     # No MissingSourceConfiguration needed -- linkedin_search_config.py always has a derived
     # default (computed from live ICP/offering/business-context config) even with zero saved
     # overrides, same "empty config is a valid state" reasoning as HN/RSS above. Rate-limited
@@ -702,6 +702,17 @@ def _run_linkedin_post_search(db: Session, tenant_id: int):
     #
     # Worst case is bounded by the same config the sensing call uses, so the estimate matches
     # what will actually be bought rather than being a guess.
+    #
+    # budget_tenant_id ADDED 2026-09-22, real gap found testing the "majji" partner tenant: this
+    # source is now called for partner tenants too (see main.py's partner_daily_run_tick), and a
+    # partner tenant has no gtm_os_control_config of its own -- check_apify_budget would read
+    # None/None and correctly, but silently, block forever (fails closed, "None is never
+    # unlimited" -- never an accidental spend, just a permanent no-op nobody would notice).
+    # "Our key, our cost, not the partner's tenant": the SAME rule run_apify_discovery's own
+    # budget_tenant_id parameter and partner_pipeline.py's enrichment_tenant_id already follow
+    # for every other partner-facing paid call in this codebase. The API KEY lookup
+    # (_get_apify_api_key, inside sense_linkedin_post_search) already falls back to Elephant
+    # Edge's own credential automatically -- only the SPEND CAP check needed this fix.
     from app.apify_budget_guard import STATUS_ALLOWED, check_apify_budget
     from app.apify_client import GOOGLE_SEARCH_COST_PER_QUERY_NO_AI_OVERVIEW_USD, LINKEDIN_POST_COST_PER_POST_USD
     from app.gtm_os.intelligence.linkedin_search_config import get_linkedin_search_config
@@ -714,7 +725,7 @@ def _run_linkedin_post_search(db: Session, tenant_id: int):
         + max_phrases * posts_per_phrase * LINKEDIN_POST_COST_PER_POST_USD
     )
 
-    budget_result = check_apify_budget(db, tenant_id, worst_case_usd, operation="linkedin_post_search")
+    budget_result = check_apify_budget(db, budget_tenant_id or tenant_id, worst_case_usd, operation="linkedin_post_search")
     if budget_result["status"] != STATUS_ALLOWED:
         raise SourceBudgetBlocked(budget_result["reason"])
 
@@ -737,11 +748,11 @@ def _run_linkedin_post_search(db: Session, tenant_id: int):
         ]
         if post_urls:
             engagement_budget = check_apify_budget(
-                db, tenant_id, DEFAULT_ENGAGERS_PER_SEARCH_TICK * LINKEDIN_ENGAGEMENT_COST_PER_ENGAGER_USD,
+                db, budget_tenant_id or tenant_id, DEFAULT_ENGAGERS_PER_SEARCH_TICK * LINKEDIN_ENGAGEMENT_COST_PER_ENGAGER_USD,
                 operation="linkedin_engagement",
             )
             if engagement_budget["status"] == STATUS_ALLOWED:
-                signals = signals + sense_linkedin_post_engagement(db, tenant_id, post_urls)
+                signals = signals + sense_linkedin_post_engagement(db, tenant_id, post_urls, budget_tenant_id=budget_tenant_id)
 
     return signals
 
