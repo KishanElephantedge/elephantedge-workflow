@@ -686,6 +686,13 @@ def _run_rss(db: Session, tenant_id: int):
     return sense_rss_articles(db, tenant_id)
 
 
+# Concentrate the engagement-harvest budget on the FEW real posts most likely to have real
+# comments, not spread thin across every post a phrase search returns -- see the real
+# "engagement prioritization" comment below for why. Small and explicit, same convention as
+# every other per-tick cap in this codebase.
+MAX_POSTS_FOR_ENGAGEMENT_HARVEST = 5
+
+
 def _run_linkedin_post_search(db: Session, tenant_id: int, budget_tenant_id: int | None = None):
     # No MissingSourceConfiguration needed -- linkedin_search_config.py always has a derived
     # default (computed from live ICP/offering/business-context config) even with zero saved
@@ -742,9 +749,27 @@ def _run_linkedin_post_search(db: Session, tenant_id: int, budget_tenant_id: int
         from app.apify_client import LINKEDIN_ENGAGEMENT_COST_PER_ENGAGER_USD
         from app.gtm_os.intelligence.sensing import DEFAULT_ENGAGERS_PER_SEARCH_TICK, sense_linkedin_post_engagement
 
+        # ENGAGEMENT PRIORITIZATION ADDED 2026-09-22, real user feedback after the first live
+        # test: a post found by phrase search can have near-zero real engagement (confirmed --
+        # the actual post majji's first test harvested had numComments=1, numLikes=0, so there
+        # was almost nothing there TO find). The actor bills maxResults as a SHARED cap across
+        # every post_url passed in, so spreading it evenly across many low-engagement posts
+        # wastes most of the budget on posts with nothing to harvest. Concentrating the same
+        # budget on the posts that actually have comments/likes/shares is strictly better yield
+        # per dollar, and the data is already free -- numLikes/numComments/numShares are already
+        # present in raw_evidence, a byproduct of the post-search call already paid for; nothing
+        # new is bought to compute this.
+        def _engagement_score(s):
+            ev = s.raw_evidence or {}
+            return (ev.get("numComments") or 0, ev.get("numLikes") or 0, ev.get("numShares") or 0)
+
+        ranked = sorted(
+            (s for s in signals if (s.raw_evidence or {}).get("postUrl") or (s.raw_evidence or {}).get("url")),
+            key=_engagement_score, reverse=True,
+        )
         post_urls = [
-            url for s in signals
-            if (url := (s.raw_evidence or {}).get("postUrl") or (s.raw_evidence or {}).get("url"))
+            (s.raw_evidence or {}).get("postUrl") or (s.raw_evidence or {}).get("url")
+            for s in ranked[:MAX_POSTS_FOR_ENGAGEMENT_HARVEST]
         ]
         if post_urls:
             engagement_budget = check_apify_budget(
