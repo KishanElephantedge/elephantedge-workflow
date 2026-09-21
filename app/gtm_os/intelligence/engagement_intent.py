@@ -89,6 +89,59 @@ _ALL = [
     (CATEGORY_PAIN, _PAIN_PATTERNS),
 ]
 
+# INTERNAL-HIRING PRE-FILTER, added 2026-09-21 -- real miss found live on majji's first test:
+# the phrase search matched "We're hiring our first SDR for Group Sales at Backcountry" (an
+# ordinary recruiting post for an EMPLOYEE) because one of the configured phrases
+# ("hiring a head of sales") is inherently ambiguous -- it reads the same whether a company wants
+# to hire someone onto their OWN payroll or is signaling they'd take FRACTIONAL/external help.
+# Harvesting that post's comments cost real Apify money on 10 job APPLICANTS, none of whom could
+# ever be a real lead -- classify_engagement_intent correctly rejected all 10, but only after
+# paying to find them. This filter runs on the POST's own text, BEFORE the paid engagement-
+# harvest call, so a post that reads as internal recruiting is skipped before spending on it.
+#
+# Deliberately narrow (same low-false-positive-risk discipline as every other pattern list in
+# this module): an EXTERNAL_HELP override phrase (fractional/consultant/agency/advisor/outside
+# help) always wins, since those are exactly the words majji's ICP notes use for what he sells,
+# and a post can legitimately use "hiring" language while asking for that. A post that matches
+# neither list is left alone -- this only filters clear internal-recruiting language, never
+# guesses "irrelevant" from silence. FIRST CUT, not validated against volume yet -- revisit once
+# more real engagement-mining posts have been seen, same caveat as the rest of this module.
+_INTERNAL_HIRING_PATTERNS = [
+    re.compile(r"\bwe'?re hiring (?:our|a|an|for)\b", re.I),
+    re.compile(r"\bwe are hiring (?:our|a|an|for)\b", re.I),
+    re.compile(r"\bjoin (?:our|my) team\b", re.I),
+    re.compile(r"\bopen (?:role|position|roles|positions)\b", re.I),
+    re.compile(r"\bapply (?:now|here|today|within)\b", re.I),
+    re.compile(r"\bsend (?:me )?your resume\b", re.I),
+    re.compile(r"\bdm me your resume\b", re.I),
+    re.compile(r"\bwe'?re looking to hire\b", re.I),
+    re.compile(r"\bwe are looking to hire\b", re.I),
+    re.compile(r"\bjob (?:opening|opportunity|posting)\b", re.I),
+    re.compile(r"\bnew(?:est)? (?:member|addition) to (?:our|the) team\b", re.I),
+]
+
+_EXTERNAL_HELP_OVERRIDE_PATTERNS = [
+    re.compile(r"\bfractional\b", re.I),
+    re.compile(r"\bconsult(?:ant|ing)\b", re.I),
+    re.compile(r"\bagency\b", re.I),
+    re.compile(r"\bexternal help\b", re.I),
+    re.compile(r"\boutside help\b", re.I),
+    re.compile(r"\badvisor\b", re.I),
+]
+
+
+def is_internal_hiring_post(post_text: str | None) -> bool:
+    """True if this post reads as ordinary internal recruiting (hiring an EMPLOYEE onto the
+    poster's own team) rather than a need/offering signal -- see the module comment above for
+    the real example this was built from. Never raises; empty/missing text is simply not a
+    match (never guesses relevance from silence)."""
+    text = (post_text or "").strip()
+    if not text:
+        return False
+    if any(p.search(text) for p in _EXTERNAL_HELP_OVERRIDE_PATTERNS):
+        return False
+    return any(p.search(text) for p in _INTERNAL_HIRING_PATTERNS)
+
 
 def classify_engagement_intent(comment_text: str | None) -> dict:
     """Returns {"qualified": bool, "categories": [...], "matched_phrases": [...]}.

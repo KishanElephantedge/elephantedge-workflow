@@ -414,12 +414,20 @@ def run_apify_discovery(
         domains_new.add(domain)
 
     seen_this_run: set[str] = set()
-    kept: list[Company] = []
     rejection_counts: dict[str, int] = {}
 
+    # PHASE 1 -- FREE filters only, over EVERY posting in `jobs`, no `target` cap. Real bug
+    # found live 2026-09-21 (majji tenant, batch 171): the old code capped this same loop with
+    # `if len(kept) >= target: break`, but the Apify call above already paid for all of `jobs`
+    # up front at a fixed cost -- the break didn't save a cent, it just stopped us from looking
+    # at postings we'd already bought. Measured: 80 postings for $0.41, 65 new-domain companies
+    # available, only 8 kept -- the other 57 already-paid-for companies were silently discarded.
+    # Exactly the "discover, discard, re-buy later" pattern W7 fixed once before, recurring here.
+    # Splitting into two phases fixes it without spending a cent more Apify money: every posting
+    # that clears these FREE checks becomes a real Company + signal below, regardless of
+    # `target`; only the PAID step in phase 2 still respects `target` as a real cost ceiling.
+    free_qualified: list[tuple[dict, str, int | None, str | None, str | None, list | None, str, str]] = []
     for job in jobs:
-        if len(kept) >= target:
-            break
         domain = _normalize_domain(job.get("org_linkedin_website") or "")
         if not domain or domain in seen_domains or domain in seen_this_run:
             continue
@@ -469,6 +477,19 @@ def run_apify_discovery(
             rejection_counts[profile_reason] = rejection_counts.get(profile_reason, 0) + 1
             continue
 
+        free_qualified.append((job, domain, headcount, org_headquarters, role, product_fit_categories, description, title))
+
+    # PHASE 2 -- persist every free-qualified candidate (never discard what's already paid for),
+    # but only spend on the PAID team-composition check (Deepline) for up to `target` of them --
+    # the real cost ceiling this project has always intended `target` to be. A company excluded
+    # here (already has a full sales team) costs nothing extra to skip past: the next
+    # free-qualified candidate is tried instead, at zero additional Apify spend, so reaching
+    # `target` kept companies costs the same Deepline calls as before, just drawn from the full
+    # pool instead of an arbitrary prefix. Candidates past the point `target` is reached still
+    # get a real Company + signal row (team_fit left unassessed) -- available for a later,
+    # separately-budgeted backlog pass instead of being thrown away.
+    kept: list[Company] = []
+    for job, domain, headcount, org_headquarters, role, product_fit_categories, description, title in free_qualified:
         company = Company(
             batch_id=batch_id,
             name=job.get("organization") or "Unknown",
@@ -487,6 +508,12 @@ def run_apify_discovery(
         db.commit()
         db.refresh(company)
 
+        if len(kept) >= target:
+            # Already paid for (Apify) and now persisted -- just not worth spending Deepline on
+            # today. seen_domains still gets it below so a future run never re-buys this posting.
+            seen_domains.add(domain)
+            continue
+
         # Team composition runs BEFORE hire-type classification (reordered 2026-08-14) --
         # assess_team_composition persists sales_headcount_percent/marketing_headcount_percent
         # as a free byproduct of its own paid calls, and _infer_hire_type() below needs those
@@ -496,6 +523,7 @@ def run_apify_discovery(
             rejection_counts["full_team"] = rejection_counts.get("full_team", 0) + 1
             db.delete(company)
             db.commit()
+            seen_domains.add(domain)
             continue
 
         if role:
@@ -511,7 +539,7 @@ def run_apify_discovery(
             db.commit()
 
         # Keep the evidence we already paid for, linked to the company it produced. Placed
-        # after the team-composition gate above so a company that gets deleted never leaves an
+        # after the team-composition gate above so a company excluded there never leaves an
         # orphaned signal behind, and after the hiring_signal_* writes so the Company row is
         # complete first. Never allowed to break discovery: a signal-write failure must not
         # discard a company that was otherwise successfully found and paid for.

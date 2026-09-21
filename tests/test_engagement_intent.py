@@ -6,6 +6,7 @@ honesty note about needing revalidation once real signals flow.
 """
 from app.gtm_os.intelligence.engagement_intent import (
     CATEGORY_ATTENDANCE, CATEGORY_DIRECT_INTEREST, CATEGORY_PAIN, classify_engagement_intent,
+    is_internal_hiring_post,
 )
 
 
@@ -92,3 +93,34 @@ def test_off_topic_comments_from_a_real_thread_are_not_qualified():
         "The reversible edit plan is the part I find most interesting.",
     ]:
         assert classify_engagement_intent(text)["qualified"] is False, text
+
+
+def test_the_real_missed_post_is_now_caught():
+    """THE REAL MISS. Verbatim post text from majji's first live test (2026-09-21) -- an
+    ordinary internal recruiting post that matched the "hiring a head of sales" search phrase
+    and cost real money to harvest 10 job applicants, none of whom could ever qualify."""
+    text = (
+        "We're hiring our first SDR for Group Sales at Backcountry.\n\n"
+        "We need an ambitious, motivated individual to open doors and build demand for our "
+        "Group Sales team. This is an opportunity to build a system and set yourself up for "
+        "growth within Backcountry."
+    )
+    assert is_internal_hiring_post(text) is True
+
+
+def test_a_genuine_need_for_fractional_help_is_not_flagged_as_internal_hiring():
+    for text in [
+        "We're hiring a fractional VP of Sales to run our outbound",
+        "Considering bringing in a sales consultant to fix our process",
+        "Looking to work with an agency for our sales function",
+    ]:
+        assert is_internal_hiring_post(text) is False, text
+
+
+def test_an_offering_announcement_is_not_flagged_as_internal_hiring():
+    assert is_internal_hiring_post("I built an AI video editor that works inside Claude.") is False
+
+
+def test_empty_or_missing_post_text_is_never_flagged():
+    assert is_internal_hiring_post(None) is False
+    assert is_internal_hiring_post("") is False

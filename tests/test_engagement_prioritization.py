@@ -135,3 +135,39 @@ def test_a_post_with_no_engagement_data_at_all_still_participates_safely(db, mon
 
     sweep._run_linkedin_post_search(db, TENANT, budget_tenant_id=ELEPHANT_EDGE)
     assert seen["post_urls"] == ["https://x/bare"]
+
+
+def test_internal_hiring_posts_are_excluded_from_harvest_entirely(db, monkeypatch):
+    """THE REAL FIX. A post that reads as ordinary internal recruiting must never be sent to the
+    paid engagement-harvest call at all, even if it has high engagement -- real money was
+    wasted on exactly this post in majji's first live test (10 job applicants, 0 qualified)."""
+    import app.gtm_os.orchestration.sweep as sweep
+
+    _setup_budget(db, monkeypatch)
+    monkeypatch.setattr(
+        "app.gtm_os.intelligence.linkedin_search_config.get_linkedin_search_config",
+        lambda d, t: _search_config(),
+    )
+
+    def _fake_post_search(d, t):
+        hiring_post = GtmSignal(
+            tenant_id=TENANT, source="linkedin_post", source_ref="hiring", signal_type="post",
+            dedup_key="k-hiring",
+            raw_evidence={"postUrl": "https://x/hiring", "numComments": 158, "numLikes": 110},
+            extracted_info={"text": "We're hiring our first SDR for Group Sales at Backcountry."},
+        )
+        real_signal = _signal(d, "https://x/real", comments=5, likes=10, ref="real")
+        d.add(hiring_post)
+        d.commit()
+        return [hiring_post, real_signal]
+
+    monkeypatch.setattr(sweep, "sense_linkedin_post_search", _fake_post_search)
+
+    seen = {}
+    monkeypatch.setattr(
+        "app.gtm_os.intelligence.sensing.sense_linkedin_post_engagement",
+        lambda d, t, post_urls, **kw: seen.__setitem__("post_urls", post_urls) or [],
+    )
+
+    sweep._run_linkedin_post_search(db, TENANT, budget_tenant_id=ELEPHANT_EDGE)
+    assert seen["post_urls"] == ["https://x/real"], "the hiring post must be filtered out despite its higher engagement"
