@@ -76,6 +76,60 @@ def is_discovery_due(db: Session, tenant_id: int, now: datetime | None = None) -
     return True, f"last run {elapsed_hours:.1f}h ago, cadence is {cadence_hours}h -- due"
 
 
+ICP_GATE_TIMEOUT_SECONDS = 180
+
+# 2026-09-22 -- REAL FIX for a live hang confirmed in run 152 (triggered 2026-09-21 04:00 UTC,
+# never completed, zero spend movement for 28+ minutes, stage_results never reported once).
+# run_v2_discovery_if_due (this function) has never had a timeout at all -- a known,
+# pre-existing gap this project's own diagnosis flagged before this session started ("discovery
+# has no timeout and runs on the shared aged DB session") -- and the ICP gate added the same day
+# as run 152 (gate_batch_before_decision_makers, added below) put a real, unbounded, sequential
+# per-company Deepline/Google revenue lookup inside that exact unbounded stage. Deepline's own
+# subprocess timeout is 120s PER CALL; a handful of companies needing revenue enrichment,
+# checked one at a time, easily exceeds any tick's real budget with nothing reported until it
+# either finishes or the 120-minute stale-run recovery eventually kills the whole run.
+#
+# Bounded here, LOCALLY, rather than by wrapping the whole discovery stage (sweep.py's own
+# _run_stage_with_timeout pattern) -- this is the one new, slow addition; the pre-existing keep
+# loop above has run reliably for weeks without this failure mode, so the surgical fix is to
+# bound the new call, not to restructure a stage that was not the problem.
+#
+# On timeout: the gate result is simply not applied. Discovery's own companies -- already found
+# and already paid for -- are returned exactly as before this fix existed (the gate is an
+# ADDITIVE safety check, not a precondition for discovery to succeed), same "a gate failure must
+# not lose an otherwise-good discovery result" principle the surrounding try/except already
+# established for a real exception. The abandoned thread may still be mid-write when this
+# returns -- the SAME accepted, documented trade-off sweep.py's own _run_stage_with_timeout
+# makes everywhere else in this codebase, not a new risk class introduced here.
+def _run_icp_gate_with_timeout(tenant_id: int, batch_id: int, timeout_seconds: int = ICP_GATE_TIMEOUT_SECONDS) -> dict:
+    import queue
+    import threading
+
+    from app.db.session import SessionLocal
+    from app.gtm_os.icp.icp_matching import gate_batch_before_decision_makers
+
+    result_queue: queue.Queue = queue.Queue(maxsize=1)
+
+    def _target():
+        gate_db = SessionLocal()
+        try:
+            result_queue.put(("ok", gate_batch_before_decision_makers(gate_db, tenant_id, batch_id)))
+        except Exception as e:  # noqa: BLE001 -- reported through the queue, never crashes the thread silently
+            result_queue.put(("error", str(e)))
+        finally:
+            gate_db.close()
+
+    thread = threading.Thread(target=_target, daemon=True)
+    thread.start()
+    try:
+        status, value = result_queue.get(timeout=timeout_seconds)
+    except queue.Empty:
+        return {"status": "timed_out", "reason": f"ICP gate exceeded {timeout_seconds}s -- abandoned, discovery result kept as-is"}
+    if status == "error":
+        raise RuntimeError(value)
+    return value
+
+
 def run_v2_discovery_if_due(db: Session, tenant_id: int) -> dict:
     """The Phase 1 entrypoint -- called once per hourly V2 intelligence sweep tick (see
     run_gtm_intelligence_sweep in sweep.py). Never raises: a provider failure here must not
@@ -131,10 +185,12 @@ def run_v2_discovery_if_due(db: Session, tenant_id: int) -> dict:
             from app.gtm_os.orchestration.discovery_profiles import ELEPHANT_EDGE_TENANT_ID as _EE, _has_own_icp_config
 
             if tenant_id == _EE or _has_own_icp_config(db, tenant_id):
-                from app.gtm_os.icp.icp_matching import gate_batch_before_decision_makers
-
                 try:
-                    icp_gate = gate_batch_before_decision_makers(db, tenant_id, batch.id)
+                    # ICP_GATE_TIMEOUT_SECONDS read at call time, not baked in as the wrapped
+                    # function's default -- a Python default argument is bound once at import,
+                    # so passing it explicitly here is what makes the module-level constant
+                    # actually reconfigurable (and testable) rather than frozen at import time.
+                    icp_gate = _run_icp_gate_with_timeout(tenant_id, batch.id, timeout_seconds=ICP_GATE_TIMEOUT_SECONDS)
                     result["icp_gate"] = icp_gate
                 except Exception as e:  # noqa: BLE001 -- gate failure must not lose an otherwise-good discovery result
                     result["icp_gate_error"] = str(e)
