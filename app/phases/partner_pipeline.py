@@ -30,7 +30,7 @@ from sqlalchemy.orm import Session
 from app.apify_budget_guard import STATUS_ALLOWED as APIFY_BUDGET_ALLOWED, check_apify_budget
 from app.apify_client import estimate_cost_usd
 from app.db.models import Batch, Company, LinkedinMonitorProfile, Tenant
-from app.gtm_os.icp.icp_matching import REVENUE_PER_EMPLOYEE_USD
+from app.gtm_os.icp.icp_matching import REVENUE_PER_EMPLOYEE_USD, estimated_sales_and_marketing_team_size_range
 from app.gtm_os.icp.revenue_estimation import estimate_company_revenue
 from app.llm_client import generate_json
 from app.phases.apify_discovery import APIFY_TITLE_SEARCH, run_apify_discovery
@@ -161,6 +161,15 @@ def enforce_icp_on_companies(db: Session, tenant_id: int, companies: list, icp: 
                 revenue_enrichment["not_found"] += 1
                 logger.warning("partner_pipeline: revenue lookup failed for %r -- %s", c.name, e)
 
+    # Sales+marketing team-size check (2026-09-21) -- the "problem" half of an ICP like Majji's
+    # ("has a small, under-resourced sales+marketing function," e.g. 2-3 people), as distinct
+    # from the "money" half (employee_min/max, already enforced at discovery time via
+    # headcount_band_for_partner_icp). Unconfigured for every ICP before this one -- both bounds
+    # None is a no-op, same "None never means unlimited, and never changes default behavior for
+    # anyone who hasn't set it" discipline every other cap in this codebase follows.
+    team_lo, team_hi = icp.get("sales_team_size_min"), icp.get("sales_team_size_max")
+    check_team_size = isinstance(team_lo, (int, float)) or isinstance(team_hi, (int, float))
+
     excl = [e.strip().lower() for e in (exclude_locations or []) if e and e.strip()]
     kept, dropped, dropped_companies, needs_review = [], [], [], []
     for c in companies:
@@ -185,6 +194,25 @@ def enforce_icp_on_companies(db: Session, tenant_id: int, companies: list, icp: 
         if isinstance(hi, int) and c.estimated_revenue_higher_usd and c.estimated_revenue_higher_usd > hi:
             needs_review.append((c.name, f"revenue range ${(c.estimated_revenue_lower_usd or 0):,}-${c.estimated_revenue_higher_usd:,} straddles the ${hi:,} ceiling"))
             continue
+        if check_team_size:
+            team_low, team_high, team_is_proxy, team_evidence = estimated_sales_and_marketing_team_size_range(c)
+            if team_low is not None:
+                out_of_band = (
+                    (isinstance(team_hi, (int, float)) and team_low > team_hi)
+                    or (isinstance(team_lo, (int, float)) and team_high < team_lo)
+                )
+                if out_of_band:
+                    label = f"estimated sales+marketing team {team_low:.1f}-{team_high:.1f} outside configured {team_lo}-{team_hi} -- {team_evidence}"
+                    if team_is_proxy:
+                        # UNCERTAIN, not KNOWN-bad -- same "absence of a figure is not evidence of
+                        # a bad fit" discipline the revenue check above already applies. No
+                        # calibrated marketing-headcount percentile exists for any tenant, so a
+                        # proxy-only mismatch goes to a human, never straight to deletion.
+                        needs_review.append((c.name, label))
+                        continue
+                    dropped.append((c.name, label))
+                    dropped_companies.append(c)
+                    continue
         kept.append(c)
 
     # Real bug fix (2026-09-09): dropped/kept used to be reflected only in the RETURN VALUE -- the

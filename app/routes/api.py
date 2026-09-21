@@ -5703,9 +5703,15 @@ def get_partner_icp(request: Request, db: Session = Depends(get_db)):
 @router.put("/gtm-os/partner/icp")
 def put_partner_icp(request: Request, body: dict = Body(...), db: Session = Depends(get_db)):
     """Accepts the same shape run_partner_discovery/_jobo already take as their icp= override
-    (industries, geographies, revenue_min_usd, revenue_max_usd) -- deliberately not re-validated
-    into a stricter schema here, since those two functions are the actual consumers and already
-    define what a usable ICP looks like."""
+    (industries, geographies, revenue_min_usd, revenue_max_usd, and -- explicit fields,
+    build_partner_discovery_profiles/headcount_band_for_partner_icp read them directly when
+    present -- employee_min, employee_max). Also accepts sales_team_size_min/sales_team_size_max
+    (2026-09-21, added for the "majji" partner tenant): a DEPARTMENT-size check within the
+    company, distinct from employee_min/max which sizes the whole company. Both None (the
+    default for every ICP set before this field existed) is a no-op -- enforce_icp_on_companies
+    only applies the check when at least one bound is set. Deliberately not re-validated into a
+    stricter schema here, since enforce_icp_on_companies/build_partner_discovery_profiles are the
+    actual consumers and already define what a usable ICP looks like."""
     tenant_id = _resolve_tenant_id(request)
     param = db.query(Parameter).filter(Parameter.tenant_id == tenant_id, Parameter.key == PARTNER_ICP_PARAMETER_KEY).first()
     changed = param is None or param.value != body

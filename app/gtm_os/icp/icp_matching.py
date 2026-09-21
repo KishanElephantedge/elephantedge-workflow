@@ -197,6 +197,53 @@ def _estimated_sales_team_size_range(company: Company) -> tuple[float | None, fl
     )
 
 
+def estimated_sales_and_marketing_team_size_range(company: Company) -> tuple[float | None, float | None, bool, str | None]:
+    """(low, high, is_derived, evidence) for a COMBINED sales+marketing headcount check.
+
+    WHY THIS EXISTS (2026-09-21). Elephant Edge's own icp_config.py has sales_team_size_max, but
+    that field -- and _estimated_sales_team_size_range above -- is SALES only and is wired only
+    into icp_matching.py, which is Elephant-Edge-only by design (see that module's own header and
+    TODO.md's "icp_matching.py vs partner_icp.py" note). A partner tenant's ICP has never had any
+    team-size dimension at all -- enforce_icp_on_companies() below only ever checked revenue and
+    location. The first real need for one: a partner ICP defined as "has a small, under-resourced
+    sales AND marketing function" (2-3 people combined) -- not expressible as a headcount BAND
+    (employee_min/max already covers company size; this is a department-size check within that).
+
+    Reuses company.sales_headcount_percent / marketing_headcount_percent -- both already
+    populated for FREE as a side effect of the SAME paid assess_team_composition() call that
+    already runs during discovery's keep loop, for every company, partner tenants included. No
+    new provider spend to support this.
+
+    Exact when at least one percentage was actually measured (never partially estimated and
+    partially proxied in the same number -- a measured 0% marketing function is real information,
+    not a missing one). Falls back to the sales-only p25-p75 proxy range when NEITHER was
+    measured, honestly labeled as sales-only -- there is no calibrated marketing-headcount
+    percentile for this or any tenant, and inventing one would be false precision. A marketing
+    function this proxy under-counts costs one borderline match; over-stating precision that does
+    not exist risks silently rejecting real ones."""
+    if company.employee_count is None:
+        return None, None, False, None
+    sales_pct = company.sales_headcount_percent
+    marketing_pct = company.marketing_headcount_percent
+    if sales_pct is not None or marketing_pct is not None:
+        combined_pct = (sales_pct or 0) + (marketing_pct or 0)
+        exact = company.employee_count * combined_pct / 100
+        return exact, exact, False, (
+            f"employee_count={company.employee_count} * measured "
+            f"sales_headcount_percent={sales_pct if sales_pct is not None else '(not measured)'}% + "
+            f"marketing_headcount_percent={marketing_pct if marketing_pct is not None else '(not measured)'}%"
+        )
+    low = company.employee_count * SALES_HEADCOUNT_PERCENT_P25 / 100
+    high = company.employee_count * SALES_HEADCOUNT_PERCENT_P75 / 100
+    return low, high, True, (
+        f"PLAUSIBLE RANGE derived from employee_count={company.employee_count} x "
+        f"{SALES_HEADCOUNT_PERCENT_P25}%-{SALES_HEADCOUNT_PERCENT_P75}% (tenant p25-p75, SALES ONLY -- "
+        f"no calibrated marketing-headcount percentile exists) = {low:.1f}-{high:.1f} employees "
+        f"-- no measured sales_headcount_percent or marketing_headcount_percent on file, this is a "
+        f"proxy, not a counted team"
+    )
+
+
 # Industries where revenue routinely includes pass-through billings (contractor/placement
 # revenue), so revenue-per-employee runs far above the tenant's own p25-p75 of $54k-$129k and the
 # headcount proxy understates real revenue by an order of magnitude.
