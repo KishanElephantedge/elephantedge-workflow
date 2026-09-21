@@ -718,7 +718,32 @@ def _run_linkedin_post_search(db: Session, tenant_id: int):
     if budget_result["status"] != STATUS_ALLOWED:
         raise SourceBudgetBlocked(budget_result["reason"])
 
-    return sense_linkedin_post_search(db, tenant_id)
+    signals = sense_linkedin_post_search(db, tenant_id)
+
+    # ENGAGEMENT MINING ADDED 2026-09-21, off by default -- new, unvalidated (see
+    # engagement_intent.py's own honesty note), so it must not silently start spending for a
+    # tenant that never opted in. Chains off THESE SAME posts rather than searching again --
+    # see sense_linkedin_post_engagement's own docstring for why a second search would double-
+    # pay Apify for scraping the same real-world posts. A blocked/skipped engagement step never
+    # fails the whole source: the post-search half already succeeded and its signals are real
+    # regardless of whether the extra engagement harvest could also run today.
+    if search_config.get("engagement_mining_enabled"):
+        from app.apify_client import LINKEDIN_ENGAGEMENT_COST_PER_ENGAGER_USD
+        from app.gtm_os.intelligence.sensing import DEFAULT_ENGAGERS_PER_SEARCH_TICK, sense_linkedin_post_engagement
+
+        post_urls = [
+            url for s in signals
+            if (url := (s.raw_evidence or {}).get("postUrl") or (s.raw_evidence or {}).get("url"))
+        ]
+        if post_urls:
+            engagement_budget = check_apify_budget(
+                db, tenant_id, DEFAULT_ENGAGERS_PER_SEARCH_TICK * LINKEDIN_ENGAGEMENT_COST_PER_ENGAGER_USD,
+                operation="linkedin_engagement",
+            )
+            if engagement_budget["status"] == STATUS_ALLOWED:
+                signals = signals + sense_linkedin_post_engagement(db, tenant_id, post_urls)
+
+    return signals
 
 
 def _run_website_visitors(db: Session, tenant_id: int):

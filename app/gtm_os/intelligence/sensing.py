@@ -297,6 +297,105 @@ def sense_linkedin_posts(
     return signals
 
 
+DEFAULT_ENGAGERS_PER_SEARCH_TICK = 50
+
+
+def sense_linkedin_post_engagement(
+    db: Session, tenant_id: int, post_urls: list[str], max_results: int = DEFAULT_ENGAGERS_PER_SEARCH_TICK,
+    budget_tenant_id: int | None = None,
+) -> list[GtmSignal]:
+    """Engagement mining -- built 2026-09-21 for the "majji" partner tenant's real ICP: SMB
+    founders/CEOs who comment on posts about the problem we solve, or on a similar/adjacent
+    offering's own post (the same pattern a competitor's or complementary tool's own commenters
+    represent for them). See engagement_intent.py's module docstring for the full reasoning and
+    the real example (a LinkedIn video-editor launch post) this was built from.
+
+    DELIBERATELY TAKES post_urls AS INPUT rather than searching for them itself. This chains off
+    posts sense_linkedin_post_search() (this same file) ALREADY found and already paid for via
+    the shared phrase-search mechanism -- a second, independent phrase search here would pay
+    Apify AGAIN for scraping the same real-world posts, exactly the double-spend class of bug
+    this project spent this whole session fixing (the discovery/sensing duplicate-purchase gap,
+    the two previously-unguarded paid paths). One search, two uses of its result.
+
+    NO BUDGET CHECK IN THIS FUNCTION -- deliberately, matching every other function in this
+    file. Budget gating lives one layer up, in the _run_* sweep wrapper (sweep.py) for the V2
+    sweep caller, and in the equivalent partner-tenant entrypoint -- this is a pure worker, same
+    "sensing.py does the work, the caller decides whether it's affordable" split every other
+    adapter here already follows (see sense_linkedin_post_search's own sibling _run_linkedin_
+    post_search in sweep.py, which is where THAT function's budget check actually lives).
+
+    NEVER DISCARDS PURCHASED DATA. The actor bills per engager RETURNED, not per one this
+    function decides to keep -- so EVERY returned engager is persisted as a raw signal, exactly
+    the governing principle W7/the discovery fix established this session. The intent classifier
+    (engagement_intent.py) only sets `intent_qualified`/`intent_categories` on the signal for
+    downstream stages to prioritize on -- it never gates persistence. A comment that reads as
+    noise today may still be worth a human's eyes, and re-classification later (once this
+    classifier is revalidated against real data) must not require re-buying data already paid
+    for once.
+
+    `dedupePeople=True` at the actor level means one row per PERSON (not per comment) even when
+    they engaged with several of the given posts -- source_ref is their profile URL, unique per
+    person, so repeat engagement naturally dedupes via the same already_sensed guard every other
+    adapter in this file already uses."""
+    if not post_urls:
+        return []
+
+    from app.apify_client import search_linkedin_post_engagers
+    from app.gtm_os.intelligence.engagement_intent import classify_engagement_intent
+
+    api_key = _get_apify_api_key(db, budget_tenant_id or tenant_id)
+    items = search_linkedin_post_engagers(api_key, post_urls, max_results=max_results)
+
+    signals = []
+    for item in items:
+        source_ref = str(item.get("profileUrl") or "")
+        if not source_ref:
+            continue
+
+        already_sensed = (
+            db.query(GtmSignal)
+            .filter(GtmSignal.tenant_id == tenant_id, GtmSignal.source == "linkedin_engagement", GtmSignal.source_ref == source_ref)
+            .first()
+        )
+        if already_sensed:
+            continue
+
+        comment_text = item.get("commentText")
+        intent = classify_engagement_intent(comment_text)
+
+        signal = GtmSignal(
+            tenant_id=tenant_id,
+            source="linkedin_engagement",
+            source_ref=source_ref,
+            signal_type="post_comment",
+            # commentPostedAgoText is relative ("2h", "1d"), not a real timestamp -- not parsed
+            # into a fabricated absolute time; captured_at (set at insert) is the honest proxy.
+            observed_at=None,
+            person_name_raw=item.get("fullName"),
+            company_name_raw=item.get("currentCompany"),
+            raw_evidence=item,
+            extracted_info={
+                "comment_text": comment_text,
+                "job_title": item.get("jobTitle"),
+                "seniority_level": item.get("seniorityLevel"),
+                "department": item.get("department"),
+                "location": item.get("locationName"),
+                "lead_score": item.get("leadScore"),
+                "times_engaged": item.get("timesEngaged"),
+                "matched_post_urls": item.get("engagedPostUrls") or [item.get("postUrl")],
+                "post_author_name": item.get("postAuthorName"),
+                "intent_qualified": intent["qualified"],
+                "intent_categories": intent["categories"],
+                "matched_intent_phrases": intent["matched_phrases"],
+            },
+            dedup_key=_dedup_key("linkedin_engagement", source_ref),
+        )
+        db.add(signal)
+        signals.append(signal)
+    db.commit()
+    return signals
+
+
 def sense_linkedin_post_search(db: Session, tenant_id: int) -> list[GtmSignal]:
     """GTM-OS end-to-end wiring -- the one gap that was actually blocking ProblemHypothesis/
     DemandHypothesis from ever opening (see app/gtm_os/intelligence/problem_detection.py's own

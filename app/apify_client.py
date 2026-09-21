@@ -229,6 +229,14 @@ PEOPLE_SEARCH_COST_PER_PROFILE_USD = 0.004
 LINKEDIN_POST_ACTOR_ID = "supreme_coder~linkedin-post"
 LINKEDIN_POST_COST_PER_POST_USD = 0.002
 
+# 2026-09-21 -- engagement mining (app/gtm_os/intelligence/engagement.py). Given a set of post
+# URLs, returns one row per real person who commented, pre-enriched with job title/seniority/
+# department/company/location -- confirmed via the actor's own Store API page. No LinkedIn
+# login/cookie required (reads what LinkedIn publishes to logged-out visitors, same as
+# LINKEDIN_POST_ACTOR_ID above). Pay-per-event: a run that finds nobody charges nothing.
+LINKEDIN_ENGAGEMENT_ACTOR_ID = "scrapesage~linkedin-post-engagement-scraper"
+LINKEDIN_ENGAGEMENT_COST_PER_ENGAGER_USD = 0.005
+
 
 def search_linkedin_posts(api_key: str, profile_urls: list[str], scrape_until: str | None = None, limit_per_source: int = 5) -> list[dict]:
     """Returns recent posts for each given LinkedIn profile/company/post URL. scrape_until
@@ -253,6 +261,42 @@ def search_linkedin_posts(api_key: str, profile_urls: list[str], scrape_until: s
     )
     if response.status_code >= 300:
         raise ApifyError(f"LinkedIn post search failed ({response.status_code}): {response.text[:500]}")
+    return response.json()
+
+
+def search_linkedin_post_engagers(
+    api_key: str, post_urls: list[str], max_results: int = 50, max_comments_per_post: int = 50,
+) -> list[dict]:
+    """One row per real person who commented on any of `post_urls`, pre-enriched with jobTitle/
+    seniorityLevel/department/currentCompany/locationName/commentText/leadScore -- see this
+    actor's real output schema at LINKEDIN_ENGAGEMENT_ACTOR_ID's Store listing.
+
+    `maxResults` is the REAL worst-case cost lever -- this actor bills per engager returned
+    ($0.005 each), and it is a hard cap across every post in `post_urls` combined, not per-post
+    (same "the limit IS the spend ceiling" discipline as LINKEDIN_JOBS_ACTOR_ID's own `limit`).
+    `dedupePeople: True` collapses one person who commented on several of the given posts into a
+    single row with a real timesEngaged count, rather than billing/returning them once per post.
+    `includeCompanyPages: False` excludes brand-account commenters (a company's own official
+    page reacting), which are never a real lead. `enrichProfiles: True` is what buys the
+    title/seniority/company fields -- without it this would return bare names only, pushing the
+    entire company-resolution cost onto the paid decision-maker waterfall downstream instead of
+    getting it for free from this one call."""
+    payload = {
+        "postUrls": post_urls,
+        "enrichProfiles": True,
+        "dedupePeople": True,
+        "includeCompanyPages": False,
+        "maxResults": max_results,
+        "maxCommentsPerPost": max_comments_per_post,
+    }
+    response = _post(
+        f"{BASE_URL}/acts/{LINKEDIN_ENGAGEMENT_ACTOR_ID}/run-sync-get-dataset-items",
+        params={"token": api_key},
+        json=payload,
+        timeout=240,
+    )
+    if response.status_code >= 300:
+        raise ApifyError(f"LinkedIn post engagement search failed ({response.status_code}): {response.text[:500]}")
     return response.json()
 
 

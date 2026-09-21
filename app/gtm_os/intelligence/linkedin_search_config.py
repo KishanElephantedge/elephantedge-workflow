@@ -140,6 +140,11 @@ def _validate_search_config(config: dict) -> None:
             raise SearchConfigError(f"{key!r} must be a positive integer")
     if "date_posted_filter" in config and not isinstance(config["date_posted_filter"], str):
         raise SearchConfigError("'date_posted_filter' must be a string")
+    # 2026-09-21 -- engagement mining (sense_linkedin_post_engagement, sweep.py's
+    # _run_linkedin_post_search). Off by default for every tenant configured before this field
+    # existed; only a tenant that explicitly opts in pays for the extra engagement-scraper call.
+    if "engagement_mining_enabled" in config and not isinstance(config["engagement_mining_enabled"], bool):
+        raise SearchConfigError("'engagement_mining_enabled' must be true/false")
 
 
 def get_linkedin_search_config(db: Session, tenant_id: int) -> dict:
