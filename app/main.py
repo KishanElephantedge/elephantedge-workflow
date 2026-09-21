@@ -549,36 +549,3 @@ def health():
     import os
 
     return {"status": "ok", "service": "elephant-edge-backend", "git_commit": os.environ.get("RENDER_GIT_COMMIT", "unknown")}
-
-
-@app.get("/api/health/db")
-def health_db():
-    """TEMPORARY (2026-09-21) -- diagnosing production data that doesn't match what direct psql
-    access shows against the DATABASE_URL documented as this service's own: real, deleted rows
-    are still being served, and the two GET content-* routes intermittently 500 on the live
-    server but never locally against that same connection string. Confirms, from inside the
-    actual running process, which database and rows this instance really sees. Revert once
-    root-caused."""
-    from sqlalchemy import text
-
-    from app.db.session import SessionLocal
-
-    def _try(fn):
-        try:
-            return fn()
-        except Exception as e:  # noqa: BLE001 -- TEMPORARY debug-only capture, see docstring
-            db.rollback()
-            return f"ERROR: {type(e).__name__}: {e}"
-
-    db = SessionLocal()
-    try:
-        return {
-            "server_addr": _try(lambda: db.execute(text("SELECT inet_server_addr()::text")).scalar()),
-            "server_port": _try(lambda: db.execute(text("SELECT inet_server_port()")).scalar()),
-            "current_database": _try(lambda: db.execute(text("SELECT current_database()")).scalar()),
-            "content_opportunities_count": _try(lambda: db.execute(text("SELECT count(*) FROM content_opportunities")).scalar()),
-            "content_opportunities_ids": _try(lambda: [row[0] for row in db.execute(text("SELECT id FROM content_opportunities ORDER BY id")).fetchall()]),
-            "content_pillars_count": _try(lambda: db.execute(text("SELECT count(*) FROM content_pillars")).scalar()),
-        }
-    finally:
-        db.close()

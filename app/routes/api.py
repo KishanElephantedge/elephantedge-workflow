@@ -4392,21 +4392,15 @@ def post_gtm_os_content_pillar_generate(request: Request, payload: dict = Body(.
 
 @router.get("/gtm-os/content-pillars")
 def get_gtm_os_content_pillars(request: Request, db: Session = Depends(get_db)):
-    # TEMPORARY (2026-09-21) -- diagnosing a live 500 that only reproduces on the deployed
-    # server, never locally against the same DB. Revert this try/except once root-caused.
-    import traceback
-    try:
-        from app.gtm_os.content.content_pillar import ContentPillar
+    from app.gtm_os.content.content_pillar import ContentPillar
 
-        pillars = db.query(ContentPillar).filter(ContentPillar.tenant_id == _resolve_tenant_id(request)).order_by(ContentPillar.created_at.desc()).all()
-        return {"pillars": [
-            {"id": p.id, "theme": p.theme, "title": p.title, "primary_keyword": p.primary_keyword,
-             "commercial_goal": p.commercial_goal, "grounded_function": p.grounded_function,
-             "status": p.status, "draft_generated_at": p.draft_generated_at, "created_at": p.created_at}
-            for p in pillars
-        ]}
-    except Exception as e:  # noqa: BLE001 -- TEMPORARY debug-only capture, see comment above
-        return {"debug_error": str(e), "debug_type": type(e).__name__, "debug_traceback": traceback.format_exc()}
+    pillars = db.query(ContentPillar).filter(ContentPillar.tenant_id == _resolve_tenant_id(request)).order_by(ContentPillar.created_at.desc()).all()
+    return {"pillars": [
+        {"id": p.id, "theme": p.theme, "title": p.title, "primary_keyword": p.primary_keyword,
+         "commercial_goal": p.commercial_goal, "grounded_function": p.grounded_function,
+         "status": p.status, "draft_generated_at": p.draft_generated_at, "created_at": p.created_at}
+        for p in pillars
+    ]}
 
 
 @router.get("/gtm-os/content-pillars/{content_pillar_id}")
@@ -4491,45 +4485,39 @@ def list_gtm_os_content_opportunities(request: Request, status: str | None = Non
     """Real content opportunities (content_opportunity.py, 2026-08-28), joined with their real
     topic name so the frontend never needs a second lookup. `status` optionally filters
     (candidate/approved/rejected/changes_requested); defaults to every status."""
-    # TEMPORARY (2026-09-21) -- diagnosing a live 500 that only reproduces on the deployed
-    # server, never locally against the same DB. Revert this try/except once root-caused.
-    import traceback
-    try:
-        from app.gtm_os.content.content_opportunity import ContentOpportunity
-        from app.gtm_os.content.topic import ContentTopic
+    from app.gtm_os.content.content_opportunity import ContentOpportunity
+    from app.gtm_os.content.topic import ContentTopic
 
-        query = db.query(ContentOpportunity).filter(ContentOpportunity.tenant_id == _resolve_tenant_id(request))
-        if status:
-            query = query.filter(ContentOpportunity.status == status)
-        opportunities = query.order_by(ContentOpportunity.created_at.desc()).all()
+    query = db.query(ContentOpportunity).filter(ContentOpportunity.tenant_id == _resolve_tenant_id(request))
+    if status:
+        query = query.filter(ContentOpportunity.status == status)
+    opportunities = query.order_by(ContentOpportunity.created_at.desc()).all()
 
-        topic_ids = {o.content_topic_id for o in opportunities}
-        topics_by_id = {t.id: t for t in db.query(ContentTopic).filter(ContentTopic.id.in_(topic_ids)).all()} if topic_ids else {}
+    topic_ids = {o.content_topic_id for o in opportunities}
+    topics_by_id = {t.id: t for t in db.query(ContentTopic).filter(ContentTopic.id.in_(topic_ids)).all()} if topic_ids else {}
 
-        return {
-            "opportunities": [
-                {
-                    "id": o.id,
-                    "content_topic_id": o.content_topic_id,
-                    "topic_name": o.headline or (topics_by_id[o.content_topic_id].canonical_name if o.content_topic_id in topics_by_id else None),
-                    "origin": o.origin,
-                    "trend_state": o.trend_state,
-                    "why_now": o.why_now,
-                    "suggested_angle": o.suggested_angle,
-                    "cited_urls": o.cited_urls,
-                    "status": o.status,
-                    "reviewed_at": o.reviewed_at,
-                    "reviewed_by": o.reviewed_by,
-                    "review_note": o.review_note,
-                    "drafts": o.drafts or {},
-                    "draft_generated_at": o.draft_generated_at,
-                    "created_at": o.created_at,
-                }
-                for o in opportunities
-            ]
-        }
-    except Exception as e:  # noqa: BLE001 -- TEMPORARY debug-only capture, see comment above
-        return {"debug_error": str(e), "debug_type": type(e).__name__, "debug_traceback": traceback.format_exc()}
+    return {
+        "opportunities": [
+            {
+                "id": o.id,
+                "content_topic_id": o.content_topic_id,
+                "topic_name": o.headline or (topics_by_id[o.content_topic_id].canonical_name if o.content_topic_id in topics_by_id else None),
+                "origin": o.origin,
+                "trend_state": o.trend_state,
+                "why_now": o.why_now,
+                "suggested_angle": o.suggested_angle,
+                "cited_urls": o.cited_urls,
+                "status": o.status,
+                "reviewed_at": o.reviewed_at,
+                "reviewed_by": o.reviewed_by,
+                "review_note": o.review_note,
+                "drafts": o.drafts or {},
+                "draft_generated_at": o.draft_generated_at,
+                "created_at": o.created_at,
+            }
+            for o in opportunities
+        ]
+    }
 
 
 @router.post("/gtm-os/content-opportunities/{content_opportunity_id}/review")

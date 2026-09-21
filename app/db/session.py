@@ -928,6 +928,58 @@ def ensure_indexes():
         """))
         conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ux_llm_daily_usage_tenant_date_model ON llm_daily_usage (tenant_id, usage_date, model)"))
 
+        # Content Clusters (see app/gtm_os/content/content_pillar.py). Found missing here entirely
+        # (2026-09-21) -- the two rounds of manual `CREATE TABLE` this feature got were both run by
+        # hand against a database that turned out NOT to be the one this service's own
+        # DATABASE_URL actually points at (a real, confirmed mismatch between render.md's
+        # documented DSN and the live one), so the schema silently never reached the real
+        # production database at all. Added here so it's no longer a manual, easy-to-misapply step.
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS content_pillars (
+                id SERIAL PRIMARY KEY,
+                tenant_id INTEGER NOT NULL,
+                theme VARCHAR NOT NULL,
+                title VARCHAR NOT NULL,
+                primary_keyword VARCHAR NOT NULL,
+                secondary_keywords JSON,
+                commercial_goal VARCHAR,
+                search_intent TEXT,
+                core_narrative TEXT,
+                sections JSON NOT NULL,
+                grounded_function VARCHAR,
+                why_now TEXT,
+                status VARCHAR NOT NULL DEFAULT 'candidate',
+                reviewed_at TIMESTAMP,
+                reviewed_by VARCHAR,
+                review_note TEXT,
+                draft_text TEXT,
+                draft_generated_at TIMESTAMP,
+                created_at TIMESTAMP DEFAULT now()
+            )
+        """))
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS content_clusters (
+                id SERIAL PRIMARY KEY,
+                tenant_id INTEGER NOT NULL,
+                content_pillar_id INTEGER NOT NULL REFERENCES content_pillars(id),
+                order_index INTEGER NOT NULL,
+                title VARCHAR NOT NULL,
+                keyword VARCHAR NOT NULL,
+                intent VARCHAR,
+                angle TEXT NOT NULL,
+                cta TEXT,
+                offering_name VARCHAR,
+                status VARCHAR NOT NULL DEFAULT 'candidate',
+                reviewed_at TIMESTAMP,
+                reviewed_by VARCHAR,
+                review_note TEXT,
+                draft_text TEXT,
+                draft_generated_at TIMESTAMP,
+                created_at TIMESTAMP DEFAULT now()
+            )
+        """))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_content_clusters_pillar ON content_clusters (content_pillar_id)"))
+
         # 2026-09-19 -- immediate local record of committed provider spend (app/spend_ledger.py).
         # The Apify guard decides affordability from Apify's own dailyServiceUsages, which is
         # real but is an aggregated BILLING figure that lags: inside one sweep many calls read
