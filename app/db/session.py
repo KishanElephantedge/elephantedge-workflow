@@ -536,6 +536,11 @@ def ensure_indexes():
         # a backwards-compat shim.
         conn.execute(text("ALTER TABLE content_opportunities DROP COLUMN IF EXISTS draft_text"))
         conn.execute(text("ALTER TABLE content_opportunities ADD COLUMN IF NOT EXISTS drafts JSON"))
+        # 2026-09-19 -- real, specific headline for trend/competitor-origin opportunities (see
+        # content_opportunity.py's ContentOpportunity.headline docstring). Missing here was a real
+        # gap: the ORM model declared the column but production's actual table never got it,
+        # so every GET /gtm-os/content-opportunities 500'd on the live DB.
+        conn.execute(text("ALTER TABLE content_opportunities ADD COLUMN IF NOT EXISTS headline TEXT"))
         # Batch 4 -- Opportunity Engine (see app/gtm_os/opportunity/opportunity.py). One
         # Opportunity per DemandHypothesis -- unique index enforces this at the DB level too, not
         # just at the application check-before-insert layer.
