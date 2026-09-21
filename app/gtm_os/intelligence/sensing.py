@@ -333,10 +333,13 @@ def sense_linkedin_post_engagement(
     classifier is revalidated against real data) must not require re-buying data already paid
     for once.
 
-    `dedupePeople=True` at the actor level means one row per PERSON (not per comment) even when
-    they engaged with several of the given posts -- source_ref is their profile URL, unique per
-    person, so repeat engagement naturally dedupes via the same already_sensed guard every other
-    adapter in this file already uses."""
+    ONE ROW PER PERSON, not per comment, even though the actor itself returns one row per
+    COMMENT (no dedupePeople option, unlike the actor originally tried) -- source_ref is the
+    commenter's profile URL, so the SAME already_sensed guard every other adapter in this file
+    uses collapses a person commenting more than once (same post or across posts in one call)
+    into a single signal, keeping their first comment as the evidence. This is what makes "each
+    qualified person counts as one" (the real target unit for this objective) hold structurally,
+    not just by convention."""
     if not post_urls:
         return []
 
@@ -348,7 +351,7 @@ def sense_linkedin_post_engagement(
 
     signals = []
     for item in items:
-        source_ref = str(item.get("profileUrl") or "")
+        source_ref = str(item.get("commentAuthorProfileUrl") or "")
         if not source_ref:
             continue
 
@@ -368,22 +371,26 @@ def sense_linkedin_post_engagement(
             source="linkedin_engagement",
             source_ref=source_ref,
             signal_type="post_comment",
-            # commentPostedAgoText is relative ("2h", "1d"), not a real timestamp -- not parsed
-            # into a fabricated absolute time; captured_at (set at insert) is the honest proxy.
-            observed_at=None,
-            person_name_raw=item.get("fullName"),
-            company_name_raw=item.get("currentCompany"),
+            # commentAge is relative ("2h", "3d"), not a real timestamp; commentDate IS a real
+            # ISO timestamp when the actor provides one -- parsed via the same _parse_dt every
+            # other adapter here uses, falls back to None (captured_at is the honest proxy)
+            # rather than fabricating a time from the relative string.
+            observed_at=_parse_dt(item.get("commentDate")),
+            person_name_raw=item.get("commentAuthorName"),
+            # No company_name_raw -- this actor does not pre-enrich (see
+            # LINKEDIN_ENGAGEMENT_ACTOR_ID's own comment for the real trade-off against the
+            # actor originally tried). Left for the same company_resolution.py waterfall other
+            # orphaned signals already go through, rather than guessed here.
+            company_name_raw=None,
             raw_evidence=item,
             extracted_info={
                 "comment_text": comment_text,
-                "job_title": item.get("jobTitle"),
-                "seniority_level": item.get("seniorityLevel"),
-                "department": item.get("department"),
-                "location": item.get("locationName"),
-                "lead_score": item.get("leadScore"),
-                "times_engaged": item.get("timesEngaged"),
-                "matched_post_urls": item.get("engagedPostUrls") or [item.get("postUrl")],
+                "comment_reaction_count": item.get("commentReactionCount"),
+                "post_url": item.get("postUrl"),
                 "post_author_name": item.get("postAuthorName"),
+                "post_text": item.get("postText"),
+                "post_reaction_count": item.get("postReactionCount"),
+                "post_comment_count": item.get("postCommentCount"),
                 "intent_qualified": intent["qualified"],
                 "intent_categories": intent["categories"],
                 "matched_intent_phrases": intent["matched_phrases"],

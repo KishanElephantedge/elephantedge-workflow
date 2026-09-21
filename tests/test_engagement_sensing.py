@@ -25,23 +25,24 @@ def db(db_factory):
     return session
 
 
+# Real shape from parseforge/linkedin-comments-scraper -- one row per COMMENT, no pre-
+# enrichment (no company/title/seniority), confirmed live 2026-09-22 (see
+# LINKEDIN_ENGAGEMENT_ACTOR_ID's own comment in apify_client.py for why this actor, not the one
+# originally tried).
 ENGAGER_ITEM = {
-    "fullName": "Rohan Karunakaran",
-    "profileUrl": "https://www.linkedin.com/in/rohan-karunakaran",
-    "jobTitle": "Founder/CEO",
-    "seniorityLevel": "Owner",
-    "department": "Executive",
-    "currentCompany": "Frontier Studio",
-    "locationName": "San Francisco, CA",
+    "commentAuthorName": "Rohan Karunakaran",
+    "commentAuthorProfileUrl": "https://www.linkedin.com/in/rohan-karunakaran",
+    "commentId": "7506307156950962176",
     "commentText": "We're struggling with exactly this, would love access",
-    "commentPostedAgoText": "2h",
-    "timesEngaged": 1,
-    "engagedPostUrls": ["https://www.linkedin.com/posts/ericosiu_video-editor"],
+    "commentDate": "2026-09-21T07:12:44.358801Z",
+    "commentAge": "2h",
+    "commentReactionCount": 3,
     "postUrl": "https://www.linkedin.com/posts/ericosiu_video-editor",
+    "postId": "7505635029323124736",
     "postAuthorName": "Eric Siu",
-    "isCompanyPage": False,
-    "profileEnriched": True,
-    "leadScore": 78,
+    "postText": "I built an AI video editor that works inside Claude.",
+    "postReactionCount": 110,
+    "postCommentCount": 158,
 }
 
 
@@ -50,8 +51,8 @@ def test_persists_every_engager_returned_regardless_of_intent(db, monkeypatch):
     discarded, only flagged differently."""
     import app.gtm_os.intelligence.sensing as sensing
 
-    noise_item = dict(ENGAGER_ITEM, fullName="Random Commenter",
-                      profileUrl="https://www.linkedin.com/in/random", commentText="Nice post!")
+    noise_item = dict(ENGAGER_ITEM, commentAuthorName="Random Commenter",
+                      commentAuthorProfileUrl="https://www.linkedin.com/in/random", commentText="Nice post!")
     monkeypatch.setattr("app.apify_client.search_linkedin_post_engagers", lambda key, urls, max_results: [ENGAGER_ITEM, noise_item])
 
     signals = sense_linkedin_post_engagement(db, TENANT, ["https://www.linkedin.com/posts/ericosiu_video-editor"])
@@ -72,11 +73,11 @@ def test_signal_shape_and_fields(db, monkeypatch):
     assert signal.tenant_id == TENANT
     assert signal.source == "linkedin_engagement"
     assert signal.signal_type == "post_comment"
-    assert signal.source_ref == ENGAGER_ITEM["profileUrl"]
+    assert signal.source_ref == ENGAGER_ITEM["commentAuthorProfileUrl"]
     assert signal.person_name_raw == "Rohan Karunakaran"
-    assert signal.company_name_raw == "Frontier Studio"
-    assert signal.extracted_info["job_title"] == "Founder/CEO"
-    assert signal.extracted_info["lead_score"] == 78
+    assert signal.company_name_raw is None  # this actor does not pre-enrich
+    assert signal.extracted_info["comment_reaction_count"] == 3
+    assert signal.extracted_info["post_comment_count"] == 158
     assert signal.extracted_info["intent_qualified"] is True
     assert "pain_signal" in signal.extracted_info["intent_categories"]
     assert signal.dedup_key
@@ -107,7 +108,7 @@ def test_empty_post_urls_returns_empty_without_calling_the_actor(db, monkeypatch
 
 def test_an_item_with_no_profile_url_is_skipped_not_crashed(db, monkeypatch):
     import app.gtm_os.intelligence.sensing as sensing
-    bad_item = dict(ENGAGER_ITEM, profileUrl=None)
+    bad_item = dict(ENGAGER_ITEM, commentAuthorProfileUrl=None)
     monkeypatch.setattr("app.apify_client.search_linkedin_post_engagers", lambda key, urls, max_results: [bad_item])
 
     assert sense_linkedin_post_engagement(db, TENANT, ["https://x"]) == []

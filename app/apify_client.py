@@ -229,13 +229,24 @@ PEOPLE_SEARCH_COST_PER_PROFILE_USD = 0.004
 LINKEDIN_POST_ACTOR_ID = "supreme_coder~linkedin-post"
 LINKEDIN_POST_COST_PER_POST_USD = 0.002
 
-# 2026-09-21 -- engagement mining (app/gtm_os/intelligence/engagement.py). Given a set of post
-# URLs, returns one row per real person who commented, pre-enriched with job title/seniority/
-# department/company/location -- confirmed via the actor's own Store API page. No LinkedIn
-# login/cookie required (reads what LinkedIn publishes to logged-out visitors, same as
-# LINKEDIN_POST_ACTOR_ID above). Pay-per-event: a run that finds nobody charges nothing.
-LINKEDIN_ENGAGEMENT_ACTOR_ID = "scrapesage~linkedin-post-engagement-scraper"
-LINKEDIN_ENGAGEMENT_COST_PER_ENGAGER_USD = 0.005
+# 2026-09-21 -- engagement mining (app/gtm_os/intelligence/sensing.py's
+# sense_linkedin_post_engagement). Given a set of post URLs, returns one row per real COMMENT
+# with the commenter's name/profile URL and the comment text.
+#
+# REAL FIX, 2026-09-22: the original choice here (scrapesage/linkedin-post-engagement-scraper,
+# advertised as pre-enriched with job title/seniority/company/location) was confirmed live to
+# return ZERO results on two real, well-engaged posts (158 and 14 comments respectively) --
+# its own run status message said why: "Those posts have no public comments yet... LinkedIn
+# does not publish who REACTED, only who commented" -- i.e. it could not actually see comment
+# CONTENT as a logged-out visitor, only the count. Swapped to parseforge/linkedin-comments-
+# scraper, confirmed live on the SAME two posts to return real, distinct commenters (not just
+# the post author replying to their own thread) -- e.g. a genuine reply from someone other than
+# the post author, with real substantive comment text. Also no login/cookie required. The
+# trade-off: no pre-enrichment (no jobTitle/company/seniority) -- company_name_raw is left None
+# and resolved later by the same company_resolution.py waterfall other orphaned signals already
+# go through, rather than bought here. Cheaper too: $0.002/comment vs the old $0.005/engager.
+LINKEDIN_ENGAGEMENT_ACTOR_ID = "parseforge~linkedin-comments-scraper"
+LINKEDIN_ENGAGEMENT_COST_PER_ENGAGER_USD = 0.002
 
 
 def search_linkedin_posts(api_key: str, profile_urls: list[str], scrape_until: str | None = None, limit_per_source: int = 5) -> list[dict]:
@@ -264,30 +275,29 @@ def search_linkedin_posts(api_key: str, profile_urls: list[str], scrape_until: s
     return response.json()
 
 
-def search_linkedin_post_engagers(
-    api_key: str, post_urls: list[str], max_results: int = 50, max_comments_per_post: int = 50,
-) -> list[dict]:
-    """One row per real person who commented on any of `post_urls`, pre-enriched with jobTitle/
-    seniorityLevel/department/currentCompany/locationName/commentText/leadScore -- see this
-    actor's real output schema at LINKEDIN_ENGAGEMENT_ACTOR_ID's Store listing.
+def search_linkedin_post_engagers(api_key: str, post_urls: list[str], max_results: int = 50) -> list[dict]:
+    """One row per real COMMENT on any of `post_urls` -- commentAuthorName, commentAuthorProfileUrl,
+    commentText, commentReactionCount, plus full post context (postUrl, postAuthorName, postText,
+    postReactionCount, postCommentCount). See LINKEDIN_ENGAGEMENT_ACTOR_ID's own comment for why
+    this actor, not the one originally tried (confirmed live to return nothing on two real,
+    well-engaged posts).
 
-    `maxResults` is the REAL worst-case cost lever -- this actor bills per engager returned
-    ($0.005 each), and it is a hard cap across every post in `post_urls` combined, not per-post
-    (same "the limit IS the spend ceiling" discipline as LINKEDIN_JOBS_ACTOR_ID's own `limit`).
-    `dedupePeople: True` collapses one person who commented on several of the given posts into a
-    single row with a real timesEngaged count, rather than billing/returning them once per post.
-    `includeCompanyPages: False` excludes brand-account commenters (a company's own official
-    page reacting), which are never a real lead. `enrichProfiles: True` is what buys the
-    title/seniority/company fields -- without it this would return bare names only, pushing the
-    entire company-resolution cost onto the paid decision-maker waterfall downstream instead of
-    getting it for free from this one call."""
+    NOTE: one row per COMMENT, not one row per PERSON -- this actor has no dedupePeople option.
+    The same person commenting on two different `post_urls` in one call produces two rows.
+    Caller-side dedup (sense_linkedin_post_engagement's own already_sensed guard, keyed on the
+    commenter's profile URL) is what collapses that, same as it already collapses one person
+    re-appearing across separate ticks.
+
+    `maxItems` is the REAL worst-case cost lever -- this actor bills per comment row returned
+    ($0.002 each), a hard cap across every post in `post_urls` combined, not per-post (same "the
+    limit IS the spend ceiling" discipline as LINKEDIN_JOBS_ACTOR_ID's own `limit`).
+    `maxPostsPerSource` bounds how many posts a single startUrl entry can expand into if it were
+    a profile URL rather than a direct post URL -- 1 here since every url passed in is already a
+    specific post, not a profile to crawl."""
     payload = {
-        "postUrls": post_urls,
-        "enrichProfiles": True,
-        "dedupePeople": True,
-        "includeCompanyPages": False,
-        "maxResults": max_results,
-        "maxCommentsPerPost": max_comments_per_post,
+        "startUrls": [{"url": url} for url in post_urls],
+        "maxItems": max_results,
+        "maxPostsPerSource": 1,
     }
     response = _post(
         f"{BASE_URL}/acts/{LINKEDIN_ENGAGEMENT_ACTOR_ID}/run-sync-get-dataset-items",
