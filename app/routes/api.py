@@ -3,6 +3,7 @@ import csv
 import io
 import json
 import logging
+import re
 from collections import Counter
 from datetime import datetime, timedelta
 
@@ -84,6 +85,48 @@ def _resolve_tenant_id(request: Request) -> int:
         return int(raw)
     except ValueError:
         return ELEPHANT_EDGE_TENANT_ID
+
+
+# Real, explicit "which objective found this" label, added 2026-09-22 after a partner (majji)
+# asked to see this in the UI -- the raw values were always there (Company.source,
+# hiring_signal_reasoning) but nothing translated them into "here's how we got this" for a
+# human. Company.source is set once, at creation, by whichever discovery path created the row
+# (see apify_discovery.py/partner_pipeline_jobo.py) -- a plain prefix match is enough, no new
+# column needed.
+_SOURCE_OBJECTIVE_LABEL = {
+    "apify:fantastic-jobs_advanced-linkedin-job-search-api": "Firmographic ICP discovery (hiring signal)",
+    "jobo": "Firmographic ICP discovery (Jobo leadership feed)",
+}
+
+# hiring_signal_reasoning always ends with "... [posting: <url>] [headcount: N] [industry: X]"
+# (see apify_discovery.py's own reasoning string) -- pulling the URL back out here rather than
+# adding a new column, since the full string is already the source of truth and a company
+# reprocessed later must not silently go out of sync with a second copy of the same fact.
+_POSTING_URL_RE = re.compile(r"\[posting:\s*(\S+)\]")
+
+
+def _discovery_objective(company: Company) -> dict:
+    """What a human should see when asking "how/where did we find this company" -- the
+    objective (which discovery mechanism), and, for the hiring-signal path, the actual posting
+    that surfaced it. Returns a plain dict, never raises on missing/unrecognized source."""
+    label = None
+    if company.source:
+        for prefix, text in _SOURCE_OBJECTIVE_LABEL.items():
+            if company.source.startswith(prefix):
+                label = text
+                break
+        if label is None:
+            label = company.source
+    posting_url = None
+    if company.hiring_signal_reasoning:
+        m = _POSTING_URL_RE.search(company.hiring_signal_reasoning)
+        if m:
+            posting_url = m.group(1)
+    return {
+        "objective_label": label,
+        "job_title": company.active_job_title,
+        "posting_url": posting_url,
+    }
 
 
 def _is_company_qualified(company: Company) -> bool:
@@ -1298,6 +1341,7 @@ def list_companies(request: Request, page: int = 1, page_size: int = 25, search:
                 "created_at": c.created_at,
                 "hot_lead": c.hot_lead,
                 "hot_lead_reasoning": c.hot_lead_reasoning,
+                "discovered_via": _discovery_objective(c),
                 **states_by_id.get(c.id, {"account_status": "insufficient_context", "signal_count": 0, "opportunity_count": 0}),
             }
             for c in page_items
@@ -5860,6 +5904,53 @@ def put_partner_daily_run_route(request: Request, updates: dict = Body(...), db:
         raise HTTPException(status_code=400, detail=str(e))
 
 
+# ---- Partner engagement-mining leads (2026-09-22) ----
+# Engagement mining (LinkedIn comment harvesting) doesn't create Company rows -- the actor
+# doesn't pre-enrich a commenter's employer (see sensing.py's own note on
+# sense_linkedin_post_engagement), so these people have nowhere to show up in the Accounts
+# table at all today. A partner asking "how many did engagement mining get us" has no way to
+# see that objective's real output otherwise. This is a read-only, tenant-scoped view straight
+# onto GtmSignal -- no new storage, just surfacing what's already there.
+@router.get("/gtm-os/partner/engagement-leads")
+def get_partner_engagement_leads(request: Request, page: int = 1, page_size: int = 25, qualified_only: bool = False, db: Session = Depends(get_db)):
+    from app.gtm_os.intelligence.signal import GtmSignal
+
+    tenant_id = _resolve_tenant_id(request)
+    query = db.query(GtmSignal).filter(GtmSignal.tenant_id == tenant_id, GtmSignal.source == "linkedin_engagement")
+    signals = query.order_by(GtmSignal.created_at.desc()).all()
+
+    if qualified_only:
+        signals = [s for s in signals if (s.extracted_info or {}).get("intent_qualified")]
+
+    total = len(signals)
+    page = max(page, 1)
+    page_size = max(1, min(page_size, 100))
+    page_items = signals[(page - 1) * page_size: page * page_size]
+
+    return {
+        "page": page,
+        "page_size": page_size,
+        "total": total,
+        "total_pages": (total + page_size - 1) // page_size if total else 0,
+        "qualified_total": sum(1 for s in signals if (s.extracted_info or {}).get("intent_qualified")),
+        "leads": [
+            {
+                "id": s.id,
+                "person_name": s.person_name_raw,
+                "profile_url": s.source_ref,
+                "comment_text": (s.extracted_info or {}).get("comment_text"),
+                "intent_qualified": bool((s.extracted_info or {}).get("intent_qualified")),
+                "intent_categories": (s.extracted_info or {}).get("intent_categories") or [],
+                "post_url": (s.extracted_info or {}).get("post_url"),
+                "post_author_name": (s.extracted_info or {}).get("post_author_name"),
+                "post_text": (s.extracted_info or {}).get("post_text"),
+                "found_at": s.created_at.isoformat() if s.created_at else None,
+            }
+            for s in page_items
+        ],
+    }
+
+
 # ---- Partner content context (stage 2 -- Content feature, 2026-09-09) ----
 # Same Parameter-backed pattern as PARTNER_ICP_PARAMETER_KEY above -- one small JSON blob, no new
 # storage concept. Holds what a partner's content prompts need to write AS them instead of as
@@ -5933,6 +6024,7 @@ def get_partner_company_detail(company_id: int, request: Request, db: Session = 
         "estimated_revenue_lower_usd": company.estimated_revenue_lower_usd,
         "estimated_revenue_higher_usd": company.estimated_revenue_higher_usd,
         "linkedin_url": company.linkedin_url,
+        "discovered_via": _discovery_objective(company),
         "contacts": [
             {
                 "id": c.id,
