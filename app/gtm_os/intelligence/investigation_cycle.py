@@ -50,19 +50,39 @@ def _objective_priority_key(objective: InvestigationObjective):
          company-agnostic objective (target_company_id=None) exists specifically because NO
          ICPMatch exists yet at all -- Rule 1. So "company-specific" and "has a matched ICP" are
          the same real fact here, not two separate signals to invent.
-      2. fewer attempts so far (a never-attempted objective is preferred over one already tried
-         and cooling down).
-      3. "freshest" eligibility -- next_eligible_at=None (never attempted, no cooldown standing
-         in the way at all) sorts as freshest; among cooldown-cleared objectives, the one whose
-         cooldown ended earliest (has been sitting ready longest) sorts next.
+      2. "waiting longest" -- see waited_since() below. THE FIX, 2026-09-21.
+      3. fewer attempts so far, as a tie-break only (see below for why it moved).
       4. closest to Opportunity eligibility, via the real evidence_sought categories above.
-      5. id ascending -- the final, stable tie-break (unchanged from before)."""
+      5. id ascending -- the final, stable tie-break (unchanged from before).
+
+    STARVATION BUG, confirmed live 2026-09-21 before this fix: sorting by `attempts` ascending
+    as the PRIMARY tiebreak means a never-attempted objective (attempts=0) always outranks one
+    that already made an attempt and is ready to retry (attempts>=1), regardless of how long the
+    retry-ready one has been sitting eligible. S2 (gap_identification) creates fresh attempts=0
+    objectives on every tick with no cap, so the supply of "beats everything at attempts>=1"
+    candidates never runs out. Measured against production at the moment of the fix: 200 eligible
+    objectives -- 124 never-attempted, 76 whose 15-minute cooldown had already elapsed and were
+    ready to retry -- with every one of the 76 ranked dead last, no rotation, indefinitely.
+    Raising investigation.max_objectives_per_tick 2->20 (2026-09-18) did not fix this; it only
+    made each tick heavier while the same ordering kept picking from the front of an
+    ever-refilling attempts=0 queue.
+
+    THE FIX: order by how long an objective has been WAITING, not by how many times it has been
+    tried. waited_since() is next_eligible_at when set (a cooldown-cleared objective has been
+    ready since its cooldown ended), else created_at (a never-attempted objective has been ready
+    since it was created) -- both real, already-populated columns, no invented score. This
+    naturally interleaves fresh and retried objectives by arrival order into the eligible pool,
+    which cannot starve anything: every objective's wait time increases every tick until it is
+    finally selected, so eventually it outranks whatever was created more recently than it became
+    eligible. attempts demoted to a tie-break only, kept because a strict FIFO on a table with
+    second-level timestamp precision can otherwise collide."""
     is_company_agnostic = objective.target_company_id is None
     proximity = _EVIDENCE_SOUGHT_PROXIMITY_RANK.get(objective.evidence_sought, 3)
+    waited_since = objective.next_eligible_at or objective.created_at or _MIN_DATETIME
     return (
         is_company_agnostic,
+        waited_since,
         objective.attempts,
-        objective.next_eligible_at or _MIN_DATETIME,
         proximity,
         objective.id,
     )
