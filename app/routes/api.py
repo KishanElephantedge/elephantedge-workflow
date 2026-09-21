@@ -6,6 +6,7 @@ import logging
 import re
 from collections import Counter
 from datetime import datetime, timedelta
+from urllib.parse import quote
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Request, Response
 from pydantic import BaseModel
@@ -6089,6 +6090,20 @@ def get_partner_account_detail(account_id: str, request: Request, db: Session = 
     raise HTTPException(status_code=404, detail="Not found")
 
 
+# Real, documented LinkedIn URL pattern (the same one LinkedIn's own "Copy link to comment"
+# produces) built from postId + commentId -- both already present in every engagement signal's
+# raw_evidence (the ParseForge actor returns them separately but never combines them). Computed
+# at read time, not stored, so every already-collected signal gets a working comment link
+# without a backfill. Never fabricated when either id is missing -- falls back to the post link.
+def _engagement_comment_url(raw_evidence: dict | None) -> str | None:
+    ev = raw_evidence or {}
+    post_id, comment_id, post_url = ev.get("postId"), ev.get("commentId"), ev.get("postUrl")
+    if not (post_id and comment_id and post_url):
+        return None
+    comment_urn = quote(f"urn:li:comment:(urn:li:activity:{post_id},{comment_id})", safe="")
+    return f"{post_url}?commentUrn={comment_urn}"
+
+
 def _engagement_lead_detail_payload(db: Session, signal_id: int, tenant_id: int) -> dict:
     from app.gtm_os.intelligence.signal import GtmSignal
 
@@ -6107,6 +6122,7 @@ def _engagement_lead_detail_payload(db: Session, signal_id: int, tenant_id: int)
             "intent_qualified": bool(info.get("intent_qualified")),
             "intent_categories": info.get("intent_categories") or [],
             "post_url": info.get("post_url"),
+            "comment_url": _engagement_comment_url(s.raw_evidence),
             "post_author_name": info.get("post_author_name"),
             "post_text": info.get("post_text"),
         },
