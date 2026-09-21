@@ -122,12 +122,58 @@ BROADER_LEADERSHIP_TITLE_KEYWORDS = [
 CEO_FIRST_MAX_EMPLOYEES = 50
 
 
-def _size_ordered_tiers(company: Company, tiers: list) -> list:
+def _partner_wants_ceo_tier_first(db: Session, tenant_id: int) -> bool:
+    """True when this tenant's own partner_icp explicitly names a founder/CEO/owner-shaped
+    buyer persona -- see _size_ordered_tiers's own force_ceo_first docstring for why that
+    overrides Elephant Edge's size-based heuristic rather than adding a new title vocabulary.
+
+    Deliberately narrow: only checks for the CEO_TITLE_KEYWORDS family already covering the
+    stated titles (case-insensitive substring, same matching discipline _matching_persons
+    already uses) -- a partner ICP naming a DIFFERENT persona (e.g. "VP Sales") is correctly
+    left on the existing size-based order, since that persona already lives in a different
+    tier. Fails safe to False (unchanged behavior) on any lookup problem -- this must never be
+    what breaks a real decision-maker search."""
+    try:
+        from app.phases.partner_icp import PARTNER_ICP_PARAMETER_KEY
+        from app.db.models import Parameter
+
+        param = (
+            db.query(Parameter)
+            .filter(Parameter.tenant_id == tenant_id, Parameter.key == PARTNER_ICP_PARAMETER_KEY)
+            .first()
+        )
+        if not param or not isinstance(param.value, dict):
+            return False
+        titles = param.value.get("decision_maker_titles")
+        if not isinstance(titles, list) or not titles:
+            return False
+        return any(
+            any(keyword in str(title).lower() for keyword in CEO_TITLE_KEYWORDS)
+            for title in titles
+        )
+    except Exception:  # noqa: BLE001 -- a config-read problem must fall back to existing behavior, never break the search
+        return False
+
+
+def _size_ordered_tiers(company: Company, tiers: list, force_ceo_first: bool = False) -> list:
     """Reorders a [ceo_tier, sales_leader_tier, ...rest] tier list so that, for companies above
     CEO_FIRST_MAX_EMPLOYEES, the sales-leader tier is tried BEFORE the CEO/Founder tier -- the
     CEO tier still runs, just second, so it still fills the quota if the sales-leader tier comes
     up short. Falls back to the given (CEO-first) order whenever employee_count isn't known --
-    never guesses a company's size."""
+    never guesses a company's size.
+
+    force_ceo_first (2026-09-22, real gap found for the "majji" partner tenant): CEO_FIRST_MAX_
+    EMPLOYEES=50 is an ELEPHANT-EDGE-CALIBRATED heuristic ("CEO-first made sense for icp_1's
+    11-50 employee band but not icp_2/icp_3's 125-300 band, where a functional sales leader is
+    the more realistic real buyer") -- a real finding about ELEPHANT EDGE's own ICPs, not a
+    universal rule. A partner who has explicitly stated their buyer persona is Owner/Founder/
+    CEO/Co-Founder (majji's real, stated ICP) should not have that overridden by a size
+    threshold calibrated for a different business's different ICPs -- his own 30-100 employee
+    band straddles CEO_FIRST_MAX_EMPLOYEES, so roughly half his real target range would
+    otherwise try the sales-leader tier first, contradicting his explicit instruction. See
+    find_decision_makers's own docstring for where this is decided per tenant."""
+    if force_ceo_first:
+        return tiers
     if company.employee_count is not None and company.employee_count > CEO_FIRST_MAX_EMPLOYEES and len(tiers) >= 2:
         return [tiers[1], tiers[0], *tiers[2:]]
     return tiers
@@ -310,11 +356,18 @@ def find_decision_makers(
 
     used_paid = False
 
-    # Tier order is size-aware (see _size_ordered_tiers) -- CEO/Founder first for small
-    # companies, sales-leader first above CEO_FIRST_MAX_EMPLOYEES employees. Each tier still
-    # only runs if the quota isn't already filled (same cost-bounding principle throughout:
-    # never more paid calls than the quota genuinely still needs), and a company can genuinely
-    # end up with contacts from more than one tier.
+    # Tier order is size-aware by default (see _size_ordered_tiers) -- CEO/Founder first for
+    # small companies, sales-leader first above CEO_FIRST_MAX_EMPLOYEES employees. A partner
+    # tenant that has explicitly stated a buyer persona overrides that Elephant-Edge-calibrated
+    # heuristic: CEO_TITLE_KEYWORDS already covers "ceo"/"founder"/"owner" (majji's real, stated
+    # persona -- Owner/Founder/CEO/Co-Founder, "co-founder" matching via the "founder"
+    # substring), so force_ceo_first just means "trust what this partner told us", not a new
+    # title vocabulary.
+    force_ceo_first = _partner_wants_ceo_tier_first(db, tenant_id)
+
+    # Each tier still only runs if the quota isn't already filled (same cost-bounding principle
+    # throughout: never more paid calls than the quota genuinely still needs), and a company can
+    # genuinely end up with contacts from more than one tier.
     tiers = _size_ordered_tiers(company, [
         (CEO_FILTER, CEO_TITLE_KEYWORDS, True, "founder_ceo"),
         (SALES_LEADER_FILTER, SALES_LEADER_TITLE_KEYWORDS, False, "sales_leader"),
@@ -323,7 +376,7 @@ def find_decision_makers(
         # another pass at CEO/Founder/President in case this call's own candidate set surfaces
         # someone the earlier (differently-ranked) CEO-tier call didn't.
         (BROADER_LEADERSHIP_FILTER, BROADER_LEADERSHIP_TITLE_KEYWORDS, False, "other_leadership"),
-    ])
+    ], force_ceo_first=force_ceo_first)
     for title_filter, title_keywords, require_bare_president, thread_role in tiers:
         if len(contacts) >= target:
             break
