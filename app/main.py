@@ -563,22 +563,22 @@ def health_db():
 
     from app.db.session import SessionLocal
 
+    def _try(fn):
+        try:
+            return fn()
+        except Exception as e:  # noqa: BLE001 -- TEMPORARY debug-only capture, see docstring
+            db.rollback()
+            return f"ERROR: {type(e).__name__}: {e}"
+
     db = SessionLocal()
     try:
-        host = db.execute(text("SELECT inet_server_addr()::text, inet_server_port(), current_database()")).fetchone()
-        opp_count = db.execute(text("SELECT count(*) FROM content_opportunities")).scalar()
-        opp_ids = [row[0] for row in db.execute(text("SELECT id FROM content_opportunities ORDER BY id")).fetchall()]
-        pillar_count = db.execute(text("SELECT count(*) FROM content_pillars")).scalar()
         return {
-            "server_addr": host[0] if host else None,
-            "server_port": host[1] if host else None,
-            "current_database": host[2] if host else None,
-            "content_opportunities_count": opp_count,
-            "content_opportunities_ids": opp_ids,
-            "content_pillars_count": pillar_count,
+            "server_addr": _try(lambda: db.execute(text("SELECT inet_server_addr()::text")).scalar()),
+            "server_port": _try(lambda: db.execute(text("SELECT inet_server_port()")).scalar()),
+            "current_database": _try(lambda: db.execute(text("SELECT current_database()")).scalar()),
+            "content_opportunities_count": _try(lambda: db.execute(text("SELECT count(*) FROM content_opportunities")).scalar()),
+            "content_opportunities_ids": _try(lambda: [row[0] for row in db.execute(text("SELECT id FROM content_opportunities ORDER BY id")).fetchall()]),
+            "content_pillars_count": _try(lambda: db.execute(text("SELECT count(*) FROM content_pillars")).scalar()),
         }
-    except Exception as e:  # noqa: BLE001 -- TEMPORARY debug-only capture, see docstring
-        import traceback
-        return {"debug_error": str(e), "debug_type": type(e).__name__, "debug_traceback": traceback.format_exc()}
     finally:
         db.close()
