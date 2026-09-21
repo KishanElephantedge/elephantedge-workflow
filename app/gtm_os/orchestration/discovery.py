@@ -111,6 +111,34 @@ def run_v2_discovery_if_due(db: Session, tenant_id: int) -> dict:
     try:
         result = _run_apify_discovery_across_offerings(batch, db, tenant_id, daily_target)
         status = "failed" if result.get("api_error") and result.get("companies_discovered") == 0 else "succeeded"
+
+        # ICP GATE ADDED 2026-09-21. This path had no ICP/real-revenue check at all -- the
+        # autonomous_orchestrator.py jd_first branch and the manual POST /gtm-os/companies/
+        # {batch_id}/icp-gate route both call gate_batch_before_decision_makers() before any
+        # contact spend, but the V2 sweep's own discovery went straight from "kept by the job
+        # actor's headcount filter" to sensing/investigation/decision-maker work. Headcount
+        # cannot predict revenue: gate_batch_before_decision_makers()'s own docstring records
+        # batch 127 (2026-09-13), where 4 of 10 surviving companies were below every ICP's
+        # revenue floor and the engine searched (and paid for) decision makers for all of them
+        # before a real revenue figure ever arrived.
+        #
+        # Same uses_gtm_os_icp guard autonomous_orchestrator.py already uses for the jd_first
+        # branch: Elephant Edge and any tenant with its OWN icp config get the real gate; a
+        # tenant with no icp config row would otherwise silently inherit Elephant Edge's ICPs
+        # via get_icp_config()'s fallback, which is meaningless for that tenant's real business
+        # -- see the icp_matching.py-vs-partner_icp.py distinction recorded in TODO.md.
+        if status == "succeeded" and result.get("companies_discovered", 0) > 0:
+            from app.gtm_os.orchestration.discovery_profiles import ELEPHANT_EDGE_TENANT_ID as _EE, _has_own_icp_config
+
+            if tenant_id == _EE or _has_own_icp_config(db, tenant_id):
+                from app.gtm_os.icp.icp_matching import gate_batch_before_decision_makers
+
+                try:
+                    icp_gate = gate_batch_before_decision_makers(db, tenant_id, batch.id)
+                    result["icp_gate"] = icp_gate
+                except Exception as e:  # noqa: BLE001 -- gate failure must not lose an otherwise-good discovery result
+                    result["icp_gate_error"] = str(e)
+
         return {"status": status, "batch_id": batch.id, "reason": reason, **result}
     except Exception as e:  # noqa: BLE001 -- a provider failure must not crash the sweep; see module docstring
         return {"status": "failed", "batch_id": batch.id, "error": str(e)}
