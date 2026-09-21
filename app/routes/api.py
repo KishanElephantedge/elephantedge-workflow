@@ -5904,50 +5904,214 @@ def put_partner_daily_run_route(request: Request, updates: dict = Body(...), db:
         raise HTTPException(status_code=400, detail=str(e))
 
 
-# ---- Partner engagement-mining leads (2026-09-22) ----
-# Engagement mining (LinkedIn comment harvesting) doesn't create Company rows -- the actor
-# doesn't pre-enrich a commenter's employer (see sensing.py's own note on
-# sense_linkedin_post_engagement), so these people have nowhere to show up in the Accounts
-# table at all today. A partner asking "how many did engagement mining get us" has no way to
-# see that objective's real output otherwise. This is a read-only, tenant-scoped view straight
-# onto GtmSignal -- no new storage, just surfacing what's already there.
-@router.get("/gtm-os/partner/engagement-leads")
-def get_partner_engagement_leads(request: Request, page: int = 1, page_size: int = 25, qualified_only: bool = False, db: Session = Depends(get_db)):
+# ---- Partner unified accounts+leads list (2026-09-22, real correction) ----
+# FIRST VERSION of this put engagement-mining leads on their own separate sidebar tab
+# ("Engagement Leads") -- explicit correction from the partner: "I never told you to separate
+# that into a different tab... add into the same tab Accounts... add filters. All and these
+# two." One list, one detail page design, a source filter -- not a second page. Engagement
+# leads still have no Company row (the comment actor doesn't pre-enrich an employer), so this
+# merges two real sources (Company + GtmSignal) into one response shape rather than inventing a
+# new table for either. `id` is a prefixed string ("company:123" / "engagement:45") so the
+# detail route below can tell which table to read without a naming collision between the two
+# id spaces.
+@router.get("/gtm-os/partner/accounts")
+def get_partner_accounts(
+    request: Request, page: int = 1, page_size: int = 25, search: str = "", source_filter: str = "all",
+    period_days: int = 0, period_date_from: str = "", period_date_to: str = "", db: Session = Depends(get_db),
+):
     from app.gtm_os.intelligence.signal import GtmSignal
 
     tenant_id = _resolve_tenant_id(request)
-    query = db.query(GtmSignal).filter(GtmSignal.tenant_id == tenant_id, GtmSignal.source == "linkedin_engagement")
-    signals = query.order_by(GtmSignal.created_at.desc()).all()
 
-    if qualified_only:
-        signals = [s for s in signals if (s.extracted_info or {}).get("intent_qualified")]
+    # Same "fetched -- any time / today / 7d / 30d / custom" filter the pre-merge PartnerAccounts
+    # page already had (2026-09-16, explicit instruction: "for the partners let for them also be
+    # filters") -- kept working across the merge, not dropped. Filters on when a row was actually
+    # FOUND (Company.created_at for a firmographic row, GtmSignal.created_at for an engagement
+    # one), the one real date-based fact both objectives share.
+    period_start = period_end = None
+    if period_days or period_date_from or period_date_to:
+        from datetime import date as _date
+        if period_date_from or period_date_to:
+            period_start = datetime.fromisoformat(period_date_from) if period_date_from else datetime.min
+            period_end = datetime.fromisoformat(period_date_to) + timedelta(days=1) if period_date_to else datetime.max
+        else:
+            period_start = datetime.combine(_date.today(), datetime.min.time()) - timedelta(days=period_days - 1)
+            period_end = datetime.utcnow()
+    rows = []
 
-    total = len(signals)
+    if source_filter in ("all", "firmographic"):
+        companies = (
+            db.query(Company)
+            .join(Batch)
+            .filter(Batch.tenant_id == tenant_id)
+            .order_by(Company.created_at.desc())
+            .all()
+        )
+        company_ids = [c.id for c in companies]
+        contact_counts: dict[int, int] = {}
+        if company_ids:
+            for cid, count in (
+                db.query(Contact.company_id, func.count(Contact.id))
+                .filter(Contact.company_id.in_(company_ids))
+                .group_by(Contact.company_id)
+                .all()
+            ):
+                contact_counts[cid] = count
+        for c in companies:
+            objective = _discovery_objective(c)
+            rows.append({
+                "id": f"company:{c.id}",
+                "kind": "company",
+                "name": c.name,
+                "domain": c.domain,
+                "industry": c.industry,
+                "employee_count": c.employee_count,
+                "estimated_revenue_lower_usd": c.estimated_revenue_lower_usd,
+                "estimated_revenue_higher_usd": c.estimated_revenue_higher_usd,
+                "signal": (
+                    f"Hiring: {c.hiring_signal_role.replace('_', ' ')}" if c.hiring_signal_role
+                    else ("Hot lead" if c.hot_lead else None)
+                ),
+                "source_label": objective["objective_label"],
+                "contact_count": contact_counts.get(c.id, 0),
+                "created_at": c.created_at,
+            })
+
+    if source_filter in ("all", "engagement"):
+        signals = (
+            db.query(GtmSignal)
+            .filter(GtmSignal.tenant_id == tenant_id, GtmSignal.source == "linkedin_engagement")
+            .order_by(GtmSignal.created_at.desc())
+            .all()
+        )
+        for s in signals:
+            info = s.extracted_info or {}
+            rows.append({
+                "id": f"engagement:{s.id}",
+                "kind": "engagement_lead",
+                "name": s.person_name_raw,
+                "domain": None,
+                "industry": None,
+                "employee_count": None,
+                "estimated_revenue_lower_usd": None,
+                "estimated_revenue_higher_usd": None,
+                "signal": "Qualified" if info.get("intent_qualified") else "Not qualified",
+                "source_label": "Engagement mining",
+                "contact_count": None,
+                "created_at": s.created_at,
+            })
+
+    if search.strip():
+        needle = search.strip().lower()
+        rows = [r for r in rows if r["name"] and needle in r["name"].lower() or (r["domain"] and needle in r["domain"].lower()) or (r["industry"] and needle in r["industry"].lower())]
+
+    if period_start is not None:
+        rows = [r for r in rows if r["created_at"] and period_start <= r["created_at"] <= period_end]
+
+    rows.sort(key=lambda r: r["created_at"] or datetime.min, reverse=True)
+
+    total = len(rows)
     page = max(page, 1)
     page_size = max(1, min(page_size, 100))
-    page_items = signals[(page - 1) * page_size: page * page_size]
+    page_items = rows[(page - 1) * page_size: page * page_size]
+    for r in page_items:
+        r["created_at"] = r["created_at"].isoformat() if r["created_at"] else None
+
+    # Tab counts are ALWAYS the true total for each source, independent of which filter/search
+    # is currently applied -- a filter tab's own number must not change just because a different
+    # tab is selected, or "All (28)" / "Firmographic (8)" / "Engagement (20)" would drift
+    # depending on which one a partner happened to click first. Cheap COUNT queries, not derived
+    # from `rows` above (which may already be filtered down to one source_filter).
+    firmographic_count = db.query(func.count(Company.id)).join(Batch).filter(Batch.tenant_id == tenant_id).scalar() or 0
+    engagement_count = (
+        db.query(func.count(GtmSignal.id))
+        .filter(GtmSignal.tenant_id == tenant_id, GtmSignal.source == "linkedin_engagement")
+        .scalar() or 0
+    )
+
+    # Real, objective stats for the selected period -- same shape the pre-merge page already
+    # showed. Firmographic-only (decision-makers/pushed-to-campaigns are a Company/Contact
+    # concept; engagement mining's own period count is already in `counts.engagement` above,
+    # filtered by the SAME period via the `rows` filter, so it isn't duplicated here).
+    period_stats = None
+    if period_start is not None:
+        period_company_ids = [
+            row[0] for row in db.query(Company.id).join(Batch, Company.batch_id == Batch.id)
+            .filter(Batch.tenant_id == tenant_id, Company.created_at >= period_start, Company.created_at <= period_end).all()
+        ]
+        decision_makers_fetched = (
+            db.query(func.count(Contact.id))
+            .filter(Contact.company_id.in_(period_company_ids), Contact.created_at >= period_start, Contact.created_at <= period_end)
+            .scalar() if period_company_ids else 0
+        )
+        pushed_to_campaigns = (
+            db.query(func.count(func.distinct(Contact.company_id)))
+            .join(CampaignPush, CampaignPush.contact_id == Contact.id)
+            .filter(Contact.company_id.in_(period_company_ids), CampaignPush.status == "pushed",
+                    CampaignPush.pushed_at >= period_start, CampaignPush.pushed_at <= period_end)
+            .scalar() if period_company_ids else 0
+        )
+        period_stats = {
+            "companies_fetched": len(period_company_ids),
+            "decision_makers_fetched": decision_makers_fetched or 0,
+            "pushed_to_campaigns": pushed_to_campaigns or 0,
+        }
 
     return {
         "page": page,
         "page_size": page_size,
         "total": total,
         "total_pages": (total + page_size - 1) // page_size if total else 0,
-        "qualified_total": sum(1 for s in signals if (s.extracted_info or {}).get("intent_qualified")),
-        "leads": [
-            {
-                "id": s.id,
-                "person_name": s.person_name_raw,
-                "profile_url": s.source_ref,
-                "comment_text": (s.extracted_info or {}).get("comment_text"),
-                "intent_qualified": bool((s.extracted_info or {}).get("intent_qualified")),
-                "intent_categories": (s.extracted_info or {}).get("intent_categories") or [],
-                "post_url": (s.extracted_info or {}).get("post_url"),
-                "post_author_name": (s.extracted_info or {}).get("post_author_name"),
-                "post_text": (s.extracted_info or {}).get("post_text"),
-                "found_at": s.created_at.isoformat() if s.created_at else None,
-            }
-            for s in page_items
-        ],
+        "period_stats": period_stats,
+        "counts": {
+            "all": firmographic_count + engagement_count,
+            "firmographic": firmographic_count,
+            "engagement": engagement_count,
+        },
+        "accounts": page_items,
+    }
+
+
+@router.get("/gtm-os/partner/accounts/{account_id}/detail")
+def get_partner_account_detail(account_id: str, request: Request, db: Session = Depends(get_db)):
+    """Single detail route for BOTH row kinds -- dispatches on the "company:" / "engagement:"
+    prefix get_partner_accounts above puts on every id, so the frontend's one detail page can
+    fetch either kind through one call without knowing which table backs it."""
+    tenant_id = _resolve_tenant_id(request)
+    kind, _, raw_id = account_id.partition(":")
+    if not raw_id or not raw_id.isdigit():
+        raise HTTPException(status_code=404, detail="Not found")
+
+    if kind == "company":
+        return _company_detail_payload(db, int(raw_id), tenant_id)
+    if kind == "engagement":
+        return _engagement_lead_detail_payload(db, int(raw_id), tenant_id)
+    raise HTTPException(status_code=404, detail="Not found")
+
+
+def _engagement_lead_detail_payload(db: Session, signal_id: int, tenant_id: int) -> dict:
+    from app.gtm_os.intelligence.signal import GtmSignal
+
+    s = db.get(GtmSignal, signal_id)
+    if s is None or s.tenant_id != tenant_id or s.source != "linkedin_engagement":
+        raise HTTPException(status_code=404, detail="Not found")
+    info = s.extracted_info or {}
+    return {
+        "id": f"engagement:{s.id}",
+        "kind": "engagement_lead",
+        "name": s.person_name_raw,
+        "profile_url": s.source_ref,
+        "discovered_via": {
+            "objective_label": "Engagement mining",
+            "comment_text": info.get("comment_text"),
+            "intent_qualified": bool(info.get("intent_qualified")),
+            "intent_categories": info.get("intent_categories") or [],
+            "post_url": info.get("post_url"),
+            "post_author_name": info.get("post_author_name"),
+            "post_text": info.get("post_text"),
+        },
+        "found_at": s.created_at.isoformat() if s.created_at else None,
+        "contacts": [],
     }
 
 
@@ -5990,14 +6154,12 @@ def put_partner_content_context(request: Request, body: dict = Body(...), db: Se
 # (ICP matches, opportunities, strategy, hypotheses) a stage-1 partner tenant has never
 # populated -- it would either error or surface a page full of "insufficient_context" jargon
 # that doesn't apply to what a partner was actually promised (accounts + who we found).
-@router.get("/companies/{company_id}/detail")
-def get_partner_company_detail(company_id: int, request: Request, db: Session = Depends(get_db)):
+def _company_detail_payload(db: Session, company_id: int, tenant_id: int) -> dict:
     """Real tenant-isolation check, not just a header trust: the resolved tenant_id must match
     this SPECIFIC company's own tenant, not just be a valid tenant somewhere -- otherwise a
     partner could enumerate ids and read another tenant's company by number alone. This is the
     one place a wrong X-Tenant-Id value (forged or, in this backend's own no-auth-model design,
     simply omitted) fails closed instead of silently returning someone else's account."""
-    tenant_id = _resolve_tenant_id(request)
     company = db.get(Company, company_id)
     if company is None or company.batch.tenant_id != tenant_id:
         raise HTTPException(status_code=404, detail="Company not found")
@@ -6015,7 +6177,8 @@ def get_partner_company_detail(company_id: int, request: Request, db: Session = 
     contacts.sort(key=lambda c: (not _is_verified(c), c.thread_role != "primary", c.id))
 
     return {
-        "id": company.id,
+        "id": f"company:{company.id}",
+        "kind": "company",
         "name": company.name,
         "domain": company.domain,
         "industry": company.industry,
@@ -6046,3 +6209,10 @@ def get_partner_company_detail(company_id: int, request: Request, db: Session = 
             for c in contacts
         ],
     }
+
+
+@router.get("/companies/{company_id}/detail")
+def get_partner_company_detail(company_id: int, request: Request, db: Session = Depends(get_db)):
+    """Kept for compatibility with any old bookmarked/cached URL -- get_partner_account_detail
+    (the "company:"/"engagement:" prefixed route above) is what the frontend calls now."""
+    return _company_detail_payload(db, company_id, _resolve_tenant_id(request))
