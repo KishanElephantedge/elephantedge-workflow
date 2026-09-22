@@ -165,3 +165,33 @@ def classify_engagement_intent(comment_text: str | None) -> dict:
             matched.extend(hits)
 
     return {"qualified": bool(categories), "categories": categories, "matched_phrases": matched}
+
+
+def select_relevant_post_urls(signals: list, limit: int) -> list[str]:
+    """Extracted 2026-09-22 from sweep.py's _run_linkedin_post_search so majji's own controlled
+    daily engagement-mining run (partner_daily_run.py) can pick posts with the exact same real
+    filtering the V2 sweep already uses -- reject internal-hiring posts, rank by real engagement
+    (numComments/numLikes/numShares, already free -- a byproduct of the post-search call already
+    paid for) -- rather than a second, drifting copy of this logic. Pure function: takes
+    already-fetched `linkedin_post` GtmSignal rows, returns up to `limit` post URLs, no I/O, no
+    spend of its own."""
+    def _post_text(s):
+        ev = s.raw_evidence or {}
+        return (s.extracted_info or {}).get("text") or ev.get("text") or ev.get("content")
+
+    def _engagement_score(s):
+        ev = s.raw_evidence or {}
+        return (ev.get("numComments") or 0, ev.get("numLikes") or 0, ev.get("numShares") or 0)
+
+    ranked = sorted(
+        (
+            s for s in signals
+            if ((s.raw_evidence or {}).get("postUrl") or (s.raw_evidence or {}).get("url"))
+            and not is_internal_hiring_post(_post_text(s))
+        ),
+        key=_engagement_score, reverse=True,
+    )
+    return [
+        (s.raw_evidence or {}).get("postUrl") or (s.raw_evidence or {}).get("url")
+        for s in ranked[:limit]
+    ]

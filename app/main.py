@@ -117,37 +117,15 @@ def _scheduled_partner_daily_run_tick():
             try:
                 result = run_partner_daily_tick_for_tenant(db, tenant_id)
                 if result.get("status") == "started":
-                    logging.getLogger(__name__).info("partner_daily_run_tick: tenant_id=%s started batch_id=%s", tenant_id, result.get("batch_id"))
+                    logging.getLogger(__name__).info("partner_daily_run_tick: tenant_id=%s result=%s", tenant_id, result)
 
-                # ENGAGEMENT MINING (2026-09-21) -- built for the "majji" partner tenant. Piggybacks
-                # on this SAME hourly tick/lease rather than a new scheduler job: partner tenants
-                # have no other sensing entrypoint at all today (this module is purely firmographic
-                # discovery), and one more per-tenant job on this scheduler is one more place a
-                # missed lease/coalesce setting could reintroduce the exact duplicate-execution
-                # class of bug the lease work this session exists to prevent.
-                #
-                # Reuses sweep.py's _run_linkedin_post_search UNCHANGED -- it is already
-                # tenant-generic (only the V2 SWEEP's own caller restricts it to Elephant Edge,
-                # nothing inside the function itself does), so no partner-specific version exists
-                # or is needed. Gated on the tenant's OWN linkedin_search_config.engagement_mining_
-                # enabled flag, checked BEFORE calling in so tenants who have not opted in never
-                # touch this path at all -- not even a config read they didn't ask for.
-                from app.gtm_os.intelligence.linkedin_search_config import get_linkedin_search_config
-
-                if get_linkedin_search_config(db, tenant_id).get("engagement_mining_enabled"):
-                    from app.gtm_os.orchestration.sweep import SourceBudgetBlocked, _run_linkedin_post_search
-
-                    try:
-                        # budget_tenant_id=ELEPHANT_EDGE_TENANT_ID: "our key, our cost, not the
-                        # partner's" -- a partner tenant has no gtm_os_control_config of its own,
-                        # so checking against its own tenant_id would read None/None and fail
-                        # closed forever (see _run_linkedin_post_search's own comment on this).
-                        engagement_result = _run_linkedin_post_search(db, tenant_id, budget_tenant_id=ELEPHANT_EDGE_TENANT_ID)
-                        logging.getLogger(__name__).info(
-                            "partner_engagement_tick: tenant_id=%s signals=%s", tenant_id, len(engagement_result or []),
-                        )
-                    except SourceBudgetBlocked as e:
-                        logging.getLogger(__name__).info("partner_engagement_tick: tenant_id=%s blocked -- %s", tenant_id, e)
+                # ENGAGEMENT MINING used to piggyback here directly, firing every HOURLY tick
+                # with no target and no pause control of its own -- a real, unintended bug
+                # (confirmed live 2026-09-22: 30 new signals appeared for majji in one day with
+                # nobody having triggered anything -- "i naver told that should run every hour").
+                # Moved INTO run_partner_daily_tick_for_tenant above, which now fires it at most
+                # once per UTC day, gated by its own enabled flag and last_run_date, same as
+                # firmographic discovery -- see that function's own docstring.
             except Exception:
                 logging.getLogger(__name__).exception("partner_daily_run_tick: tenant_id=%s failed", tenant_id)
             finally:

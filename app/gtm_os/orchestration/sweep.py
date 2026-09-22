@@ -759,34 +759,13 @@ def _run_linkedin_post_search(db: Session, tenant_id: int, budget_tenant_id: int
         # per dollar, and the data is already free -- numLikes/numComments/numShares are already
         # present in raw_evidence, a byproduct of the post-search call already paid for; nothing
         # new is bought to compute this.
-        def _engagement_score(s):
-            ev = s.raw_evidence or {}
-            return (ev.get("numComments") or 0, ev.get("numLikes") or 0, ev.get("numShares") or 0)
+        # INTERNAL-HIRING FILTER + ENGAGEMENT RANKING moved into select_relevant_post_urls()
+        # (engagement_intent.py, 2026-09-22) so majji's own controlled daily engagement-mining
+        # run (partner_daily_run.py) can reuse the exact same real filtering instead of a second,
+        # drifting copy -- see that function's own docstring.
+        from app.gtm_os.intelligence.engagement_intent import select_relevant_post_urls
 
-        # INTERNAL-HIRING FILTER ADDED 2026-09-21 -- see engagement_intent.py's own comment for
-        # the real example (a phrase search matched an ordinary "We're hiring our first SDR..."
-        # recruiting post, and harvesting its comments spent real money on 10 job applicants,
-        # none of whom could ever qualify). Filtering on the post's own text BEFORE the paid
-        # harvest call, not after, is what actually saves the spend -- classify_engagement_intent
-        # on the comments only decides what to do with money already spent.
-        from app.gtm_os.intelligence.engagement_intent import is_internal_hiring_post
-
-        def _post_text(s):
-            ev = s.raw_evidence or {}
-            return (s.extracted_info or {}).get("text") or ev.get("text") or ev.get("content")
-
-        ranked = sorted(
-            (
-                s for s in signals
-                if ((s.raw_evidence or {}).get("postUrl") or (s.raw_evidence or {}).get("url"))
-                and not is_internal_hiring_post(_post_text(s))
-            ),
-            key=_engagement_score, reverse=True,
-        )
-        post_urls = [
-            (s.raw_evidence or {}).get("postUrl") or (s.raw_evidence or {}).get("url")
-            for s in ranked[:MAX_POSTS_FOR_ENGAGEMENT_HARVEST]
-        ]
+        post_urls = select_relevant_post_urls(signals, MAX_POSTS_FOR_ENGAGEMENT_HARVEST)
         if post_urls:
             engagement_budget = check_apify_budget(
                 db, budget_tenant_id or tenant_id, DEFAULT_ENGAGERS_PER_SEARCH_TICK * LINKEDIN_ENGAGEMENT_COST_PER_ENGAGER_USD,

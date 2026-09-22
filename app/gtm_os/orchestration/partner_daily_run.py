@@ -13,11 +13,29 @@ CONFIG. One Parameter per tenant (PARTNER_DAILY_RUN_PARAMETER_KEY), shape:
     {
         "enabled": bool,               # the on/off toggle -- OFF until a human turns it on
         "schedule_hour_utc": int,      # 0-23, which hour this tenant's run fires
-        "daily_target": int,           # how many companies to aim for per day
+        "daily_target": int,           # how many companies to aim for per day (firmographic)
         "source": "apify" | "jobo",    # which discovery source this tenant's daily run uses
         "pages": int,                  # jobo only, same meaning as elsewhere
+        "engagement_mining_enabled": bool,     # the SECOND objective's own on/off, within the
+                                                # same daily run -- see ENGAGEMENT MINING below
+        "engagement_posts_per_day": int,       # how many LinkedIn posts to check per day
+        "engagement_commenters_per_post": int, # minimum commenters harvested PER post (a floor,
+                                                # not a shared pool -- see ENGAGEMENT MINING)
         "last_run_date": "YYYY-MM-DD", # UTC date of the last real trigger, prevents double-firing
     }
+
+ENGAGEMENT MINING, 2026-09-22 real correction. This started as a side effect of piggybacking on
+main.py's HOURLY tick with no target and no pause control of its own -- an accident, not a
+design, caught live when 30 new engagement signals appeared for majji in one day with nobody
+having triggered anything ("i naver told that should run every hour it should run daily and
+with a target set"). Moved here so it fires exactly once per day, at the SAME gated trigger as
+firmographic discovery, under the SAME enabled/pause control, with a real, explicit target:
+"5 posts, 2-3 commentators each" (5x2=10 to 5x3=15 raw commenters/day) rather than one shared
+harvest pool that lets a single popular post starve the other four (see
+select_relevant_post_urls's own docstring for the ranking/filtering this reuses unmodified, and
+LINKEDIN_ENGAGEMENT_ACTOR_ID's own comment for why `maxItems` is a SHARED cap across every
+post_url in one call -- guaranteeing a PER-POST floor means calling the harvest actor once per
+selected post, not once for all of them).
 
 REAL FIX, 2026-09-16 (was wrong before this): title_search does NOT live here. It is a property
 of the PARTNER'S OWN ICP (partner_icp Parameter, app/routes/api.py's PUT /gtm-os/partner/icp) --
@@ -59,7 +77,15 @@ DEFAULT_CONFIG = {
     "daily_target": None,
     "source": None,
     "pages": 2,
+    "engagement_mining_enabled": False,
+    "engagement_posts_per_day": None,
+    "engagement_commenters_per_post": None,
     "last_run_date": None,
+    # Separate from last_run_date's firmographic gate -- engagement mining is opt-in on its own
+    # within one daily run (a partner could enable firmographic discovery without ever having
+    # configured engagement mining), so it needs its own "already ran today" marker rather than
+    # silently piggybacking on firmographic's.
+    "engagement_last_run_date": None,
 }
 
 
@@ -103,6 +129,26 @@ def _validate_config(config: dict) -> None:
 
     if config.get("enabled") and (hour is None or target is None or source is None):
         raise DailyRunConfigError("enabled=true requires schedule_hour_utc, daily_target, and source to all be set")
+
+    if not isinstance(config.get("engagement_mining_enabled"), bool):
+        raise DailyRunConfigError("engagement_mining_enabled must be true/false")
+
+    posts_per_day = config.get("engagement_posts_per_day")
+    if posts_per_day is not None and (not isinstance(posts_per_day, int) or isinstance(posts_per_day, bool) or posts_per_day <= 0):
+        raise DailyRunConfigError("engagement_posts_per_day must be a positive integer, or null")
+
+    commenters_per_post = config.get("engagement_commenters_per_post")
+    if commenters_per_post is not None and (not isinstance(commenters_per_post, int) or isinstance(commenters_per_post, bool) or commenters_per_post <= 0):
+        raise DailyRunConfigError("engagement_commenters_per_post must be a positive integer, or null")
+
+    if config.get("engagement_mining_enabled") and (posts_per_day is None or commenters_per_post is None):
+        raise DailyRunConfigError("engagement_mining_enabled=true requires engagement_posts_per_day and engagement_commenters_per_post to both be set")
+
+    # engagement mining is a SEPARATE objective from firmographic discovery, but they share one
+    # daily run -- turning either on requires the run itself to be scheduled (schedule_hour_utc),
+    # otherwise "enable engagement mining" would silently do nothing (no hour to check it at).
+    if config.get("engagement_mining_enabled") and hour is None:
+        raise DailyRunConfigError("engagement_mining_enabled=true requires schedule_hour_utc to be set (both objectives share one daily trigger time)")
 
 
 def set_daily_run_config(db: Session, tenant_id: int, updates: dict) -> dict:
@@ -222,11 +268,60 @@ def run_partner_discovery_now(batch_id: int, tenant_id: int, source: str, target
         db.close()
 
 
+def run_partner_engagement_mining_now(tenant_id: int, posts_per_day: int, commenters_per_post: int) -> None:
+    """THE ENGAGEMENT-MINING RUNNER -- one call per day (see run_partner_daily_tick_for_tenant),
+    own db session, same "never share a session across threads" discipline as
+    run_partner_discovery_now. Guarantees a PER-POST floor rather than one shared harvest pool:
+    calls the harvest actor once per selected post (each with its own commenters_per_post cap),
+    instead of once for all posts combined -- see this module's own docstring and
+    LINKEDIN_ENGAGEMENT_ACTOR_ID's comment for why a shared call lets one popular post starve
+    the rest. Spend is bounded per call by check_apify_budget, same as every other paid path in
+    this codebase -- a day with a low/exhausted Apify budget simply harvests fewer posts, never
+    raises, never overspends."""
+    import logging
+
+    from app.db.session import SessionLocal
+
+    logger = logging.getLogger(__name__)
+    db = SessionLocal()
+    try:
+        from app.apify_budget_guard import STATUS_ALLOWED, check_apify_budget
+        from app.apify_client import LINKEDIN_ENGAGEMENT_COST_PER_ENGAGER_USD
+        from app.gtm_os.intelligence.engagement_intent import select_relevant_post_urls
+        from app.gtm_os.intelligence.sensing import sense_linkedin_post_engagement, sense_linkedin_post_search
+
+        signals = sense_linkedin_post_search(db, tenant_id)
+        post_urls = select_relevant_post_urls(signals, posts_per_day)
+
+        harvested = 0
+        for post_url in post_urls:
+            budget = check_apify_budget(
+                db, ELEPHANT_EDGE_TENANT_ID, commenters_per_post * LINKEDIN_ENGAGEMENT_COST_PER_ENGAGER_USD,
+                operation="linkedin_engagement",
+            )
+            if budget["status"] != STATUS_ALLOWED:
+                logger.info("partner engagement mining: budget exhausted for tenant_id=%s after %s/%s posts", tenant_id, harvested, len(post_urls))
+                break
+            sense_linkedin_post_engagement(db, tenant_id, [post_url], max_results=commenters_per_post, budget_tenant_id=ELEPHANT_EDGE_TENANT_ID)
+            harvested += 1
+    except Exception:  # noqa: BLE001 -- one objective's failure must never look like a crash with nothing recorded
+        logger.exception("partner engagement mining failed for tenant_id=%s", tenant_id)
+    finally:
+        db.close()
+
+
 def run_partner_daily_tick_for_tenant(db: Session, tenant_id: int, now: datetime | None = None) -> dict:
     """Checked once an hour, per partner tenant, by the scheduler (main.py). Fires the real
-    discovery run (in its own background thread, same as the manual route -- this function
-    itself must return quickly, never block the hourly tick on a multi-minute discovery run)
+    discovery run(s) (each in its own background thread, same as the manual route -- this
+    function itself must return quickly, never block the hourly tick on a multi-minute run)
     exactly once per UTC day, at the tenant's own configured hour.
+
+    TWO INDEPENDENT OBJECTIVES, one shared trigger hour, 2026-09-22 -- firmographic discovery
+    and engagement mining are gated and tracked separately (own enabled flag, own
+    last_run_date), since a tenant could have one configured without the other, but both check
+    the SAME schedule_hour_utc so a partner who wants "both, once a day" gets exactly that. Real
+    correction after engagement mining was found firing every hour with no target: "it should
+    run daily and with a target set."
 
     KNOWN LIMITATION, not silently hidden: a discovery run can occasionally hang (confirmed live
     2026-09-16, root cause not yet found) with no watchdog to kill it. A hung run from one day
@@ -236,7 +331,7 @@ def run_partner_daily_tick_for_tenant(db: Session, tenant_id: int, now: datetime
     import threading
 
     config = get_daily_run_config(db, tenant_id)
-    if not config["enabled"]:
+    if not config["enabled"] and not config["engagement_mining_enabled"]:
         return {"status": "skipped", "reason": "daily run disabled for this tenant"}
 
     now = now or datetime.now(timezone.utc)
@@ -244,31 +339,48 @@ def run_partner_daily_tick_for_tenant(db: Session, tenant_id: int, now: datetime
         return {"status": "skipped", "reason": f"not this tenant's scheduled hour ({config['schedule_hour_utc']} UTC)"}
 
     today_str = now.strftime("%Y-%m-%d")
-    if config.get("last_run_date") == today_str:
-        return {"status": "skipped", "reason": "already ran today"}
+    result: dict = {"firmographic": None, "engagement": None}
 
-    title_search = get_daily_run_title_search(db, tenant_id)
-    if not title_search:
-        return {"status": "skipped", "reason": "enabled, but this tenant's ICP has no title_search set -- fix the ICP, not this config"}
+    if config["enabled"] and config.get("last_run_date") != today_str:
+        title_search = get_daily_run_title_search(db, tenant_id)
+        if not title_search:
+            result["firmographic"] = {"status": "skipped", "reason": "enabled, but this tenant's ICP has no title_search set -- fix the ICP, not this config"}
+        else:
+            batch = Batch(
+                tenant_id=tenant_id, name=f"Partner daily run ({config['source']}) — {now:%Y-%m-%d %H:%M} UTC",
+                source="partner_discovery", current_phase="signal_discovery", status="in_progress",
+            )
+            db.add(batch)
+            db.commit()
+            db.refresh(batch)
 
-    batch = Batch(
-        tenant_id=tenant_id, name=f"Partner daily run ({config['source']}) — {now:%Y-%m-%d %H:%M} UTC",
-        source="partner_discovery", current_phase="signal_discovery", status="in_progress",
-    )
-    db.add(batch)
-    db.commit()
-    db.refresh(batch)
+            # Mark last_run_date BEFORE the thread starts, not after it finishes -- a run that
+            # hangs (see the known limitation above) must not cause the same tenant to fire again
+            # every hour for the rest of the day while the earlier run is still stuck.
+            set_daily_run_config(db, tenant_id, {"last_run_date": today_str})
 
-    # Mark last_run_date BEFORE the thread starts, not after it finishes -- a run that hangs
-    # (see the known limitation above) must not cause the same tenant to fire again every hour
-    # for the rest of the day while the earlier run is still stuck.
-    set_daily_run_config(db, tenant_id, {"last_run_date": today_str})
+            thread = threading.Thread(
+                target=run_partner_discovery_now,
+                args=(batch.id, tenant_id, config["source"], config["daily_target"], title_search, config["pages"]),
+                daemon=True,
+            )
+            thread.start()
+            result["firmographic"] = {"status": "started", "batch_id": batch.id}
+    elif config["enabled"]:
+        result["firmographic"] = {"status": "skipped", "reason": "already ran today"}
 
-    thread = threading.Thread(
-        target=run_partner_discovery_now,
-        args=(batch.id, tenant_id, config["source"], config["daily_target"], title_search, config["pages"]),
-        daemon=True,
-    )
-    thread.start()
+    if config["engagement_mining_enabled"] and config.get("engagement_last_run_date") != today_str:
+        set_daily_run_config(db, tenant_id, {"engagement_last_run_date": today_str})
+        thread = threading.Thread(
+            target=run_partner_engagement_mining_now,
+            args=(tenant_id, config["engagement_posts_per_day"], config["engagement_commenters_per_post"]),
+            daemon=True,
+        )
+        thread.start()
+        result["engagement"] = {"status": "started"}
+    elif config["engagement_mining_enabled"]:
+        result["engagement"] = {"status": "skipped", "reason": "already ran today"}
 
-    return {"status": "started", "batch_id": batch.id}
+    if result["firmographic"] is None and result["engagement"] is None:
+        return {"status": "skipped", "reason": "neither objective is enabled for this tenant"}
+    return {"status": "started" if "started" in (result["firmographic"] or {}).get("status", "") or "started" in (result["engagement"] or {}).get("status", "") else "skipped", **result}
