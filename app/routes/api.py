@@ -4563,6 +4563,32 @@ def post_gtm_os_content_opportunity_generate_draft(content_opportunity_id: int, 
     return generate_content_draft(db, _resolve_tenant_id(request), content_opportunity_id, platform=platform)
 
 
+@router.post("/gtm-os/content-opportunities/{content_opportunity_id}/publish-wordpress")
+def post_gtm_os_content_opportunity_publish_wordpress(content_opportunity_id: int, request: Request, payload: dict = Body(default={}), db: Session = Depends(get_db)):
+    """Direct publish (2026-09-22, explicit instruction: "no need to touch any wordpress") --
+    only ever called on an already-generated blog draft the user has already reviewed in this
+    dashboard; see wordpress_publish.py's own module docstring for why this is one explicit
+    click, not a second manual step."""
+    from app.gtm_os.content.content_opportunity import ContentOpportunity
+    from app.gtm_os.content.wordpress_publish import publish_blog_to_wordpress
+
+    tenant_id = _resolve_tenant_id(request)
+    o = db.get(ContentOpportunity, content_opportunity_id)
+    if o is None or o.tenant_id != tenant_id:
+        raise HTTPException(status_code=404, detail="Content opportunity not found")
+    draft = (o.drafts or {}).get("blog")
+    if not draft:
+        raise HTTPException(status_code=400, detail="No blog draft generated yet for this opportunity")
+
+    title = payload.get("title") or o.headline
+    if not title:
+        from app.gtm_os.content.topic import ContentTopic
+        topic = db.get(ContentTopic, o.content_topic_id)
+        title = topic.canonical_name if topic else "Untitled"
+
+    return publish_blog_to_wordpress(db, tenant_id, title, draft)
+
+
 @router.get("/gtm-os/debug/signal-texts")
 def get_gtm_os_debug_signal_texts(limit: int = 500, db: Session = Depends(get_db)):
     """TEMPORARY read-only diagnostic (2026-08-19) -- dumps the exact text topic_linking.py's
