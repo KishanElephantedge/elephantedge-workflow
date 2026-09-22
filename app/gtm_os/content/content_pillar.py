@@ -368,6 +368,10 @@ Also naturally mention, near the end, that {business_name}'s real offering "{off
 the practical next step for a reader convinced by this piece -- woven into the narrative, never a \
 bolted-on sales pitch.
 
+This will be copied and pasted directly into the real publishing tool, never rendered from \
+markdown -- so write PLAIN TEXT ONLY: no #, ##, **, __, or - used as formatting, and no em dash \
+or en dash anywhere (rewrite the sentence instead).
+
 Return JSON exactly:
 {{"draft_text": "<the full sub-blog>"}}"""
 

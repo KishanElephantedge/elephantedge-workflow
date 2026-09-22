@@ -295,7 +295,12 @@ VALID_PLATFORMS = {"blog", "linkedin", "linkedin_article", "twitter"}
 # (2026-08-28 explicit instruction). Grounded in how these platforms actually differ, not
 # invented style rules.
 PLATFORM_BRIEF = {
-    "blog": "A blog post (500-700 words): structured with a clear opening hook, 2-3 body sections, and a real conclusion. Can go deeper into the evidence and reasoning than a social post would.",
+    "blog": (
+        "A blog post (500-700 words): structured with a clear opening hook, 2-3 body sections, "
+        "and a real conclusion. Can go deeper into the evidence and reasoning than a social post "
+        "would, and paragraphs can run longer (3-5 sentences) since a reader is settling in to "
+        "read, not scrolling a feed."
+    ),
     "linkedin_article": (
         "A LinkedIn Article (LinkedIn's long-form publishing format, 900-1400 words) -- NOT a "
         "short feed post. Has a real title and can use a few plain subheadings, but the body "
@@ -303,7 +308,9 @@ PLATFORM_BRIEF = {
         "rules above) rather than reading as a listicle or a report with headers stacked for "
         "their own sake. Written for someone who clicked in because the title promised a real "
         "answer to something they're stuck on -- longer than a feed post, but still a story, "
-        "never a whitepaper."
+        "never a whitepaper. Keep paragraphs SHORT (1-3 sentences) with a blank line between "
+        "each -- LinkedIn's own reading pattern is scannable white space, not dense blocks, even "
+        "in the long-form format."
     ),
     "linkedin": (
         "A LinkedIn post (120-200 words): short paragraphs or line breaks, no headers, "
@@ -368,6 +375,13 @@ Real evidence this is grounded in:
 
 Format for this platform specifically: {platform_brief}
 {expedition_guidance}
+
+This will be copied and pasted directly into the real publishing tool (LinkedIn's own editor or \
+a blog CMS), never rendered from markdown -- so write PLAIN TEXT ONLY. No markdown syntax at all: \
+no #, ##, **, __, or - used as formatting. If a title or subheading is needed, write it as its \
+own plain line followed by a blank line, nothing else marking it as a heading. Never use an em \
+dash or en dash (-- or a long dash character) anywhere -- rewrite the sentence instead (a comma, \
+period, or "and"/"but" always works).
 
 Write in {business_name}'s real voice: direct, no fluff, grounded in real evidence, consistent \
 with this positioning: {positioning}. Return JSON exactly:
@@ -489,6 +503,10 @@ What the user asked to write about: {user_request}
 Real audience: {audience}
 
 Format for this platform specifically: {platform_brief}
+
+This will be copied and pasted directly into the real publishing tool, never rendered from \
+markdown -- so write PLAIN TEXT ONLY: no #, ##, **, __, or - used as formatting, and no em dash \
+or en dash anywhere (rewrite the sentence instead).
 
 Write in {business_name}'s real voice: direct, no fluff, a genuine point of view -- not a \
 generic listicle unless the user specifically asked for one. Return JSON exactly:

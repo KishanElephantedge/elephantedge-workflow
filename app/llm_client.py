@@ -38,6 +38,7 @@ Whichever is primary, the other is the fallback, so an outage or an exhausted ba
 side degrades to a working model instead of failing the run.
 """
 import logging
+import re
 
 from sqlalchemy.orm import Session
 
@@ -45,6 +46,30 @@ from app.claude_client import ClaudeError, call_claude, call_claude_json
 from app.gemini_client import GeminiError, call_gemini, call_gemini_json
 
 logger = logging.getLogger("llm_client")
+
+# Both models default to em/en dashes constantly regardless of prompt wording -- flagged live
+# (2026-09-22) as reading as an obvious tell that content is AI-written. Cheaper and more
+# reliable to sanitize every string this module ever returns, once, here, than to depend on
+# every future prompt remembering to ask nicely. Applied to every generate_text/generate_json
+# caller in the whole codebase, not just content -- the same "obviously AI" problem applies
+# everywhere text reaches a real human.
+_DASH_REPLACEMENTS = {"—": ", ", "–": "-", "―": ", "}
+
+
+def _sanitize_text(s: str) -> str:
+    for ch, repl in _DASH_REPLACEMENTS.items():
+        s = s.replace(ch, repl)
+    return re.sub(r" {2,}", " ", s)
+
+
+def _sanitize(value):
+    if isinstance(value, str):
+        return _sanitize_text(value)
+    if isinstance(value, list):
+        return [_sanitize(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _sanitize(v) for k, v in value.items()}
+    return value
 
 # Set to "claude" the moment the Anthropic account has credit -- that is the whole point of this
 # switch and the reason both paths are wired. It is "gemini" today ONLY because Anthropic returns
@@ -205,27 +230,31 @@ def generate_text(prompt: str, db: Session, tenant_id: int, max_tokens: int = 20
     _gate(db, tenant_id)
     if PRIMARY == "gemini":
         try:
-            return _gemini_with_model_fallback(call_gemini, prompt, db, tenant_id, max_tokens)
+            result = _gemini_with_model_fallback(call_gemini, prompt, db, tenant_id, max_tokens)
         except GeminiError as e:
             logger.warning("Gemini call failed, falling back to Claude Haiku: %s", e)
-            return call_claude(prompt, db, tenant_id, max_tokens=max_tokens)
-    try:
-        return call_claude(prompt, db, tenant_id, max_tokens=max_tokens)
-    except ClaudeError as e:
-        logger.warning("Claude call failed, falling back to Gemini: %s", e)
-        return _gemini_with_model_fallback(call_gemini, prompt, db, tenant_id, max_tokens)
+            result = call_claude(prompt, db, tenant_id, max_tokens=max_tokens)
+    else:
+        try:
+            result = call_claude(prompt, db, tenant_id, max_tokens=max_tokens)
+        except ClaudeError as e:
+            logger.warning("Claude call failed, falling back to Gemini: %s", e)
+            result = _gemini_with_model_fallback(call_gemini, prompt, db, tenant_id, max_tokens)
+    return _sanitize_text(result)
 
 
 def generate_json(prompt: str, db: Session, tenant_id: int, max_tokens: int = 2000) -> dict:
     _gate(db, tenant_id)
     if PRIMARY == "gemini":
         try:
-            return _gemini_with_model_fallback(call_gemini_json, prompt, db, tenant_id, max_tokens)
+            result = _gemini_with_model_fallback(call_gemini_json, prompt, db, tenant_id, max_tokens)
         except GeminiError as e:
             logger.warning("Gemini call failed, falling back to Claude Haiku: %s", e)
-            return call_claude_json(prompt, db, tenant_id, max_tokens=max_tokens)
-    try:
-        return call_claude_json(prompt, db, tenant_id, max_tokens=max_tokens)
-    except ClaudeError as e:
-        logger.warning("Claude call failed, falling back to Gemini: %s", e)
-        return _gemini_with_model_fallback(call_gemini_json, prompt, db, tenant_id, max_tokens)
+            result = call_claude_json(prompt, db, tenant_id, max_tokens=max_tokens)
+    else:
+        try:
+            result = call_claude_json(prompt, db, tenant_id, max_tokens=max_tokens)
+        except ClaudeError as e:
+            logger.warning("Claude call failed, falling back to Gemini: %s", e)
+            result = _gemini_with_model_fallback(call_gemini_json, prompt, db, tenant_id, max_tokens)
+    return _sanitize(result)
