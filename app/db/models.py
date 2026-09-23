@@ -475,6 +475,38 @@ class Notification(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
+class CrmLead(Base):
+    """Sandy Yu's (tenant_id=6) webinar outreach CRM -- her own stated pain point (per Slack):
+    no structured way to see where each outreach target is in the process. `stage` is an
+    explicit pipeline, not a generic status: imported -> fit_review -> enriched -> outreached ->
+    replied -> registered -> attended, plus no_response/not_interested as terminal side-states --
+    mirrors the real workflow (raw import, then company/role fit BEFORE spending on email
+    enrichment, per Majji's own instruction on the JV Sales Nav file) rather than just a send/
+    reply funnel. One row per PERSON. `event` is a plain string (e.g. "2026-10-08-sf") so the
+    other 4 events in the series need no schema change. See app/db/session.py's ensure_indexes()
+    for the real table DDL and dedup index (tenant_id, event, profile_linkedin_url)."""
+    __tablename__ = "crm_leads"
+
+    id = Column(Integer, primary_key=True)
+    tenant_id = Column(Integer, nullable=False)
+    event = Column(String, nullable=False)
+    first_name = Column(String, nullable=True)
+    last_name = Column(String, nullable=True)
+    title = Column(String, nullable=True)
+    company_name = Column(String, nullable=True)
+    company_linkedin_url = Column(String, nullable=True)
+    profile_linkedin_url = Column(String, nullable=True)
+    email = Column(String, nullable=True)
+    email_source = Column(String, nullable=True)
+    source_file = Column(String, nullable=False)  # "JV Sales Nav" | "Joe Fontana" | "SalesIntel SF" | ...
+    stage = Column(String, nullable=False, default="imported")
+    role_fit = Column(String, nullable=True)  # "pass" | "fail" | null (not yet checked)
+    company_fit = Column(String, nullable=True)  # "pass" | "fail" | null (not yet checked)
+    fit_notes = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
 class AutonomousRun(Base):
     __tablename__ = "autonomous_runs"
 

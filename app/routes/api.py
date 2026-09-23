@@ -15,7 +15,7 @@ from sqlalchemy import func, or_
 
 from app.cache import active_keys, bump_batch_version, cache_get, cache_set, get_batch_version, mark_active
 from app.claude_client import DEFAULT_MODEL as DEFAULT_CHAT_MODEL, ClaudeError, call_claude_messages
-from app.db.models import AutonomousRun, Batch, CalendarBooking, CampaignEvent, CampaignPush, ChatConversation, ChatMessage, Company, Contact, Credential, DailyReview, LinkedinMonitorProfile, LinkedinMonitorSignal, Notification, Parameter, PartnerCompanyRecommendation, PartnerRecommendationMessage, PersonalizedMessage, Proposal, ReverseDiscoveryCandidate, ReviewComment, Score
+from app.db.models import AutonomousRun, Batch, CalendarBooking, CampaignEvent, CampaignPush, ChatConversation, ChatMessage, Company, Contact, CrmLead, Credential, DailyReview, LinkedinMonitorProfile, LinkedinMonitorSignal, Notification, Parameter, PartnerCompanyRecommendation, PartnerRecommendationMessage, PersonalizedMessage, Proposal, ReverseDiscoveryCandidate, ReviewComment, Score
 from app.notifications import create_notification, delete_expired_notifications
 from app.google_calendar_client import GoogleCalendarError
 from app.phases.hiring_signal import has_qualifying_hiring_signal
@@ -6122,7 +6122,126 @@ def enrich_partner_account(account_id: str, request: Request, db: Session = Depe
     if result["status"] == "not_found":
         raise HTTPException(status_code=404, detail="Not found")
     return result
-    raise HTTPException(status_code=404, detail="Not found")
+
+
+# ---- Sandy Yu webinar outreach CRM (2026-09-23) ----
+# Her own stated pain point (per Slack): no structured way to see where each outreach target is
+# in the process. See CrmLead's own model docstring (app/db/models.py) for the full stage
+# design. Tenant-scoped the same way every other partner route is (X-Tenant-Id via
+# _resolve_tenant_id) -- not hardcoded to Sandy's tenant id, so this is reusable if another
+# partner needs the same kind of tracked outreach campaign later.
+CRM_STAGES = ["imported", "fit_review", "enriched", "outreached", "replied", "registered", "attended", "no_response", "not_interested"]
+
+
+def _crm_lead_dict(lead: CrmLead) -> dict:
+    return {
+        "id": lead.id,
+        "event": lead.event,
+        "first_name": lead.first_name,
+        "last_name": lead.last_name,
+        "title": lead.title,
+        "company_name": lead.company_name,
+        "company_linkedin_url": lead.company_linkedin_url,
+        "profile_linkedin_url": lead.profile_linkedin_url,
+        "email": lead.email,
+        "email_source": lead.email_source,
+        "source_file": lead.source_file,
+        "stage": lead.stage,
+        "role_fit": lead.role_fit,
+        "company_fit": lead.company_fit,
+        "fit_notes": lead.fit_notes,
+        "created_at": lead.created_at.isoformat() if lead.created_at else None,
+        "updated_at": lead.updated_at.isoformat() if lead.updated_at else None,
+    }
+
+
+@router.get("/gtm-os/partner/crm/leads")
+def list_crm_leads(
+    request: Request, page: int = 1, page_size: int = 50, search: str = "",
+    event: str = "", stage: str = "", source_file: str = "", db: Session = Depends(get_db),
+):
+    tenant_id = _resolve_tenant_id(request)
+    query = db.query(CrmLead).filter(CrmLead.tenant_id == tenant_id)
+    if event:
+        query = query.filter(CrmLead.event == event)
+    if stage:
+        query = query.filter(CrmLead.stage == stage)
+    if source_file:
+        query = query.filter(CrmLead.source_file == source_file)
+    if search.strip():
+        like = f"%{search.strip()}%"
+        query = query.filter(or_(CrmLead.first_name.ilike(like), CrmLead.last_name.ilike(like), CrmLead.company_name.ilike(like)))
+
+    leads = query.order_by(CrmLead.created_at.desc()).all()
+    total = len(leads)
+    page = max(page, 1)
+    page_size = max(1, min(page_size, 200))
+    page_items = leads[(page - 1) * page_size: page * page_size]
+
+    # Stage counts -- ALWAYS the true totals for the selected event/source_file/search, so the
+    # filter pills read correctly regardless of which stage tab is currently active. Computed
+    # over the same pre-stage-filter query, not the already-narrowed `leads` list above.
+    base_query = db.query(CrmLead).filter(CrmLead.tenant_id == tenant_id)
+    if event:
+        base_query = base_query.filter(CrmLead.event == event)
+    if source_file:
+        base_query = base_query.filter(CrmLead.source_file == source_file)
+    stage_counts = {s: 0 for s in CRM_STAGES}
+    for s, count in base_query.with_entities(CrmLead.stage, func.count(CrmLead.id)).group_by(CrmLead.stage).all():
+        stage_counts[s] = count
+
+    return {
+        "page": page, "page_size": page_size, "total": total,
+        "total_pages": (total + page_size - 1) // page_size if total else 0,
+        "stage_counts": stage_counts,
+        "leads": [_crm_lead_dict(lead) for lead in page_items],
+    }
+
+
+@router.get("/gtm-os/partner/crm/leads/{lead_id}")
+def get_crm_lead(lead_id: int, request: Request, db: Session = Depends(get_db)):
+    tenant_id = _resolve_tenant_id(request)
+    lead = db.get(CrmLead, lead_id)
+    if lead is None or lead.tenant_id != tenant_id:
+        raise HTTPException(status_code=404, detail="Not found")
+    return _crm_lead_dict(lead)
+
+
+class CrmLeadUpdate(BaseModel):
+    stage: str | None = None
+    role_fit: str | None = None
+    company_fit: str | None = None
+    fit_notes: str | None = None
+    email: str | None = None
+    email_source: str | None = None
+
+
+@router.patch("/gtm-os/partner/crm/leads/{lead_id}")
+def update_crm_lead(lead_id: int, updates: CrmLeadUpdate, request: Request, db: Session = Depends(get_db)):
+    """Moves a lead's stage, or fills in fit/enrichment fields -- the one write path this whole
+    CRM uses, real fields only, never a free-text status string that would drift from CRM_STAGES."""
+    tenant_id = _resolve_tenant_id(request)
+    lead = db.get(CrmLead, lead_id)
+    if lead is None or lead.tenant_id != tenant_id:
+        raise HTTPException(status_code=404, detail="Not found")
+
+    if updates.stage is not None:
+        if updates.stage not in CRM_STAGES:
+            raise HTTPException(status_code=400, detail=f"stage must be one of {CRM_STAGES}")
+        lead.stage = updates.stage
+    if updates.role_fit is not None:
+        lead.role_fit = updates.role_fit
+    if updates.company_fit is not None:
+        lead.company_fit = updates.company_fit
+    if updates.fit_notes is not None:
+        lead.fit_notes = updates.fit_notes
+    if updates.email is not None:
+        lead.email = updates.email
+    if updates.email_source is not None:
+        lead.email_source = updates.email_source
+    db.commit()
+    db.refresh(lead)
+    return _crm_lead_dict(lead)
 
 
 # Real, documented LinkedIn URL pattern (the same one LinkedIn's own "Copy link to comment"

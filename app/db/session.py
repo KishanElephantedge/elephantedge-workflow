@@ -1002,3 +1002,38 @@ def ensure_indexes():
             )
         """))
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_provider_spend_tenant_provider_date ON provider_spend_ledger (tenant_id, provider, spend_date)"))
+
+        # 2026-09-23 -- Sandy Yu (partner:sandy-yu, tenant_id=6) webinar outreach CRM. Her own
+        # stated pain point (per Slack): no structured way to see where each outreach target is
+        # in the process. Explicit stage design, not a generic status string: "first all these
+        # and next step or column will be next thing company fit and role fit and next step in
+        # that all the enriched data/details" -- the pipeline mirrors the real workflow (raw
+        # import -> fit review -> enriched -> outreach funnel), not just a send/reply/no-reply
+        # funnel, because company/role fit has to be decided BEFORE spending on email enrichment
+        # (Majji's own instruction on file 1/JV Sales Nav). One row per PERSON, tagged with which
+        # source file they came from and which event they're being worked for (Oct 8 SF is the
+        # only one configured today; event is a plain string so the other 4 need no schema change).
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS crm_leads (
+                id SERIAL PRIMARY KEY,
+                tenant_id INTEGER NOT NULL,
+                event VARCHAR NOT NULL,
+                first_name VARCHAR,
+                last_name VARCHAR,
+                title VARCHAR,
+                company_name VARCHAR,
+                company_linkedin_url VARCHAR,
+                profile_linkedin_url VARCHAR,
+                email VARCHAR,
+                email_source VARCHAR,
+                source_file VARCHAR NOT NULL,
+                stage VARCHAR NOT NULL DEFAULT 'imported',
+                role_fit VARCHAR,
+                company_fit VARCHAR,
+                fit_notes TEXT,
+                created_at TIMESTAMP DEFAULT now(),
+                updated_at TIMESTAMP DEFAULT now()
+            )
+        """))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_crm_leads_tenant_event_stage ON crm_leads (tenant_id, event, stage)"))
+        conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ux_crm_leads_dedup ON crm_leads (tenant_id, event, profile_linkedin_url)"))
