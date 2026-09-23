@@ -119,3 +119,40 @@ def test_search_matches_name_and_company(db):
     data = resp.json()
     assert data["total"] == 1
     assert data["leads"][0]["last_name"] == "Mooney"
+
+
+def test_source_file_filter_shows_only_that_list(db):
+    _make_lead(db, source_file="JV Sales Nav", profile_linkedin_url="https://linkedin.com/in/a")
+    _make_lead(db, source_file="SalesIntel SF", profile_linkedin_url="https://linkedin.com/in/b")
+
+    resp = client.get("/api/gtm-os/partner/crm/leads", headers={"X-Tenant-Id": str(TENANT)}, params={"source_file": "SalesIntel SF"})
+    data = resp.json()
+    assert data["total"] == 1
+    assert data["leads"][0]["source_file"] == "SalesIntel SF"
+    assert set(data["source_files"]) == {"JV Sales Nav", "SalesIntel SF"}, "source_files must list every real list for this tenant"
+
+
+def test_company_fit_filter_pass_vs_pending(db):
+    _make_lead(db, company_fit="pass", profile_linkedin_url="https://linkedin.com/in/a")
+    _make_lead(db, company_fit="fail", profile_linkedin_url="https://linkedin.com/in/b")
+    _make_lead(db, company_fit=None, profile_linkedin_url="https://linkedin.com/in/c")
+
+    resp_pass = client.get("/api/gtm-os/partner/crm/leads", headers={"X-Tenant-Id": str(TENANT)}, params={"company_fit": "pass"})
+    assert resp_pass.json()["total"] == 1
+
+    resp_pending = client.get("/api/gtm-os/partner/crm/leads", headers={"X-Tenant-Id": str(TENANT)}, params={"company_fit": "pending"})
+    assert resp_pending.json()["total"] == 1, "pending must mean company_fit IS NULL, not a literal string"
+
+
+def test_role_fit_and_source_file_combine(db):
+    _make_lead(db, source_file="SalesIntel SF", role_fit="pass", profile_linkedin_url="https://linkedin.com/in/a")
+    _make_lead(db, source_file="SalesIntel SF", role_fit="fail", profile_linkedin_url="https://linkedin.com/in/b")
+    _make_lead(db, source_file="JV Sales Nav", role_fit="pass", profile_linkedin_url="https://linkedin.com/in/c")
+
+    resp = client.get(
+        "/api/gtm-os/partner/crm/leads", headers={"X-Tenant-Id": str(TENANT)},
+        params={"source_file": "SalesIntel SF", "role_fit": "pass"},
+    )
+    data = resp.json()
+    assert data["total"] == 1
+    assert data["leads"][0]["profile_linkedin_url"] == "https://linkedin.com/in/a"

@@ -6158,8 +6158,13 @@ def _crm_lead_dict(lead: CrmLead) -> dict:
 @router.get("/gtm-os/partner/crm/leads")
 def list_crm_leads(
     request: Request, page: int = 1, page_size: int = 50, search: str = "",
-    event: str = "", stage: str = "", source_file: str = "", db: Session = Depends(get_db),
+    event: str = "", stage: str = "", source_file: str = "",
+    role_fit: str = "", company_fit: str = "", db: Session = Depends(get_db),
 ):
+    """role_fit/company_fit accept "pass" | "fail" | "pending" (pending means the column IS
+    NULL -- not yet checked, distinct from a real fail). source_file is a real per-list filter
+    ("show me only SalesIntel SF, not everything mixed together" -- explicit ask 2026-09-23),
+    not just a display label."""
     tenant_id = _resolve_tenant_id(request)
     query = db.query(CrmLead).filter(CrmLead.tenant_id == tenant_id)
     if event:
@@ -6168,6 +6173,10 @@ def list_crm_leads(
         query = query.filter(CrmLead.stage == stage)
     if source_file:
         query = query.filter(CrmLead.source_file == source_file)
+    if role_fit:
+        query = query.filter(CrmLead.role_fit.is_(None) if role_fit == "pending" else CrmLead.role_fit == role_fit)
+    if company_fit:
+        query = query.filter(CrmLead.company_fit.is_(None) if company_fit == "pending" else CrmLead.company_fit == company_fit)
     if search.strip():
         like = f"%{search.strip()}%"
         query = query.filter(or_(CrmLead.first_name.ilike(like), CrmLead.last_name.ilike(like), CrmLead.company_name.ilike(like)))
@@ -6178,22 +6187,34 @@ def list_crm_leads(
     page_size = max(1, min(page_size, 200))
     page_items = leads[(page - 1) * page_size: page * page_size]
 
-    # Stage counts -- ALWAYS the true totals for the selected event/source_file/search, so the
-    # filter pills read correctly regardless of which stage tab is currently active. Computed
-    # over the same pre-stage-filter query, not the already-narrowed `leads` list above.
+    # Stage counts -- ALWAYS the true totals for the selected event/source_file/fit/search, so
+    # the filter pills read correctly regardless of which stage tab is currently active.
+    # Computed over the same pre-stage-filter query, not the already-narrowed `leads` list above.
     base_query = db.query(CrmLead).filter(CrmLead.tenant_id == tenant_id)
     if event:
         base_query = base_query.filter(CrmLead.event == event)
     if source_file:
         base_query = base_query.filter(CrmLead.source_file == source_file)
+    if role_fit:
+        base_query = base_query.filter(CrmLead.role_fit.is_(None) if role_fit == "pending" else CrmLead.role_fit == role_fit)
+    if company_fit:
+        base_query = base_query.filter(CrmLead.company_fit.is_(None) if company_fit == "pending" else CrmLead.company_fit == company_fit)
     stage_counts = {s: 0 for s in CRM_STAGES}
     for s, count in base_query.with_entities(CrmLead.stage, func.count(CrmLead.id)).group_by(CrmLead.stage).all():
         stage_counts[s] = count
+
+    # Real distinct source files for THIS tenant/event -- lets the UI's "which list" dropdown
+    # populate itself instead of hardcoding file names that will drift as new lists get imported.
+    source_files = [
+        row[0] for row in
+        db.query(CrmLead.source_file).filter(CrmLead.tenant_id == tenant_id).distinct().order_by(CrmLead.source_file).all()
+    ]
 
     return {
         "page": page, "page_size": page_size, "total": total,
         "total_pages": (total + page_size - 1) // page_size if total else 0,
         "stage_counts": stage_counts,
+        "source_files": source_files,
         "leads": [_crm_lead_dict(lead) for lead in page_items],
     }
 
