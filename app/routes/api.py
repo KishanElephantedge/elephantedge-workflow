@@ -6150,6 +6150,9 @@ def _crm_lead_dict(lead: CrmLead) -> dict:
         "role_fit": lead.role_fit,
         "company_fit": lead.company_fit,
         "fit_notes": lead.fit_notes,
+        "industry": lead.industry,
+        "estimated_revenue": lead.estimated_revenue,
+        "employee_count": lead.employee_count,
         "created_at": lead.created_at.isoformat() if lead.created_at else None,
         "updated_at": lead.updated_at.isoformat() if lead.updated_at else None,
     }
@@ -6235,6 +6238,9 @@ class CrmLeadUpdate(BaseModel):
     fit_notes: str | None = None
     email: str | None = None
     email_source: str | None = None
+    industry: str | None = None
+    estimated_revenue: str | None = None
+    employee_count: str | None = None
 
 
 @router.patch("/gtm-os/partner/crm/leads/{lead_id}")
@@ -6260,6 +6266,12 @@ def update_crm_lead(lead_id: int, updates: CrmLeadUpdate, request: Request, db: 
         lead.email = updates.email
     if updates.email_source is not None:
         lead.email_source = updates.email_source
+    if updates.industry is not None:
+        lead.industry = updates.industry
+    if updates.estimated_revenue is not None:
+        lead.estimated_revenue = updates.estimated_revenue
+    if updates.employee_count is not None:
+        lead.employee_count = updates.employee_count
     db.commit()
     db.refresh(lead)
     return _crm_lead_dict(lead)

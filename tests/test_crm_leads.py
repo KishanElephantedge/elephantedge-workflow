@@ -156,3 +156,18 @@ def test_role_fit_and_source_file_combine(db):
     data = resp.json()
     assert data["total"] == 1
     assert data["leads"][0]["profile_linkedin_url"] == "https://linkedin.com/in/a"
+
+
+def test_fit_check_fields_industry_revenue_size_round_trip(db):
+    lead = _make_lead(db)
+    resp = client.patch(
+        f"/api/gtm-os/partner/crm/leads/{lead.id}", headers={"X-Tenant-Id": str(TENANT)},
+        json={"industry": "Software Development", "estimated_revenue": "$10M-$75M", "employee_count": "51-200 employees"},
+    )
+    body = resp.json()
+    assert body["industry"] == "Software Development"
+    assert body["estimated_revenue"] == "$10M-$75M"
+    assert body["employee_count"] == "51-200 employees"
+
+    listed = client.get("/api/gtm-os/partner/crm/leads", headers={"X-Tenant-Id": str(TENANT)}).json()
+    assert listed["leads"][0]["industry"] == "Software Development"

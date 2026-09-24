@@ -1037,3 +1037,9 @@ def ensure_indexes():
         """))
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_crm_leads_tenant_event_stage ON crm_leads (tenant_id, event, stage)"))
         conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ux_crm_leads_dedup ON crm_leads (tenant_id, event, profile_linkedin_url)"))
+
+        # 2026-09-24 -- real fit-check fields for the UI (industry/revenue/size shown alongside
+        # the pass/fail badge, not just a free-text note). See CrmLead's own model comment.
+        conn.execute(text("ALTER TABLE crm_leads ADD COLUMN IF NOT EXISTS industry VARCHAR"))
+        conn.execute(text("ALTER TABLE crm_leads ADD COLUMN IF NOT EXISTS estimated_revenue VARCHAR"))
+        conn.execute(text("ALTER TABLE crm_leads ADD COLUMN IF NOT EXISTS employee_count VARCHAR"))

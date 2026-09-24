@@ -503,6 +503,13 @@ class CrmLead(Base):
     role_fit = Column(String, nullable=True)  # "pass" | "fail" | null (not yet checked)
     company_fit = Column(String, nullable=True)  # "pass" | "fail" | null (not yet checked)
     fit_notes = Column(Text, nullable=True)
+    # Real fit-check fields, added 2026-09-24 so the UI can show exactly what was checked
+    # (industry/revenue/size) instead of only a pass/fail badge + a free-text note. String, not
+    # numeric -- source data is routinely a range/bucket ("51-200 employees", "$10M-$75M"), not
+    # a clean point figure; forcing a number would fabricate precision the sources don't have.
+    industry = Column(String, nullable=True)
+    estimated_revenue = Column(String, nullable=True)
+    employee_count = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
