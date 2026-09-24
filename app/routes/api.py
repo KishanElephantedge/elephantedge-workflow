@@ -6222,6 +6222,56 @@ def list_crm_leads(
     }
 
 
+@router.get("/gtm-os/partner/crm/leads/export")
+def export_crm_leads(
+    request: Request, search: str = "", event: str = "", stage: str = "",
+    source_file: str = "", role_fit: str = "", company_fit: str = "", db: Session = Depends(get_db),
+):
+    """Same filters as list_crm_leads, but every matching row (no pagination) as a direct CSV
+    download -- the button downloads exactly what's on screen, not just the current page."""
+    tenant_id = _resolve_tenant_id(request)
+    query = db.query(CrmLead).filter(CrmLead.tenant_id == tenant_id)
+    if event:
+        query = query.filter(CrmLead.event == event)
+    if stage:
+        query = query.filter(CrmLead.stage == stage)
+    if source_file:
+        query = query.filter(CrmLead.source_file == source_file)
+    if role_fit:
+        query = query.filter(CrmLead.role_fit.is_(None) if role_fit == "pending" else CrmLead.role_fit == role_fit)
+    if company_fit:
+        query = query.filter(CrmLead.company_fit.is_(None) if company_fit == "pending" else CrmLead.company_fit == company_fit)
+    if search.strip():
+        like = f"%{search.strip()}%"
+        query = query.filter(or_(CrmLead.first_name.ilike(like), CrmLead.last_name.ilike(like), CrmLead.company_name.ilike(like)))
+    leads = query.order_by(CrmLead.created_at.desc()).all()
+
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow([
+        "id", "event", "first_name", "last_name", "title", "company_name", "company_linkedin_url",
+        "profile_linkedin_url", "email", "email_source", "source_file", "stage", "role_fit",
+        "company_fit", "fit_notes", "industry", "estimated_revenue", "employee_count",
+        "created_at", "updated_at",
+    ])
+    for lead in leads:
+        writer.writerow([
+            lead.id, lead.event, lead.first_name, lead.last_name, lead.title, lead.company_name,
+            lead.company_linkedin_url, lead.profile_linkedin_url, lead.email, lead.email_source,
+            lead.source_file, lead.stage, lead.role_fit, lead.company_fit, lead.fit_notes,
+            lead.industry, lead.estimated_revenue, lead.employee_count,
+            lead.created_at.isoformat() if lead.created_at else "",
+            lead.updated_at.isoformat() if lead.updated_at else "",
+        ])
+
+    filename = f"crm_leads_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.csv"
+    return Response(
+        content=buf.getvalue(),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
 @router.get("/gtm-os/partner/crm/leads/{lead_id}")
 def get_crm_lead(lead_id: int, request: Request, db: Session = Depends(get_db)):
     tenant_id = _resolve_tenant_id(request)
