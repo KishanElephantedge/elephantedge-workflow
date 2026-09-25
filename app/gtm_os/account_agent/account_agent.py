@@ -345,7 +345,7 @@ def build_account_brief(db: Session, tenant_id: int, company_id: int) -> dict:
         "account_status": account_status,
         "company": _company_dict(company),
         "contacts": [
-            {"id": c.id, "first_name": c.first_name, "last_name": c.last_name, "title": c.title, "linkedin_url": c.linkedin_url, "has_email": c.email is not None}
+            {"id": c.id, "first_name": c.first_name, "last_name": c.last_name, "title": c.title, "linkedin_url": c.linkedin_url, "email": c.email, "has_email": c.email is not None}
             for c in contacts
         ],
         "decision_maker": decision_maker,

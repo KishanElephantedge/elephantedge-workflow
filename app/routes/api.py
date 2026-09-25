@@ -6,6 +6,7 @@ import logging
 import re
 from collections import Counter
 from datetime import datetime, timedelta
+from typing import Callable
 from urllib.parse import quote
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Request, Response
@@ -1348,6 +1349,168 @@ def list_companies(request: Request, page: int = 1, page_size: int = 25, search:
             for c in page_items
         ],
     }
+
+
+# Accounts CSV export (2026-09-26, explicit ask: "add what and all we can download -- all means
+# all companies and decision-makers, companies means all companies, contacts means all the
+# contacts... add all the columns whatever required"). Column keys are stable strings the
+# frontend sends back in `columns` to pick a subset -- every column is opt-in via this registry,
+# not a fixed CSV shape, so adding a new exportable field later is a one-line addition here.
+_COMPANY_EXPORT_COLUMNS: dict[str, tuple[str, Callable]] = {
+    "company_id": ("Company ID", lambda c, ctx: c.id),
+    "company_name": ("Company Name", lambda c, ctx: c.name),
+    "domain": ("Domain", lambda c, ctx: c.domain),
+    "industry": ("Industry", lambda c, ctx: c.industry),
+    "company_linkedin_url": ("Company LinkedIn URL", lambda c, ctx: c.linkedin_url),
+    "employee_count": ("Employee Count", lambda c, ctx: c.employee_count),
+    "revenue_lower_usd": ("Revenue Lower (USD)", lambda c, ctx: c.estimated_revenue_lower_usd),
+    "revenue_higher_usd": ("Revenue Higher (USD)", lambda c, ctx: c.estimated_revenue_higher_usd),
+    "account_status": ("Account Status", lambda c, ctx: ctx["states"].get(c.id, {}).get("account_status", "insufficient_context")),
+    "qualified": ("Qualified", lambda c, ctx: _is_company_qualified(c)),
+    "resolved_offering_name": ("Offering", lambda c, ctx: c.resolved_offering_name),
+    "hiring_signal_role": ("Hiring Signal Role", lambda c, ctx: c.hiring_signal_role),
+    "hot_lead": ("Hot Lead", lambda c, ctx: c.hot_lead),
+    "hot_lead_reasoning": ("Hot Lead Reasoning", lambda c, ctx: c.hot_lead_reasoning),
+    "contact_count": ("Contact Count", lambda c, ctx: ctx["contact_counts"].get(c.id, 0)),
+    "company_outreached": ("Company Outreached", lambda c, ctx: c.id in ctx["outreached_company_ids"]),
+    "source": ("Source", lambda c, ctx: _normalize_company_source(c.source)),
+    "company_added_at": ("Company Added", lambda c, ctx: c.created_at.isoformat() if c.created_at else ""),
+}
+
+_CONTACT_EXPORT_COLUMNS: dict[str, tuple[str, Callable]] = {
+    "contact_id": ("Contact ID", lambda ct, ctx: ct.id),
+    "first_name": ("First Name", lambda ct, ctx: ct.first_name),
+    "last_name": ("Last Name", lambda ct, ctx: ct.last_name),
+    "title": ("Title", lambda ct, ctx: ct.title),
+    "contact_linkedin_url": ("Contact LinkedIn URL", lambda ct, ctx: ct.linkedin_url),
+    "email": ("Email", lambda ct, ctx: ct.email),
+    "email_source": ("Email Source", lambda ct, ctx: ct.email_source),
+    "contact_outreached": ("Contact Outreached", lambda ct, ctx: ct.id in ctx["outreached_contact_ids"]),
+    "contact_added_at": ("Contact Added", lambda ct, ctx: ct.created_at.isoformat() if ct.created_at else ""),
+}
+
+DEFAULT_COMPANY_EXPORT_COLUMNS = list(_COMPANY_EXPORT_COLUMNS.keys())
+DEFAULT_CONTACT_EXPORT_COLUMNS = list(_CONTACT_EXPORT_COLUMNS.keys())
+
+
+@router.get("/companies/export")
+def export_companies(
+    request: Request, scope: str = "all", columns: str = "",
+    search: str = "", qualified: str = "", account_filter: str = "",
+    period_days: int = 0, period_date_from: str = "", period_date_to: str = "",
+    db: Session = Depends(get_db),
+):
+    """`scope`: "all" (one row per contact, one per contact-less company) | "companies" (one row
+    per company) | "contacts" (one row per contact, company columns ignored). Same filters as
+    list_companies, but no pagination -- every matching row, not just the current page. `columns`
+    is a comma-separated subset of _COMPANY_EXPORT_COLUMNS/_CONTACT_EXPORT_COLUMNS keys; empty
+    means every column for the requested scope."""
+    if scope not in ("all", "companies", "contacts"):
+        raise HTTPException(status_code=400, detail="scope must be one of: all, companies, contacts")
+
+    tenant_id = _resolve_tenant_id(request)
+    query = db.query(Company).join(Batch).filter(Batch.tenant_id == tenant_id)
+    if search.strip():
+        like = f"%{search.strip()}%"
+        query = query.filter(or_(Company.name.ilike(like), Company.domain.ilike(like), Company.industry.ilike(like)))
+    companies = query.order_by(Company.created_at.desc()).all()
+
+    if qualified == "true":
+        companies = [c for c in companies if _is_company_qualified(c)]
+    elif qualified == "false":
+        companies = [c for c in companies if not _is_company_qualified(c)]
+
+    if period_days or period_date_from or period_date_to:
+        from datetime import date as _date
+        if period_date_from or period_date_to:
+            period_start = datetime.fromisoformat(period_date_from) if period_date_from else datetime.min
+            period_end = datetime.fromisoformat(period_date_to) + timedelta(days=1) if period_date_to else datetime.max
+        else:
+            period_start = datetime.combine(_date.today(), datetime.min.time()) - timedelta(days=period_days - 1)
+            period_end = datetime.utcnow()
+        companies = [c for c in companies if c.created_at and period_start <= c.created_at <= period_end]
+
+    if account_filter == "hot_leads":
+        companies = [c for c in companies if c.hot_lead]
+    elif account_filter in ("no_contact", "missing_email"):
+        companies = [c for c in companies if c.decision_maker_searched_at is not None]
+        company_ids = [c.id for c in companies]
+        ids_with_contacts = {row[0] for row in db.query(Contact.company_id).filter(Contact.company_id.in_(company_ids)).distinct().all()} if company_ids else set()
+        if account_filter == "no_contact":
+            companies = [c for c in companies if c.id not in ids_with_contacts]
+        else:
+            ids_missing_email = {row[0] for row in db.query(Contact.company_id).filter(Contact.company_id.in_(company_ids), Contact.email_source.is_(None)).distinct().all()} if company_ids else set()
+            companies = [c for c in companies if c.id in ids_missing_email]
+
+    company_ids = [c.id for c in companies]
+    contacts_by_company: dict[int, list] = {}
+    if company_ids:
+        for ct in db.query(Contact).filter(Contact.company_id.in_(company_ids)).order_by(Contact.id).all():
+            contacts_by_company.setdefault(ct.company_id, []).append(ct)
+
+    from app.gtm_os.account_agent.account_agent import list_account_states
+    states = list_account_states(db, tenant_id, company_ids) if company_ids else {}
+
+    contact_counts = {cid: len(cts) for cid, cts in contacts_by_company.items()}
+    outreached_company_ids: set[int] = set()
+    outreached_contact_ids: set[int] = set()
+    if company_ids:
+        outreached_contact_ids = {
+            row[0] for row in db.query(Contact.id)
+            .join(CampaignPush, CampaignPush.contact_id == Contact.id)
+            .filter(Contact.company_id.in_(company_ids), CampaignPush.status == "pushed")
+            .distinct().all()
+        }
+        outreached_company_ids = {
+            row[0] for row in db.query(Contact.company_id)
+            .join(CampaignPush, CampaignPush.contact_id == Contact.id)
+            .filter(Contact.company_id.in_(company_ids), CampaignPush.status == "pushed")
+            .distinct().all()
+        }
+    ctx = {
+        "states": states, "contact_counts": contact_counts,
+        "outreached_company_ids": outreached_company_ids, "outreached_contact_ids": outreached_contact_ids,
+    }
+
+    requested_columns = [c.strip() for c in columns.split(",") if c.strip()]
+
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+
+    if scope == "companies":
+        cols = [c for c in (requested_columns or DEFAULT_COMPANY_EXPORT_COLUMNS) if c in _COMPANY_EXPORT_COLUMNS]
+        writer.writerow([_COMPANY_EXPORT_COLUMNS[c][0] for c in cols])
+        for c in companies:
+            writer.writerow([_COMPANY_EXPORT_COLUMNS[col][1](c, ctx) for col in cols])
+    elif scope == "contacts":
+        cols = [c for c in (requested_columns or DEFAULT_CONTACT_EXPORT_COLUMNS) if c in _CONTACT_EXPORT_COLUMNS]
+        writer.writerow(["Company Name", "Domain"] + [_CONTACT_EXPORT_COLUMNS[c][0] for c in cols])
+        for c in companies:
+            for ct in contacts_by_company.get(c.id, []):
+                writer.writerow([c.name, c.domain] + [_CONTACT_EXPORT_COLUMNS[col][1](ct, ctx) for col in cols])
+    else:  # "all" -- companies joined with their contacts, one row per contact, one row for a
+        # contact-less company so no company is silently dropped from the export.
+        requested_company_cols = [c for c in requested_columns if c in _COMPANY_EXPORT_COLUMNS] or DEFAULT_COMPANY_EXPORT_COLUMNS
+        requested_contact_cols = [c for c in requested_columns if c in _CONTACT_EXPORT_COLUMNS] or DEFAULT_CONTACT_EXPORT_COLUMNS
+        writer.writerow(
+            [_COMPANY_EXPORT_COLUMNS[c][0] for c in requested_company_cols]
+            + [_CONTACT_EXPORT_COLUMNS[c][0] for c in requested_contact_cols]
+        )
+        for c in companies:
+            company_values = [_COMPANY_EXPORT_COLUMNS[col][1](c, ctx) for col in requested_company_cols]
+            company_contacts = contacts_by_company.get(c.id, [])
+            if not company_contacts:
+                writer.writerow(company_values + ["" for _ in requested_contact_cols])
+                continue
+            for ct in company_contacts:
+                writer.writerow(company_values + [_CONTACT_EXPORT_COLUMNS[col][1](ct, ctx) for col in requested_contact_cols])
+
+    filename = f"accounts_{scope}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.csv"
+    return Response(
+        content=buf.getvalue(),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 def _get_smartlead_sent_emails(db: Session) -> set[str]:
