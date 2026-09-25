@@ -6206,17 +6206,39 @@ def list_crm_leads(
     for s, count in base_query.with_entities(CrmLead.stage, func.count(CrmLead.id)).group_by(CrmLead.stage).all():
         stage_counts[s] = count
 
+    # Headline stats for the top-of-page cards -- computed over the same pre-stage-filter
+    # base_query as stage_counts, so the cards stay consistent with whichever event/list/fit
+    # filter is active. "reached_out" is every stage at or past outreach (CRM_STAGES[3:] --
+    # outreached, replied, registered, attended, no_response, not_interested), not just the
+    # literal "outreached" stage, so a reply or registration still counts as reached. Real,
+    # asked-for distinction: "not_contacts_fetched" is a company-fit-passed row with no person
+    # attached yet (first_name IS NULL) -- an account we know is worth pursuing but haven't
+    # found a human at, the exact "accounts fetched, not yet people" gap flagged 2026-09-25.
+    stats = {
+        "company_fit_pass": base_query.filter(CrmLead.company_fit == "pass").count(),
+        "role_fit_pass": base_query.filter(CrmLead.role_fit == "pass").count(),
+        "reached_out": base_query.filter(CrmLead.stage.in_(CRM_STAGES[3:])).count(),
+        "contacts_needed": base_query.filter(CrmLead.company_fit == "pass", CrmLead.first_name.is_(None)).count(),
+        "emails_found": base_query.filter(CrmLead.email.isnot(None)).count(),
+    }
+
     # Real distinct source files for THIS tenant/event -- lets the UI's "which list" dropdown
     # populate itself instead of hardcoding file names that will drift as new lists get imported.
+    # Ordered by each file's earliest created_at (first imported first), not alphabetically, so
+    # the frontend's generic "List 1 / List 2 / ..." labels stay in a stable, meaningful order
+    # instead of jumbling with every re-sort.
     source_files = [
         row[0] for row in
-        db.query(CrmLead.source_file).filter(CrmLead.tenant_id == tenant_id).distinct().order_by(CrmLead.source_file).all()
+        db.query(CrmLead.source_file, func.min(CrmLead.created_at))
+        .filter(CrmLead.tenant_id == tenant_id).group_by(CrmLead.source_file)
+        .order_by(func.min(CrmLead.created_at)).all()
     ]
 
     return {
         "page": page, "page_size": page_size, "total": total,
         "total_pages": (total + page_size - 1) // page_size if total else 0,
         "stage_counts": stage_counts,
+        "stats": stats,
         "source_files": source_files,
         "leads": [_crm_lead_dict(lead) for lead in page_items],
     }
