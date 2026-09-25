@@ -75,6 +75,35 @@ never actually fixed. Real next step: either bound the backlog-search the same w
 `discovery.daily_target` bounds fresh discovery, or make it a separate, explicitly-approved
 step rather than an implicit side effect of any real-run trigger.
 
+## 2026-09-26 — real Deepline budget-guard bug found live and fixed ($8.01 vs a $0.50/day cap)
+
+A SECOND, related symptom of the same underlying gap as the parked `flow_target` bug above,
+but a distinct root cause, on the Deepline side rather than Apify. `run_v2_contact_discovery_sweep`
+(`app/gtm_os/sales/contact_discovery.py`) processes up to 50 Opportunities per sweep call; each
+one's paid-fallback pre-flight check (`_check_paid_fallback_budget`) constructed a FRESH
+`BudgetGuard(contact_budget_usd)` per opportunity -- and `BudgetGuard.__init__` re-baselines to
+the CURRENT real balance on every construction, so "spent so far today" was always ~$0 no matter
+how many opportunities had already been processed. The configured
+`limits.contact_discovery_daily_budget_usd: 0.5` was compared against one company's own estimated
+max cost (~$0.336), never against real cumulative spend -- the exact "guard recreated fresh each
+call" bug already diagnosed and fixed for `check_daily_deepline_budget`'s three other call sites
+on 2026-09-15, just never fixed here. Confirmed live via the real billing ledger: 97
+`search_contact` charges between 2026-09-24 05:00-08:28 UTC, $8.01 total, 16x the configured cap.
+
+**Fixed**: `_check_paid_fallback_budget` now delegates to `check_daily_deepline_budget` (the
+already-correct, persisted-UTC-day-snapshot mechanism), so the daily cap is real cumulative spend,
+not a per-call estimate. The redundant per-opportunity `BudgetGuard` (pre- and post-call) was
+removed entirely -- it never added real protection once its baseline was shown to reset every
+call. Two tests pin the fix (`tests/test_contact_discovery_budget.py`): a second opportunity is
+allowed once spend is still under the cap, and blocked once cumulative spend crosses it within
+the same run. 185 tests passing.
+
+**V2 autonomous run paused** (`state: running -> paused`) while this was diagnosed -- not yet
+resumed; that's a separate decision from this fix landing.
+
+**The original Apify-side `flow_target` backlog-search bug above is still open** -- different
+code path (`free_decision_maker`/Apify vs. `search_contact`/Deepline), not touched by this fix.
+
 ## Non-goals right now (explicitly deferred, not forgotten)
 
 - Deal progression / closing automation (rest of item 1) — not started, not the current focus.

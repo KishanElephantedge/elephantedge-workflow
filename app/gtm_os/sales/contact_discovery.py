@@ -14,9 +14,8 @@ from datetime import datetime
 
 from sqlalchemy.orm import Session
 
-from app.budget_guard import BudgetExceededError, BudgetGuard
+from app.budget_guard import BudgetExceededError, check_daily_deepline_budget
 from app.db.models import Batch, Company, Contact
-from app.deepline_client import DeeplineError, get_credit_balance_usd
 from app.gtm_os.opportunity.opportunity import TERMINAL_STATUSES, Opportunity
 from app.gtm_os.orchestration.control import ControlPlaneHalted, check_can_run, get_control_config
 from app.gtm_os.strategy.strategy import GtmStrategy
@@ -36,25 +35,33 @@ def _estimate_max_paid_fallback_cost_usd() -> float:
     return PAID_FALLBACK_MAX_TIERS * CANDIDATES_PER_SEARCH * PAID_FALLBACK_COST_PER_RESULT_USD
 
 
-def _check_paid_fallback_budget(contact_budget_usd: float) -> tuple[bool, str | None]:
+def _check_paid_fallback_budget(db: Session, tenant_id: int, contact_budget_usd: float) -> tuple[bool, str | None]:
     """Real PRE-FLIGHT check, run BEFORE find_decision_makers() is ever given
-    allow_paid_fallback=True -- unlike BudgetGuard's own guard.check() (only called AFTER a paid
-    call already happened; a post-hoc spend detector, not a pre-emptive block, and the real gap
-    this fix closes). Returns (allowed, reason). Never raises -- an unavailable OR negative real
-    balance fails CLOSED (blocked), same fail-safe discipline as every other budget guard in this
-    codebase. Does not replace BudgetGuard -- that stays as a second, defense-in-depth check on
-    the ACTUAL post-call spend, unchanged."""
+    allow_paid_fallback=True. Returns (allowed, reason). Never raises -- an unavailable OR
+    negative real balance fails CLOSED (blocked), same fail-safe discipline as every other budget
+    guard in this codebase.
+
+    Real bug fix (2026-09-26, confirmed live -- $8.01 spent against a configured $0.50/day cap,
+    97 search_contact calls in one sweep): this used to ALSO construct a fresh BudgetGuard(...)
+    per opportunity below, whose baseline resets to the CURRENT balance on every construction --
+    the exact same "guard recreated fresh each call, so cumulative spend is always ~0" bug
+    check_daily_deepline_budget's own docstring already documents as fixed elsewhere (2026-09-15,
+    company_resolution.py/investigation_execution.py). It was never fixed HERE. With
+    run_v2_contact_discovery_sweep's limit=50 and each company's estimated max cost (~$0.336)
+    always comfortably under the $0.50 daily figure, every single opportunity passed its own
+    isolated check -- the configured budget was compared against one company's spend, never
+    against the day's real cumulative total. Now delegates to check_daily_deepline_budget, which
+    persists a real UTC-day balance snapshot and compares TODAY's actual cumulative spend (not a
+    per-call estimate) against the cap -- the same mechanism already proven correct for the other
+    three Deepline-billed call sites."""
     estimated_cost = _estimate_max_paid_fallback_cost_usd()
     if estimated_cost > contact_budget_usd:
         return False, f"estimated max paid-fallback cost ${estimated_cost:.3f} exceeds configured limits.contact_discovery_daily_budget_usd ${contact_budget_usd:.2f}"
 
     try:
-        balance = get_credit_balance_usd()
-    except DeeplineError as e:
-        return False, f"could not verify real Deepline balance before paid fallback: {e}"
-
-    if balance < estimated_cost:
-        return False, f"real Deepline balance ${balance:.4f} is insufficient for estimated max paid-fallback cost ${estimated_cost:.3f}"
+        check_daily_deepline_budget(db, tenant_id, contact_budget_usd)
+    except BudgetExceededError as e:
+        return False, str(e)
 
     return True, None
 
@@ -185,36 +192,13 @@ def discover_contacts_for_opportunity(db: Session, tenant_id: int, opportunity: 
 
     # Real, PRE-FLIGHT budget check -- runs BEFORE find_decision_makers() is ever allowed to
     # attempt the paid Deepline fallback, closing the real gap where the free Jobo path always
-    # ran fine, but a paid attempt could fire before any budget/balance check happened at all
-    # (the old BudgetGuard.check() below only ever caught it AFTER the fact). The free path
-    # itself is never affected by this -- allow_paid_fallback=False still lets find_decision_makers
-    # run its free tier exactly as before, at $0 cost.
-    paid_allowed, paid_blocked_reason = _check_paid_fallback_budget(contact_budget_usd)
-
-    # Real bug fix (2026-08-25, confirmed live): BudgetGuard's constructor calls
-    # get_credit_balance_usd() itself, unguarded -- when paid_allowed is already False (e.g. a
-    # real Deepline outage/CLI issue, confirmed live), constructing this guard at all was an
-    # unnecessary second balance call that could crash the WHOLE sweep with an unhandled
-    # DeeplineError, even though the guard is only ever actually used below when used_paid is
-    # True -- which can never happen when paid_allowed is False (find_decision_makers only
-    # attempts the paid tier when allow_paid_fallback=True). Only constructed when actually
-    # needed now, same "one opportunity's failure must never crash the sweep" discipline this
-    # function already applies everywhere else.
-    guard = None
-    if paid_allowed:
-        try:
-            guard = BudgetGuard(contact_budget_usd)
-        except Exception as e:  # noqa: BLE001 -- a provider/balance-check failure must not crash the sweep
-            # Real bug fix (2026-08-26, confirmed live): a raw DB-level exception caught here
-            # (as opposed to a provider/network error) leaves this SHARED session's transaction
-            # "invalid" until rolled back -- confirmed live, the very next opportunity's
-            # `db.get(Opportunity, ...)` in run_v2_contact_discovery_sweep's loop crashed the
-            # WHOLE sweep with sqlalchemy.exc.PendingRollbackError, because nothing here ever
-            # rolled the poisoned transaction back before returning "failed" and moving on.
-            # rollback() is always safe to call even when the real cause was a non-DB error
-            # (a no-op on a still-valid transaction), so this isn't gated on the exception type.
-            db.rollback()
-            return {"status": "failed", "opportunity_id": opportunity.id, "error": f"could not initialize budget guard: {e}"}
+    # ran fine, but a paid attempt could fire before any budget/balance check happened at all.
+    # The free path itself is never affected by this -- allow_paid_fallback=False still lets
+    # find_decision_makers run its free tier exactly as before, at $0 cost. Now the ONLY budget
+    # gate (see _check_paid_fallback_budget's own docstring, 2026-09-26, for why the separate
+    # per-opportunity BudgetGuard that used to sit here was removed -- it re-baselined on every
+    # call and never actually enforced a cumulative daily cap).
+    paid_allowed, paid_blocked_reason = _check_paid_fallback_budget(db, tenant_id, contact_budget_usd)
 
     try:
         new_contacts, used_paid = find_decision_makers(
@@ -224,13 +208,16 @@ def discover_contacts_for_opportunity(db: Session, tenant_id: int, opportunity: 
     except BudgetExceededError:
         raise
     except Exception as e:  # noqa: BLE001 -- a provider failure must not crash the sweep
-        # Same real fix as above -- this is the exact except block whose swallowed DB-level
-        # exception caused the live PendingRollbackError crash.
+        # Real bug fix (2026-08-26, confirmed live): a raw DB-level exception caught here (as
+        # opposed to a provider/network error) leaves this SHARED session's transaction "invalid"
+        # until rolled back -- confirmed live, the very next opportunity's
+        # `db.get(Opportunity, ...)` in run_v2_contact_discovery_sweep's loop crashed the WHOLE
+        # sweep with sqlalchemy.exc.PendingRollbackError, because nothing here ever rolled the
+        # poisoned transaction back before returning "failed" and moving on. rollback() is always
+        # safe to call even when the real cause was a non-DB error (a no-op on a still-valid
+        # transaction), so this isn't gated on the exception type.
         db.rollback()
         return {"status": "failed", "opportunity_id": opportunity.id, "error": str(e)}
-
-    if used_paid and guard is not None:
-        guard.check()  # still a second, defense-in-depth check on the ACTUAL post-call spend
 
     result = {
         "status": "succeeded",
