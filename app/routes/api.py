@@ -6153,6 +6153,7 @@ def _crm_lead_dict(lead: CrmLead) -> dict:
         "industry": lead.industry,
         "estimated_revenue": lead.estimated_revenue,
         "employee_count": lead.employee_count,
+        "outreach_channel": lead.outreach_channel,
         "created_at": lead.created_at.isoformat() if lead.created_at else None,
         "updated_at": lead.updated_at.isoformat() if lead.updated_at else None,
     }
@@ -6274,14 +6275,14 @@ def export_crm_leads(
         "id", "event", "first_name", "last_name", "title", "company_name", "company_linkedin_url",
         "profile_linkedin_url", "email", "email_source", "source_file", "stage", "role_fit",
         "company_fit", "fit_notes", "industry", "estimated_revenue", "employee_count",
-        "created_at", "updated_at",
+        "outreach_channel", "created_at", "updated_at",
     ])
     for lead in leads:
         writer.writerow([
             lead.id, lead.event, lead.first_name, lead.last_name, lead.title, lead.company_name,
             lead.company_linkedin_url, lead.profile_linkedin_url, lead.email, lead.email_source,
             lead.source_file, lead.stage, lead.role_fit, lead.company_fit, lead.fit_notes,
-            lead.industry, lead.estimated_revenue, lead.employee_count,
+            lead.industry, lead.estimated_revenue, lead.employee_count, lead.outreach_channel,
             lead.created_at.isoformat() if lead.created_at else "",
             lead.updated_at.isoformat() if lead.updated_at else "",
         ])
@@ -6313,6 +6314,7 @@ class CrmLeadUpdate(BaseModel):
     industry: str | None = None
     estimated_revenue: str | None = None
     employee_count: str | None = None
+    outreach_channel: str | None = None  # "linkedin" | "email" -- asked for when stage -> outreached
 
 
 @router.patch("/gtm-os/partner/crm/leads/{lead_id}")
@@ -6344,6 +6346,10 @@ def update_crm_lead(lead_id: int, updates: CrmLeadUpdate, request: Request, db: 
         lead.estimated_revenue = updates.estimated_revenue
     if updates.employee_count is not None:
         lead.employee_count = updates.employee_count
+    if updates.outreach_channel is not None:
+        if updates.outreach_channel not in ("linkedin", "email"):
+            raise HTTPException(status_code=400, detail="outreach_channel must be 'linkedin' or 'email'")
+        lead.outreach_channel = updates.outreach_channel
     db.commit()
     db.refresh(lead)
     return _crm_lead_dict(lead)

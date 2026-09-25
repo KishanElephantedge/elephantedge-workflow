@@ -510,6 +510,10 @@ class CrmLead(Base):
     industry = Column(String, nullable=True)
     estimated_revenue = Column(String, nullable=True)
     employee_count = Column(String, nullable=True)
+    # Which channel the outreach itself went out on -- "linkedin" | "email" | null. Captured at
+    # the moment a lead is moved to the "outreached" stage (explicit ask 2026-09-26: picking
+    # Outreached in the UI should immediately ask which channel), not inferred after the fact.
+    outreach_channel = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 

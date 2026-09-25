@@ -1043,3 +1043,7 @@ def ensure_indexes():
         conn.execute(text("ALTER TABLE crm_leads ADD COLUMN IF NOT EXISTS industry VARCHAR"))
         conn.execute(text("ALTER TABLE crm_leads ADD COLUMN IF NOT EXISTS estimated_revenue VARCHAR"))
         conn.execute(text("ALTER TABLE crm_leads ADD COLUMN IF NOT EXISTS employee_count VARCHAR"))
+
+        # 2026-09-26 -- which channel the outreach itself went out on ("linkedin" | "email"),
+        # captured the moment a lead moves to "outreached" (see CrmLead's own model comment).
+        conn.execute(text("ALTER TABLE crm_leads ADD COLUMN IF NOT EXISTS outreach_channel VARCHAR"))
