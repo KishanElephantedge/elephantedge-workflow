@@ -1384,7 +1384,6 @@ _CONTACT_EXPORT_COLUMNS: dict[str, tuple[str, Callable]] = {
     "title": ("Title", lambda ct, ctx: ct.title),
     "contact_linkedin_url": ("Contact LinkedIn URL", lambda ct, ctx: ct.linkedin_url),
     "email": ("Email", lambda ct, ctx: ct.email),
-    "email_source": ("Email Source", lambda ct, ctx: ct.email_source),
     "contact_outreached": ("Contact Outreached", lambda ct, ctx: ct.id in ctx["outreached_contact_ids"]),
     "contact_added_at": ("Contact Added", lambda ct, ctx: ct.created_at.isoformat() if ct.created_at else ""),
 }
