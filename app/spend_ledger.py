@@ -23,6 +23,9 @@ reserve-and-check rather than just check means no call site has to remember to r
 two currently-unguarded paid paths got that way.
 """
 import logging
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass
 from datetime import date, datetime
 
 from sqlalchemy import Column, Date, DateTime, Float, Integer, String
@@ -34,6 +37,7 @@ logger = logging.getLogger(__name__)
 
 PROVIDER_APIFY = "apify"
 PROVIDER_DEEPLINE = "deepline"
+PROVIDER_LLM = "llm"
 
 
 class ProviderSpend(Base):
@@ -156,3 +160,137 @@ def reconcile_drift(db: Session, tenant_id: int, provider: str,
         "drift_usd": round(drift, 4),
         "drift_pct": round(pct, 1) if pct is not None else None,
     }
+
+
+# ---------------------------------------------------------------------------------------------
+# One combined budget across every paid provider (2026-09-26).
+#
+# Before this, only Apify wrote to the ledger. Deepline was capped by comparing its account balance
+# against a morning snapshot (lagging, and blind to calls still in flight), and the Claude fallback
+# was not counted anywhere. Three providers, three different half-guards -- which is how a run
+# spent $8.01 against a configured $0.50 cap on 2026-09-24.
+#
+# reserve_spend() is now the one place spend is decided: it checks the tenant's combined daily cap
+# (`spend.daily_cap_usd` in the control config, summed across ALL providers) and the current run's
+# cap, then records the reservation BEFORE the paid call is made. It fails closed: no configured
+# cap means no spend, never "unlimited".
+#
+# spend_scope() marks a block of work (one Play A run) as budget-governed. Paid clients that have
+# no db/tenant of their own (deepline_client.execute_tool, the Claude fallback in llm_client) read
+# the active scope and reserve against it. Outside a scope their legacy behaviour is unchanged,
+# so the rest of V2 keeps working while it stays paused.
+# ---------------------------------------------------------------------------------------------
+
+
+class SpendBlocked(Exception):
+    """A paid call was refused by the budget. Callers stop that unit of work; it is not an error
+    to retry until the budget resets or is raised."""
+
+
+@dataclass
+class SpendScope:
+    db: Session
+    tenant_id: int
+    operation: str
+    run_cap_usd: float | None = None
+    entity_key: str | None = None
+    spent_usd: float = 0.0
+
+
+_current_scope: ContextVar["SpendScope | None"] = ContextVar("spend_scope", default=None)
+
+
+@contextmanager
+def spend_scope(db: Session, tenant_id: int, operation: str, run_cap_usd: float | None = None):
+    """Everything paid inside this block is reserved against the tenant's combined daily cap and,
+    when given, this run's own cap. Not inherited by new threads -- keep a governed run on one
+    thread."""
+    scope = SpendScope(db=db, tenant_id=tenant_id, operation=operation, run_cap_usd=run_cap_usd)
+    token = _current_scope.set(scope)
+    try:
+        yield scope
+    finally:
+        _current_scope.reset(token)
+
+
+def current_spend_scope() -> "SpendScope | None":
+    return _current_scope.get()
+
+
+def get_daily_spend_cap_usd(db: Session, tenant_id: int) -> float | None:
+    from app.gtm_os.orchestration.control import get_control_config
+
+    cap = (get_control_config(db, tenant_id).get("spend") or {}).get("daily_cap_usd")
+    return float(cap) if isinstance(cap, (int, float)) and not isinstance(cap, bool) else None
+
+
+def total_spend_today(db: Session, tenant_id: int) -> float:
+    """Combined committed spend today across every provider. Raises on a read failure -- a cap
+    enforced against an unreadable number must block, not assume zero."""
+    rows = (
+        db.query(ProviderSpend)
+        .filter(ProviderSpend.tenant_id == tenant_id, ProviderSpend.spend_date == _today())
+        .all()
+    )
+    return sum((r.actual_usd if r.actual_usd is not None else (r.estimated_usd or 0.0)) for r in rows)
+
+
+def reserve_spend(db: Session, tenant_id: int, provider: str, estimated_usd: float,
+                  operation: str | None = None, entity_key: str | None = None) -> int:
+    """Check the combined daily cap and the active run's cap, then record the reservation.
+    Returns the ledger row id (pass it to settle_spend once the real cost is known). Raises
+    SpendBlocked when either cap would be passed, when no daily cap is configured, or when
+    today's spend cannot be read."""
+    estimated_usd = float(estimated_usd or 0.0)
+    cap = get_daily_spend_cap_usd(db, tenant_id)
+    if cap is None:
+        raise SpendBlocked("spend.daily_cap_usd is not configured -- no cap means no spend")
+
+    try:
+        spent = total_spend_today(db, tenant_id)
+    except Exception as e:  # noqa: BLE001
+        db.rollback()
+        raise SpendBlocked(f"could not read today's spend, refusing the call: {e}") from e
+
+    if spent + estimated_usd > cap:
+        raise SpendBlocked(
+            f"today's spend ${spent:.4f} + ${estimated_usd:.4f} ({provider}:{operation}) "
+            f"would pass the ${cap:.2f} daily cap"
+        )
+
+    scope = current_spend_scope()
+    if scope is not None and scope.tenant_id == tenant_id and scope.run_cap_usd is not None:
+        if scope.spent_usd + estimated_usd > scope.run_cap_usd:
+            raise SpendBlocked(
+                f"this run's spend ${scope.spent_usd:.4f} + ${estimated_usd:.4f} would pass "
+                f"its ${scope.run_cap_usd:.2f} run cap"
+            )
+
+    row = ProviderSpend(
+        tenant_id=tenant_id, provider=provider, operation=operation, entity_key=entity_key,
+        estimated_usd=estimated_usd, spend_date=_today(),
+    )
+    db.add(row)
+    db.commit()
+    if scope is not None and scope.tenant_id == tenant_id:
+        scope.spent_usd += estimated_usd
+    return row.id
+
+
+def settle_spend(db: Session, ledger_id: int | None, actual_usd: float) -> None:
+    """Record what a reserved call really cost (e.g. 0.0 when a pay-per-result provider found
+    nothing), freeing the unused allowance for the rest of the day. Never raises."""
+    if ledger_id is None:
+        return
+    try:
+        row = db.get(ProviderSpend, ledger_id)
+        if row is None:
+            return
+        scope = current_spend_scope()
+        if scope is not None and scope.tenant_id == row.tenant_id:
+            scope.spent_usd -= (row.estimated_usd or 0.0) - float(actual_usd)
+        row.actual_usd = float(actual_usd)
+        db.commit()
+    except Exception:  # noqa: BLE001
+        db.rollback()
+        logger.exception("spend_ledger: failed to settle ledger row %s", ledger_id)

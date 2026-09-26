@@ -226,6 +226,21 @@ def _gate(db: Session, tenant_id: int) -> None:
     check_daily_llm_budget(db, tenant_id)
 
 
+def _reserve_claude(prompt: str, max_tokens: int) -> None:
+    """Inside a spend_scope, reserve a Claude call's worst-case cost (Haiku: $1/MTok in, $5/MTok
+    out; ~4 chars per token) before making it. Raises spend_ledger.SpendBlocked when the budget
+    refuses. Outside a scope: no-op. Gemini is free-tier and stays governed by the call-count cap
+    in _gate -- only the Claude fallback costs real money, and it was previously counted nowhere."""
+    from app.spend_ledger import PROVIDER_LLM, current_spend_scope, reserve_spend
+
+    scope = current_spend_scope()
+    if scope is None:
+        return
+    estimate = (len(prompt) / 4) / 1_000_000 * 1.0 + max_tokens / 1_000_000 * 5.0
+    reserve_spend(scope.db, scope.tenant_id, PROVIDER_LLM, estimate,
+                  operation=f"{scope.operation}:claude", entity_key=scope.entity_key)
+
+
 def generate_text(prompt: str, db: Session, tenant_id: int, max_tokens: int = 2000) -> str:
     _gate(db, tenant_id)
     if PRIMARY == "gemini":
@@ -233,9 +248,11 @@ def generate_text(prompt: str, db: Session, tenant_id: int, max_tokens: int = 20
             result = _gemini_with_model_fallback(call_gemini, prompt, db, tenant_id, max_tokens)
         except GeminiError as e:
             logger.warning("Gemini call failed, falling back to Claude Haiku: %s", e)
+            _reserve_claude(prompt, max_tokens)
             result = call_claude(prompt, db, tenant_id, max_tokens=max_tokens)
     else:
         try:
+            _reserve_claude(prompt, max_tokens)
             result = call_claude(prompt, db, tenant_id, max_tokens=max_tokens)
         except ClaudeError as e:
             logger.warning("Claude call failed, falling back to Gemini: %s", e)
@@ -250,9 +267,11 @@ def generate_json(prompt: str, db: Session, tenant_id: int, max_tokens: int = 20
             result = _gemini_with_model_fallback(call_gemini_json, prompt, db, tenant_id, max_tokens)
         except GeminiError as e:
             logger.warning("Gemini call failed, falling back to Claude Haiku: %s", e)
+            _reserve_claude(prompt, max_tokens)
             result = call_claude_json(prompt, db, tenant_id, max_tokens=max_tokens)
     else:
         try:
+            _reserve_claude(prompt, max_tokens)
             result = call_claude_json(prompt, db, tenant_id, max_tokens=max_tokens)
         except ClaudeError as e:
             logger.warning("Claude call failed, falling back to Gemini: %s", e)

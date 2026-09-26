@@ -144,6 +144,14 @@ DEFAULT_GTM_OS_CONTROL_CONFIG: dict = {
     "company_resolution": {
         "allow_paid_enrichment": False,
     },
+    # One combined budget across every paid provider (Apify + Deepline + paid LLM calls), enforced
+    # by app/spend_ledger.reserve_spend before each call (2026-09-26). daily_cap_usd is the day's
+    # total for the tenant; run_cap_usd bounds a single Play run. None means no spend at all under a
+    # governed run -- never unlimited. Optional in stored configs so older saved configs stay valid.
+    "spend": {
+        "daily_cap_usd": None,
+        "run_cap_usd": None,
+    },
 }
 
 
@@ -274,6 +282,13 @@ def _validate_control_config(config: dict) -> None:
         raise ControlPlaneConfigError("'company_resolution' must be an object")
     if not isinstance(company_resolution.get("allow_paid_enrichment"), bool):
         raise ControlPlaneConfigError("'company_resolution.allow_paid_enrichment' must be a boolean")
+
+    spend = config.get("spend")
+    if spend is not None:
+        if not isinstance(spend, dict):
+            raise ControlPlaneConfigError("'spend' must be an object")
+        _validate_positive_number_or_none(spend.get("daily_cap_usd"), "spend.daily_cap_usd")
+        _validate_positive_number_or_none(spend.get("run_cap_usd"), "spend.run_cap_usd")
 
 
 def get_control_config(db: Session, tenant_id: int) -> dict:

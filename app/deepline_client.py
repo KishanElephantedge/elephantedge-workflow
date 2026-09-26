@@ -197,15 +197,81 @@ def _rate_limit_retry_delay(stdout: str) -> float | None:
     return int(match.group(1)) / 1000 if match else RATE_LIMIT_DEFAULT_DELAY_SECONDS
 
 
+class DeeplineSpendBlocked(DeeplineError):
+    """The combined spend budget refused this call before it was made (see spend_ledger)."""
+
+
+# Worst-case USD per call, from Deepline's own `tools describe` pricing (per result; a miss is
+# free, so the estimate is settled down afterwards where the caller knows it missed). Only used
+# inside a governed spend_scope -- a tool with no entry here is refused there, so every paid call
+# a governed run can make has a price someone looked up, instead of an unknown cost.
+DEEPLINE_TOOL_COST_USD = {
+    "prospeo_enrich_person": lambda p: 0.055 * (10 if (p.get("enrich_mobile") or p.get("only_verified_mobile")) else 1),
+    "prospeo_search_person": lambda p: 0.055 * 25,
+    "search_contact": lambda p: 0.056 * int(p.get("page_size") or 3),
+    "icypeas_email_search": lambda p: 0.014,
+    "hunter_email_finder": lambda p: 0.030,
+    "leadmagic_email_finder": lambda p: 0.034,
+}
+
+
+def _reserve_for_tool(tool_id: str, payload: dict) -> int | None:
+    """Inside a spend_scope: reserve this call's worst-case cost, or raise DeeplineSpendBlocked.
+    Outside one: no-op (legacy behaviour, returns None)."""
+    from app.spend_ledger import PROVIDER_DEEPLINE, SpendBlocked, current_spend_scope, reserve_spend
+
+    scope = current_spend_scope()
+    if scope is None:
+        return None
+    estimate = DEEPLINE_TOOL_COST_USD.get(tool_id)
+    if estimate is None:
+        raise DeeplineSpendBlocked(f"{tool_id} has no price in DEEPLINE_TOOL_COST_USD -- refused inside a governed run")
+    try:
+        return reserve_spend(
+            scope.db, scope.tenant_id, PROVIDER_DEEPLINE, estimate(payload),
+            operation=f"{scope.operation}:{tool_id}", entity_key=scope.entity_key,
+        )
+    except SpendBlocked as e:
+        raise DeeplineSpendBlocked(str(e)) from e
+
+
 def execute_tool(tool_id: str, payload: dict) -> dict:
     """Run `deepline tools execute <tool_id> --input '<json>' --json` and return the parsed
     response. Retries on a rate-limit response (see _rate_limit_retry_delay) before giving up
-    -- any other failure still raises immediately, no change there."""
+    -- any other failure still raises immediately, no change there.
+
+    Inside a spend_scope, the call's cost is reserved first and the ledger row id is returned as
+    response["_spend_ledger_id"] so the caller can settle it (e.g. to 0 on a miss)."""
     if not is_deepline_enabled():
         raise DeeplineDisabled(
             f"{tool_id} not called: billed Deepline access is switched off by the operator "
             "(deepline_enabled=false). Re-enable with set_deepline_enabled(db, True)."
         )
+    ledger_id = _reserve_for_tool(tool_id, payload)
+    try:
+        response = _call_deepline_cli(tool_id, payload)
+    except DeeplineMaybeBilled:
+        raise  # may have been billed -- keep the reservation (the safe side)
+    except DeeplineError:
+        # A failed call was not billed: release its reservation.
+        if ledger_id is not None:
+            from app.spend_ledger import current_spend_scope, settle_spend
+
+            scope = current_spend_scope()
+            if scope is not None:
+                settle_spend(scope.db, ledger_id, 0.0)
+        raise
+    if ledger_id is not None and isinstance(response, dict):
+        response["_spend_ledger_id"] = ledger_id
+    return response
+
+
+class DeeplineMaybeBilled(DeeplineError):
+    """The provider may have charged for this call (timeout, or a successful exit whose output we
+    could not read) -- its spend reservation is kept rather than released."""
+
+
+def _call_deepline_cli(tool_id: str, payload: dict) -> dict:
     result = None
     for attempt in range(RATE_LIMIT_MAX_RETRIES + 1):
         try:
@@ -214,7 +280,7 @@ def execute_tool(tool_id: str, payload: dict) -> dict:
                 timeout_seconds=120,
             )
         except subprocess.TimeoutExpired as e:
-            raise DeeplineError(f"{tool_id} timed out after 120s") from e
+            raise DeeplineMaybeBilled(f"{tool_id} timed out after 120s") from e
         except FileNotFoundError as e:
             # Found live: a real production run failed outright with "[Errno 2] No such
             # file or directory: 'deepline'" -- correlated against deploy timing, this
@@ -241,11 +307,11 @@ def execute_tool(tool_id: str, payload: dict) -> dict:
     stdout = result.stdout
     brace_index = stdout.find("{")
     if brace_index == -1:
-        raise DeeplineError(f"{tool_id} returned no JSON output: {stdout[:500]}")
+        raise DeeplineMaybeBilled(f"{tool_id} returned no JSON output: {stdout[:500]}")
     try:
         return json.loads(stdout[brace_index:])
     except json.JSONDecodeError as e:
-        raise DeeplineError(f"{tool_id} returned malformed JSON: {stdout[:500]}") from e
+        raise DeeplineMaybeBilled(f"{tool_id} returned malformed JSON: {stdout[:500]}") from e
 
 
 def _get_credit_balance_usd_once(timeout_seconds: float) -> float:

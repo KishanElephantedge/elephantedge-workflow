@@ -140,8 +140,19 @@ def check_apify_budget(db: Session, tenant_id: int, estimated_cost_usd: float,
     # next check in this same sweep counts it even though Apify's own figure will not for a
     # while yet. `operation` is what makes per-job cost attribution possible afterwards, instead
     # of averaging unrelated jobs into "cost per company".
-    record_spend(
-        db, tenant_id, PROVIDER_APIFY, estimated_cost_usd,
-        operation=operation, entity_key=entity_key,
-    )
+    # With a combined spend cap configured (spend.daily_cap_usd), Apify's reservation goes through
+    # the same reserve_spend every other provider uses, so it counts against the one daily total
+    # and the active run's cap. Without it, legacy behaviour: record only.
+    from app.spend_ledger import SpendBlocked, get_daily_spend_cap_usd, reserve_spend
+
+    if get_daily_spend_cap_usd(db, tenant_id) is not None:
+        try:
+            reserve_spend(db, tenant_id, PROVIDER_APIFY, estimated_cost_usd, operation=operation, entity_key=entity_key)
+        except SpendBlocked as e:
+            return {"status": STATUS_BLOCKED_BUDGET, "reason": str(e)}
+    else:
+        record_spend(
+            db, tenant_id, PROVIDER_APIFY, estimated_cost_usd,
+            operation=operation, entity_key=entity_key,
+        )
     return {"status": STATUS_ALLOWED, "reason": f"estimated ${estimated_cost_usd:.4f} fits within configured Apify budget(s)"}
