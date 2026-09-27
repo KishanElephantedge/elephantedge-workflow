@@ -220,6 +220,7 @@ DEEPLINE_TOOL_COST_USD = {
     "harvestapi_get_post_comments": lambda p: 0.003,
     "harvestapi_get_post_reactions": lambda p: 0.003,
     "harvestapi_get_company": lambda p: 0.003,
+    "harvestapi_get_job": lambda p: 0.001,
 }
 
 

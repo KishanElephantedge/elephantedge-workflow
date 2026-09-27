@@ -320,7 +320,7 @@ def find_contacts(db: Session, tenant_id: int, limit: int = 10, channels: list[s
 
     for lead in leads:
         company = db.get(Company, lead.company_id)
-        contact = known_contact(company)
+        contact = None if company.id in harvested else known_contact(company)
         if contact is not None:
             reused += 1
         elif company.id in harvested:
