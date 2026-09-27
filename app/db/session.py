@@ -1047,3 +1047,33 @@ def ensure_indexes():
         # 2026-09-26 -- which channel the outreach itself went out on ("linkedin" | "email"),
         # captured the moment a lead moves to "outreached" (see CrmLead's own model comment).
         conn.execute(text("ALTER TABLE crm_leads ADD COLUMN IF NOT EXISTS outreach_channel VARCHAR"))
+
+        # 2026-09-26 -- one row per person per play, moved forward through fixed states once
+        # (app/gtm_os/plays/lead.py). The unique index is what guarantees a person is never picked
+        # up, or paid for, twice by the same play.
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS gtm_leads (
+                id SERIAL PRIMARY KEY,
+                tenant_id INTEGER NOT NULL,
+                play VARCHAR NOT NULL,
+                person_linkedin_url VARCHAR NOT NULL,
+                person_name VARCHAR,
+                signal_id INTEGER REFERENCES gtm_signals(id),
+                state VARCHAR NOT NULL DEFAULT 'signal',
+                evidence TEXT,
+                icp_fit_score INTEGER,
+                intent VARCHAR,
+                qualifier_reason TEXT,
+                qualifier_output JSON,
+                company_id INTEGER REFERENCES companies(id),
+                contact_id INTEGER REFERENCES contacts(id),
+                opportunity_id INTEGER REFERENCES opportunities(id),
+                message_draft_id INTEGER REFERENCES message_drafts(id),
+                spend_usd DOUBLE PRECISION NOT NULL DEFAULT 0,
+                last_error TEXT,
+                created_at TIMESTAMP DEFAULT now(),
+                updated_at TIMESTAMP DEFAULT now()
+            )
+        """))
+        conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ux_gtm_leads_person ON gtm_leads (tenant_id, play, person_linkedin_url)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_gtm_leads_state ON gtm_leads (tenant_id, play, state)"))
