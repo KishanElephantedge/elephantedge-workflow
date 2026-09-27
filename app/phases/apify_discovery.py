@@ -287,7 +287,7 @@ def run_apify_discovery(
     location_search: list[str] | None = None, title_search: list[str] | None = None,
     employee_min: int | None = None, employee_max: int | None = None,
     industry_filter: list[str] | None = None, limit: int | None = None,
-    budget_tenant_id: int | None = None,
+    budget_tenant_id: int | None = None, assess_team: bool = True,
 ) -> dict:
     """Entrypoint -- single synchronous Apify actor call (no budget_guard/paging loop like
     jd_first, since the actor's own `limit` already bounds spend deterministically: N results
@@ -511,6 +511,12 @@ def run_apify_discovery(
         if len(kept) >= target:
             # Already paid for (Apify) and now persisted -- just not worth spending Deepline on
             # today. seen_domains still gets it below so a future run never re-buys this posting.
+            # Its posting is kept as a signal too: a Company with no signal can never be picked
+            # up by anything downstream, which is the discard this branch exists to prevent.
+            try:
+                _persist_posting_as_signal(db, tenant_id, company, job)
+            except Exception:  # noqa: BLE001 -- evidence persistence is additive, never fatal
+                db.rollback()
             seen_domains.add(domain)
             continue
 
@@ -518,7 +524,9 @@ def run_apify_discovery(
         # assess_team_composition persists sales_headcount_percent/marketing_headcount_percent
         # as a free byproduct of its own paid calls, and _infer_hire_type() below needs those
         # percentages to be real, not None, or it always falls back to "unknown".
-        team_fit = assess_team_composition(company, db)
+        # assess_team=False: the caller's own qualifier agent judges fit from the posting, so the
+        # paid Deepline team-size lookup is not bought here (Play B -- app/gtm_os/plays/hiring.py).
+        team_fit = assess_team_composition(company, db) if assess_team else {"tier": "unassessed"}
         if team_fit["tier"] == "excluded":
             rejection_counts["full_team"] = rejection_counts.get("full_team", 0) + 1
             db.delete(company)

@@ -356,12 +356,12 @@ def _run_gtm_intelligence_cycle_locked():
             return
 
         run = start_gtm_intelligence_run(db, ELEPHANT_EDGE_TENANT_ID)
-        # 2026-09-27: the daily run is now Play A (app/gtm_os/plays/post_engagement.py) -- one
+        # 2026-09-27: the daily run is now the active plays (app/gtm_os/plays/runner.py) -- one
         # pass, each lead moved forward once, every paid call under the one combined budget. The
         # old ~25-stage run_gtm_daily_flow_cycle chain is no longer scheduled.
-        from app.gtm_os.plays.post_engagement import run_play_a
+        from app.gtm_os.plays.runner import run_active_plays
 
-        result = run_play_a(db, ELEPHANT_EDGE_TENANT_ID)
+        result = run_active_plays(db, ELEPHANT_EDGE_TENANT_ID)
         finish_gtm_intelligence_run(db, run, result)
         logging.getLogger(__name__).info("gtm_intelligence_cycle: %s", result)
     finally:

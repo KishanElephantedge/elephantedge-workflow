@@ -195,6 +195,9 @@ class SpendScope:
     run_cap_usd: float | None = None
     entity_key: str | None = None
     spent_usd: float = 0.0
+    blocked: int = 0          # reservations refused inside this scope -- lets a caller whose
+                              # provider wrapper swallows the refusal still tell "out of budget"
+                              # apart from "found nothing"
 
 
 _current_scope: ContextVar["SpendScope | None"] = ContextVar("spend_scope", default=None)
@@ -242,6 +245,17 @@ def reserve_spend(db: Session, tenant_id: int, provider: str, estimated_usd: flo
     SpendBlocked when either cap would be passed, when no daily cap is configured, or when
     today's spend cannot be read."""
     estimated_usd = float(estimated_usd or 0.0)
+    try:
+        return _reserve(db, tenant_id, provider, estimated_usd, operation, entity_key)
+    except SpendBlocked:
+        scope = current_spend_scope()
+        if scope is not None and scope.tenant_id == tenant_id:
+            scope.blocked += 1
+        raise
+
+
+def _reserve(db: Session, tenant_id: int, provider: str, estimated_usd: float,
+             operation: str | None, entity_key: str | None) -> int:
     cap = get_daily_spend_cap_usd(db, tenant_id)
     if cap is None:
         raise SpendBlocked("spend.daily_cap_usd is not configured -- no cap means no spend")

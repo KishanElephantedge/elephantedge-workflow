@@ -109,10 +109,23 @@ def test_companies_beyond_target_are_not_team_fit_assessed_but_still_get_a_signa
     unassessed = [c for c in companies if c.hiring_signal_role is None]
     assert len(assessed) == 1
     assert len(unassessed) == 9
-    # The one that went through the full pipeline has a linked signal; the backlog ones don't yet
-    # (they were never evaluated for team fit, so nothing has been decided about them either way).
+    # Every company keeps its posting as a signal -- the backlog ones too (2026-09-27). A company
+    # with no signal can never be picked up downstream (Play B's Qualifier reads signals), so
+    # leaving them out was the same discard of purchased data this file exists to prevent.
     signal_company_ids = {s.company_id for s in db.query(GtmSignal).filter(GtmSignal.tenant_id == TENANT).all()}
-    assert {c.id for c in assessed} <= signal_company_ids
+    assert {c.id for c in companies} == signal_company_ids
+
+
+def test_assess_team_false_buys_no_team_lookup_and_keeps_everything(discovery_db, patched_discovery, monkeypatch):
+    """Play B passes assess_team=False: its Qualifier agent judges fit from the posting, so the
+    paid Deepline team-size lookup is never bought, and every company keeps its signal."""
+    db, batch = discovery_db
+    monkeypatch.setattr(patched_discovery, "assess_team_composition", lambda company, db: pytest.fail("paid lookup"))
+
+    result = patched_discovery.run_apify_discovery(batch.id, db, TENANT, target=10, assess_team=False)
+
+    assert result["companies_discovered"] == 10
+    assert db.query(GtmSignal).filter(GtmSignal.tenant_id == TENANT).count() == 10
 
 
 def test_a_team_fit_excluded_company_is_still_deleted_same_as_before(discovery_db, patched_discovery, monkeypatch):

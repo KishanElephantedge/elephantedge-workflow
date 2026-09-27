@@ -1056,7 +1056,8 @@ def ensure_indexes():
                 id SERIAL PRIMARY KEY,
                 tenant_id INTEGER NOT NULL,
                 play VARCHAR NOT NULL,
-                person_linkedin_url VARCHAR NOT NULL,
+                lead_key VARCHAR NOT NULL,
+                person_linkedin_url VARCHAR,
                 person_name VARCHAR,
                 signal_id INTEGER REFERENCES gtm_signals(id),
                 state VARCHAR NOT NULL DEFAULT 'signal',
@@ -1075,5 +1076,12 @@ def ensure_indexes():
                 updated_at TIMESTAMP DEFAULT now()
             )
         """))
-        conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ux_gtm_leads_person ON gtm_leads (tenant_id, play, person_linkedin_url)"))
+        # lead_key replaced person_linkedin_url as the unique key once a company-level play (hiring)
+        # existed -- migrate a table created before that.
+        conn.execute(text("ALTER TABLE gtm_leads ADD COLUMN IF NOT EXISTS lead_key VARCHAR"))
+        conn.execute(text("UPDATE gtm_leads SET lead_key = person_linkedin_url WHERE lead_key IS NULL"))
+        conn.execute(text("ALTER TABLE gtm_leads ALTER COLUMN lead_key SET NOT NULL"))
+        conn.execute(text("ALTER TABLE gtm_leads ALTER COLUMN person_linkedin_url DROP NOT NULL"))
+        conn.execute(text("DROP INDEX IF EXISTS ux_gtm_leads_person"))
+        conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ux_gtm_leads_key ON gtm_leads (tenant_id, play, lead_key)"))
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_gtm_leads_state ON gtm_leads (tenant_id, play, state)"))

@@ -74,7 +74,7 @@ def ingest_new_signals(db: Session, tenant_id: int, limit: int = 100, now: datet
 
     now = now or datetime.utcnow()
     known = {
-        row[0] for row in db.query(GtmLead.person_linkedin_url)
+        row[0] for row in db.query(GtmLead.lead_key)
         .filter(GtmLead.tenant_id == tenant_id, GtmLead.play == PLAY).all()
     }
     signals = (
@@ -96,7 +96,8 @@ def ingest_new_signals(db: Session, tenant_id: int, limit: int = 100, now: datet
         if fields is None or fields["person_linkedin_url"] in known:
             skipped += 1
             continue
-        db.add(GtmLead(tenant_id=tenant_id, play=PLAY, signal_id=signal.id, state=STATE_SIGNAL, **fields))
+        db.add(GtmLead(tenant_id=tenant_id, play=PLAY, lead_key=fields["person_linkedin_url"], signal_id=signal.id,
+                       state=STATE_SIGNAL, **fields))
         known.add(fields["person_linkedin_url"])
         created += 1
     db.commit()
@@ -280,18 +281,21 @@ def _company_for(db: Session, tenant_id: int, name: str, domain: str | None, lin
     return company
 
 
-def _write_opportunity(db: Session, tenant_id: int, lead: GtmLead, company: Company) -> tuple:
+def _write_opportunity(db: Session, tenant_id: int, lead: GtmLead, company: Company, play: str = PLAY,
+                       objective: str = "Open a conversation about the problem they raised on LinkedIn",
+                       source_note: str = "on LinkedIn") -> tuple:
     """The Qualifier's one verdict, written as the Problem -> Demand -> Opportunity -> Strategy rows
-    the existing drafter, Pipeline and Messages screens read. Replaces four LLM stages with one."""
+    the existing drafter, Pipeline and Messages screens read. Replaces four LLM stages with one.
+    Shared by every play; `play`/`objective`/`source_note` say where the lead came from."""
     from app.gtm_os.intelligence.demand_hypothesis import DemandHypothesis
     from app.gtm_os.intelligence.problem_hypothesis import ProblemHypothesis
     from app.gtm_os.opportunity.opportunity import Opportunity
     from app.gtm_os.strategy.strategy import GtmStrategy
 
     v = lead.qualifier_output or {}
-    problem_text = v.get("problem_statement") or f"{company.name} shows a sales/growth problem in their own words on LinkedIn."
+    problem_text = v.get("problem_statement") or f"{company.name} shows a sales/growth problem {source_note}."
     demand_text = v.get("demand_statement") or f"{company.name} appears open to outside help with sales."
-    evidence = {"play": PLAY, "lead_id": lead.id, "evidence_quote": v.get("evidence_quote"), "intent": lead.intent,
+    evidence = {"play": play, "lead_id": lead.id, "evidence_quote": v.get("evidence_quote"), "intent": lead.intent,
                 "icp_fit_score": lead.icp_fit_score, "reason": lead.qualifier_reason}
 
     problem = ProblemHypothesis(tenant_id=tenant_id, company_id=company.id, company_name_raw=company.name,
@@ -315,7 +319,7 @@ def _write_opportunity(db: Session, tenant_id: int, lead: GtmLead, company: Comp
         first_observed_at=lead.created_at,
         icp_context={"has_icp_match": bool(icp_id), "status": "matched" if icp_id else "no_match_recorded",
                      "matches": [{"icp_id": icp_id, "reasons": [lead.qualifier_reason]}] if icp_id else [],
-                     "source": "play_a_qualifier"},
+                     "source": f"{play}_qualifier"},
     )
     db.add(opportunity)
     db.flush()
@@ -325,9 +329,9 @@ def _write_opportunity(db: Session, tenant_id: int, lead: GtmLead, company: Comp
         positioning_angle=v.get("positioning_angle"), offering_fit_status="candidate_match",
         matched_offering_name=v.get("matched_offering"), evidence_basis=evidence,
         missing_information=[], decision_maker_known=True, recommended_next_step="prepare_message",
-        action_plan=[{"action_type": "prepare_message", "objective": "Open a conversation about the problem they raised on LinkedIn",
+        action_plan=[{"action_type": "prepare_message", "objective": objective,
                       "target_function": "sales", "rationale": lead.qualifier_reason, "prerequisite": None, "status": "ready"}],
-        reasoning_note=f"Play A qualifier verdict (lead {lead.id}).",
+        reasoning_note=f"{play} qualifier verdict (lead {lead.id}).",
     )
     db.add(strategy)
     db.commit()
@@ -402,7 +406,7 @@ def find_contacts(db: Session, tenant_id: int, limit: int = 10) -> dict:
 # draft -- the existing message drafter, targeted at this exact person
 # ---------------------------------------------------------------------------------------------
 
-def draft_messages(db: Session, tenant_id: int, limit: int = 10) -> dict:
+def draft_messages(db: Session, tenant_id: int, limit: int = 10, play: str = PLAY) -> dict:
     from app.gtm_os.learning.message_draft import generate_message_draft
     from app.gtm_os.opportunity.opportunity import Opportunity
     from app.gtm_os.strategy.strategy import GtmStrategy
@@ -410,7 +414,7 @@ def draft_messages(db: Session, tenant_id: int, limit: int = 10) -> dict:
 
     leads = (
         db.query(GtmLead)
-        .filter(GtmLead.tenant_id == tenant_id, GtmLead.play == PLAY, GtmLead.state == STATE_CONTACT_FOUND)
+        .filter(GtmLead.tenant_id == tenant_id, GtmLead.play == play, GtmLead.state == STATE_CONTACT_FOUND)
         .order_by(GtmLead.icp_fit_score.desc())
         .limit(limit)
         .all()
@@ -422,7 +426,7 @@ def draft_messages(db: Session, tenant_id: int, limit: int = 10) -> dict:
             db.query(GtmStrategy).filter(GtmStrategy.opportunity_id == lead.opportunity_id)
             .order_by(GtmStrategy.id.desc()).first()
         )
-        # Aim the draft at the person who actually engaged, not whoever else we know at the company.
+        # Aim the draft at the lead's own contact, not whoever else we know at the company.
         others = [c.id for c in db.query(Contact.id).filter(Contact.company_id == lead.company_id, Contact.id != lead.contact_id)]
         try:
             draft = generate_message_draft(db, tenant_id, opportunity, strategy, exclude_contact_ids=others)

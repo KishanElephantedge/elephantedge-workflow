@@ -5513,11 +5513,12 @@ def trigger_gtm_intelligence_run(dry_run: bool = False, db: Session = Depends(ge
     # 2026-09-18 real fix: `run` is now threaded through so GET /gtm-os/intelligence-runs/{id}
     # shows real, live per-stage progress (current_stage, flow_cycle_iteration) while this is
     # still executing, instead of only "running" until the whole thing finishes or fails.
-    # 2026-09-27: same Play A pass the daily schedule runs (see app/main.py), so a manual run and
-    # the scheduled one can never do different work.
-    from app.gtm_os.plays.post_engagement import run_play_a
+    # 2026-09-27: the daily run is now the active plays (app/gtm_os/plays/runner.py) -- one
+    # pass, each lead moved forward once, every paid call under the one combined budget. The
+    # old ~25-stage run_gtm_daily_flow_cycle chain is no longer scheduled.
+    from app.gtm_os.plays.runner import run_active_plays
 
-    result = run_play_a(db, ELEPHANT_EDGE_TENANT_ID)
+    result = run_active_plays(db, ELEPHANT_EDGE_TENANT_ID)
     finish_gtm_intelligence_run(db, run, result)
     return {"run_id": run.id, "status": run.status, "result": result}
 

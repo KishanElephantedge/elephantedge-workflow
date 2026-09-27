@@ -1,10 +1,14 @@
-"""GtmLead -- one person, found by one play, moving forward through fixed states exactly once.
+"""GtmLead -- one person or company, found by one play, moving forward through fixed states exactly once.
 
 Why this exists: V2 used to re-derive "where is this lead?" on every run from five tables
 (Contact, MessageDraft, MessageSendAttempt, CampaignPush, Opportunity.status), and its batch sweeps
 re-scanned the whole backlog to find work. That is how weeks-old companies got re-bought on
 2026-09-24. A lead here has one row, one state, and a unique key per (tenant, play, person), so the
 same person can never be picked up -- or paid for -- twice.
+
+lead_key is what makes a lead unique within a play: the normalized LinkedIn profile URL for a
+person-level play (Play A, post engagement), "company:<id>" for a company-level play (Play B,
+hiring), where the person to contact is only chosen after the company qualifies.
 
 States (forward only):
     signal         -- found by the play, not yet judged
@@ -37,7 +41,8 @@ class GtmLead(Base):
     id = Column(Integer, primary_key=True)
     tenant_id = Column(Integer, nullable=False)
     play = Column(String, nullable=False)                   # e.g. "post_engagement"
-    person_linkedin_url = Column(String, nullable=False)    # normalized; unique per tenant+play
+    lead_key = Column(String, nullable=False)               # unique per tenant+play -- see module docstring
+    person_linkedin_url = Column(String, nullable=True)     # normalized; person-level plays only
     person_name = Column(String, nullable=True)
     signal_id = Column(Integer, ForeignKey("gtm_signals.id"), nullable=True)
     state = Column(String, nullable=False, default=STATE_SIGNAL)
