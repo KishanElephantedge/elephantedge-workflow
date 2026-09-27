@@ -5489,7 +5489,7 @@ def trigger_gtm_intelligence_run(dry_run: bool = False, db: Session = Depends(ge
     from app.gtm_os.orchestration.control import ControlPlaneHalted, check_can_run
     from app.gtm_os.orchestration.sweep import (
         GtmIntelligenceRun, finish_gtm_intelligence_run, recover_stale_gtm_intelligence_runs,
-        run_gtm_daily_flow_cycle, run_gtm_intelligence_sweep, start_gtm_intelligence_run,
+        run_gtm_intelligence_sweep, start_gtm_intelligence_run,
     )
 
     if dry_run:
@@ -5513,7 +5513,11 @@ def trigger_gtm_intelligence_run(dry_run: bool = False, db: Session = Depends(ge
     # 2026-09-18 real fix: `run` is now threaded through so GET /gtm-os/intelligence-runs/{id}
     # shows real, live per-stage progress (current_stage, flow_cycle_iteration) while this is
     # still executing, instead of only "running" until the whole thing finishes or fails.
-    result = run_gtm_daily_flow_cycle(db, ELEPHANT_EDGE_TENANT_ID, run=run)
+    # 2026-09-27: same Play A pass the daily schedule runs (see app/main.py), so a manual run and
+    # the scheduled one can never do different work.
+    from app.gtm_os.plays.post_engagement import run_play_a
+
+    result = run_play_a(db, ELEPHANT_EDGE_TENANT_ID)
     finish_gtm_intelligence_run(db, run, result)
     return {"run_id": run.id, "status": run.status, "result": result}
 
