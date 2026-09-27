@@ -261,7 +261,8 @@ def _matching_persons(
     return matches
 
 
-def _make_contact(company: Company, db: Session, tenant_id: int, person: dict, reasoning: str, thread_role: str) -> Contact:
+def _make_contact(company: Company, db: Session, tenant_id: int, person: dict, reasoning: str, thread_role: str,
+                  resolve_email: bool = True) -> Contact:
     # Free -- already present in search_contact's own response, just never extracted before
     # (confirmed live 2026-08-10). professional_email preferred over personal_email since it's
     # the one actually tied to the company domain we're targeting. Only ever populated via this
@@ -282,7 +283,7 @@ def _make_contact(company: Company, db: Session, tenant_id: int, person: dict, r
     db.commit()
     db.refresh(contact)
 
-    if not contact.email:
+    if not contact.email and resolve_email:
         # Deferred import -- same circular-import reason as the free-path call in
         # find_decision_maker below.
         from app.phases.free_decision_maker import resolve_fallback_email
@@ -299,7 +300,7 @@ MAX_CONTACTS_PER_COMPANY = 3
 
 def find_decision_makers(
     company: Company, db: Session, tenant_id: int, allow_paid_fallback: bool = True, max_contacts: int = MAX_CONTACTS_PER_COMPANY,
-    existing_contacts: list[Contact] | None = None,
+    existing_contacts: list[Contact] | None = None, resolve_email: bool = True,
 ) -> tuple[list[Contact], bool]:
     """Multi-contact version -- fetches up to max_contacts real decision-makers per company,
     spanning both the founder/CEO/Co-Founder family and the sales-leader family (Head of
@@ -326,6 +327,9 @@ def find_decision_makers(
     across a batch (see autonomous_orchestrator.py's per-run paid-fallback cap) count on this
     to know when money was actually spent, not just when a contact was found.
 
+    resolve_email=False skips the paid email waterfall for contacts found without one -- for a
+    caller whose outreach is LinkedIn-only, where an email is bought and never used.
+
     allow_paid_fallback=False skips the paid path entirely once the free layer's contacts are
     collected -- used once a caller's own per-run cap on paid attempts has been reached, so
     remaining companies that miss/undershoot the free layer simply get fewer contacts instead
@@ -347,7 +351,8 @@ def find_decision_makers(
         if key in seen_keys:
             continue
         seen_keys.add(key)
-        contacts.append(_make_contact(company, db, tenant_id, free_person, free_person["reasoning"], free_person["thread_role"]))
+        contacts.append(_make_contact(company, db, tenant_id, free_person, free_person["reasoning"], free_person["thread_role"],
+                                      resolve_email=resolve_email))
         if len(contacts) >= target:
             break
 
@@ -385,7 +390,8 @@ def find_decision_makers(
         for person in _matching_persons(persons, title_keywords, require_bare_president=require_bare_president, exclude_keys=seen_keys):
             if len(contacts) >= target:
                 break
-            contacts.append(_make_contact(company, db, tenant_id, person, f"title_filter={title_filter}, verified_title={person.get('title')!r}", thread_role))
+            contacts.append(_make_contact(company, db, tenant_id, person, f"title_filter={title_filter}, verified_title={person.get('title')!r}", thread_role,
+                                          resolve_email=resolve_email))
 
     return contacts, used_paid
 

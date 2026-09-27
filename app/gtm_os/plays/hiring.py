@@ -213,13 +213,17 @@ def qualify_leads(db: Session, tenant_id: int, limit: int = 20, min_fit_score: i
 # contact -- the existing decision-maker finder, one contact per qualified company
 # ---------------------------------------------------------------------------------------------
 
-def _reachable(contact: Contact) -> bool:
-    return bool(contact.email or contact.linkedin_url)
+def _reachable(contact: Contact, channels: list[str]) -> bool:
+    """Contactable on at least one channel the tenant's campaigns actually use."""
+    return ("linkedin" in channels and bool(contact.linkedin_url)) or ("email" in channels and bool(contact.email))
 
 
-def find_contacts(db: Session, tenant_id: int, limit: int = 10) -> dict:
+def find_contacts(db: Session, tenant_id: int, limit: int = 10, channels: list[str] | None = None) -> dict:
+    from app.gtm_os.orchestration.control import get_control_config, get_outreach_channels
     from app.gtm_os.sales.contact_discovery import get_eligible_contacts
     from app.phases.decision_maker import find_decision_makers
+
+    channels = channels or get_outreach_channels(get_control_config(db, tenant_id))
 
     leads = (
         db.query(GtmLead)
@@ -233,7 +237,8 @@ def find_contacts(db: Session, tenant_id: int, limit: int = 10) -> dict:
     for lead in leads:
         company = db.get(Company, lead.company_id)
         # Someone we already know at this company costs nothing -- prefer one with an email.
-        known = sorted((c for c in get_eligible_contacts(db, company.id) if _reachable(c)), key=lambda c: not c.email)
+        known = sorted((c for c in get_eligible_contacts(db, company.id) if _reachable(c, channels)),
+                       key=lambda c: not c.linkedin_url if channels[0] == "linkedin" else not c.email)
         contact = known[0] if known else None
         if contact is not None:
             reused += 1
@@ -241,11 +246,13 @@ def find_contacts(db: Session, tenant_id: int, limit: int = 10) -> dict:
             spent_before = scope.spent_usd if scope else 0.0
             blocked_before = scope.blocked if scope else 0
             try:
-                # Free leadership list + Google, the agent picks the person, then the per-result email
-                # waterfall (icypeas $0.014 -> hunter -> leadmagic, $0 on a miss): ~$0.02-0.06 a company.
+                # Free leadership list + Google, the agent picks the person, then -- only when email is
+                # an outreach channel -- the per-result email waterfall (icypeas $0.014 -> hunter ->
+                # leadmagic, $0 on a miss). LinkedIn-only: ~$0.035 a company, all of it the LinkedIn lookup.
                 # The paid search_contact fallback is off -- it bills $0.056 for every person it
                 # returns (3 per call, up to 3 calls), which is what made a contact cost ~$0.25.
-                new_contacts, _used_paid = find_decision_makers(company, db, tenant_id, allow_paid_fallback=False, max_contacts=1)
+                new_contacts, _used_paid = find_decision_makers(company, db, tenant_id, allow_paid_fallback=False, max_contacts=1,
+                                                                resolve_email="email" in channels)
             except SpendBlocked as e:
                 return {"found": found, "reused": reused, "missing": missing, "stopped": f"budget: {e}"}
             except Exception as e:  # noqa: BLE001
@@ -255,7 +262,7 @@ def find_contacts(db: Session, tenant_id: int, limit: int = 10) -> dict:
                 continue
             if scope:
                 lead.spend_usd = (lead.spend_usd or 0.0) + max(0.0, scope.spent_usd - spent_before)
-            contact = next((c for c in new_contacts if _reachable(c)), None)
+            contact = next((c for c in new_contacts if _reachable(c, channels)), None)
             if contact is None and scope and scope.blocked > blocked_before:
                 # The finder swallows a refused paid call as "nobody found". Nothing was bought,
                 # so the lead waits for tomorrow's budget instead of being marked missing.

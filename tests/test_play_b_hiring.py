@@ -123,7 +123,7 @@ def test_known_contact_is_reused_without_spend(db, monkeypatch):
 def test_found_decision_maker_moves_lead_forward(db, monkeypatch):
     acme = _qualified(db, monkeypatch)
 
-    def fake_find(company, db_, tenant_id, allow_paid_fallback=True, max_contacts=3):
+    def fake_find(company, db_, tenant_id, **kwargs):
         reserve_spend(db_, tenant_id, "deepline", 0.168, operation="search_contact")
         c = Contact(company_id=company.id, first_name="Sam", title="CEO", linkedin_url="https://linkedin.com/in/sam")
         db_.add(c)
@@ -141,7 +141,7 @@ def test_found_decision_maker_moves_lead_forward(db, monkeypatch):
 def test_refused_paid_lookup_leaves_lead_waiting(db, monkeypatch):
     _qualified(db, monkeypatch)
 
-    def fake_find(company, db_, tenant_id, allow_paid_fallback=True, max_contacts=3):
+    def fake_find(company, db_, tenant_id, **kwargs):
         try:  # the real finder swallows the refusal and reports "nobody found"
             reserve_spend(db_, tenant_id, "deepline", 5.0, operation="search_contact")
         except Exception:
@@ -185,3 +185,29 @@ def test_company_with_an_earlier_opportunity_chain_is_reused_not_duplicated(db, 
     assert db.query(ProblemHypothesis).count() == 1
     assert db.get(ProblemHypothesis, old.id).problem_statement == "No sales leadership."
     assert db.query(Opportunity).count() == 1
+
+
+def test_linkedin_only_outreach_never_buys_an_email(db, monkeypatch):
+    _qualified(db, monkeypatch)
+    seen = {}
+
+    def fake_find(company, db_, tenant_id, **kwargs):
+        seen.update(kwargs)
+        c = Contact(company_id=company.id, first_name="Sam", title="CEO", linkedin_url="https://linkedin.com/in/sam")
+        db_.add(c)
+        db_.commit()
+        return [c], False
+
+    monkeypatch.setattr(decision_maker, "find_decision_makers", fake_find)
+    with spend_scope(db, TENANT, "hiring", run_cap_usd=0.5):
+        assert play.find_contacts(db, TENANT, channels=["linkedin"])["found"] == 1
+    assert seen["resolve_email"] is False
+
+
+def test_linkedin_only_skips_a_known_contact_with_no_linkedin(db, monkeypatch):
+    acme = _qualified(db, monkeypatch)
+    db.add(Contact(company_id=acme.id, first_name="Jane", email="jane@acme.io"))  # email only
+    db.commit()
+    monkeypatch.setattr(decision_maker, "find_decision_makers", lambda *a, **k: ([], False))
+    with spend_scope(db, TENANT, "hiring", run_cap_usd=0.5):
+        assert play.find_contacts(db, TENANT, channels=["linkedin"])["missing"] == 1

@@ -152,7 +152,20 @@ DEFAULT_GTM_OS_CONTROL_CONFIG: dict = {
         "daily_cap_usd": None,
         "run_cap_usd": None,
     },
+    # Which outreach channels the tenant's campaigns actually use. The plays only buy the contact
+    # data a listed channel needs -- a LinkedIn-only tenant never pays for an email lookup.
+    # Optional in stored configs; missing means both, the behaviour before this existed.
+    "outreach": {
+        "channels": ["linkedin", "email"],
+    },
 }
+
+OUTREACH_CHANNELS = ("linkedin", "email")
+
+
+def get_outreach_channels(config: dict) -> list[str]:
+    channels = (config.get("outreach") or {}).get("channels")
+    return list(channels) if channels else list(OUTREACH_CHANNELS)
 
 
 class ControlPlaneConfigError(ValueError):
@@ -289,6 +302,12 @@ def _validate_control_config(config: dict) -> None:
             raise ControlPlaneConfigError("'spend' must be an object")
         _validate_positive_number_or_none(spend.get("daily_cap_usd"), "spend.daily_cap_usd")
         _validate_positive_number_or_none(spend.get("run_cap_usd"), "spend.run_cap_usd")
+
+    outreach = config.get("outreach")
+    if outreach is not None:
+        channels = outreach.get("channels") if isinstance(outreach, dict) else None
+        if not isinstance(channels, list) or not channels or any(c not in OUTREACH_CHANNELS for c in channels):
+            raise ControlPlaneConfigError(f"'outreach.channels' must be a non-empty list drawn from {OUTREACH_CHANNELS}")
 
 
 def get_control_config(db: Session, tenant_id: int) -> dict:
