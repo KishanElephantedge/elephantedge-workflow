@@ -211,3 +211,72 @@ def test_linkedin_only_skips_a_known_contact_with_no_linkedin(db, monkeypatch):
     monkeypatch.setattr(decision_maker, "find_decision_makers", lambda *a, **k: ([], False))
     with spend_scope(db, TENANT, "hiring", run_cap_usd=0.5):
         assert play.find_contacts(db, TENANT, channels=["linkedin"])["missing"] == 1
+
+
+# ------------------------------------------------------------------ HarvestAPI (LinkedIn) path
+
+def _icp3(monkeypatch):
+    import app.gtm_os.icp.icp_config as icp_config
+    monkeypatch.setattr(icp_config, "get_icp_config", lambda db, t: [{
+        "id": "icp_3", "name": "Needs Fractional Leadership", "revenue_min_usd": 20_000_000, "revenue_max_usd": 50_000_000,
+        "employee_max": 300, "trigger_mode": "requires_presence", "trigger_hiring_roles": ["head_of_sales"], "enabled": True}])
+
+
+def test_harvest_discovery_keeps_only_in_band_companies_and_never_rechecks(db, monkeypatch):
+    import app.harvestapi as h
+    _icp3(monkeypatch)
+    jobs = [{"job_id": "1", "title": "VP Sales", "url": "u1", "posted_at": "2026-09-25T00:00:00Z", "company_name": "Good",
+             "company_linkedin_url": "https://www.linkedin.com/company/good", "company_universal_name": "good", "location": "US"},
+            {"job_id": "2", "title": "VP Sales", "url": "u2", "posted_at": None, "company_name": "Tiny",
+             "company_linkedin_url": "https://www.linkedin.com/company/tiny", "company_universal_name": "tiny", "location": "US"}]
+    monkeypatch.setattr(h, "search_jobs", lambda title, **k: jobs if title == "VP Sales" else [])
+    lookups = []
+    facts = {"good": {"name": "Good", "employee_count": 200, "industry": "Software Development", "hq_country": "US",
+                      "hq_text": "Austin, TX, US", "website": "https://good.io", "description": "d", "linkedin_url": "https://www.linkedin.com/company/good"},
+             "tiny": {"name": "Tiny", "employee_count": 12, "industry": "Software Development", "hq_country": "US",
+                      "hq_text": "", "website": "https://tiny.io", "description": "", "linkedin_url": "https://www.linkedin.com/company/tiny"}}
+    monkeypatch.setattr(h, "get_company", lambda u: lookups.append(u) or facts[u])
+    monkeypatch.setattr(h, "get_job", lambda job_id: {"descriptionText": "Build our sales team."})
+
+    result = play.sense_harvest(db, TENANT)
+    assert (result["kept"], result["rejected"]) == (1, {"size_outside_icp": 1})
+    company = db.query(Company).one()
+    assert (company.name, company.domain, company.employee_count) == ("Good", "good.io", 200)
+    signal = db.query(GtmSignal).one()
+    assert signal.company_id == company.id and signal.extracted_info["description_text"] == "Build our sales team."
+
+    play.sense_harvest(db, TENANT)
+    assert sorted(lookups) == ["good", "tiny"], "a company already checked is never paid for again"
+
+
+def test_harvest_contacts_one_search_for_many_companies_agent_picks(db, monkeypatch):
+    import app.harvestapi as h
+    import app.phases.decision_maker_reasoning as dmr
+    for name in ("alpha", "beta"):
+        c = _company(db, name.title(), f"{name}.io")
+        c.linkedin_url = f"https://www.linkedin.com/company/{name}"
+        db.commit()
+        _posting(db, c, name)
+    play.ingest_new_signals(db, TENANT)
+    monkeypatch.setattr(llm_client, "generate_json", lambda *a, **k: _verdict())
+    play.qualify_leads(db, TENANT)
+
+    calls = []
+
+    def fake_leads(page=1, **f):
+        calls.append(f)
+        return [{"first_name": "Ann", "last_name": "A", "linkedin_url": "https://linkedin.com/in/ann", "title": "CEO",
+                 "company_name": "Alpha", "company_linkedin_url": "https://www.linkedin.com/company/alpha"},
+                {"first_name": "Ned", "last_name": "N", "linkedin_url": "https://linkedin.com/in/ned", "title": "CEO",
+                 "company_name": "Alpha Robotics", "company_linkedin_url": "https://www.linkedin.com/company/alpha-robotics"}]
+
+    monkeypatch.setattr(h, "search_leads", fake_leads)
+    monkeypatch.setattr(dmr, "select_best_decision_makers",
+                        lambda db, t, company, cands, n, offering_name=None: [{"name": cands[0]["name"], "thread_role": "founder_ceo", "reasoning": "CEO"}])
+    with spend_scope(db, TENANT, "hiring", run_cap_usd=0.5):
+        result = play.find_contacts(db, TENANT, channels=["linkedin"])
+
+    assert len(calls) == 1 and "alpha" in calls[0]["currentCompanies"] and "beta" in calls[0]["currentCompanies"]
+    assert (result["found"], result["missing"]) == (1, 1)
+    alpha_lead = next(l for l in db.query(GtmLead) if db.get(Company, l.company_id).name == "Alpha")
+    assert db.get(Contact, alpha_lead.contact_id).linkedin_url == "https://linkedin.com/in/ann"  # never Ned at a look-alike company

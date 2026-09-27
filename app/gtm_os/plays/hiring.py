@@ -222,6 +222,64 @@ def _reachable(contact: Contact, channels: list[str]) -> bool:
     return ("linkedin" in channels and bool(contact.linkedin_url)) or ("email" in channels and bool(contact.email))
 
 
+DECISION_MAKER_TITLES = ["CEO", "Founder", "Co-Founder", "President", "Chief Revenue Officer", "Chief Operating Officer",
+                         "VP Sales", "VP of Sales", "Head of Sales", "Head of Revenue"]
+LEADS_PER_CALL = 50                 # HarvestAPI accepts up to 50 currentCompanies in one search
+
+
+def _norm(name: str | None) -> str:
+    import re
+
+    n = re.sub(r"[^a-z0-9 ]", "", (name or "").lower())
+    for suffix in (" inc", " llc", " ltd", " corp", " corporation", " co", " company", " technologies", " labs"):
+        n = n.removesuffix(suffix)
+    return n.strip()
+
+
+def _harvest_decision_makers(db: Session, tenant_id: int, pairs: list) -> dict:
+    """One LinkedIn people search for up to 50 companies at once ($0.07 a page of 25), then the
+    agent picks the buyer at each company from the people found. HarvestAPI matches companies by
+    NAME, so every person is checked back against the company they were searched for.
+    Returns {company_id: Contact or None}. Raises DeeplineSpendBlocked when the budget refuses."""
+    from app import harvestapi
+    from app.phases.decision_maker_reasoning import select_best_decision_makers
+
+    out: dict = {}
+    for start in range(0, len(pairs), LEADS_PER_CALL):
+        chunk = pairs[start:start + LEADS_PER_CALL]
+        by_universal = {harvestapi.universal_name(c.linkedin_url): (lead, c) for lead, c in chunk}
+        by_name = {_norm(c.name): (lead, c) for lead, c in chunk}
+        people: dict[int, list] = {}
+        for page in (1, 2):
+            found = harvestapi.search_leads(page=page, currentCompanies=",".join(c.linkedin_url for _, c in chunk),
+                                            currentJobTitles=",".join(DECISION_MAKER_TITLES))
+            for person in found:
+                target = by_universal.get(harvestapi.universal_name(person.get("company_linkedin_url"))) or by_name.get(_norm(person.get("company_name")))
+                if target and person.get("linkedin_url"):
+                    people.setdefault(target[1].id, []).append(person)
+            if len(found) < 25 or all(c.id in people for _, c in chunk):
+                break
+        for lead, company in chunk:
+            candidates = people.get(company.id) or []
+            if not candidates:
+                out[company.id] = None
+                continue
+            named = {f"{p['first_name'] or ''} {p['last_name'] or ''}".strip(): p for p in candidates}
+            picks = select_best_decision_makers(db, tenant_id, company, [{"name": n, "title": p["title"]} for n, p in named.items()], 1,
+                                                offering_name=(lead.qualifier_output or {}).get("matched_offering"))
+            pick = named.get(picks[0]["name"]) if picks else None
+            if pick is None:
+                out[company.id] = None
+                continue
+            contact = Contact(company_id=company.id, first_name=pick["first_name"], last_name=pick["last_name"], title=pick["title"],
+                              linkedin_url=pick["linkedin_url"], thread_role=picks[0].get("thread_role") or "decision_maker",
+                              matched_title_reasoning=f"HarvestAPI LinkedIn search; agent: {picks[0].get('reasoning') or ''}"[:1000])
+            db.add(contact)
+            db.commit()
+            out[company.id] = contact
+    return out
+
+
 def find_contacts(db: Session, tenant_id: int, limit: int = 10, channels: list[str] | None = None) -> dict:
     from app.gtm_os.orchestration.control import get_control_config, get_outreach_channels
     from app.gtm_os.sales.contact_discovery import get_eligible_contacts
@@ -236,16 +294,42 @@ def find_contacts(db: Session, tenant_id: int, limit: int = 10, channels: list[s
         .limit(limit)
         .all()
     )
+    from app.deepline_client import DeeplineError, DeeplineSpendBlocked
+
     scope = current_spend_scope()
     found = missing = reused = 0
-    for lead in leads:
-        company = db.get(Company, lead.company_id)
-        # Someone we already know at this company costs nothing -- prefer one with an email.
+
+    def known_contact(company):
+        # Someone we already know at this company costs nothing.
         known = sorted((c for c in get_eligible_contacts(db, company.id) if _reachable(c, channels)),
                        key=lambda c: not c.linkedin_url if channels[0] == "linkedin" else not c.email)
-        contact = known[0] if known else None
+        return known[0] if known else None
+
+    # LinkedIn-only: one batched LinkedIn people search covers every company with a LinkedIn page.
+    harvested: dict = {}
+    if channels == ["linkedin"]:
+        pairs = [(lead, c) for lead in leads if (c := db.get(Company, lead.company_id)) is not None
+                 and c.linkedin_url and known_contact(c) is None]
+        if pairs:
+            try:
+                harvested = _harvest_decision_makers(db, tenant_id, pairs)
+            except DeeplineSpendBlocked as e:
+                return {"found": 0, "reused": 0, "missing": 0, "stopped": f"budget: {e}"}
+            except DeeplineError as e:
+                logger.warning("hiring: LinkedIn people search failed, falling back per company: %s", e)
+
+    for lead in leads:
+        company = db.get(Company, lead.company_id)
+        contact = known_contact(company)
         if contact is not None:
             reused += 1
+        elif company.id in harvested:
+            contact = harvested[company.id]
+            if contact is None:
+                lead.state = STATE_CONTACT_MISSING
+                db.commit()
+                missing += 1
+                continue
         else:
             spent_before = scope.spent_usd if scope else 0.0
             blocked_before = scope.blocked if scope else 0
@@ -293,6 +377,150 @@ def find_contacts(db: Session, tenant_id: int, limit: int = 10, channels: list[s
         db.commit()
         found += 1
     return {"found": found, "reused": reused, "missing": missing, "stopped": None}
+
+
+# ---------------------------------------------------------------------------------------------
+# sense (default) -- HarvestAPI LinkedIn job search per ICP trigger title ($0.001 a page of 25),
+# then exact company facts ($0.003) only for companies we have never seen, free size/US/industry
+# checks, and the full job description ($0.001) only for the ones that pass.
+# ---------------------------------------------------------------------------------------------
+
+HARVEST_SEEN_KEY = "hiring_play_checked_companies"
+NON_BUYER_INDUSTRIES = {"IT Services and IT Consulting", "Staffing and Recruiting", "Business Consulting and Services",
+                        "Outsourcing and Offshoring Consulting", "Human Resources Services"}
+
+
+def _seen_param(db: Session, tenant_id: int):
+    from app.db.models import Parameter
+
+    param = db.query(Parameter).filter(Parameter.tenant_id == tenant_id, Parameter.key == HARVEST_SEEN_KEY).first()
+    if param is None:
+        param = Parameter(tenant_id=tenant_id, key=HARVEST_SEEN_KEY, value={},
+                          description="Play B: LinkedIn companies already checked (never paid for twice) -> outcome")
+        db.add(param)
+        db.commit()
+    return param
+
+
+def _known_company_names(db: Session, tenant_id: int) -> set[str]:
+    from app.harvestapi import universal_name
+
+    rows = db.query(Company.linkedin_url).join(Batch, Company.batch_id == Batch.id).filter(Batch.tenant_id == tenant_id).all()
+    return {u for (url,) in rows if (u := universal_name(url))}
+
+
+def sense_harvest(db: Session, tenant_id: int, max_companies: int = 25, posted: str = "week") -> dict:
+    from app.deepline_client import DeeplineError, DeeplineSpendBlocked
+    from app.gtm_os.icp.icp_config import get_icp_config
+    from app.gtm_os.intelligence.signal import GtmSignal
+    from app.gtm_os.orchestration.discovery_profiles import headcount_band_for_icp, titles_for_icp
+    from app import harvestapi
+
+    icps = [i for i in get_icp_config(db, tenant_id) if i.get("enabled", True)]
+    result = {"source": "harvestapi", "postings": 0, "new_companies": 0, "checked": 0, "kept": 0,
+              "rejected": {}, "stopped": None}
+
+    # 1. postings, grouped by company, first ICP to find a company wins
+    candidates: dict[str, dict] = {}
+    try:
+        for icp in icps:
+            for title in titles_for_icp(icp):
+                for job in harvestapi.search_jobs(title, posted=posted):
+                    result["postings"] += 1
+                    u = job["company_universal_name"]
+                    if u:
+                        candidates.setdefault(u, {"icp": icp, "jobs": []})["jobs"].append(job)
+    except DeeplineSpendBlocked as e:
+        result["stopped"] = f"budget: {e}"
+    except DeeplineError as e:
+        result["stopped"] = f"job search failed: {e}"
+
+    seen = _seen_param(db, tenant_id)
+    checked = dict(seen.value or {})
+    known = _known_company_names(db, tenant_id)
+    new = [(u, c) for u, c in candidates.items() if u not in known and u not in checked]
+    result["new_companies"] = len(new)
+
+    batch = None
+    for u, cand in new[:max_companies]:
+        if result["stopped"]:
+            break
+        icp = cand["icp"]
+        try:
+            facts = harvestapi.get_company(u)
+        except DeeplineSpendBlocked as e:
+            result["stopped"] = f"budget: {e}"
+            break
+        except DeeplineError:
+            continue
+        result["checked"] += 1
+        lo, hi = headcount_band_for_icp(icp)
+        size = (facts or {}).get("employee_count")
+        reason = None
+        if not facts:
+            reason = "not_found"
+        elif size is None or not (lo <= size <= hi):
+            reason = "size_outside_icp"
+        elif facts.get("hq_country") and facts["hq_country"].upper() not in ("US", "USA", "UNITED STATES"):
+            reason = "non_us_hq"
+        elif facts.get("industry") in NON_BUYER_INDUSTRIES:
+            reason = "services_industry"
+        checked[u] = reason or "kept"
+        if reason:
+            result["rejected"][reason] = result["rejected"].get(reason, 0) + 1
+            continue
+
+        if batch is None:
+            batch = Batch(tenant_id=tenant_id, name=f"Play B -- hiring (LinkedIn) {datetime.utcnow().date().isoformat()}",
+                          source=PLAY_BATCH_SOURCE, status="in_progress")
+            db.add(batch)
+            db.commit()
+        website = facts.get("website")
+        company = Company(batch_id=batch.id, name=facts.get("name") or cand["jobs"][0]["company_name"] or u,
+                          domain=_domain(website), linkedin_url=facts.get("linkedin_url") or f"https://www.linkedin.com/company/{u}",
+                          industry=facts.get("industry"), employee_count=size, location=facts.get("hq_text") or None,
+                          source="harvestapi:linkedin_jobs", active_job_title=cand["jobs"][0]["title"],
+                          hiring_signal_posting_count=len(cand["jobs"]))
+        db.add(company)
+        db.commit()
+        for i, job in enumerate(cand["jobs"][:POSTINGS_PER_LEAD]):
+            description = None
+            if i == 0 and job["job_id"]:
+                try:
+                    description = (harvestapi.get_job(job["job_id"]) or {}).get("descriptionText")
+                except DeeplineSpendBlocked as e:
+                    result["stopped"] = f"budget: {e}"
+                except DeeplineError:
+                    pass
+            ref = job["job_id"] or job["url"]
+            if not ref or db.query(GtmSignal.id).filter(GtmSignal.tenant_id == tenant_id, GtmSignal.source == "linkedin_job",
+                                                       GtmSignal.source_ref == ref).first():
+                continue
+            db.add(GtmSignal(
+                tenant_id=tenant_id, source="linkedin_job", source_ref=ref, signal_type="job_posting",
+                observed_at=_parse_iso(job["posted_at"]), company_id=company.id, company_name_raw=company.name,
+                raw_evidence=job, dedup_key=f"linkedin_job:{ref}",
+                extracted_info={"title": job["title"], "location": job["location"], "description_text": (description or "")[:6000],
+                                "organization_domain": website, "organization_headcount": size,
+                                "organization_industry": facts.get("industry"), "organization_description": facts.get("description")},
+                company_resolution_status="resolved", company_resolution_method="explicit",
+                company_resolution_reason="linked at discovery: HarvestAPI job posting names this company",
+                company_resolved_at=datetime.utcnow()))
+        db.commit()
+        result["kept"] += 1
+
+    seen.value = checked
+    db.commit()
+    return result
+
+
+def _parse_iso(value):
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).replace(tzinfo=None)
+    except ValueError:
+        return None
 
 
 # ---------------------------------------------------------------------------------------------
@@ -535,7 +763,7 @@ def run_play_b(db: Session, tenant_id: int, run_cap_usd: float | None = None, do
             if prospeo_key(db, tenant_id):
                 result["sense"] = sense_prospeo(db, tenant_id)
             else:
-                result["sense"] = sense(db, tenant_id, postings_per_profile=postings_per_profile)
+                result["sense"] = sense_harvest(db, tenant_id)
         result["ingest"] = ingest_new_signals(db, tenant_id)
         result["qualify"] = qualify_leads(db, tenant_id, limit=qualify_limit)
         result["contact"] = find_contacts(db, tenant_id, limit=contact_limit)
