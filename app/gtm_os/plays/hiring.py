@@ -145,7 +145,9 @@ Reject if ANY of these is true:
 - it is a staffing agency, recruiter, or consultancy hiring for a client, or it sells sales/GTM services itself
 - the hire does not point to a problem one of our offerings solves
 - the company clearly does not match any of our ideal customers (size, revenue, stage, or market);
-  when revenue is unknown, judge it from employees, funding and what the company does
+  when revenue is unknown, judge it from employees, funding and what the company does. As a rough
+  guide a B2B software company makes $100-250K revenue per employee, so a company under ~50
+  employees rarely reaches $10M -- only qualify one if the data gives a concrete reason it does
 - the posting is generic or unrelated to sales, revenue or go-to-market
 
 Qualify only when the hire itself shows a real, current problem or initiative that one of our

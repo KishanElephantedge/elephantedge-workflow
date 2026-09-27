@@ -212,6 +212,14 @@ DEEPLINE_TOOL_COST_USD = {
     "icypeas_email_search": lambda p: 0.014,
     "hunter_email_finder": lambda p: 0.030,
     "leadmagic_email_finder": lambda p: 0.034,
+    # HarvestAPI (LinkedIn) bills per requested PAGE, not per result (deepline tools describe, 2026-09-27).
+    "harvestapi_search_jobs": lambda p: 0.001,
+    "harvestapi_search_leads": lambda p: 0.07,
+    "harvestapi_search_companies": lambda p: 0.003,
+    "harvestapi_search_posts": lambda p: 0.003,
+    "harvestapi_get_post_comments": lambda p: 0.003,
+    "harvestapi_get_post_reactions": lambda p: 0.003,
+    "harvestapi_get_company": lambda p: 0.003,
 }
 
 
