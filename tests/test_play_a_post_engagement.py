@@ -197,3 +197,23 @@ def test_linkedin_only_contact_is_free(db, monkeypatch):
     assert db.get(Contact, lead.contact_id).linkedin_url == "https://www.linkedin.com/in/jane"
     assert db.get(Company, lead.company_id).name == "Acme"
     assert total_spend_today(db, TENANT) == 0.0
+
+
+def test_harvest_takes_commenters_not_the_author_and_never_reharvests(db, monkeypatch):
+    import app.harvestapi as h
+    import app.gtm_os.intelligence.linkedin_search_config as lsc
+    monkeypatch.setattr(lsc, "get_linkedin_search_config", lambda db, t: {"phrases": ["scale outbound"]})
+    post = {"id": "p1", "linkedinUrl": "https://www.linkedin.com/posts/x", "content": "How do you scale outbound?",
+            "author": {"name": "Guru", "linkedinUrl": "https://www.linkedin.com/in/guru"}, "engagement": {"comments": 12}}
+    monkeypatch.setattr(h, "search_posts", lambda q, **k: [post, {**post, "id": "p2", "engagement": {"comments": 1}}])
+    harvested = []
+    monkeypatch.setattr(h, "get_post_comments", lambda url, **k: harvested.append(url) or [
+        {"commentary": "We can't keep up", "actor": {"name": "Jane Doe", "linkedinUrl": "https://www.linkedin.com/in/jane", "position": "CEO at Acme"}},
+        {"commentary": "Thanks all", "actor": {"name": "Guru", "linkedinUrl": "https://www.linkedin.com/in/guru"}}])
+
+    result = play.sense_harvest(db, TENANT)
+    assert (result["posts_harvested"], result["new_signals"]) == (1, 1)
+    assert play.ingest_new_signals(db, TENANT)["created"] == 1
+    assert "CEO at Acme" in db.query(GtmLead).one().evidence
+    play.sense_harvest(db, TENANT)
+    assert len(harvested) == 1, "a post whose commenters were already bought is never bought again"

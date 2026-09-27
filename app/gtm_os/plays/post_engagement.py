@@ -35,7 +35,11 @@ logger = logging.getLogger(__name__)
 
 PLAY = "post_engagement"
 PLAY_BATCH_NAME = "Play A -- LinkedIn post engagement"
-SIGNAL_SOURCES = ("linkedin_engagement", "linkedin_post")
+# Commenters only. Post AUTHORS were dropped 2026-09-27: people who post about "struggling to scale
+# sales" are mostly the consultants and agencies selling the fix -- 0 of 30 qualified in the first
+# live test, 15 of them vendors. The buyers are the audience engaging with those posts, which is
+# also how Quicklead's social signals work.
+SIGNAL_SOURCES = ("linkedin_engagement",)
 SIGNAL_LOOKBACK_DAYS = 14          # never ingest old backlog -- only recent signals
 DEFAULT_MIN_FIT_SCORE = 70
 QUALIFYING_INTENTS = {"buying", "pain", "seeking_help", "evaluating_tools", "hiring_sales_role"}
@@ -54,7 +58,8 @@ def _lead_fields_from_signal(signal) -> dict | None:
         url = info.get("author_profile_url") or signal.source_ref
         comment = (info.get("comment_text") or "").strip()
         post = (info.get("post_text") or "").strip()
-        evidence = f"Comment: {comment}\n\nOn a post by {info.get('post_author_name') or 'someone'}: {post[:800]}"
+        evidence = (f"Their headline: {info.get('headline') or 'unknown'}\n\nComment: {comment}\n\n"
+                    f"On a post by {info.get('post_author_name') or 'someone'}: {post[:800]}")
     else:  # linkedin_post -- the post's author
         if info.get("author_type") == "Company":
             return None
@@ -508,6 +513,89 @@ def draft_messages(db: Session, tenant_id: int, limit: int = 10, play: str = PLA
 
 
 # ---------------------------------------------------------------------------------------------
+# sense (default) -- HarvestAPI: problem-phrase post search ($0.003 a page of 50 posts), then the
+# commenters of the most-discussed posts ($0.003 a page of up to 100 comments)
+# ---------------------------------------------------------------------------------------------
+
+HARVESTED_POSTS_KEY = "play_a_harvested_posts"
+MIN_POST_COMMENTS = 5
+
+
+def sense_harvest(db: Session, tenant_id: int, phrases_per_run: int = 4, posts_to_harvest: int = 4) -> dict:
+    from app.db.models import Parameter
+    from app.deepline_client import DeeplineError, DeeplineSpendBlocked
+    from app.gtm_os.intelligence.linkedin_search_config import get_linkedin_search_config
+    from app.gtm_os.intelligence.sensing import _dedup_key
+    from app.gtm_os.intelligence.signal import GtmSignal
+    from app import harvestapi
+
+    state = db.query(Parameter).filter(Parameter.tenant_id == tenant_id, Parameter.key == HARVESTED_POSTS_KEY).first()
+    if state is None:
+        state = Parameter(tenant_id=tenant_id, key=HARVESTED_POSTS_KEY, value={"phrase_index": 0, "posts": []},
+                          description="Play A: rotating phrase index + posts whose commenters were already harvested")
+        db.add(state)
+        db.commit()
+    value = dict(state.value or {})
+    done_posts = set(value.get("posts") or [])
+    phrases = get_linkedin_search_config(db, tenant_id).get("phrases") or []
+    start = value.get("phrase_index", 0) % max(len(phrases), 1)
+    todays = (phrases[start:] + phrases[:start])[:phrases_per_run]
+    result = {"source": "harvestapi", "phrases": todays, "posts": 0, "posts_harvested": 0, "commenters": 0, "new_signals": 0, "stopped": None}
+
+    posts = {}
+    try:
+        for phrase in todays:
+            for post in harvestapi.search_posts(phrase):
+                result["posts"] += 1
+                pid = str(post.get("id") or post.get("linkedinUrl"))
+                comments = ((post.get("engagement") or {}).get("comments") or 0)
+                if pid not in done_posts and comments >= MIN_POST_COMMENTS:
+                    posts[pid] = (comments, phrase, post)
+    except DeeplineSpendBlocked as e:
+        result["stopped"] = f"budget: {e}"
+    except DeeplineError as e:
+        result["stopped"] = f"post search failed: {e}"
+
+    for pid, (_, phrase, post) in sorted(posts.items(), key=lambda kv: -kv[1][0])[:posts_to_harvest]:
+        if result["stopped"]:
+            break
+        try:
+            comments = harvestapi.get_post_comments(post.get("linkedinUrl"))
+        except DeeplineSpendBlocked as e:
+            result["stopped"] = f"budget: {e}"
+            break
+        except DeeplineError:
+            continue
+        done_posts.add(pid)
+        result["posts_harvested"] += 1
+        author = post.get("author") or {}
+        author_url = normalize_linkedin_url(author.get("linkedinUrl"))
+        for c in comments:
+            actor = c.get("actor") or {}
+            url = actor.get("linkedinUrl")
+            if not url or normalize_linkedin_url(url) == author_url:
+                continue
+            result["commenters"] += 1
+            if db.query(GtmSignal.id).filter(GtmSignal.tenant_id == tenant_id, GtmSignal.source == "linkedin_engagement",
+                                            GtmSignal.source_ref == url).first():
+                continue
+            db.add(GtmSignal(
+                tenant_id=tenant_id, source="linkedin_engagement", source_ref=url, signal_type="post_comment",
+                observed_at=None, person_name_raw=actor.get("name"), raw_evidence=c, dedup_key=_dedup_key("linkedin_engagement", url),
+                extracted_info={"comment_text": c.get("commentary"), "post_url": post.get("linkedinUrl"),
+                                "post_author_name": author.get("name"), "post_text": (post.get("content") or "")[:2000],
+                                "post_comment_count": (post.get("engagement") or {}).get("comments"),
+                                "headline": actor.get("position"), "search_phrase": phrase, "author_profile_url": url}))
+            result["new_signals"] += 1
+        db.commit()
+
+    value.update({"phrase_index": start + len(todays), "posts": sorted(done_posts)[-2000:]})
+    state.value = value
+    db.commit()
+    return result
+
+
+# ---------------------------------------------------------------------------------------------
 # sense -- existing adapters, budget-checked per call
 # ---------------------------------------------------------------------------------------------
 
@@ -559,7 +647,7 @@ def run_play_a(db: Session, tenant_id: int, run_cap_usd: float | None = None, do
     result: dict = {"status": "completed", "play": PLAY}
     with spend_scope(db, tenant_id, PLAY, run_cap_usd=run_cap_usd) as scope:
         if do_sense:
-            result["sense"] = sense(db, tenant_id)
+            result["sense"] = sense_harvest(db, tenant_id)
         result["ingest"] = ingest_new_signals(db, tenant_id)
         result["qualify"] = qualify_leads(db, tenant_id, limit=qualify_limit)
         result["contact"] = find_contacts(db, tenant_id, limit=contact_limit)
