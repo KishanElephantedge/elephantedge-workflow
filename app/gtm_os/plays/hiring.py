@@ -8,8 +8,9 @@
     qualify    ONE LLM call per company: reading its real job postings, does this hire show a
                problem one of our offerings solves, for a company that fits an ICP? Nothing is
                paid for before this says yes.
-    contact    the existing decision-maker finder (free layer first, paid fallback after), for
-               qualified companies only, one contact each
+    contact    the existing decision-maker finder's free layer (leadership list + Google, the agent
+               picks the person) and the per-result email waterfall -- no paid people search --
+               for qualified companies only, one contact each
     draft      the existing message drafter -> awaits approval
 
 Same guarantees as Play A: every paid call is reserved against the tenant's combined daily cap
@@ -240,7 +241,11 @@ def find_contacts(db: Session, tenant_id: int, limit: int = 10) -> dict:
             spent_before = scope.spent_usd if scope else 0.0
             blocked_before = scope.blocked if scope else 0
             try:
-                new_contacts, _used_paid = find_decision_makers(company, db, tenant_id, allow_paid_fallback=True, max_contacts=1)
+                # Free leadership list + Google, the agent picks the person, then the per-result email
+                # waterfall (icypeas $0.014 -> hunter -> leadmagic, $0 on a miss): ~$0.02-0.06 a company.
+                # The paid search_contact fallback is off -- it bills $0.056 for every person it
+                # returns (3 per call, up to 3 calls), which is what made a contact cost ~$0.25.
+                new_contacts, _used_paid = find_decision_makers(company, db, tenant_id, allow_paid_fallback=False, max_contacts=1)
             except SpendBlocked as e:
                 return {"found": found, "reused": reused, "missing": missing, "stopped": f"budget: {e}"}
             except Exception as e:  # noqa: BLE001

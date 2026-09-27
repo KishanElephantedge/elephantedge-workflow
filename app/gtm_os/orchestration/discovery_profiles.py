@@ -205,6 +205,13 @@ def titles_for_icp(icp: dict) -> list[str]:
     return titles or list(REP_LEVEL_TITLES)
 
 
+# Elephant Edge's ICPs are software companies. APIFY_INDUSTRY_FILTER also includes "IT Services and
+# IT Consulting", and every company that industry returned in the 2026-09-27 Play B sample was a
+# consultancy or agency the Qualifier then rejected (XCentium, Echez, Beyond20, Brilliant Infotech,
+# The Miller Group) -- paid-for postings from companies that sell services rather than buy them.
+ICP_INDUSTRY_FILTER = [i for i in APIFY_INDUSTRY_FILTER if i != "IT Services and IT Consulting"]
+
+
 def build_icp_discovery_profiles(db: Session, tenant_id: int) -> list[dict]:
     """One profile PER ICP -- not per offering.
 
@@ -234,11 +241,14 @@ def build_icp_discovery_profiles(db: Session, tenant_id: int) -> list[dict]:
             "id": icp["id"],
             "time_range": DEFAULT_TIME_RANGE,
             "offering_names": offerings,
-            "enabled": True,
+            # A disabled ICP must not be searched. This was hardcoded True, so icp_1's search
+            # (small companies hiring SDRs/AEs) kept buying postings after icp_1 was switched off
+            # -- 9 of the first 15 Play B rejections on 2026-09-27 were exactly those companies.
+            "enabled": bool(icp.get("enabled", True)),
             "title_search": titles_for_icp(icp),
             "employee_min": lo,
             "employee_max": hi,
-            "industry_filter": list(APIFY_INDUSTRY_FILTER),
+            "industry_filter": list(ICP_INDUSTRY_FILTER),
         })
     return profiles
 
