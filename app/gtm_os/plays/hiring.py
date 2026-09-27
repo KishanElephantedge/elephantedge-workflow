@@ -1,6 +1,8 @@
 """Play B -- hiring signals (a company hiring for the problem we solve).
 
-    sense      the existing Apify job discovery, once per ENABLED ICP's discovery profile, with a
+    sense      preferred: one direct Prospeo search per ENABLED ICP (hiring-for + revenue + size +
+               decision maker, with LinkedIn URL) -- see sense_prospeo. Fallback when no Prospeo
+               key is set: the existing Apify job discovery, once per enabled ICP's profile, with a
                small posting limit. Every posting is kept as a GtmSignal linked to its company.
                The paid team-size lookup is skipped -- the Qualifier judges fit instead.
     ingest     every recently-hired-for company becomes one GtmLead (lead_key "company:<id>");
@@ -292,7 +294,182 @@ def find_contacts(db: Session, tenant_id: int, limit: int = 10, channels: list[s
 
 
 # ---------------------------------------------------------------------------------------------
-# sense -- the existing Apify job discovery, per enabled ICP, small and budget-checked
+# sense (preferred) -- one direct Prospeo search per enabled ICP: companies hiring the ICP's
+# trigger roles, in its revenue and size band, with their decision maker's LinkedIn URL.
+# ~$0.0004 a person. Used whenever a prospeo_api_key credential exists.
+# ---------------------------------------------------------------------------------------------
+
+PROSPEO_CURSOR_KEY = "hiring_play_prospeo_cursor"
+DECISION_MAKER_SENIORITY = ["Founder/Owner", "C-Suite", "Vice President", "Head"]
+DECISION_MAKER_DEPARTMENTS = ["C-Suite", "Sales"]
+PEOPLE_PER_COMPANY = 2              # the Qualifier / drafter pick between them, at no extra cost
+
+
+def prospeo_filters_for_icp(icp: dict) -> dict:
+    """Built from the ICP config itself, so editing an ICP changes the search -- nothing hand-typed."""
+    from app.gtm_os.orchestration.discovery_profiles import ICP_INDUSTRY_FILTER, headcount_band_for_icp, titles_for_icp
+    from app.prospeo_client import revenue_filter
+
+    lo, hi = headcount_band_for_icp(icp)
+    filters = {
+        "company_job_posting_hiring_for": {"include": titles_for_icp(icp), "match_type": "contains"},
+        "company_headcount_custom": {"min": lo, "max": hi},
+        "company_industry": {"include": list(ICP_INDUSTRY_FILTER)},
+        "company_location_search": {"include": ["United States"]},
+        "person_seniority": {"include": DECISION_MAKER_SENIORITY},
+        "person_department": {"include": DECISION_MAKER_DEPARTMENTS},
+        "max_person_per_company": PEOPLE_PER_COMPANY,
+    }
+    revenue = revenue_filter(icp.get("revenue_min_usd"), icp.get("revenue_max_usd"))
+    if revenue:
+        filters["company_revenue"] = revenue
+    return filters
+
+
+def _cursor(db: Session, tenant_id: int):
+    from app.db.models import Parameter
+
+    param = db.query(Parameter).filter(Parameter.tenant_id == tenant_id, Parameter.key == PROSPEO_CURSOR_KEY).first()
+    if param is None:
+        param = Parameter(tenant_id=tenant_id, key=PROSPEO_CURSOR_KEY, value={},
+                          description="Play B: next Prospeo search page per ICP (reset when the ICP's filters change)")
+        db.add(param)
+        db.commit()
+    return param
+
+
+def _domain(value: str | None) -> str | None:
+    if not value:
+        return None
+    d = value.lower().replace("https://", "").replace("http://", "").replace("www.", "").split("/")[0].strip()
+    return d or None
+
+
+def _prospeo_evidence(icp: dict, person: dict, company: dict) -> str:
+    import json
+
+    keep = {k: v for k, v in company.items() if v not in (None, "", [], {}) and "logo" not in k}
+    return (
+        f"Found by searching for companies hiring for: {', '.join(prospeo_filters_for_icp(icp)['company_job_posting_hiring_for']['include'])} "
+        f"(ICP {icp['id']}: {icp.get('name')})\n"
+        f"Person: {person.get('full_name') or ''} -- {person.get('current_job_title') or person.get('job_title') or ''} "
+        f"({person.get('linkedin_url') or ''})\nHeadline: {person.get('headline') or ''}\n\n"
+        f"Company data:\n{json.dumps(keep, default=str)[:4000]}"
+    )
+
+
+def _ingest_prospeo_result(db: Session, tenant_id: int, batch: Batch, icp: dict, result: dict, known: set) -> str:
+    """One search hit -> Company + Contact + signal + lead. Returns what happened."""
+    from app.gtm_os.intelligence.signal import GtmSignal
+    from app.gtm_os.plays.lead import normalize_linkedin_url
+
+    person, company_data = result.get("person") or {}, result.get("company") or {}
+    linkedin = normalize_linkedin_url(person.get("linkedin_url"))
+    domain = _domain(company_data.get("domain") or company_data.get("website"))
+    if not linkedin or not domain:
+        return "incomplete"
+
+    company = (
+        db.query(Company).join(Batch, Company.batch_id == Batch.id)
+        .filter(Batch.tenant_id == tenant_id, Company.domain == domain).first()
+    )
+    if company is None:
+        company = Company(batch_id=batch.id, name=company_data.get("name") or domain, domain=domain,
+                          linkedin_url=company_data.get("linkedin_url"), industry=company_data.get("industry"),
+                          employee_count=company_data.get("employee_count") if isinstance(company_data.get("employee_count"), int) else None,
+                          source="prospeo:search_person")
+        db.add(company)
+        db.commit()
+    elif _already_in_outreach(db, company.id):
+        return "in_outreach"
+
+    contact = (db.query(Contact).filter(Contact.company_id == company.id, Contact.linkedin_url.ilike(f"%{linkedin}%")).first())
+    if contact is None:
+        contact = Contact(company_id=company.id, first_name=person.get("first_name"), last_name=person.get("last_name"),
+                          title=person.get("current_job_title") or person.get("job_title"),
+                          linkedin_url=f"https://www.{linkedin}", thread_role="hiring_play_decision_maker",
+                          matched_title_reasoning=f"Prospeo search for ICP {icp['id']}")
+        db.add(contact)
+        db.commit()
+
+    ref = str(person.get("person_id") or person.get("id") or linkedin)
+    if not db.query(GtmSignal.id).filter(GtmSignal.tenant_id == tenant_id, GtmSignal.source == "prospeo_search",
+                                         GtmSignal.source_ref == ref).first():
+        db.add(GtmSignal(tenant_id=tenant_id, source="prospeo_search", source_ref=ref, signal_type="hiring_search_match",
+                         company_id=company.id, company_name_raw=company.name, contact_id=contact.id,
+                         person_name_raw=person.get("full_name"), raw_evidence=result,
+                         extracted_info={"icp_id": icp["id"], "hiring_for": titles_for(icp)},
+                         dedup_key=f"prospeo_search:{ref}", company_resolution_status="resolved",
+                         company_resolution_method="explicit"))
+        db.commit()
+
+    key = lead_key_for(company.id)
+    if key in known:
+        return "known"
+    db.add(GtmLead(tenant_id=tenant_id, play=PLAY, lead_key=key, company_id=company.id, contact_id=contact.id,
+                   person_name=person.get("full_name"), person_linkedin_url=linkedin, state=STATE_SIGNAL,
+                   evidence=_prospeo_evidence(icp, person, company_data)))
+    db.commit()
+    known.add(key)
+    return "created"
+
+
+def titles_for(icp: dict) -> list[str]:
+    from app.gtm_os.orchestration.discovery_profiles import titles_for_icp
+    return titles_for_icp(icp)
+
+
+def sense_prospeo(db: Session, tenant_id: int, pages_per_icp: int = 1) -> dict:
+    import hashlib
+    import json
+
+    from app.gtm_os.icp.icp_config import get_icp_config
+    from app.prospeo_client import ProspeoError, search_person
+
+    icps = [i for i in get_icp_config(db, tenant_id) if i.get("enabled", True)]
+    batch = Batch(tenant_id=tenant_id, name=f"Play B -- hiring (Prospeo) {datetime.utcnow().date().isoformat()}",
+                  source=PLAY_BATCH_SOURCE, status="in_progress")
+    db.add(batch)
+    db.commit()
+
+    cursor = _cursor(db, tenant_id)
+    state = dict(cursor.value or {})
+    known = {row[0] for row in db.query(GtmLead.lead_key).filter(GtmLead.tenant_id == tenant_id, GtmLead.play == PLAY)}
+    result = {"source": "prospeo", "batch_id": batch.id, "people": 0, "outcomes": {}, "icps": {}, "stopped": None}
+    for icp in icps:
+        filters = prospeo_filters_for_icp(icp)
+        fingerprint = hashlib.sha1(json.dumps(filters, sort_keys=True).encode()).hexdigest()[:12]
+        entry = state.get(icp["id"]) if (state.get(icp["id"]) or {}).get("filters") == fingerprint else None
+        page = (entry or {}).get("next_page", 1)
+        for _ in range(pages_per_icp):
+            try:
+                found = search_person(db, tenant_id, filters, page=page)
+            except SpendBlocked as e:
+                result["stopped"] = f"budget: {e}"
+                break
+            except ProspeoError as e:
+                result["icps"][icp["id"]] = {"error": str(e), "code": e.code}
+                break
+            people = found["results"]
+            result["people"] += len(people)
+            for r in people:
+                outcome = _ingest_prospeo_result(db, tenant_id, batch, icp, r, known)
+                result["outcomes"][outcome] = result["outcomes"].get(outcome, 0) + 1
+            total_pages = (found.get("pagination") or {}).get("total_page") or 0
+            result["icps"][icp["id"]] = {"page": page, "people": len(people), "total_pages": total_pages}
+            page = page + 1 if people and page < total_pages else 1   # wrap around once exhausted
+            if not people:
+                break
+        state[icp["id"]] = {"filters": fingerprint, "next_page": page}
+        cursor.value = dict(state)
+        db.commit()
+        if result["stopped"]:
+            break
+    return result
+
+
+# ---------------------------------------------------------------------------------------------
+# sense (fallback) -- the existing Apify job discovery, per enabled ICP, small and budget-checked
 # ---------------------------------------------------------------------------------------------
 
 def sense(db: Session, tenant_id: int, postings_per_profile: int = 20) -> dict:
@@ -351,7 +528,12 @@ def run_play_b(db: Session, tenant_id: int, run_cap_usd: float | None = None, do
     result: dict = {"status": "completed", "play": PLAY}
     with spend_scope(db, tenant_id, PLAY, run_cap_usd=run_cap_usd) as scope:
         if do_sense:
-            result["sense"] = sense(db, tenant_id, postings_per_profile=postings_per_profile)
+            from app.prospeo_client import get_api_key as prospeo_key
+
+            if prospeo_key(db, tenant_id):
+                result["sense"] = sense_prospeo(db, tenant_id)
+            else:
+                result["sense"] = sense(db, tenant_id, postings_per_profile=postings_per_profile)
         result["ingest"] = ingest_new_signals(db, tenant_id)
         result["qualify"] = qualify_leads(db, tenant_id, limit=qualify_limit)
         result["contact"] = find_contacts(db, tenant_id, limit=contact_limit)
