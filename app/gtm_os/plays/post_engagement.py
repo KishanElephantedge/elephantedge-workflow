@@ -6,8 +6,9 @@
                already known to this play is never ingested again
     qualify    ONE LLM call per lead: is this a real decision-maker at a company we fit, showing
                real intent? -> "qualified" or "rejected". Nothing is paid for before this says yes.
-    contact    ONE Prospeo enrich-person call (LinkedIn URL -> verified email + company), only for
-               qualified leads. Writes the Company/Contact and the Opportunity/Strategy rows the
+    contact    LinkedIn-only outreach (outreach.channels): free -- the signal already carries the
+               person's LinkedIn profile. With email outreach: ONE Prospeo enrich-person call
+               (LinkedIn URL -> verified email + company), only for qualified leads. Writes the Company/Contact and the Opportunity/Strategy rows the
                existing Messages, Pipeline and approval screens already read.
     draft      the existing message drafter, targeted at this exact person -> awaits approval
 
@@ -275,6 +276,14 @@ def _company_for(db: Session, tenant_id: int, name: str, domain: str | None, lin
         )
         if existing:
             return existing
+    else:
+        # No domain (a LinkedIn-only lead named by the Qualifier): reuse an exact-name match.
+        existing = (
+            db.query(Company).join(Batch, Company.batch_id == Batch.id)
+            .filter(Batch.tenant_id == tenant_id, Company.name.ilike(name)).first()
+        )
+        if existing:
+            return existing
     company = Company(batch_id=_play_batch(db, tenant_id).id, name=name, domain=domain, linkedin_url=linkedin_url)
     db.add(company)
     db.commit()
@@ -355,9 +364,33 @@ def _write_opportunity(db: Session, tenant_id: int, lead: GtmLead, company: Comp
     return opportunity, strategy
 
 
-def find_contacts(db: Session, tenant_id: int, limit: int = 10) -> dict:
+def _contact_from_signal(db: Session, tenant_id: int, lead: GtmLead) -> None:
+    """LinkedIn-only outreach: the post/comment already gave us the person's LinkedIn profile, so
+    nothing is bought -- the lead is written straight through with the Qualifier's company guess."""
+    v = lead.qualifier_output or {}
+    url = f"https://www.{lead.person_linkedin_url}"
+    company = _company_for(db, tenant_id, v.get("company_guess") or f"Company of {lead.person_name or 'unknown'}", None, None)
+    contact = (db.query(Contact)
+               .filter(Contact.company_id == company.id, Contact.linkedin_url.ilike(f"%{lead.person_linkedin_url}%")).first())
+    if contact is None:
+        first, _, last = (lead.person_name or "").partition(" ")
+        contact = Contact(company_id=company.id, first_name=first or None, last_name=last or None,
+                          title=v.get("role_guess"), linkedin_url=url, thread_role="engagement_lead",
+                          matched_title_reasoning=lead.qualifier_reason)
+        db.add(contact)
+        db.commit()
+    opportunity, _strategy = _write_opportunity(db, tenant_id, lead, company)
+    lead.company_id, lead.contact_id, lead.opportunity_id = company.id, contact.id, opportunity.id
+    lead.state = STATE_CONTACT_FOUND
+    db.commit()
+
+
+def find_contacts(db: Session, tenant_id: int, limit: int = 10, channels: list[str] | None = None) -> dict:
     from app.deepline_client import DeeplineError, DeeplineSpendBlocked, execute_tool
+    from app.gtm_os.orchestration.control import get_control_config, get_outreach_channels
     from app.spend_ledger import settle_spend
+
+    channels = channels or get_outreach_channels(get_control_config(db, tenant_id))
 
     leads = (
         db.query(GtmLead)
@@ -368,6 +401,16 @@ def find_contacts(db: Session, tenant_id: int, limit: int = 10) -> dict:
     )
     found = missing = 0
     for lead in leads:
+        if "email" not in channels:
+            try:
+                _contact_from_signal(db, tenant_id, lead)
+                found += 1
+            except Exception as e:  # noqa: BLE001
+                db.rollback()
+                lead.state = STATE_FAILED
+                lead.last_error = f"write rows: {type(e).__name__}: {e}"[:500]
+                db.commit()
+            continue
         url = f"https://www.{lead.person_linkedin_url}"
         try:
             response = execute_tool("prospeo_enrich_person", {"linkedin_url": url, "only_verified_email": True})

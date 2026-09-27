@@ -185,3 +185,15 @@ def test_run_respects_paused_control_plane(db):
     config["spend"] = {"daily_cap_usd": 1.0, "run_cap_usd": 0.5}
     set_control_config(db, TENANT, config)
     assert play.run_play_a(db, TENANT)["status"] == "skipped"
+
+
+def test_linkedin_only_contact_is_free(db, monkeypatch):
+    _qualified_lead(db, monkeypatch)
+    monkeypatch.setattr(deepline_client, "_call_deepline_cli", lambda t, p: pytest.fail("must not buy an email"))
+    with spend_scope(db, TENANT, "play_a"):
+        assert play.find_contacts(db, TENANT, channels=["linkedin"])["found"] == 1
+    lead = db.query(GtmLead).one()
+    assert lead.state == "contact_found"
+    assert db.get(Contact, lead.contact_id).linkedin_url == "https://www.linkedin.com/in/jane"
+    assert db.get(Company, lead.company_id).name == "Acme"
+    assert total_spend_today(db, TENANT) == 0.0
