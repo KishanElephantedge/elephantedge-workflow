@@ -169,3 +169,19 @@ def test_run_respects_paused_control_plane(db):
     config["spend"] = {"daily_cap_usd": 1.0, "run_cap_usd": 0.5}
     set_control_config(db, TENANT, config)
     assert play.run_play_b(db, TENANT)["status"] == "skipped"
+
+
+def test_company_with_an_earlier_opportunity_chain_is_reused_not_duplicated(db, monkeypatch):
+    acme = _qualified(db, monkeypatch)
+    db.add(Contact(company_id=acme.id, first_name="Jane", title="CEO", email="jane@acme.io"))
+    old = ProblemHypothesis(tenant_id=TENANT, company_id=acme.id, company_name_raw="Acme", affected_function="sales",
+                            problem_statement="old")
+    db.add(old)
+    db.commit()
+
+    with spend_scope(db, TENANT, "hiring", run_cap_usd=0.5):
+        assert play.find_contacts(db, TENANT)["reused"] == 1
+    assert db.query(GtmLead).one().state == "contact_found"
+    assert db.query(ProblemHypothesis).count() == 1
+    assert db.get(ProblemHypothesis, old.id).problem_statement == "No sales leadership."
+    assert db.query(Opportunity).count() == 1

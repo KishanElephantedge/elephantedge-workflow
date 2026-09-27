@@ -298,30 +298,47 @@ def _write_opportunity(db: Session, tenant_id: int, lead: GtmLead, company: Comp
     evidence = {"play": play, "lead_id": lead.id, "evidence_quote": v.get("evidence_quote"), "intent": lead.intent,
                 "icp_fit_score": lead.icp_fit_score, "reason": lead.qualifier_reason}
 
-    problem = ProblemHypothesis(tenant_id=tenant_id, company_id=company.id, company_name_raw=company.name,
-                                person_name_raw=lead.person_name, affected_function="sales",
-                                problem_statement=problem_text, reasoning_note=lead.qualifier_reason,
-                                confidence=evidence, first_observed_at=lead.created_at)
-    db.add(problem)
+    # A company can already carry a problem/demand/opportunity from an earlier run (problem rows are
+    # unique per tenant+function+company). Reuse and refresh that chain rather than duplicating it.
+    now = datetime.utcnow()
+    problem = (db.query(ProblemHypothesis)
+               .filter(ProblemHypothesis.tenant_id == tenant_id, ProblemHypothesis.company_id == company.id,
+                       ProblemHypothesis.affected_function == "sales").first())
+    if problem is None:
+        problem = ProblemHypothesis(tenant_id=tenant_id, company_id=company.id, company_name_raw=company.name,
+                                    affected_function="sales", first_observed_at=lead.created_at)
+        db.add(problem)
+    problem.person_name_raw = lead.person_name
+    problem.problem_statement, problem.reasoning_note, problem.confidence = problem_text, lead.qualifier_reason, evidence
+    problem.last_updated_at = now
     db.flush()
-    demand = DemandHypothesis(tenant_id=tenant_id, company_id=company.id, company_name_raw=company.name,
-                              problem_hypothesis_id=problem.id, affected_function="sales",
-                              demand_statement=demand_text, reasoning_note=lead.qualifier_reason,
-                              confidence=evidence, first_observed_at=lead.created_at)
-    db.add(demand)
+
+    demand = (db.query(DemandHypothesis)
+              .filter(DemandHypothesis.tenant_id == tenant_id, DemandHypothesis.problem_hypothesis_id == problem.id)
+              .order_by(DemandHypothesis.id.desc()).first())
+    if demand is None:
+        demand = DemandHypothesis(tenant_id=tenant_id, company_id=company.id, company_name_raw=company.name,
+                                  problem_hypothesis_id=problem.id, affected_function="sales",
+                                  first_observed_at=lead.created_at)
+        db.add(demand)
+    demand.demand_statement, demand.reasoning_note, demand.confidence = demand_text, lead.qualifier_reason, evidence
+    demand.last_updated_at = now
     db.flush()
+
     icp_id = v.get("matched_icp_id")
-    opportunity = Opportunity(
-        tenant_id=tenant_id, company_id=company.id, company_name_raw=company.name,
-        demand_hypothesis_id=demand.id, problem_hypothesis_id=problem.id, affected_function="sales",
-        opportunity_statement=f"{lead.person_name or 'A leader'} at {company.name}: {problem_text}",
-        reasoning_note=lead.qualifier_reason, status="qualified", confidence=evidence,
-        first_observed_at=lead.created_at,
-        icp_context={"has_icp_match": bool(icp_id), "status": "matched" if icp_id else "no_match_recorded",
-                     "matches": [{"icp_id": icp_id, "reasons": [lead.qualifier_reason]}] if icp_id else [],
-                     "source": f"{play}_qualifier"},
-    )
-    db.add(opportunity)
+    opportunity = db.query(Opportunity).filter(Opportunity.demand_hypothesis_id == demand.id).first()
+    if opportunity is None:
+        opportunity = Opportunity(tenant_id=tenant_id, company_id=company.id, company_name_raw=company.name,
+                                  demand_hypothesis_id=demand.id, affected_function="sales",
+                                  first_observed_at=lead.created_at)
+        db.add(opportunity)
+    opportunity.problem_hypothesis_id = problem.id
+    opportunity.opportunity_statement = f"{lead.person_name or 'A leader'} at {company.name}: {problem_text}"
+    opportunity.reasoning_note, opportunity.status, opportunity.confidence = lead.qualifier_reason, "qualified", evidence
+    opportunity.icp_context = {"has_icp_match": bool(icp_id), "status": "matched" if icp_id else "no_match_recorded",
+                               "matches": [{"icp_id": icp_id, "reasons": [lead.qualifier_reason]}] if icp_id else [],
+                               "source": f"{play}_qualifier"}
+    opportunity.last_updated_at = now
     db.flush()
     strategy = GtmStrategy(
         tenant_id=tenant_id, opportunity_id=opportunity.id, strategy_type="consultative",
