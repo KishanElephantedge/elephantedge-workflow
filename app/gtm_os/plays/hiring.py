@@ -24,6 +24,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timedelta
 
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 from app.db.models import Batch, CampaignPush, Company, Contact
@@ -441,7 +442,6 @@ def sense_harvest(db: Session, tenant_id: int, max_companies: int = 25, posted: 
     new = [(u, c) for u, c in candidates.items() if u not in known and u not in checked]
     result["new_companies"] = len(new)
 
-    batch = None
     for u, cand in new[:max_companies]:
         if result["stopped"]:
             break
@@ -466,52 +466,77 @@ def sense_harvest(db: Session, tenant_id: int, max_companies: int = 25, posted: 
         elif facts.get("industry") in NON_BUYER_INDUSTRIES:
             reason = "services_industry"
         checked[u] = reason or "kept"
+        try:
+            # Saved per company, not at the end: a dropped connection later in the run must not
+            # lose lookups already paid for (they would be bought again next run).
+            seen.value = dict(checked)
+            db.commit()
+        except OperationalError:
+            db.rollback()
         if reason:
             result["rejected"][reason] = result["rejected"].get(reason, 0) + 1
             continue
-
-        if batch is None:
-            batch = Batch(tenant_id=tenant_id, name=f"Play B -- hiring (LinkedIn) {datetime.utcnow().date().isoformat()}",
-                          source=PLAY_BATCH_SOURCE, status="in_progress")
-            db.add(batch)
-            db.commit()
-        website = facts.get("website")
-        company = Company(batch_id=batch.id, name=facts.get("name") or cand["jobs"][0]["company_name"] or u,
-                          domain=_domain(website), linkedin_url=facts.get("linkedin_url") or f"https://www.linkedin.com/company/{u}",
-                          industry=facts.get("industry"), employee_count=size, location=facts.get("hq_text") or None,
-                          source="harvestapi:linkedin_jobs", active_job_title=cand["jobs"][0]["title"],
-                          hiring_signal_posting_count=len(cand["jobs"]))
-        db.add(company)
+        try:
+            _keep_company(db, tenant_id, u, cand, facts, size, result)
+        except OperationalError as e:
+            # One company's write failed (connection dropped mid-run); the rest carry on.
+            db.rollback()
+            result.setdefault("write_errors", []).append(f"{u}: {str(e)[:120]}")
+            checked.pop(u, None)  # not saved -- let the next run pick it up again
+    try:
+        seen.value = dict(checked)
         db.commit()
-        for i, job in enumerate(cand["jobs"][:POSTINGS_PER_LEAD]):
-            description = None
-            if i == 0 and job["job_id"]:
-                try:
-                    description = (harvestapi.get_job(job["job_id"]) or {}).get("descriptionText")
-                except DeeplineSpendBlocked as e:
-                    result["stopped"] = f"budget: {e}"
-                except DeeplineError:
-                    pass
-            ref = job["job_id"] or job["url"]
-            if not ref or db.query(GtmSignal.id).filter(GtmSignal.tenant_id == tenant_id, GtmSignal.source == "linkedin_job",
-                                                       GtmSignal.source_ref == ref).first():
-                continue
-            db.add(GtmSignal(
-                tenant_id=tenant_id, source="linkedin_job", source_ref=ref, signal_type="job_posting",
-                observed_at=_parse_iso(job["posted_at"]), company_id=company.id, company_name_raw=company.name,
-                raw_evidence=job, dedup_key=f"linkedin_job:{ref}",
-                extracted_info={"title": job["title"], "location": job["location"], "description_text": (description or "")[:6000],
-                                "organization_domain": website, "organization_headcount": size,
-                                "organization_industry": facts.get("industry"), "organization_description": facts.get("description")},
-                company_resolution_status="resolved", company_resolution_method="explicit",
-                company_resolution_reason="linked at discovery: HarvestAPI job posting names this company",
-                company_resolved_at=datetime.utcnow()))
-        db.commit()
-        result["kept"] += 1
-
-    seen.value = checked
-    db.commit()
+    except OperationalError:
+        db.rollback()
     return result
+
+
+def _keep_company(db: Session, tenant_id: int, u: str, cand: dict, facts: dict, size: int, result: dict) -> None:
+    from app.deepline_client import DeeplineError, DeeplineSpendBlocked
+    from app.gtm_os.intelligence.signal import GtmSignal
+    from app import harvestapi
+
+    batch = (db.query(Batch).filter(Batch.tenant_id == tenant_id, Batch.source == PLAY_BATCH_SOURCE,
+                                    Batch.name == f"Play B -- hiring (LinkedIn) {datetime.utcnow().date().isoformat()}").first())
+
+    if batch is None:
+        batch = Batch(tenant_id=tenant_id, name=f"Play B -- hiring (LinkedIn) {datetime.utcnow().date().isoformat()}",
+                      source=PLAY_BATCH_SOURCE, status="in_progress")
+        db.add(batch)
+        db.commit()
+    website = facts.get("website")
+    company = Company(batch_id=batch.id, name=facts.get("name") or cand["jobs"][0]["company_name"] or u,
+                      domain=_domain(website), linkedin_url=facts.get("linkedin_url") or f"https://www.linkedin.com/company/{u}",
+                      industry=facts.get("industry"), employee_count=size, location=facts.get("hq_text") or None,
+                      source="harvestapi:linkedin_jobs", active_job_title=cand["jobs"][0]["title"],
+                      hiring_signal_posting_count=len(cand["jobs"]))
+    db.add(company)
+    db.commit()
+    for i, job in enumerate(cand["jobs"][:POSTINGS_PER_LEAD]):
+        description = None
+        if i == 0 and job["job_id"]:
+            try:
+                description = (harvestapi.get_job(job["job_id"]) or {}).get("descriptionText")
+            except DeeplineSpendBlocked as e:
+                result["stopped"] = f"budget: {e}"
+            except DeeplineError:
+                pass
+        ref = job["job_id"] or job["url"]
+        if not ref or db.query(GtmSignal.id).filter(GtmSignal.tenant_id == tenant_id, GtmSignal.source == "linkedin_job",
+                                                   GtmSignal.source_ref == ref).first():
+            continue
+        db.add(GtmSignal(
+            tenant_id=tenant_id, source="linkedin_job", source_ref=ref, signal_type="job_posting",
+            observed_at=_parse_iso(job["posted_at"]), company_id=company.id, company_name_raw=company.name,
+            raw_evidence=job, dedup_key=f"linkedin_job:{ref}",
+            extracted_info={"title": job["title"], "location": job["location"], "description_text": (description or "")[:6000],
+                            "organization_domain": website, "organization_headcount": size,
+                            "organization_industry": facts.get("industry"), "organization_description": facts.get("description")},
+            company_resolution_status="resolved", company_resolution_method="explicit",
+            company_resolution_reason="linked at discovery: HarvestAPI job posting names this company",
+            company_resolved_at=datetime.utcnow()))
+    db.commit()
+    result["kept"] += 1
 
 
 def _parse_iso(value):

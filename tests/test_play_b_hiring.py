@@ -280,3 +280,42 @@ def test_harvest_contacts_one_search_for_many_companies_agent_picks(db, monkeypa
     assert (result["found"], result["missing"]) == (1, 1)
     alpha_lead = next(l for l in db.query(GtmLead) if db.get(Company, l.company_id).name == "Alpha")
     assert db.get(Contact, alpha_lead.contact_id).linkedin_url == "https://linkedin.com/in/ann"  # never Ned at a look-alike company
+
+
+def test_harvest_discovery_survives_a_write_failure_mid_run_and_retries_that_company(db, monkeypatch):
+    """A dropped DB connection while writing one company's Company/signal rows must not lose
+    the run: the checked-companies state already committed for earlier companies is kept, the
+    failing company is NOT marked checked (so it's retried next run), and later companies still
+    get written."""
+    import app.harvestapi as h
+    from sqlalchemy.exc import OperationalError
+
+    _icp3(monkeypatch)
+    jobs = [{"job_id": str(n), "title": "VP Sales", "url": f"u{n}", "posted_at": "2026-09-25T00:00:00Z",
+             "company_name": name, "company_linkedin_url": f"https://www.linkedin.com/company/{name.lower()}",
+             "company_universal_name": name.lower(), "location": "US"}
+            for n, name in ((1, "First"), (2, "Second"), (3, "Third"))]
+    monkeypatch.setattr(h, "search_jobs", lambda title, **k: jobs if title == "VP Sales" else [])
+    facts = {name.lower(): {"name": name, "employee_count": 200, "industry": "Software Development",
+                            "hq_country": "US", "hq_text": "Austin, TX, US", "website": f"https://{name.lower()}.io",
+                            "description": "d", "linkedin_url": f"https://www.linkedin.com/company/{name.lower()}"}
+             for name in ("First", "Second", "Third")}
+    monkeypatch.setattr(h, "get_company", lambda u: facts[u])
+    monkeypatch.setattr(h, "get_job", lambda job_id: {"descriptionText": "Build our sales team."})
+
+    real_keep_company = play._keep_company
+    def flaky_keep_company(db_, tenant_id, u, cand, facts_, size, result):
+        if u == "second":
+            raise OperationalError("INSERT", {}, Exception("SSL SYSCALL error: Operation timed out"))
+        return real_keep_company(db_, tenant_id, u, cand, facts_, size, result)
+    monkeypatch.setattr(play, "_keep_company", flaky_keep_company)
+
+    result = play.sense_harvest(db, TENANT)
+    assert result["kept"] == 2
+    assert result["write_errors"][0].startswith("second:")
+    kept_names = {c.name for c in db.query(Company)}
+    assert kept_names == {"First", "Third"}
+
+    seen = db.query(Parameter).filter(Parameter.key == play.HARVEST_SEEN_KEY).one()
+    assert seen.value["first"] == "kept" and seen.value["third"] == "kept"
+    assert "second" not in seen.value, "the failed company is not marked checked, so it's retried"
