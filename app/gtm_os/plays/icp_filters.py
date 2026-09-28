@@ -65,14 +65,19 @@ def _looks_like_a_vendor(company_name: str | None) -> bool:
 
 
 def _size_fits(band: tuple[int, int | None] | None, lo: int, hi: int) -> bool | None:
-    """True/False when the free page's declared size band lets us tell; None when there's no
-    band to judge (an unreadable page, or LinkedIn simply not declaring one) -- caller falls
-    back to the paid, exact-count lookup only in that None case."""
+    """False (confident reject) only when the band is CONFIRMED TOO BIG -- its whole declared
+    range sits above the ICP's max. Never rejects on "too small": real bug found live
+    2026-09-28 -- BePresent's public page declares "2-10 employees" while its real, paid-lookup
+    count is 31, genuinely inside a 30-100 ICP. LinkedIn's self-declared band understates a
+    company that has grown since it was last updated (the exact asymmetry
+    company_profile_check.py's own profile_rejection_reason() already documented for the
+    hiring play -- "TOO BIG only, never too small" -- this play just hadn't reused it). A
+    band that looks small, or has no band at all, returns None so the caller always falls back
+    to the paid, exact-count lookup rather than risk discarding a real fit."""
     if not band:
         return None
-    band_lo, band_hi = band
-    band_hi = band_hi if band_hi is not None else 10**9
-    return not (band_hi < lo or band_lo > hi)
+    band_lo, _band_hi = band
+    return False if band_lo > hi else None
 
 
 def headcount_ranges(lo: int | None, hi: int | None) -> str | None:

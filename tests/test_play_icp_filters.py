@@ -112,16 +112,33 @@ def test_looks_like_a_vendor_matches_real_and_avoids_false_positives():
         assert not play._looks_like_a_vendor(name), name
 
 
-def test_free_size_band_rejects_without_the_paid_lookup(db, monkeypatch):
-    monkeypatch.setattr(h, "search_leads", lambda page=1, **f: [_person(1, "Tiny")])
-    monkeypatch.setattr(cpc, "fetch_public_company_profile", lambda url: {"size_band": (1, 10), "country": "US", "industry": None, "about": None})
-    monkeypatch.setattr(h, "get_company", lambda u: pytest.fail("a confirmed free size mismatch must never reach the paid lookup"))
+def test_free_size_band_rejects_only_when_confirmed_too_big(db, monkeypatch):
+    monkeypatch.setattr(h, "search_leads", lambda page=1, **f: [_person(1, "Huge")])
+    monkeypatch.setattr(cpc, "fetch_public_company_profile", lambda url: {"size_band": (501, 1000), "country": "US", "industry": None, "about": None})
+    monkeypatch.setattr(h, "get_company", lambda u: pytest.fail("a confirmed too-big free band must never reach the paid lookup"))
     with spend_scope(db, BILLING, "icp_filters", run_cap_usd=0.5):
         result = play.search(db, PARTNER, ICP)
     assert result["outcomes"] == {"size_outside_icp_free": 1}
     lead = db.query(GtmLead).one()
     assert "free public LinkedIn page" in lead.qualifier_reason
     assert db.query(ProviderSpend).count() == 0
+
+
+def test_free_size_band_that_looks_too_small_still_falls_through_to_paid(db, monkeypatch):
+    """Real bug found live 2026-09-28: BePresent's public page declares "2-10 employees" while
+    its real, paid-lookup count is 31 -- genuinely inside a 30-100 ICP. A "too small" free band
+    must never reject on its own (LinkedIn's self-declared band understates a company that has
+    grown since it was last updated); only the paid, exact-count lookup may decide that."""
+    monkeypatch.setattr(h, "search_leads", lambda page=1, **f: [_person(1, "BePresent")])
+    monkeypatch.setattr(cpc, "fetch_public_company_profile", lambda url: {"size_band": (2, 10), "country": "US", "industry": None, "about": None})
+    called = []
+    monkeypatch.setattr(h, "get_company", lambda u: called.append(u) or {
+        "name": "BePresent", "employee_count": 31, "industry": "Wellness", "hq_text": "", "website": "https://bepresent.app",
+        "description": "", "linkedin_url": None})
+    with spend_scope(db, BILLING, "icp_filters", run_cap_usd=0.5):
+        result = play.search(db, PARTNER, ICP)
+    assert called == ["bepresent"]
+    assert result["outcomes"] == {"created": 1}
 
 
 def test_free_size_band_that_fits_still_uses_the_paid_lookup_for_full_facts(db, monkeypatch):
