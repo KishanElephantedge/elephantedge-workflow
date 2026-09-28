@@ -193,3 +193,134 @@ def test_qualified_lead_gets_a_real_opportunity_visible_in_the_pipeline(db, monk
     assert opportunity.tenant_id == PARTNER and opportunity.status == "qualified"
     strategy = db.query(GtmStrategy).filter(GtmStrategy.opportunity_id == opportunity.id).one()
     assert strategy.positioning_angle == "Ask about their sales process."
+
+
+# ------------------------------------------------------------------ search_icypeas (2026-09-28 default)
+
+def _icypeas_company(n, name=None, industry="Manufacturing", employees=60):
+    return {"name": name or f"Co{n}", "url": f"https://www.linkedin.com/company/co{n}/", "industry": industry,
+            "numberOfEmployees": employees, "address": "Ohio, United States", "website": f"https://co{n}.com",
+            "description": "A real company.", "specialties": [{"value": "widgets"}]}
+
+
+def _jobo_person(name="Jane Doe", title="CEO", linkedin=True):
+    return {"name": name, "title": title, "linkedin_url": "https://www.linkedin.com/in/jane-doe" if linkedin else "https://www.crunchbase.com/person/jane-doe"}
+
+
+def test_icypeas_filters_use_exact_headcount_and_exclude_vendors_and_non_companies():
+    filters = play.icypeas_filters_for_icp(ICP)
+    assert filters["headcount"] == {">=": 30, "<=": 100}
+    assert "Staffing and Recruiting" in filters["industry"]["exclude"]
+    assert "Educational Institution" in filters["type"]["exclude"]
+    assert filters["location"] == {"include": ["United States"]}
+
+
+def test_search_icypeas_creates_a_lead_with_the_free_jobo_decision_maker(db, monkeypatch):
+    import app.deepline_client as dc
+    import app.phases.decision_maker_reasoning as dmr
+    import app.phases.free_decision_maker as fdm
+
+    monkeypatch.setattr(dc, "_call_deepline_cli", lambda tool, payload: {
+        "toolResponse": {"raw": {"leads": [_icypeas_company(1)], "pagination": {"token": None}}}})
+    monkeypatch.setattr(fdm, "_jobo_leadership_candidates", lambda db_, t, company: [_jobo_person()])
+    monkeypatch.setattr(dmr, "select_best_decision_makers",
+                        lambda db_, t, company, cands, n, offering_name=None: [{"name": "Jane Doe", "thread_role": "founder_ceo", "reasoning": "CEO"}])
+
+    with spend_scope(db, BILLING, "icp_filters", run_cap_usd=0.5):
+        result = play.search_icypeas(db, PARTNER, ICP)
+
+    assert result["outcomes"] == {"created": 1}
+    lead = db.query(GtmLead).one()
+    assert lead.state == "signal" and lead.person_name == "Jane Doe"
+    company = db.get(Company, lead.company_id)
+    assert db.query(Batch).get(company.batch_id).tenant_id == PARTNER
+    contact = db.get(Contact, lead.contact_id)
+    assert contact.linkedin_url == "https://www.linkedin.com/in/jane-doe"
+    assert {r.tenant_id for r in db.query(ProviderSpend)} == {BILLING}
+
+
+def test_search_icypeas_skips_a_company_with_no_free_decision_maker(db, monkeypatch):
+    import app.deepline_client as dc
+    import app.phases.free_decision_maker as fdm
+
+    monkeypatch.setattr(dc, "_call_deepline_cli", lambda tool, payload: {
+        "toolResponse": {"raw": {"leads": [_icypeas_company(1)], "pagination": {"token": None}}}})
+    # Jobo has a leader, but only a Crunchbase URL -- not usable for real LinkedIn outreach.
+    monkeypatch.setattr(fdm, "_jobo_leadership_candidates", lambda db_, t, company: [_jobo_person(linkedin=False)])
+
+    with spend_scope(db, BILLING, "icp_filters", run_cap_usd=0.5):
+        result = play.search_icypeas(db, PARTNER, ICP)
+
+    assert result["outcomes"] == {"no_free_decision_maker": 1}
+    assert db.query(GtmLead).count() == 0
+
+
+def test_search_icypeas_rejects_a_vendor_name_before_any_jobo_lookup(db, monkeypatch):
+    import app.deepline_client as dc
+    import app.phases.free_decision_maker as fdm
+
+    monkeypatch.setattr(dc, "_call_deepline_cli", lambda tool, payload: {
+        "toolResponse": {"raw": {"leads": [_icypeas_company(1, name="Acme Staffing Agency")], "pagination": {"token": None}}}})
+    monkeypatch.setattr(fdm, "_jobo_leadership_candidates", lambda db_, t, company: pytest.fail("must not look up a vendor"))
+
+    with spend_scope(db, BILLING, "icp_filters", run_cap_usd=0.5):
+        result = play.search_icypeas(db, PARTNER, ICP)
+
+    assert result["outcomes"] == {"vendor_name_match": 1}
+    assert db.query(GtmLead).one().state == "rejected"
+
+
+def test_search_icypeas_stores_the_real_revenue_estimate_for_free(db, monkeypatch):
+    import app.deepline_client as dc
+    import app.phases.decision_maker_reasoning as dmr
+    import app.phases.free_decision_maker as fdm
+
+    co = _icypeas_company(1)
+    co["estimatedRevenuRange"] = {"estimatedMinRevenue": {"amount": 10, "unit": "MILLION", "currency": "USD"},
+                                  "estimatedMaxRevenue": {"amount": 20, "unit": "MILLION", "currency": "USD"}}
+    monkeypatch.setattr(dc, "_call_deepline_cli", lambda tool, payload: {
+        "toolResponse": {"raw": {"leads": [co], "pagination": {"token": None}}}})
+    monkeypatch.setattr(fdm, "_jobo_leadership_candidates", lambda db_, t, company: [_jobo_person()])
+    monkeypatch.setattr(dmr, "select_best_decision_makers",
+                        lambda db_, t, company, cands, n, offering_name=None: [{"name": "Jane Doe", "thread_role": "founder_ceo", "reasoning": "CEO"}])
+
+    with spend_scope(db, BILLING, "icp_filters", run_cap_usd=0.5):
+        play.search_icypeas(db, PARTNER, ICP)
+
+    company = db.query(Company).one()
+    assert (company.estimated_revenue_lower_usd, company.estimated_revenue_higher_usd) == (10_000_000, 20_000_000)
+
+
+def test_search_icypeas_never_rechecks_a_known_company_across_runs(db, monkeypatch):
+    import app.deepline_client as dc
+    import app.phases.decision_maker_reasoning as dmr
+    import app.phases.free_decision_maker as fdm
+
+    calls = []
+    monkeypatch.setattr(dc, "_call_deepline_cli", lambda tool, payload: calls.append(1) or {
+        "toolResponse": {"raw": {"leads": [_icypeas_company(1)], "pagination": {"token": None}}}})
+    monkeypatch.setattr(fdm, "_jobo_leadership_candidates", lambda db_, t, company: [_jobo_person()])
+    monkeypatch.setattr(dmr, "select_best_decision_makers",
+                        lambda db_, t, company, cands, n, offering_name=None: [{"name": "Jane Doe", "thread_role": "founder_ceo", "reasoning": "CEO"}])
+
+    with spend_scope(db, BILLING, "icp_filters", run_cap_usd=0.5):
+        play.search_icypeas(db, PARTNER, ICP)
+        result = play.search_icypeas(db, PARTNER, ICP)
+
+    assert len(calls) == 2  # the search itself always runs (paid per page)
+    assert result["outcomes"] == {"known": 1}
+    assert db.query(GtmLead).count() == 1
+
+
+# ------------------------------------------------------------------ loosened Qualifier (2026-09-28)
+
+def test_qualifier_passes_on_qualified_true_with_no_score_gate(db, monkeypatch):
+    monkeypatch.setattr(h, "search_leads", lambda page=1, **f: [_person(1, "Good")])
+    monkeypatch.setattr(h, "get_company", lambda u: {"name": "Good", "employee_count": 60, "industry": "Manufacturing",
+                                                     "hq_text": "", "website": "https://good.com", "description": "", "linkedin_url": None})
+    # No icp_fit_score at all in the verdict -- must still pass on qualified=True alone.
+    monkeypatch.setattr(llm_client, "generate_json", lambda prompt, db, t, max_tokens=0: {"qualified": True, "reason": "clearly fits"})
+    with spend_scope(db, BILLING, "icp_filters", run_cap_usd=0.5):
+        play.search(db, PARTNER, ICP)
+    assert play.qualify(db, PARTNER, ICP)["qualified"] == 1
+    assert db.query(GtmLead).one().state == "contact_found"

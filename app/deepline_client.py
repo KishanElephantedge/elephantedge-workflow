@@ -221,6 +221,14 @@ DEEPLINE_TOOL_COST_USD = {
     "harvestapi_get_post_reactions": lambda p: 0.003,
     "harvestapi_get_company": lambda p: 0.003,
     "harvestapi_get_job": lambda p: 0.001,
+    # Icypeas bills per RESULT RETURNED (deepline tools describe, 2026-09-28) -- worst case is the
+    # requested page size, same "requested, not returned" conservative estimate every other
+    # per-page/per-result tool here uses. icypeas_count_companies/icypeas_count_people are free
+    # (no entry needed -- execute_tool only reserves for tools listed here).
+    "icypeas_find_companies": lambda p: 0.007 * int((p.get("pagination") or {}).get("size") or 25),
+    "icypeas_find_people": lambda p: 0.014 * int((p.get("pagination") or {}).get("size") or 25),
+    "icypeas_count_companies": lambda p: 0.0,
+    "icypeas_count_people": lambda p: 0.0,
 }
 
 

@@ -50,7 +50,6 @@ logger = logging.getLogger(__name__)
 PLAY = "icp_filters"
 BILLING_TENANT_ID = 2
 CURSOR_KEY = "icp_filters_play_cursor"
-DEFAULT_MIN_FIT_SCORE = 70
 # LinkedIn / Sales Navigator company-size buckets.
 HEADCOUNT_BUCKETS = [(1, 10), (11, 50), (51, 200), (201, 500), (501, 1000), (1001, 5000), (5001, 10000), (10001, 10**9)]
 
@@ -122,8 +121,166 @@ def _batch(db: Session, tenant_id: int) -> Batch:
     return batch
 
 
+# Icypeas' own LinkedIn "company type" categories that are never a real operating buyer --
+# caught for free at search time (2026-09-28 finding: "SaaS Alliance", type "Educational
+# Institution", was really a community/Slack group, not a company, and would have cost a real
+# lookup to discover under the old bucket-search path).
+NON_COMPANY_TYPES = ["Educational Institution", "Government Agency", "Nonprofit", "Non-profit Organizations",
+                     "Self-Employed", "Self-Owned"]
+# LinkedIn's own industry taxonomy -- the same disqualifiers _looks_like_a_vendor() catches by
+# name, now also excluded at the SEARCH level so a vendor/agency never gets fetched at all.
+NON_BUYER_INDUSTRIES = ["Staffing and Recruiting", "Management Consulting", "Marketing and Advertising",
+                        "Business Consulting and Services", "Human Resources Services", "IT Services and IT Consulting"]
+
+
+def icypeas_filters_for_icp(icp: dict) -> dict:
+    lo, hi = icp.get("employee_min") or 1, icp.get("employee_max") or 10**9
+    return {
+        "headcount": {">=": lo, "<=": hi},
+        "location": {"include": icp.get("geographies") or ["United States"]},
+        "industry": {"exclude": NON_BUYER_INDUSTRIES},
+        "type": {"exclude": NON_COMPANY_TYPES},
+    }
+
+
+def search_icypeas(db: Session, tenant_id: int, icp: dict, pages: int = 1) -> dict:
+    """REAL FIX, 2026-09-28: company-first search on Icypeas' EXACT numeric headcount (confirmed
+    live: 336 real US companies at exactly 30-100 employees for Majji's ICP, via the free
+    icypeas_count_companies check), replacing HarvestAPI's LinkedIn-bucket people search above
+    as the default. The old path paid $0.003-0.07 to discover a company was never in the ICP
+    band at all -- structurally unavoidable with a bucketed search (see search()'s own history).
+    An exact numeric filter has no such waste: every returned company is already a real match.
+
+    The decision maker comes from the SAME free Jobo leadership lookup the hiring play already
+    uses ($0) -- Icypeas' own people search can't combine headcount+title in one call through
+    Deepline's exposed schema, and paying per-person on top would give up most of this fix's
+    savings for no real benefit over a layer that's already free. A company whose free lookup
+    finds no genuine LinkedIn-URL decision maker is kept (never re-fetched) but produces no
+    lead this run -- simple and free, at the real cost of a lower per-company yield than a
+    paid contact-resolution step would give; that tradeoff is deliberate, not hidden."""
+    import hashlib
+
+    from app.deepline_client import DeeplineError, DeeplineSpendBlocked, execute_tool
+    from app.phases.decision_maker_reasoning import select_best_decision_makers
+    from app.phases.free_decision_maker import _jobo_leadership_candidates, _real_linkedin_url_from_jobo, _split_name
+
+    filters = icypeas_filters_for_icp(icp)
+    fingerprint = hashlib.sha1(json.dumps(filters, sort_keys=True).encode()).hexdigest()[:12]
+    cursor = _cursor(db, tenant_id)
+    state = dict(cursor.value or {})
+    token = state.get("token") if state.get("filters") == fingerprint else None
+
+    known_leads = {k for (k,) in db.query(GtmLead.lead_key).filter(GtmLead.tenant_id == tenant_id, GtmLead.play == PLAY)}
+    result = {"companies": 0, "created": 0, "outcomes": {}, "stopped": None}
+
+    def count(outcome):
+        result["outcomes"][outcome] = result["outcomes"].get(outcome, 0) + 1
+
+    for _ in range(pages):
+        payload = {"query": filters, "pagination": {"size": 25, **({"token": token} if token else {})}}
+        try:
+            response = execute_tool("icypeas_find_companies", payload)
+        except DeeplineSpendBlocked as e:
+            result["stopped"] = f"budget: {e}"
+            break
+        except DeeplineError as e:
+            result["stopped"] = f"search failed: {e}"
+            break
+        raw = (response.get("toolResponse") or {}).get("raw") or {}
+        leads = raw.get("leads") or []
+        token = (raw.get("pagination") or {}).get("token")
+        result["companies"] += len(leads)
+
+        for co in leads:
+            url = co.get("url") or ""
+            if "linkedin.com/company/" not in url:
+                count("no_linkedin_url")
+                continue
+            slug = url.rstrip("/").rsplit("/company/", 1)[-1].split("?")[0]
+            key = f"company:{slug}"
+            if key in known_leads:
+                count("known")
+                continue
+            known_leads.add(key)
+
+            name = co.get("name") or ""
+            if _looks_like_a_vendor(name):
+                db.add(GtmLead(tenant_id=tenant_id, play=PLAY, lead_key=key, state=STATE_REJECTED,
+                               qualifier_reason=f"company name matches a vendor/agency/recruiter pattern: {name!r}"))
+                db.commit()
+                count("vendor_name_match")
+                continue
+
+            company = (db.query(Company).join(Batch, Company.batch_id == Batch.id)
+                       .filter(Batch.tenant_id == tenant_id, Company.linkedin_url == url).first())
+            if company is not None and db.query(CampaignPush.id).join(Contact, CampaignPush.contact_id == Contact.id).filter(
+                    Contact.company_id == company.id).first():
+                count("in_outreach")
+                continue
+            if company is None:
+                # Real, free bonus -- Icypeas' own revenue estimate came back on 2 of the 3
+                # companies in the 2026-09-28 test, at no extra cost.
+                revenue = co.get("estimatedRevenuRange") or {}
+                rev_lo = (revenue.get("estimatedMinRevenue") or {}).get("amount")
+                rev_hi = (revenue.get("estimatedMaxRevenue") or {}).get("amount")
+                rev_unit = 1_000_000 if (revenue.get("estimatedMinRevenue") or {}).get("unit") == "MILLION" else 1
+                company = Company(batch_id=_batch(db, tenant_id).id, name=name, domain=None, linkedin_url=url,
+                                  industry=co.get("industry"), employee_count=co.get("numberOfEmployees"),
+                                  location=co.get("address"), source="icypeas:find_companies",
+                                  estimated_revenue_lower_usd=int(rev_lo * rev_unit) if rev_lo is not None else None,
+                                  estimated_revenue_higher_usd=int(rev_hi * rev_unit) if rev_hi is not None else None)
+                db.add(company)
+                db.commit()
+
+            # Free -- Jobo's own leadership list, an agent picks the buyer, only Jobo's genuine
+            # (not Crunchbase) LinkedIn URL is usable for outreach. No paid resolution here.
+            leadership = _jobo_leadership_candidates(db, tenant_id, company)
+            usable = [p for p in leadership if _real_linkedin_url_from_jobo(p)]
+            if not usable:
+                count("no_free_decision_maker")
+                continue
+            picks = select_best_decision_makers(db, tenant_id, company, usable, 1)
+            if not picks:
+                count("no_free_decision_maker")
+                continue
+            person = next((p for p in usable if p.get("name") == picks[0]["name"]), None)
+            if person is None:
+                count("no_free_decision_maker")
+                continue
+
+            first_name, last_name = _split_name(person.get("name") or "")
+            person_linkedin = normalize_linkedin_url(_real_linkedin_url_from_jobo(person))
+            contact = Contact(company_id=company.id, first_name=first_name, last_name=last_name, title=person.get("title"),
+                              linkedin_url=f"https://www.{person_linkedin}", thread_role="icp_filter_decision_maker",
+                              matched_title_reasoning=f"Jobo leadership match, free: {picks[0].get('reasoning') or ''}"[:500])
+            db.add(contact)
+            db.commit()
+            specialties = ", ".join(s.get("value") for s in (co.get("specialties") or []) if s.get("value"))[:300]
+            evidence = (
+                f"Person: {first_name} {last_name} -- {person.get('title')}\n\n"
+                f"Company: {name} | {co.get('industry')} | {co.get('numberOfEmployees')} employees | "
+                f"HQ {co.get('address')} | {co.get('website') or ''}\nSpecialties: {specialties}\nAbout: {co.get('description') or ''}"
+            )
+            db.add(GtmLead(tenant_id=tenant_id, play=PLAY, lead_key=key, company_id=company.id, contact_id=contact.id,
+                           person_name=f"{first_name} {last_name}".strip(), person_linkedin_url=person_linkedin,
+                           state=STATE_SIGNAL, evidence=evidence))
+            db.commit()
+            result["created"] += 1
+            count("created")
+
+        if result["stopped"] or not leads or not token:
+            break
+
+    cursor.value = {"filters": fingerprint, "token": token}
+    db.commit()
+    return result
+
+
 def search(db: Session, tenant_id: int, icp: dict, pages: int = 1) -> dict:
-    """People search -> verified Company + Contact + lead, on the partner's tenant."""
+    """Fallback -- HarvestAPI's LinkedIn-bucket people search. Kept for when Icypeas is
+    unavailable; search_icypeas() above is the default (2026-09-28), for the real reasons in
+    its own docstring. People search -> verified Company + Contact + lead, on the partner's
+    tenant."""
     import hashlib
 
     from app import harvestapi
@@ -249,37 +406,49 @@ def search(db: Session, tenant_id: int, icp: dict, pages: int = 1) -> dict:
     return result
 
 
-QUALIFIER_PROMPT = """You qualify B2B target companies for a partner who sells the services described below.
-The company and person were found by a filter search, so there is no buying signal -- judge fit only.
-Be strict: reject anything that clearly does not match.
+# LOOSENED, 2026-09-28, explicit instruction: this company already matches every hard, VERIFIED
+# filter (exact headcount, decision-maker title, industry not already excluded) before the
+# Qualifier ever sees it -- unlike the hiring/post_engagement plays, which read a genuine but
+# ambiguous signal. Its old prompt still asked for a 0-100 "fit score" and gated on >=70, which
+# let it reject on soft, unverifiable guesses ("likely already has a bigger sales team than
+# 2-3 people" -- Unlimited Funds, 60 employees, rejected on pure speculation with no real
+# evidence for or against). Now: reject ONLY for a hard, evidence-based disqualifier the search
+# could not already catch (B2C, vendor/agency, non-profit/school, wrong person) -- anything
+# that clears those is qualified. No score, no soft judgment call.
+QUALIFIER_PROMPT = """You qualify a B2B target company for a partner who sells the services described below.
+This company already matches every hard, VERIFIED filter (revenue/headcount, decision-maker title, industry).
+Your only job is to catch a real, clear mismatch the filters could not -- never guess or speculate.
 
 WHAT THE PARTNER SELLS AND TO WHOM:
 {icp_notes}
 
-HARD CRITERIA: {criteria}
+ALREADY VERIFIED, DO NOT RE-JUDGE: {criteria}
 
 THE PERSON AND COMPANY:
 \"\"\"{evidence}\"\"\"
 
-Reject if ANY of these is true:
-- the company sells sales, marketing, consulting, coaching, agency or recruiting services itself
+Reject ONLY if the evidence CLEARLY shows one of these -- never on a guess, an assumption, or what
+seems "likely":
+- the company sells sales, marketing, consulting, coaching, agency or recruiting services itself (a competitor/vendor)
+- the company is B2C (sells directly to individual consumers), not B2B
 - it is a non-profit, association, government body, school, or a one-person practice
-- the person is not the owner / founder / CEO (or equivalent top decision maker) of THIS company
-- the company clearly does not fit what the partner sells
+- the person is clearly not the owner/founder/CEO (or equivalent top decision maker) of THIS company
+
+If none of these clearly applies, QUALIFY it -- it already matches every real filter. Do not reject
+for a guess about their sales team size, company maturity, or whether they "probably" already have
+enough help; you have no real evidence for that, only for what's stated above.
 
 Return ONLY this JSON:
 {{
   "qualified": true or false,
-  "icp_fit_score": 0-100,
-  "reason": "one or two sentences explaining the decision",
-  "sales_team_guess": "what the data suggests about their sales team, or 'unknown'",
+  "reason": "one sentence: which disqualifier clearly applied, or why it clearly qualifies",
   "problem_statement": "the real problem this company likely has that the partner's offer addresses, one plain sentence, or null",
   "demand_statement": "what they'd likely want help with, one plain sentence, or null",
   "positioning_angle": "how the partner could open a conversation, one sentence, or null"
 }}"""
 
 
-def qualify(db: Session, tenant_id: int, icp: dict, limit: int = 25, min_fit_score: int = DEFAULT_MIN_FIT_SCORE) -> dict:
+def qualify(db: Session, tenant_id: int, icp: dict, limit: int = 25) -> dict:
     from app.gtm_os.plays.post_engagement import _write_opportunity
     from app.llm_budget import LlmBudgetExceeded
     from app.llm_client import generate_json
@@ -300,10 +469,12 @@ def qualify(db: Session, tenant_id: int, icp: dict, limit: int = 25, min_fit_sco
             lead.last_error = f"qualifier: {type(e).__name__}: {e}"[:500]
             db.commit()
             continue
-        score = verdict.get("icp_fit_score")
-        score = int(score) if isinstance(score, (int, float)) else 0
-        passes = bool(verdict.get("qualified")) and score >= min_fit_score
-        lead.icp_fit_score, lead.qualifier_reason, lead.qualifier_output = score, verdict.get("reason"), verdict
+        # No score gate (2026-09-28, explicit instruction): every lead here already matches every
+        # hard, verified filter before the Qualifier ever sees it, so a soft 0-100 "fit score" on
+        # top of that only reintroduces the kind of unverifiable guessing the prompt above now
+        # explicitly forbids. qualified=true/false is the one real decision.
+        passes = bool(verdict.get("qualified"))
+        lead.qualifier_reason, lead.qualifier_output = verdict.get("reason"), verdict
         if passes:
             # Real gap fixed 2026-09-28: this used to just flip the state, leaving a qualified
             # lead invisible to the Pipeline/Accounts dashboard -- no Opportunity/Strategy ever
@@ -343,8 +514,8 @@ def run_icp_filters(db: Session, tenant_id: int, pages: int = 1, run_cap_usd: fl
     if not icp:
         return {"status": "skipped", "reason": "no partner ICP configured"}
     with spend_scope(db, BILLING_TENANT_ID, f"{PLAY}:tenant_{tenant_id}", run_cap_usd=run_cap_usd) as scope:
-        result = {"status": "completed", "play": PLAY, "tenant_id": tenant_id, "filters": search_filters(icp)}
-        result["search"] = search(db, tenant_id, icp, pages=pages)
+        result = {"status": "completed", "play": PLAY, "tenant_id": tenant_id, "filters": icypeas_filters_for_icp(icp)}
+        result["search"] = search_icypeas(db, tenant_id, icp, pages=pages)
         result["qualify"] = qualify(db, tenant_id, icp)
         result["spent_usd"] = round(scope.spent_usd, 4)
     return result
