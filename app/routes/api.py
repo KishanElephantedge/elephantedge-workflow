@@ -5051,6 +5051,7 @@ def post_gtm_os_message_review(message_draft_id: int, payload: dict = Body(...),
     limitation already named in the Phase 5 write routes: any authenticated user can perform this
     action, since no role/permission system exists anywhere in this app."""
     from app.gtm_os.learning.message_draft import (
+        MessageDraft,
         approve_message_draft,  # noqa: F401 -- still the single state-transition primitive, now composed by approve_and_send
         reject_message_draft,
         request_changes_message_draft,
@@ -5076,9 +5077,24 @@ def post_gtm_os_message_review(message_draft_id: int, payload: dict = Body(...),
     }[action]
 
     try:
-        draft = handler()
+        result = handler()
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+    # Real bug fix (2026-09-28, confirmed live): approve_and_send() returns a plain dict
+    # ({"draft_id", "status", "send"}), not a MessageDraft -- unlike reject_message_draft()/
+    # request_changes_message_draft(), which both return the MessageDraft row directly. The
+    # code below used to assume every handler returned a MessageDraft and read draft.id/
+    # draft.reviewed_at/etc unconditionally, so every single "approve" call raised an
+    # unhandled AttributeError ('dict' object has no attribute 'id') -- a generic 500 on every
+    # approval, even though approve_message_draft() + the real SalesRobot/SMTP send both
+    # already succeeded underneath it. The approval and the send were never the problem; only
+    # this response never returned successfully. Re-fetching the row here (cheap, one extra
+    # read) makes both branches produce the same shape, and `send` is now actually surfaced to
+    # the caller for "approve" -- previously invisible, even on the rare non-crashing dict
+    # access that never happened.
+    send_result = result.get("send") if action == "approve" else None
+    draft = db.get(MessageDraft, message_draft_id) if action == "approve" else result
 
     return {
         "id": draft.id,
@@ -5088,6 +5104,7 @@ def post_gtm_os_message_review(message_draft_id: int, payload: dict = Body(...),
         "review_note": draft.review_note,
         "approved_at": draft.approved_at,
         "approved_by": draft.approved_by,
+        "send": send_result,
     }
 
 
