@@ -1,13 +1,16 @@
 """Play F (ICP filters, for partners): search built from the partner ICP, exact company size
 checked before anything else, rows land on the partner's tenant while spend lands on the billing
 tenant, and a qualified lead is outreach-ready with the searched person as its contact.
-No real provider or LLM call is made here."""
+No real provider or LLM call is made here -- fetch_public_company_profile (a real httpx call to
+LinkedIn's public page) is mocked in every test that reaches it, same discipline as every paid
+provider call."""
 import copy
 
 import pytest
 
 import app.harvestapi as h
 import app.llm_client as llm_client
+import app.phases.company_profile_check as cpc
 from app.db.models import Batch, CampaignPush, Company, Contact, Parameter
 from app.gtm_os.orchestration.control import DEFAULT_GTM_OS_CONTROL_CONFIG, set_control_config
 from app.gtm_os.plays import icp_filters as play
@@ -20,7 +23,7 @@ ICP = {"employee_min": 30, "employee_max": 100, "decision_maker_titles": ["Owner
 
 
 @pytest.fixture
-def db(db_factory):
+def db(db_factory, monkeypatch):
     from app.gtm_os.intelligence.signal import GtmSignal
     from app.gtm_os.learning.message_draft import MessageDraft
     from app.gtm_os.opportunity.opportunity import Opportunity
@@ -29,6 +32,10 @@ def db(db_factory):
     config = copy.deepcopy(DEFAULT_GTM_OS_CONTROL_CONFIG)
     config["spend"] = {"daily_cap_usd": 1.0, "run_cap_usd": 0.5}
     set_control_config(db, BILLING, config)
+    # Default: the free public-page check finds nothing usable, so every existing test's
+    # behaviour (always falls through to the paid lookup) is unchanged unless a test overrides
+    # this to prove the free path itself works.
+    monkeypatch.setattr(cpc, "fetch_public_company_profile", lambda url: None)
     return db
 
 
@@ -77,12 +84,67 @@ def test_qualified_lead_is_outreach_ready(db, monkeypatch):
 
 
 def test_run_respects_paused_control_plane(db):
-    import copy
-
-    from app.gtm_os.orchestration.control import DEFAULT_GTM_OS_CONTROL_CONFIG, set_control_config
-
     config = copy.deepcopy(DEFAULT_GTM_OS_CONTROL_CONFIG)
     config["state"] = "paused"
     config["spend"] = {"daily_cap_usd": 1.0, "run_cap_usd": 0.5}
     set_control_config(db, BILLING, config)
     assert play.run_icp_filters(db, PARTNER)["status"] == "skipped"
+
+
+# ------------------------------------------------------------------ free-first rejection (2026-09-28 fix)
+
+def test_obvious_vendor_name_is_rejected_free_no_lookup_spent(db, monkeypatch):
+    monkeypatch.setattr(h, "search_leads", lambda page=1, **f: [_person(1, "Acme Recruiting Agency")])
+    monkeypatch.setattr(h, "get_company", lambda u: pytest.fail("a vendor name match must never reach the paid lookup"))
+    with spend_scope(db, BILLING, "icp_filters", run_cap_usd=0.5):
+        result = play.search(db, PARTNER, ICP)
+    assert result["outcomes"] == {"vendor_name_match": 1}
+    lead = db.query(GtmLead).one()
+    assert lead.state == "rejected" and "vendor/agency/recruiter" in lead.qualifier_reason
+    assert db.query(ProviderSpend).count() == 0
+
+
+def test_looks_like_a_vendor_matches_real_and_avoids_false_positives():
+    for name in ("Acme Recruiting Agency", "Bright Path Consulting", "Talent Acquisition Partners",
+                 "Smith & Co Staffing", "Growth Coaches LLC"):
+        assert play._looks_like_a_vendor(name), name
+    for name in ("Acme Manufacturing", "Brightline Software", "Consultative Sales Inc", "Recon Robotics"):
+        assert not play._looks_like_a_vendor(name), name
+
+
+def test_free_size_band_rejects_without_the_paid_lookup(db, monkeypatch):
+    monkeypatch.setattr(h, "search_leads", lambda page=1, **f: [_person(1, "Tiny")])
+    monkeypatch.setattr(cpc, "fetch_public_company_profile", lambda url: {"size_band": (1, 10), "country": "US", "industry": None, "about": None})
+    monkeypatch.setattr(h, "get_company", lambda u: pytest.fail("a confirmed free size mismatch must never reach the paid lookup"))
+    with spend_scope(db, BILLING, "icp_filters", run_cap_usd=0.5):
+        result = play.search(db, PARTNER, ICP)
+    assert result["outcomes"] == {"size_outside_icp_free": 1}
+    lead = db.query(GtmLead).one()
+    assert "free public LinkedIn page" in lead.qualifier_reason
+    assert db.query(ProviderSpend).count() == 0
+
+
+def test_free_size_band_that_fits_still_uses_the_paid_lookup_for_full_facts(db, monkeypatch):
+    monkeypatch.setattr(h, "search_leads", lambda page=1, **f: [_person(1, "Good")])
+    monkeypatch.setattr(cpc, "fetch_public_company_profile", lambda url: {"size_band": (50, 100), "country": "US", "industry": None, "about": None})
+    called = []
+    monkeypatch.setattr(h, "get_company", lambda u: called.append(u) or {
+        "name": "Good", "employee_count": 60, "industry": "Manufacturing", "hq_text": "", "website": "https://good.com",
+        "description": "", "linkedin_url": None})
+    with spend_scope(db, BILLING, "icp_filters", run_cap_usd=0.5):
+        result = play.search(db, PARTNER, ICP)
+    assert called == ["good"]
+    assert result["outcomes"] == {"created": 1}
+
+
+def test_free_size_band_inconclusive_falls_through_to_paid_lookup(db, monkeypatch):
+    # No declared band at all (e.g. an unreadable page) -- must not be treated as a reject.
+    monkeypatch.setattr(h, "search_leads", lambda page=1, **f: [_person(1, "Good")])
+    monkeypatch.setattr(cpc, "fetch_public_company_profile", lambda url: {"size_band": None, "country": None, "industry": None, "about": None})
+    called = []
+    monkeypatch.setattr(h, "get_company", lambda u: called.append(u) or {
+        "name": "Good", "employee_count": 60, "industry": "Manufacturing", "hq_text": "", "website": "https://good.com",
+        "description": "", "linkedin_url": None})
+    with spend_scope(db, BILLING, "icp_filters", run_cap_usd=0.5):
+        play.search(db, PARTNER, ICP)
+    assert called == ["good"]

@@ -3,19 +3,34 @@
     search     one HarvestAPI LinkedIn people search built from the partner's own ICP (company
                headcount band, decision-maker titles, geography) -- $0.07 a page of 25 people,
                each with a LinkedIn URL. A cursor continues from the next page on the next run.
-    verify     exact company facts ($0.003) only for companies never seen before; the headcount
-               band is checked for free before anything else happens
+    verify     FREE first: an obvious vendor/agency/recruiter is rejected by name alone (no
+               lookup at all), then the free public LinkedIn company page decides size fit for
+               everyone else. The PAID company lookup ($0.003) is only spent on a company that
+               survives both free checks -- see the 2026-09-28 fix note below.
     qualify    ONE LLM call per company against the partner's ICP notes -> qualified / rejected
     contact    free -- the person found by the search IS the contact (LinkedIn outreach)
 
 Rows are written to the PARTNER's tenant (their data stays theirs), while every paid call is
 reserved against the BILLING tenant's combined budget (Elephant Edge's -- the Deepline account
 and the Gemini key belong to it), the same arrangement as the existing partner discovery runs.
-"""
+
+REAL FIX, 2026-09-28 (first production run: 17 companies found, 0 qualified, $0.254 spent). 14 of
+17 were rejected purely on company SIZE (HarvestAPI's people search can only filter by LinkedIn's
+own wide buckets -- "11-50" for a 30-100 ICP band pulls in plenty of real 11-29-person companies
+too, a structural limit of the bucket system, not a bug) and 2 more were an obvious consultancy
+and an obvious staffing agency, rejected by name alone. Every one of those 16 still paid the full
+$0.003 harvestapi_get_company lookup before being rejected -- exactly the "fetch, then discover
+it was never in the ICP" waste flagged live. This module already had the free public-page check
+(app/phases/company_profile_check.py's fetch_public_company_profile, used by the hiring play's
+Apify path) available and simply wasn't using it here. Now: a free company-name keyword match
+rejects an obvious vendor with zero lookup, and the free page's own declared size band is checked
+BEFORE ever calling the paid endpoint -- which is now reserved only for companies that survive
+both free filters, i.e. the ones actually worth a paid look."""
 from __future__ import annotations
 
 import json
 import logging
+import re
 from datetime import datetime
 
 from sqlalchemy.orm import Session
@@ -34,6 +49,30 @@ CURSOR_KEY = "icp_filters_play_cursor"
 DEFAULT_MIN_FIT_SCORE = 70
 # LinkedIn / Sales Navigator company-size buckets.
 HEADCOUNT_BUCKETS = [(1, 10), (11, 50), (51, 200), (201, 500), (501, 1000), (1001, 5000), (5001, 10000), (10001, 10**9)]
+
+# Free, name-only rejection -- the same disqualifiers the Qualifier prompt below already states
+# ("the company sells sales, marketing, consulting, coaching, agency or recruiting services
+# itself"). A company whose own name says this needs no paid lookup to confirm it.
+_VENDOR_NAME_PATTERN = re.compile(
+    r"\b(agency|agencies|consulting|consultants?|consultancy|recruiters?|recruiting|staffing|"
+    r"talent acquisition|talent solutions|headhunt(?:ers?|ing)|coaching|coaches|advisory|advisors?)\b",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_a_vendor(company_name: str | None) -> bool:
+    return bool(company_name) and bool(_VENDOR_NAME_PATTERN.search(company_name))
+
+
+def _size_fits(band: tuple[int, int | None] | None, lo: int, hi: int) -> bool | None:
+    """True/False when the free page's declared size band lets us tell; None when there's no
+    band to judge (an unreadable page, or LinkedIn simply not declaring one) -- caller falls
+    back to the paid, exact-count lookup only in that None case."""
+    if not band:
+        return None
+    band_lo, band_hi = band
+    band_hi = band_hi if band_hi is not None else 10**9
+    return not (band_hi < lo or band_lo > hi)
 
 
 def headcount_ranges(lo: int | None, hi: int | None) -> str | None:
@@ -80,6 +119,7 @@ def search(db: Session, tenant_id: int, icp: dict, pages: int = 1) -> dict:
 
     from app import harvestapi
     from app.deepline_client import DeeplineError, DeeplineSpendBlocked
+    from app.phases.company_profile_check import fetch_public_company_profile
 
     filters = search_filters(icp)
     fingerprint = hashlib.sha1(json.dumps(filters, sort_keys=True).encode()).hexdigest()[:12]
@@ -93,6 +133,13 @@ def search(db: Session, tenant_id: int, icp: dict, pages: int = 1) -> dict:
 
     def count(outcome):
         result["outcomes"][outcome] = result["outcomes"].get(outcome, 0) + 1
+
+    def _reject(key: str, person: dict, reason: str) -> None:
+        known_leads.add(key)
+        db.add(GtmLead(tenant_id=tenant_id, play=PLAY, lead_key=key, state=STATE_REJECTED,
+                       person_name=f"{person.get('first_name') or ''} {person.get('last_name') or ''}".strip(),
+                       qualifier_reason=reason))
+        db.commit()
 
     checked: dict[str, dict | None] = {}
     for _ in range(pages):
@@ -115,7 +162,29 @@ def search(db: Session, tenant_id: int, icp: dict, pages: int = 1) -> dict:
             if key in known_leads:
                 count("known")
                 continue
+
+            # FREE #1 -- an obvious vendor/agency/recruiter is rejected by its own name, no
+            # lookup spent at all.
+            company_name_guess = person.get("company_name") or ""
+            if _looks_like_a_vendor(company_name_guess):
+                _reject(key, person, f"company name matches a vendor/agency/recruiter pattern: {company_name_guess!r} -- free, no lookup spent")
+                count("vendor_name_match")
+                continue
+
             if universal not in checked:
+                # FREE #2 -- the public LinkedIn company page's own declared size band. Only a
+                # CONFIRMED mismatch is rejected here; an unreadable page or no declared band
+                # falls through to the paid lookup below rather than guessing.
+                try:
+                    free_profile = fetch_public_company_profile(person.get("company_linkedin_url"))
+                except Exception:  # noqa: BLE001 -- a free check failing must never block the paid fallback
+                    free_profile = None
+                if free_profile and _size_fits(free_profile.get("size_band"), lo, hi) is False:
+                    _reject(key, person, f"company size band {free_profile['size_band']} outside {lo}-{hi} -- free public LinkedIn page, no paid lookup spent")
+                    count("size_outside_icp_free")
+                    continue
+
+                # PAID -- reserved only for a company that survived both free checks above.
                 try:
                     checked[universal] = harvestapi.get_company(universal)
                 except DeeplineSpendBlocked as e:
@@ -126,11 +195,7 @@ def search(db: Session, tenant_id: int, icp: dict, pages: int = 1) -> dict:
             facts = checked[universal]
             size = (facts or {}).get("employee_count")
             if not facts or size is None or not (lo <= size <= hi):
-                known_leads.add(key)
-                db.add(GtmLead(tenant_id=tenant_id, play=PLAY, lead_key=key, state=STATE_REJECTED,
-                               person_name=f"{person.get('first_name') or ''} {person.get('last_name') or ''}".strip(),
-                               qualifier_reason=f"company size {size} outside {lo}-{hi}" if facts else "company not found"))
-                db.commit()
+                _reject(key, person, f"company size {size} outside {lo}-{hi}" if facts else "company not found")
                 count("size_outside_icp")
                 continue
 
