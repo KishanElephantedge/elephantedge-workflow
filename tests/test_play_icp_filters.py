@@ -291,7 +291,30 @@ def test_search_icypeas_stores_the_real_revenue_estimate_for_free(db, monkeypatc
     assert (company.estimated_revenue_lower_usd, company.estimated_revenue_higher_usd) == (10_000_000, 20_000_000)
 
 
-def test_search_icypeas_never_rechecks_a_known_company_across_runs(db, monkeypatch):
+def test_search_icypeas_never_rechecks_a_known_company_within_one_page(db, monkeypatch):
+    """A company that reappears (e.g. two pages overlapping) is skipped, not re-processed --
+    but the exhaustion cooldown below is the real protection across separate runs."""
+    import app.deepline_client as dc
+    import app.phases.decision_maker_reasoning as dmr
+    import app.phases.free_decision_maker as fdm
+
+    monkeypatch.setattr(dc, "_call_deepline_cli", lambda tool, payload: {
+        "toolResponse": {"raw": {"leads": [_icypeas_company(1), _icypeas_company(1)], "pagination": {"token": "next"}}}})
+    monkeypatch.setattr(fdm, "_jobo_leadership_candidates", lambda db_, t, company: [_jobo_person()])
+    monkeypatch.setattr(dmr, "select_best_decision_makers",
+                        lambda db_, t, company, cands, n, offering_name=None: [{"name": "Jane Doe", "thread_role": "founder_ceo", "reasoning": "CEO"}])
+
+    with spend_scope(db, BILLING, "icp_filters", run_cap_usd=0.5):
+        result = play.search_icypeas(db, PARTNER, ICP)
+
+    assert result["outcomes"] == {"created": 1, "known": 1}
+    assert db.query(GtmLead).count() == 1
+
+
+def test_search_icypeas_stops_paying_once_the_pool_is_genuinely_exhausted(db, monkeypatch):
+    """Real gap found live 2026-09-28 (Majji: 'what if these runs out after a few days'): once
+    Icypeas itself says there is no next page, the run must not restart from page 1 next time
+    and re-pay to re-see the same companies for zero new leads. It should cool down instead."""
     import app.deepline_client as dc
     import app.phases.decision_maker_reasoning as dmr
     import app.phases.free_decision_maker as fdm
@@ -304,12 +327,14 @@ def test_search_icypeas_never_rechecks_a_known_company_across_runs(db, monkeypat
                         lambda db_, t, company, cands, n, offering_name=None: [{"name": "Jane Doe", "thread_role": "founder_ceo", "reasoning": "CEO"}])
 
     with spend_scope(db, BILLING, "icp_filters", run_cap_usd=0.5):
-        play.search_icypeas(db, PARTNER, ICP)
-        result = play.search_icypeas(db, PARTNER, ICP)
+        first = play.search_icypeas(db, PARTNER, ICP)
+        second = play.search_icypeas(db, PARTNER, ICP)
 
-    assert len(calls) == 2  # the search itself always runs (paid per page)
-    assert result["outcomes"] == {"known": 1}
-    assert db.query(GtmLead).count() == 1
+    assert first["exhausted"] is True
+    assert len(calls) == 1, "the second run must not spend anything re-fetching an exhausted pool"
+    assert second["stopped"] and "exhausted" in second["stopped"]
+    cursor = db.query(Parameter).filter(Parameter.tenant_id == PARTNER, Parameter.key == play.CURSOR_KEY).one()
+    assert "exhausted_at" in cursor.value
 
 
 # ------------------------------------------------------------------ loosened Qualifier (2026-09-28)

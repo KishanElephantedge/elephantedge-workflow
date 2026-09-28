@@ -35,7 +35,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from sqlalchemy.orm import Session
 
@@ -50,6 +50,8 @@ logger = logging.getLogger(__name__)
 PLAY = "icp_filters"
 BILLING_TENANT_ID = 2
 CURSOR_KEY = "icp_filters_play_cursor"
+EXHAUSTION_COOLDOWN_DAYS = 7  # how long to wait, once a filter set is fully paged through,
+                              # before paying to check it again (see search_icypeas)
 # LinkedIn / Sales Navigator company-size buckets.
 HEADCOUNT_BUCKETS = [(1, 10), (11, 50), (51, 200), (201, 500), (501, 1000), (1001, 5000), (5001, 10000), (10001, 10**9)]
 
@@ -167,8 +169,24 @@ def search_icypeas(db: Session, tenant_id: int, icp: dict, pages: int = 1) -> di
     filters = icypeas_filters_for_icp(icp)
     fingerprint = hashlib.sha1(json.dumps(filters, sort_keys=True).encode()).hexdigest()[:12]
     cursor = _cursor(db, tenant_id)
-    state = dict(cursor.value or {})
-    token = state.get("token") if state.get("filters") == fingerprint else None
+    saved = dict(cursor.value or {})
+    state = saved if saved.get("filters") == fingerprint else {}
+    token = state.get("token")
+
+    # Real gap found live 2026-09-28 (Majji: "what if these runs out of 336 after a few days"):
+    # once pagination genuinely exhausts (Icypeas returns no next token), the OLD code just
+    # restarted from page 1 on the next run -- re-paying to re-fetch the exact same
+    # already-known companies, forever, producing zero new leads. Now: once exhausted, no
+    # search call is made at all (free) until EXHAUSTION_COOLDOWN_DAYS has passed, giving
+    # Icypeas' real database time to grow into a genuinely different result set (new
+    # companies founded, existing ones crossing into the headcount band) before paying to
+    # check again.
+    exhausted_at = state.get("exhausted_at")
+    if exhausted_at:
+        cooldown_until = datetime.fromisoformat(exhausted_at) + timedelta(days=EXHAUSTION_COOLDOWN_DAYS)
+        if datetime.utcnow() < cooldown_until:
+            return {"companies": 0, "created": 0, "outcomes": {}, "exhausted_until": cooldown_until.isoformat(),
+                   "stopped": f"pool exhausted for these filters as of {exhausted_at}; next check {cooldown_until.date()}"}
 
     known_leads = {k for (k,) in db.query(GtmLead.lead_key).filter(GtmLead.tenant_id == tenant_id, GtmLead.play == PLAY)}
     result = {"companies": 0, "created": 0, "outcomes": {}, "stopped": None}
@@ -268,10 +286,19 @@ def search_icypeas(db: Session, tenant_id: int, icp: dict, pages: int = 1) -> di
             result["created"] += 1
             count("created")
 
-        if result["stopped"] or not leads or not token:
+        if result["stopped"]:
+            break
+        if not leads or not token:
+            # Genuinely exhausted -- Icypeas itself says there is no next page. Cooling down
+            # (see EXHAUSTION_COOLDOWN_DAYS above) rather than restarting from page 1, which
+            # would just re-pay to re-see the same companies with zero new leads.
+            result["exhausted"] = True
             break
 
-    cursor.value = {"filters": fingerprint, "token": token}
+    new_state = {"filters": fingerprint, "token": token}
+    if result.get("exhausted"):
+        new_state["exhausted_at"] = datetime.utcnow().isoformat()
+    cursor.value = new_state
     db.commit()
     return result
 
