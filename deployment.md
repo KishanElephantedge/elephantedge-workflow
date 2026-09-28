@@ -101,21 +101,22 @@ existed as a plan. Whatever gap the cron-job.org side left uncovered (e.g. after
 a new account whose URLs were never added there) was never caught by a second mechanism, since
 the GitHub Actions half didn't exist to catch it.
 
-1. **cron-job.org** (external scheduler, real account, not accessible by any session) — the
-   only mechanism that has ever actually been live. Pings `/api/health` (not `/docs` — found
-   live that `/docs`'s response was too large for cron-job.org's size limit). **Must be
-   updated by hand whenever the active account rotates** — add/update jobs for all SIX known
-   URLs below so whichever account is currently idle (and therefore next in line once the
-   active one gets suspended) is already warm, not just the active pair:
+1. **GitHub Actions** (`gateway/.github/workflows/keepalive.yml`) — pushed and live as of
+   2026-09-28 (commit `3cb8a66`, confirmed registered via the GitHub Actions API: workflow id
+   368817664, state "active"). Pings all SIX known URLs (all 3 accounts, gateway + backend)
+   every 10 minutes, unconditionally -- so whichever account is idle right now (and therefore
+   next in line once the active one gets suspended) stays warm too, and this file never needs
+   editing on a rotation. The earlier blocker (git token lacking the `workflow` OAuth scope)
+   no longer reproduced when this was retried.
    - `https://elephantedge-gateway.onrender.com/api/health` / `https://elephantedge-main.onrender.com/api/health` (Account 1)
    - `https://workflow-automation-48nk.onrender.com/api/health` / `https://elephantedge-workflow-1.onrender.com/api/health` (Account 2)
-   - `https://workflow-automation-1ujz.onrender.com/api/health` / `https://elephantedge-workflow-1-7k9d.onrender.com/api/health` (Account 3 — active as of 2026-09-15)
-2. **GitHub Actions** (`gateway/.github/workflows/keepalive.yml`) — written 2026-09-15,
-   pinging the same six URLs every 10 min, but **not pushed**: the git token used by this
-   session's pushes lacks the `workflow` OAuth scope GitHub requires specifically for files
-   under `.github/workflows/` (confirmed live — every other file in the same commit pushes
-   fine). The file exists locally in the `gateway` checkout; add it via GitHub's web UI
-   (Add file -> Create new file, paste its contents) or push with a token that has that scope.
+   - `https://workflow-automation-1ujz.onrender.com/api/health` / `https://elephantedge-workflow-1-7k9d.onrender.com/api/health` (Account 3 — active as of 2026-09-28)
+2. **cron-job.org** (external scheduler, real account, not accessible by any session) — was
+   the only mechanism actually live before 2026-09-28; now redundant with GitHub Actions above,
+   but left running as a second, independent layer. Pings `/api/health` (not `/docs` — found
+   live that `/docs`'s response was too large for cron-job.org's size limit). If it's ever
+   checked again, it also needs the same six URLs kept current by hand -- GitHub Actions is now
+   the one that doesn't need that maintenance.
 
 ## Three-account rotation (explicit decision, 2026-09-15)
 
