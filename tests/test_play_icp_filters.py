@@ -239,7 +239,7 @@ def test_search_icypeas_creates_a_lead_with_the_free_jobo_decision_maker(db, mon
     assert {r.tenant_id for r in db.query(ProviderSpend)} == {BILLING}
 
 
-def test_search_icypeas_skips_a_company_with_no_free_decision_maker(db, monkeypatch):
+def test_search_icypeas_skips_a_company_when_both_free_and_paid_resolution_miss(db, monkeypatch):
     import app.deepline_client as dc
     import app.phases.free_decision_maker as fdm
 
@@ -247,12 +247,42 @@ def test_search_icypeas_skips_a_company_with_no_free_decision_maker(db, monkeypa
         "toolResponse": {"raw": {"leads": [_icypeas_company(1)], "pagination": {"token": None}}}})
     # Jobo has a leader, but only a Crunchbase URL -- not usable for real LinkedIn outreach.
     monkeypatch.setattr(fdm, "_jobo_leadership_candidates", lambda db_, t, company: [_jobo_person(linkedin=False)])
+    monkeypatch.setattr(h, "search_leads", lambda page=1, **f: [])  # the paid fallback also finds nobody
 
     with spend_scope(db, BILLING, "icp_filters", run_cap_usd=0.5):
         result = play.search_icypeas(db, PARTNER, ICP)
 
-    assert result["outcomes"] == {"no_free_decision_maker": 1}
+    assert result["outcomes"] == {"no_decision_maker": 1}
     assert db.query(GtmLead).count() == 0
+
+
+def test_search_icypeas_falls_back_to_the_paid_batched_resolver_when_jobo_misses(db, monkeypatch):
+    """Real bug found live 2026-09-28: the free-only design found a usable decision maker for
+    0 of 25 real companies in the first live test. Now falls back to one batched, paid
+    HarvestAPI search covering every company that missed free resolution."""
+    import app.deepline_client as dc
+    import app.phases.decision_maker_reasoning as dmr
+    import app.phases.free_decision_maker as fdm
+
+    monkeypatch.setattr(dc, "_call_deepline_cli", lambda tool, payload: {
+        "toolResponse": {"raw": {"leads": [_icypeas_company(1, name="Widgetco")], "pagination": {"token": None}}}})
+    monkeypatch.setattr(fdm, "_jobo_leadership_candidates", lambda db_, t, company: [])  # nothing free at all
+    calls = []
+    monkeypatch.setattr(h, "search_leads", lambda page=1, **f: calls.append(f) or ([
+        {"first_name": "Sam", "last_name": "Lee", "linkedin_url": "https://linkedin.com/in/sam-lee", "title": "CEO",
+         "company_name": "Widgetco", "company_linkedin_url": "https://www.linkedin.com/company/co1/"}] if page == 1 else []))
+    monkeypatch.setattr(dmr, "select_best_decision_makers",
+                        lambda db_, t, company, cands, n: [{"name": cands[0]["name"], "thread_role": "founder_ceo", "reasoning": "CEO"}])
+
+    with spend_scope(db, BILLING, "icp_filters", run_cap_usd=0.5):
+        result = play.search_icypeas(db, PARTNER, ICP)
+
+    assert result["outcomes"] == {"created": 1}
+    assert "currentCompanies" in calls[0] and "co1" in calls[0]["currentCompanies"]
+    lead = db.query(GtmLead).one()
+    assert lead.person_name == "Sam Lee"
+    contact = db.get(Contact, lead.contact_id)
+    assert contact.linkedin_url == "https://linkedin.com/in/sam-lee"
 
 
 def test_search_icypeas_rejects_a_vendor_name_before_any_jobo_lookup(db, monkeypatch):
@@ -349,3 +379,40 @@ def test_qualifier_passes_on_qualified_true_with_no_score_gate(db, monkeypatch):
         play.search(db, PARTNER, ICP)
     assert play.qualify(db, PARTNER, ICP)["qualified"] == 1
     assert db.query(GtmLead).one().state == "contact_found"
+
+
+def test_search_icypeas_survives_a_dropped_connection_mid_page_and_saves_the_cursor_first(db, monkeypatch):
+    """Real bug found live 2026-09-28: a mid-run Neon connection drop crashed the per-company
+    loop after the page was already paid for, and the cursor only saved at the very end -- so
+    the next run re-paid to re-fetch the exact same page. Now the cursor saves as soon as the
+    paid page is in hand, and one company's DB error doesn't lose the rest of the page."""
+    import app.deepline_client as dc
+    import app.gtm_os.plays.icp_filters as icp_filters_module
+    import app.phases.decision_maker_reasoning as dmr
+    import app.phases.free_decision_maker as fdm
+    from sqlalchemy.exc import OperationalError
+
+    monkeypatch.setattr(dc, "_call_deepline_cli", lambda tool, payload: {
+        "toolResponse": {"raw": {"leads": [_icypeas_company(1), _icypeas_company(2)], "pagination": {"token": "next-page"}}}})
+    monkeypatch.setattr(fdm, "_jobo_leadership_candidates", lambda db_, t, company: [_jobo_person()])
+    monkeypatch.setattr(dmr, "select_best_decision_makers",
+                        lambda db_, t, company, cands, n, offering_name=None: [{"name": "Jane Doe", "thread_role": "founder_ceo", "reasoning": "CEO"}])
+
+    real = icp_filters_module._process_icypeas_company
+    calls = {"n": 0}
+
+    def flaky(db_, tenant_id, co, known_leads, pending):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise OperationalError("SELECT", {}, Exception("SSL SYSCALL error: Operation timed out"))
+        return real(db_, tenant_id, co, known_leads, pending)
+
+    monkeypatch.setattr(icp_filters_module, "_process_icypeas_company", flaky)
+
+    with spend_scope(db, BILLING, "icp_filters", run_cap_usd=0.5):
+        result = play.search_icypeas(db, PARTNER, ICP)
+
+    assert result["outcomes"]["created"] == 1
+    assert result["outcomes"]["db_error_retry_later"] == 1
+    cursor = db.query(Parameter).filter(Parameter.tenant_id == PARTNER, Parameter.key == play.CURSOR_KEY).one()
+    assert cursor.value["token"] == "next-page", "the page's token must be saved even though a company in it failed"

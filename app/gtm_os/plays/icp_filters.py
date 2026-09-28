@@ -37,6 +37,7 @@ import logging
 import re
 from datetime import datetime, timedelta
 
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 from app.db.models import Batch, CampaignPush, Company, Contact, Parameter
@@ -145,6 +146,145 @@ def icypeas_filters_for_icp(icp: dict) -> dict:
     }
 
 
+def _resolve_decision_makers_batch(db: Session, tenant_id: int, companies: list, titles: list[str]) -> dict:
+    """Real fix, 2026-09-28: the free Jobo leadership lookup found a usable (non-Crunchbase)
+    LinkedIn URL for 0 of 25 real, exact-headcount-matched companies in the first live test of
+    search_icypeas() -- Jobo's leadership index rarely has one. One HarvestAPI LinkedIn people
+    search covers up to 50 companies at once ($0.07/page of 25 results), so this is paid but
+    still cheap and bounded -- the same batched pattern already proven for the hiring play
+    (app/gtm_os/plays/hiring.py's _harvest_decision_makers), reimplemented here without
+    requiring an already-created GtmLead (this play is company-first, no signal, so there is
+    no lead yet at the point a decision maker needs resolving). Returns {company_id: Contact
+    or None}. Raises DeeplineSpendBlocked when the budget refuses -- caller decides what to do
+    with a partial batch."""
+    from app import harvestapi
+    from app.gtm_os.plays.hiring import LEADS_PER_CALL, _norm
+    from app.phases.decision_maker_reasoning import select_best_decision_makers
+
+    out: dict = {}
+    for start in range(0, len(companies), LEADS_PER_CALL):
+        chunk = [c for c in companies[start:start + LEADS_PER_CALL] if c.linkedin_url]
+        if not chunk:
+            continue
+        by_universal = {harvestapi.universal_name(c.linkedin_url): c for c in chunk}
+        by_name = {_norm(c.name): c for c in chunk}
+        people: dict[int, list] = {}
+        for page in (1, 2):
+            found = harvestapi.search_leads(page=page, currentCompanies=",".join(c.linkedin_url for c in chunk),
+                                            currentJobTitles=",".join(titles))
+            for person in found:
+                target = by_universal.get(harvestapi.universal_name(person.get("company_linkedin_url"))) or by_name.get(_norm(person.get("company_name")))
+                if target is not None and person.get("linkedin_url"):
+                    people.setdefault(target.id, []).append(person)
+            if len(found) < 25 or all(c.id in people for c in chunk):
+                break
+        for company in chunk:
+            candidates = people.get(company.id) or []
+            if not candidates:
+                out[company.id] = None
+                continue
+            named = {f"{p['first_name'] or ''} {p['last_name'] or ''}".strip(): p for p in candidates}
+            picks = select_best_decision_makers(db, tenant_id, company, [{"name": n, "title": p["title"]} for n, p in named.items()], 1)
+            pick = named.get(picks[0]["name"]) if picks else None
+            if pick is None:
+                out[company.id] = None
+                continue
+            contact = Contact(company_id=company.id, first_name=pick["first_name"], last_name=pick["last_name"], title=pick["title"],
+                              linkedin_url=pick["linkedin_url"], thread_role="icp_filter_decision_maker",
+                              matched_title_reasoning=f"HarvestAPI LinkedIn search (batched); agent: {picks[0].get('reasoning') or ''}"[:1000])
+            db.add(contact)
+            db.commit()
+            out[company.id] = contact
+    return out
+
+
+def _create_icypeas_lead(db: Session, tenant_id: int, key: str, company: Company, contact: Contact,
+                         first_name: str | None, last_name: str | None, person_linkedin: str | None, co: dict) -> None:
+    specialties = ", ".join(s.get("value") for s in (co.get("specialties") or []) if s.get("value"))[:300]
+    evidence = (
+        f"Person: {first_name or ''} {last_name or ''} -- {contact.title or ''}\n\n"
+        f"Company: {co.get('name')} | {co.get('industry')} | {co.get('numberOfEmployees')} employees | "
+        f"HQ {co.get('address')} | {co.get('website') or ''}\nSpecialties: {specialties}\nAbout: {co.get('description') or ''}"
+    )
+    db.add(GtmLead(tenant_id=tenant_id, play=PLAY, lead_key=key, company_id=company.id, contact_id=contact.id,
+                   person_name=f"{first_name or ''} {last_name or ''}".strip(), person_linkedin_url=person_linkedin,
+                   state=STATE_SIGNAL, evidence=evidence))
+    db.commit()
+
+
+def _process_icypeas_company(db: Session, tenant_id: int, co: dict, known_leads: set, pending: list) -> str | None:
+    """One search result -> a rejected lead, a created lead, or a deferral into `pending` for
+    the batched paid decision-maker resolver. Returns the outcome label to count, or None when
+    deferred (its real outcome is only known once the batch resolves). Raises OperationalError
+    up to the caller on a dropped connection -- deliberately NOT caught here, so the caller can
+    decide whether the page's progress (the cursor token) still gets saved regardless."""
+    from app.phases.decision_maker_reasoning import select_best_decision_makers
+    from app.phases.free_decision_maker import _jobo_leadership_candidates, _real_linkedin_url_from_jobo, _split_name
+
+    url = co.get("url") or ""
+    if "linkedin.com/company/" not in url:
+        return "no_linkedin_url"
+    slug = url.rstrip("/").rsplit("/company/", 1)[-1].split("?")[0]
+    key = f"company:{slug}"
+    if key in known_leads:
+        return "known"
+    known_leads.add(key)
+
+    name = co.get("name") or ""
+    if _looks_like_a_vendor(name):
+        db.add(GtmLead(tenant_id=tenant_id, play=PLAY, lead_key=key, state=STATE_REJECTED,
+                       qualifier_reason=f"company name matches a vendor/agency/recruiter pattern: {name!r}"))
+        db.commit()
+        return "vendor_name_match"
+
+    company = (db.query(Company).join(Batch, Company.batch_id == Batch.id)
+               .filter(Batch.tenant_id == tenant_id, Company.linkedin_url == url).first())
+    if company is not None and db.query(CampaignPush.id).join(Contact, CampaignPush.contact_id == Contact.id).filter(
+            Contact.company_id == company.id).first():
+        return "in_outreach"
+    if company is None:
+        # Real, free bonus -- Icypeas' own revenue estimate came back on 2 of the 3 companies
+        # in the 2026-09-28 test, at no extra cost.
+        revenue = co.get("estimatedRevenuRange") or {}
+        rev_lo = (revenue.get("estimatedMinRevenue") or {}).get("amount")
+        rev_hi = (revenue.get("estimatedMaxRevenue") or {}).get("amount")
+        rev_unit = 1_000_000 if (revenue.get("estimatedMinRevenue") or {}).get("unit") == "MILLION" else 1
+        company = Company(batch_id=_batch(db, tenant_id).id, name=name, domain=None, linkedin_url=url,
+                          industry=co.get("industry"), employee_count=co.get("numberOfEmployees"),
+                          location=co.get("address"), source="icypeas:find_companies",
+                          estimated_revenue_lower_usd=int(rev_lo * rev_unit) if rev_lo is not None else None,
+                          estimated_revenue_higher_usd=int(rev_hi * rev_unit) if rev_hi is not None else None)
+        db.add(company)
+        db.commit()
+
+    # Free -- Jobo's own leadership list, an agent picks the buyer, only Jobo's genuine (not
+    # Crunchbase) LinkedIn URL is usable for outreach.
+    leadership = _jobo_leadership_candidates(db, tenant_id, company)
+    usable = [p for p in leadership if _real_linkedin_url_from_jobo(p)]
+    person = None
+    if usable:
+        picks = select_best_decision_makers(db, tenant_id, company, usable, 1)
+        person = next((p for p in usable if picks and p.get("name") == picks[0]["name"]), None)
+    if person is not None:
+        first_name, last_name = _split_name(person.get("name") or "")
+        person_linkedin = normalize_linkedin_url(_real_linkedin_url_from_jobo(person))
+        contact = Contact(company_id=company.id, first_name=first_name, last_name=last_name, title=person.get("title"),
+                          linkedin_url=f"https://www.{person_linkedin}", thread_role="icp_filter_decision_maker",
+                          matched_title_reasoning=f"Jobo leadership match, free: {picks[0].get('reasoning') or ''}"[:500])
+        db.add(contact)
+        db.commit()
+        _create_icypeas_lead(db, tenant_id, key, company, contact, first_name, last_name, person_linkedin, co)
+        return "created"
+
+    # Real gap found live 2026-09-28: the free-only path found a usable decision maker for 0 of
+    # 25 real, exact-headcount-matched companies in the first live test -- Jobo's leadership
+    # index rarely has a genuine (non-Crunchbase) LinkedIn URL. Deferred to a single batched
+    # paid resolution after this page, rather than paying per company -- one call covers up to
+    # 50 companies.
+    pending.append((key, company, co))
+    return None
+
+
 def search_icypeas(db: Session, tenant_id: int, icp: dict, pages: int = 1) -> dict:
     """REAL FIX, 2026-09-28: company-first search on Icypeas' EXACT numeric headcount (confirmed
     live: 336 real US companies at exactly 30-100 employees for Majji's ICP, via the free
@@ -153,18 +293,16 @@ def search_icypeas(db: Session, tenant_id: int, icp: dict, pages: int = 1) -> di
     band at all -- structurally unavoidable with a bucketed search (see search()'s own history).
     An exact numeric filter has no such waste: every returned company is already a real match.
 
-    The decision maker comes from the SAME free Jobo leadership lookup the hiring play already
-    uses ($0) -- Icypeas' own people search can't combine headcount+title in one call through
-    Deepline's exposed schema, and paying per-person on top would give up most of this fix's
-    savings for no real benefit over a layer that's already free. A company whose free lookup
-    finds no genuine LinkedIn-URL decision maker is kept (never re-fetched) but produces no
-    lead this run -- simple and free, at the real cost of a lower per-company yield than a
-    paid contact-resolution step would give; that tradeoff is deliberate, not hidden."""
+    The decision maker is tried free first -- the SAME Jobo leadership lookup the hiring play
+    already uses -- then, ONLY for a company that misses, batch-resolved via one paid HarvestAPI
+    LinkedIn search covering up to 50 companies at once (_resolve_decision_makers_batch). The
+    free-only design was tried first and measured live 2026-09-28: 0 of 25 real, exact-headcount
+    companies had a usable (non-Crunchbase) LinkedIn URL in Jobo's index -- a 0% yield despite
+    paying for a perfect company match, which is what made the paid fallback necessary rather
+    than optional."""
     import hashlib
 
     from app.deepline_client import DeeplineError, DeeplineSpendBlocked, execute_tool
-    from app.phases.decision_maker_reasoning import select_best_decision_makers
-    from app.phases.free_decision_maker import _jobo_leadership_candidates, _real_linkedin_url_from_jobo, _split_name
 
     filters = icypeas_filters_for_icp(icp)
     fingerprint = hashlib.sha1(json.dumps(filters, sort_keys=True).encode()).hexdigest()[:12]
@@ -194,6 +332,7 @@ def search_icypeas(db: Session, tenant_id: int, icp: dict, pages: int = 1) -> di
     def count(outcome):
         result["outcomes"][outcome] = result["outcomes"].get(outcome, 0) + 1
 
+    pending: list = []
     for _ in range(pages):
         payload = {"query": filters, "pagination": {"size": 25, **({"token": token} if token else {})}}
         try:
@@ -209,82 +348,53 @@ def search_icypeas(db: Session, tenant_id: int, icp: dict, pages: int = 1) -> di
         token = (raw.get("pagination") or {}).get("token")
         result["companies"] += len(leads)
 
+        # Real bug found live 2026-09-28: a mid-run Neon connection drop (this codebase's own
+        # documented recurring failure mode, see app/db/session.py) crashed the per-company loop
+        # below AFTER this page was already paid for, but the cursor only used to save at the
+        # very end of the whole function -- so the next run would re-pay $0.175+ to re-fetch the
+        # exact same page for nothing. Saving the advanced token HERE, immediately once the paid
+        # page is in hand, means a later crash in this page's processing never re-buys it.
+        try:
+            cursor.value = {"filters": fingerprint, "token": token}
+            db.commit()
+        except OperationalError:
+            db.rollback()
+
         for co in leads:
-            url = co.get("url") or ""
-            if "linkedin.com/company/" not in url:
-                count("no_linkedin_url")
-                continue
-            slug = url.rstrip("/").rsplit("/company/", 1)[-1].split("?")[0]
-            key = f"company:{slug}"
-            if key in known_leads:
-                count("known")
-                continue
-            known_leads.add(key)
+            try:
+                outcome = _process_icypeas_company(db, tenant_id, co, known_leads, pending)
+            except OperationalError:
+                # One company's DB work hit a dropped connection -- must not lose the rest of
+                # an already-paid-for page. Retried on a future run (never added to known_leads
+                # for real here, since that only happens inside the helper after a commit).
+                db.rollback()
+                outcome = "db_error_retry_later"
+            if outcome is not None:  # None = deferred to the batched resolver below
+                count(outcome)
+                if outcome == "created":
+                    result["created"] += 1
 
-            name = co.get("name") or ""
-            if _looks_like_a_vendor(name):
-                db.add(GtmLead(tenant_id=tenant_id, play=PLAY, lead_key=key, state=STATE_REJECTED,
-                               qualifier_reason=f"company name matches a vendor/agency/recruiter pattern: {name!r}"))
-                db.commit()
-                count("vendor_name_match")
-                continue
-
-            company = (db.query(Company).join(Batch, Company.batch_id == Batch.id)
-                       .filter(Batch.tenant_id == tenant_id, Company.linkedin_url == url).first())
-            if company is not None and db.query(CampaignPush.id).join(Contact, CampaignPush.contact_id == Contact.id).filter(
-                    Contact.company_id == company.id).first():
-                count("in_outreach")
-                continue
-            if company is None:
-                # Real, free bonus -- Icypeas' own revenue estimate came back on 2 of the 3
-                # companies in the 2026-09-28 test, at no extra cost.
-                revenue = co.get("estimatedRevenuRange") or {}
-                rev_lo = (revenue.get("estimatedMinRevenue") or {}).get("amount")
-                rev_hi = (revenue.get("estimatedMaxRevenue") or {}).get("amount")
-                rev_unit = 1_000_000 if (revenue.get("estimatedMinRevenue") or {}).get("unit") == "MILLION" else 1
-                company = Company(batch_id=_batch(db, tenant_id).id, name=name, domain=None, linkedin_url=url,
-                                  industry=co.get("industry"), employee_count=co.get("numberOfEmployees"),
-                                  location=co.get("address"), source="icypeas:find_companies",
-                                  estimated_revenue_lower_usd=int(rev_lo * rev_unit) if rev_lo is not None else None,
-                                  estimated_revenue_higher_usd=int(rev_hi * rev_unit) if rev_hi is not None else None)
-                db.add(company)
-                db.commit()
-
-            # Free -- Jobo's own leadership list, an agent picks the buyer, only Jobo's genuine
-            # (not Crunchbase) LinkedIn URL is usable for outreach. No paid resolution here.
-            leadership = _jobo_leadership_candidates(db, tenant_id, company)
-            usable = [p for p in leadership if _real_linkedin_url_from_jobo(p)]
-            if not usable:
-                count("no_free_decision_maker")
-                continue
-            picks = select_best_decision_makers(db, tenant_id, company, usable, 1)
-            if not picks:
-                count("no_free_decision_maker")
-                continue
-            person = next((p for p in usable if p.get("name") == picks[0]["name"]), None)
-            if person is None:
-                count("no_free_decision_maker")
-                continue
-
-            first_name, last_name = _split_name(person.get("name") or "")
-            person_linkedin = normalize_linkedin_url(_real_linkedin_url_from_jobo(person))
-            contact = Contact(company_id=company.id, first_name=first_name, last_name=last_name, title=person.get("title"),
-                              linkedin_url=f"https://www.{person_linkedin}", thread_role="icp_filter_decision_maker",
-                              matched_title_reasoning=f"Jobo leadership match, free: {picks[0].get('reasoning') or ''}"[:500])
-            db.add(contact)
-            db.commit()
-            specialties = ", ".join(s.get("value") for s in (co.get("specialties") or []) if s.get("value"))[:300]
-            evidence = (
-                f"Person: {first_name} {last_name} -- {person.get('title')}\n\n"
-                f"Company: {name} | {co.get('industry')} | {co.get('numberOfEmployees')} employees | "
-                f"HQ {co.get('address')} | {co.get('website') or ''}\nSpecialties: {specialties}\nAbout: {co.get('description') or ''}"
-            )
-            db.add(GtmLead(tenant_id=tenant_id, play=PLAY, lead_key=key, company_id=company.id, contact_id=contact.id,
-                           person_name=f"{first_name} {last_name}".strip(), person_linkedin_url=person_linkedin,
-                           state=STATE_SIGNAL, evidence=evidence))
-            db.commit()
-            result["created"] += 1
-            count("created")
+        if pending:
+            try:
+                titles = icp.get("decision_maker_titles") or ["Owner", "Founder", "CEO"]
+                resolved = _resolve_decision_makers_batch(db, tenant_id, [c for _, c, _ in pending], titles)
+            except DeeplineSpendBlocked as e:
+                result["stopped"] = f"budget: {e}"
+                resolved = {}
+            for key, company, co in pending:
+                try:
+                    contact = resolved.get(company.id)
+                    if contact is None:
+                        count("no_decision_maker")
+                        continue
+                    _create_icypeas_lead(db, tenant_id, key, company, contact, contact.first_name, contact.last_name,
+                                        normalize_linkedin_url(contact.linkedin_url), co)
+                    result["created"] += 1
+                    count("created")
+                except OperationalError:
+                    db.rollback()
+                    count("db_error_retry_later")
+            pending = []
 
         if result["stopped"]:
             break
