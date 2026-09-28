@@ -236,8 +236,20 @@ def qualify(db: Session, tenant_id: int, icp: dict, limit: int = 25, min_fit_sco
 
 
 def run_icp_filters(db: Session, tenant_id: int, pages: int = 1, run_cap_usd: float | None = 0.25) -> dict:
+    """Real bug fixed 2026-09-28, before this play's first production run: this used to spend
+    with no control-plane check at all, unlike every other play -- Elephant Edge's own pause
+    would stop the hiring and post_engagement plays but silently NOT this one, even though its
+    spend is reserved against the SAME Elephant Edge ledger (BILLING_TENANT_ID). Checked against
+    the billing tenant, not `tenant_id` (the partner) -- a partner tenant has no control-plane
+    config of its own, and pausing is Elephant Edge's own kill switch over its own spend."""
+    from app.gtm_os.orchestration.control import ControlPlaneHalted, check_can_run
     from app.phases.partner_icp import get_partner_icp
     from app.spend_ledger import spend_scope
+
+    try:
+        check_can_run(db, BILLING_TENANT_ID)
+    except ControlPlaneHalted as e:
+        return {"status": "skipped", "reason": str(e)}
 
     icp = get_partner_icp(db, tenant_id)
     if not icp:

@@ -74,3 +74,15 @@ def test_qualified_lead_is_outreach_ready(db, monkeypatch):
         play.search(db, PARTNER, ICP)
     assert play.qualify(db, PARTNER, ICP)["qualified"] == 1
     assert db.query(GtmLead).one().state == "contact_found"
+
+
+def test_run_respects_paused_control_plane(db):
+    import copy
+
+    from app.gtm_os.orchestration.control import DEFAULT_GTM_OS_CONTROL_CONFIG, set_control_config
+
+    config = copy.deepcopy(DEFAULT_GTM_OS_CONTROL_CONFIG)
+    config["state"] = "paused"
+    config["spend"] = {"daily_cap_usd": 1.0, "run_cap_usd": 0.5}
+    set_control_config(db, BILLING, config)
+    assert play.run_icp_filters(db, PARTNER)["status"] == "skipped"

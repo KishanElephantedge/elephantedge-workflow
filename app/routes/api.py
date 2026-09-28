@@ -6087,6 +6087,31 @@ def run_partner_discovery_route(request: Request, payload: PartnerDiscoveryReque
     return {"batch_id": batch.id, "status": "in_progress", "poll": f"/api/gtm-os/partner/discover/{batch.id}"}
 
 
+@router.post("/gtm-os/partner/icp-filters-run")
+def run_partner_icp_filters_route(request: Request, pages: int = 1, run_cap_usd: float = 0.25, db: Session = Depends(get_db)):
+    """Runs Play F (ICP-filter LinkedIn people search -- no signal, filters built straight from
+    the partner's own ICP config; app/gtm_os/plays/icp_filters.py) for the CALLING partner
+    tenant right now. Synchronous, unlike POST .../partner/discover above -- this play calls
+    HarvestAPI, not the slow Apify actors that route exists to background/poll around, so a
+    real run finishes in seconds, well inside a normal request timeout.
+
+    run_cap_usd is capped at $2 here regardless of what's passed -- a query-param typo (e.g. an
+    extra zero) must not turn into an accidental large spend; run_icp_filters() itself is what
+    actually reserves each call against this cap plus Elephant Edge's own combined daily cap,
+    and is gated on Elephant Edge's control-plane pause state (see its own docstring for why)."""
+    tenant_id = _resolve_tenant_id(request)
+    if tenant_id == ELEPHANT_EDGE_TENANT_ID:
+        raise HTTPException(status_code=400, detail="This route is for partner tenants only -- Elephant Edge's own hiring/post-engagement plays run through the V2 scheduler, not this.")
+
+    icp_param = db.query(Parameter).filter(Parameter.tenant_id == tenant_id, Parameter.key == PARTNER_ICP_PARAMETER_KEY).first()
+    if not icp_param or not icp_param.value:
+        raise HTTPException(status_code=400, detail="No ICP configured for this tenant yet -- set one via PUT /gtm-os/partner/icp first.")
+
+    from app.gtm_os.plays.icp_filters import run_icp_filters
+
+    return run_icp_filters(db, tenant_id, pages=pages, run_cap_usd=min(run_cap_usd, 2.0))
+
+
 @router.get("/gtm-os/partner/discover/{batch_id}")
 def get_partner_discovery_status(batch_id: int, request: Request, db: Session = Depends(get_db)):
     """Poll target for the async route above. Scoped to the calling tenant -- a batch id from a
