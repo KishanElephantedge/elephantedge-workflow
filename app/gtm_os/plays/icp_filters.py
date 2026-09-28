@@ -53,6 +53,12 @@ BILLING_TENANT_ID = 2
 CURSOR_KEY = "icp_filters_play_cursor"
 EXHAUSTION_COOLDOWN_DAYS = 7  # how long to wait, once a filter set is fully paged through,
                               # before paying to check it again (see search_icypeas)
+# _resolve_decision_makers_batch: company NAMES, not URLs (a real bug -- see that function's
+# own comment), so a page mixes real matches with same-named unrelated companies. Smaller batch
+# and more pages than the URL-based hiring play uses, so real matches aren't buried in noise;
+# not yet tuned against real yield data, first value chosen deliberately conservative.
+NAME_BATCH_SIZE = 15
+NAME_SEARCH_PAGES = 3
 # LinkedIn / Sales Navigator company-size buckets.
 HEADCOUNT_BUCKETS = [(1, 10), (11, 50), (51, 200), (201, 500), (501, 1000), (1001, 5000), (5001, 10000), (10001, 10**9)]
 
@@ -158,22 +164,33 @@ def _resolve_decision_makers_batch(db: Session, tenant_id: int, companies: list,
     or None}. Raises DeeplineSpendBlocked when the budget refuses -- caller decides what to do
     with a partial batch."""
     from app import harvestapi
-    from app.gtm_os.plays.hiring import LEADS_PER_CALL, _norm
+    from app.gtm_os.plays.hiring import _norm
     from app.phases.decision_maker_reasoning import select_best_decision_makers
 
+    # Real bug found live 2026-09-28: batching MULTIPLE company LinkedIn URLs together in one
+    # currentCompanies request silently returned 0 people, even for 3 real, correctly-sized
+    # companies with confirmed active LinkedIn pages -- while the identical request using
+    # company NAMES instead returned real matches (David Lynch, CEO of Klir; Ewen Rainer, CEO
+    # of Doorstead), and a SINGLE url also worked. So multi-URL batching specifically is what's
+    # broken, not the search or the matching logic. Switched to names.
+    #
+    # Trade-off, not hidden: name search is a broader match (returns unrelated companies with
+    # a similar name worldwide -- "Klir" also matched "Klir Online", "KLIR Sky, Ltd.", etc. in
+    # the same live test), so a smaller batch size here than the URL-based hiring play uses,
+    # to keep real matches from being buried in noise within the pages actually checked.
     out: dict = {}
-    for start in range(0, len(companies), LEADS_PER_CALL):
-        chunk = [c for c in companies[start:start + LEADS_PER_CALL] if c.linkedin_url]
+    for start in range(0, len(companies), NAME_BATCH_SIZE):
+        chunk = [c for c in companies[start:start + NAME_BATCH_SIZE] if c.name]
         if not chunk:
             continue
-        by_universal = {harvestapi.universal_name(c.linkedin_url): c for c in chunk}
+        by_universal = {harvestapi.universal_name(c.linkedin_url): c for c in chunk if c.linkedin_url}
         by_name = {_norm(c.name): c for c in chunk}
         people: dict[int, list] = {}
-        for page in (1, 2):
-            found = harvestapi.search_leads(page=page, currentCompanies=",".join(c.linkedin_url for c in chunk),
+        for page in range(1, NAME_SEARCH_PAGES + 1):
+            found = harvestapi.search_leads(page=page, currentCompanies=",".join(c.name for c in chunk),
                                             currentJobTitles=",".join(titles))
             for person in found:
-                target = by_universal.get(harvestapi.universal_name(person.get("company_linkedin_url"))) or by_name.get(_norm(person.get("company_name")))
+                target = by_name.get(_norm(person.get("company_name"))) or by_universal.get(harvestapi.universal_name(person.get("company_linkedin_url")))
                 if target is not None and person.get("linkedin_url"):
                     people.setdefault(target.id, []).append(person)
             if len(found) < 25 or all(c.id in people for c in chunk):

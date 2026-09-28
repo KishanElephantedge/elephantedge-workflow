@@ -278,7 +278,7 @@ def test_search_icypeas_falls_back_to_the_paid_batched_resolver_when_jobo_misses
         result = play.search_icypeas(db, PARTNER, ICP)
 
     assert result["outcomes"] == {"created": 1}
-    assert "currentCompanies" in calls[0] and "co1" in calls[0]["currentCompanies"]
+    assert "currentCompanies" in calls[0] and "Widgetco" in calls[0]["currentCompanies"]
     lead = db.query(GtmLead).one()
     assert lead.person_name == "Sam Lee"
     contact = db.get(Contact, lead.contact_id)
