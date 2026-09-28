@@ -416,3 +416,38 @@ def test_search_icypeas_survives_a_dropped_connection_mid_page_and_saves_the_cur
     assert result["outcomes"]["db_error_retry_later"] == 1
     cursor = db.query(Parameter).filter(Parameter.tenant_id == PARTNER, Parameter.key == play.CURSOR_KEY).one()
     assert cursor.value["token"] == "next-page", "the page's token must be saved even though a company in it failed"
+
+
+def test_resolve_decision_makers_batch_keeps_earlier_pages_when_a_later_page_is_budget_blocked(db, monkeypatch):
+    """Real bug found live 2026-09-28: a budget refusal on page 3 crashed the whole function,
+    discarding page 1's and page 2's already-paid-for results ($0.14 spent, found nothing kept).
+    Now the earlier pages' real matches are still used."""
+    import app.deepline_client as dc
+    import app.phases.decision_maker_reasoning as dmr
+
+    from app.gtm_os.plays.icp_filters import _batch
+    batch = _batch(db, PARTNER)
+    company = Company(batch_id=batch.id, name="Good", linkedin_url="https://www.linkedin.com/company/good/")
+    db.add(company)
+    db.commit()
+
+    call_n = {"n": 0}
+
+    def flaky_search(page=1, **f):
+        call_n["n"] += 1
+        if page == 1:
+            return [{"first_name": "Sam", "last_name": "Lee", "linkedin_url": "https://linkedin.com/in/sam-lee", "title": "CEO",
+                     "company_name": "Good", "company_linkedin_url": "https://www.linkedin.com/company/good/"}] + \
+                   [{"first_name": f"Noise{i}", "last_name": "X", "linkedin_url": f"https://linkedin.com/in/n{i}", "title": "CEO",
+                     "company_name": "Other", "company_linkedin_url": "https://www.linkedin.com/company/other/"} for i in range(24)]
+        raise dc.DeeplineSpendBlocked("run cap reached")
+
+    monkeypatch.setattr(h, "search_leads", flaky_search)
+    monkeypatch.setattr(dmr, "select_best_decision_makers",
+                        lambda db_, t, comp, cands, n: [{"name": cands[0]["name"], "thread_role": "founder_ceo", "reasoning": "CEO"}])
+
+    with spend_scope(db, BILLING, "icp_filters", run_cap_usd=0.5):
+        resolved = play._resolve_decision_makers_batch(db, PARTNER, [company], ["CEO"])
+
+    assert resolved[company.id] is not None
+    assert resolved[company.id].first_name == "Sam"

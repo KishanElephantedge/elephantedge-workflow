@@ -161,8 +161,9 @@ def _resolve_decision_makers_batch(db: Session, tenant_id: int, companies: list,
     (app/gtm_os/plays/hiring.py's _harvest_decision_makers), reimplemented here without
     requiring an already-created GtmLead (this play is company-first, no signal, so there is
     no lead yet at the point a decision maker needs resolving). Returns {company_id: Contact
-    or None}. Raises DeeplineSpendBlocked when the budget refuses -- caller decides what to do
-    with a partial batch."""
+    or None}. Never raises on a budget refusal or provider error -- stops paging/chunking at
+    that point and returns whatever was already found for the pages actually paid for, rather
+    than discarding it (see the real bug this fixed, in the comment below)."""
     from app import harvestapi
     from app.gtm_os.plays.hiring import _norm
     from app.phases.decision_maker_reasoning import select_best_decision_makers
@@ -178,8 +179,13 @@ def _resolve_decision_makers_batch(db: Session, tenant_id: int, companies: list,
     # a similar name worldwide -- "Klir" also matched "Klir Online", "KLIR Sky, Ltd.", etc. in
     # the same live test), so a smaller batch size here than the URL-based hiring play uses,
     # to keep real matches from being buried in noise within the pages actually checked.
+    from app.deepline_client import DeeplineError, DeeplineSpendBlocked
+
     out: dict = {}
+    budget_stopped = False
     for start in range(0, len(companies), NAME_BATCH_SIZE):
+        if budget_stopped:
+            break
         chunk = [c for c in companies[start:start + NAME_BATCH_SIZE] if c.name]
         if not chunk:
             continue
@@ -187,8 +193,17 @@ def _resolve_decision_makers_batch(db: Session, tenant_id: int, companies: list,
         by_name = {_norm(c.name): c for c in chunk}
         people: dict[int, list] = {}
         for page in range(1, NAME_SEARCH_PAGES + 1):
-            found = harvestapi.search_leads(page=page, currentCompanies=",".join(c.name for c in chunk),
-                                            currentJobTitles=",".join(titles))
+            # Real bug found live 2026-09-28: a budget/provider error on a LATER page used to
+            # crash the whole function, discarding whatever EARLIER pages in this same chunk
+            # had already been paid for and found -- the exact "buy it, then throw it away"
+            # pattern this whole build has been fixing everywhere else. Now: stop paging, but
+            # still use whatever was already found for this chunk below.
+            try:
+                found = harvestapi.search_leads(page=page, currentCompanies=",".join(c.name for c in chunk),
+                                                currentJobTitles=",".join(titles))
+            except (DeeplineSpendBlocked, DeeplineError):
+                budget_stopped = True
+                break
             for person in found:
                 target = by_name.get(_norm(person.get("company_name"))) or by_universal.get(harvestapi.universal_name(person.get("company_linkedin_url")))
                 if target is not None and person.get("linkedin_url"):
