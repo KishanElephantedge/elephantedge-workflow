@@ -7,7 +7,11 @@
                lookup at all), then the free public LinkedIn company page decides size fit for
                everyone else. The PAID company lookup ($0.003) is only spent on a company that
                survives both free checks -- see the 2026-09-28 fix note below.
-    qualify    ONE LLM call per company against the partner's ICP notes -> qualified / rejected
+    qualify    ONE LLM call per company against the partner's ICP notes -> qualified / rejected,
+               and (2026-09-28 fix) writes the same Problem->Demand->Opportunity->Strategy rows
+               every other play writes, so a qualified lead is actually visible in the
+               partner's own Pipeline/Accounts dashboard -- a qualified lead used to dead-end as
+               a bare GtmLead row nobody could see or act on
     contact    free -- the person found by the search IS the contact (LinkedIn outreach)
 
 Rows are written to the PARTNER's tenant (their data stays theirs), while every paid call is
@@ -269,11 +273,14 @@ Return ONLY this JSON:
   "icp_fit_score": 0-100,
   "reason": "one or two sentences explaining the decision",
   "sales_team_guess": "what the data suggests about their sales team, or 'unknown'",
+  "problem_statement": "the real problem this company likely has that the partner's offer addresses, one plain sentence, or null",
+  "demand_statement": "what they'd likely want help with, one plain sentence, or null",
   "positioning_angle": "how the partner could open a conversation, one sentence, or null"
 }}"""
 
 
 def qualify(db: Session, tenant_id: int, icp: dict, limit: int = 25, min_fit_score: int = DEFAULT_MIN_FIT_SCORE) -> dict:
+    from app.gtm_os.plays.post_engagement import _write_opportunity
     from app.llm_budget import LlmBudgetExceeded
     from app.llm_client import generate_json
 
@@ -297,6 +304,17 @@ def qualify(db: Session, tenant_id: int, icp: dict, limit: int = 25, min_fit_sco
         score = int(score) if isinstance(score, (int, float)) else 0
         passes = bool(verdict.get("qualified")) and score >= min_fit_score
         lead.icp_fit_score, lead.qualifier_reason, lead.qualifier_output = score, verdict.get("reason"), verdict
+        if passes:
+            # Real gap fixed 2026-09-28: this used to just flip the state, leaving a qualified
+            # lead invisible to the Pipeline/Accounts dashboard -- no Opportunity/Strategy ever
+            # existed for it. Reuses the SAME shared writer the hiring and post_engagement
+            # plays already use, so a qualified partner lead shows up exactly where every other
+            # qualified lead does.
+            company = db.get(Company, lead.company_id)
+            opportunity, _strategy = _write_opportunity(db, tenant_id, lead, company, play=PLAY,
+                                                        objective="Open a conversation about the problem their team likely has",
+                                                        source_note="from a firmographic filter match, no signal")
+            lead.opportunity_id = opportunity.id
         # The search already found the decision maker, so a qualified lead is ready for outreach.
         lead.state = STATE_CONTACT_FOUND if passes else STATE_REJECTED
         db.commit()

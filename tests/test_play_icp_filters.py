@@ -24,11 +24,15 @@ ICP = {"employee_min": 30, "employee_max": 100, "decision_maker_titles": ["Owner
 
 @pytest.fixture
 def db(db_factory, monkeypatch):
+    from app.gtm_os.intelligence.demand_hypothesis import DemandHypothesis
+    from app.gtm_os.intelligence.problem_hypothesis import ProblemHypothesis
     from app.gtm_os.intelligence.signal import GtmSignal
     from app.gtm_os.learning.message_draft import MessageDraft
     from app.gtm_os.opportunity.opportunity import Opportunity
+    from app.gtm_os.strategy.strategy import GtmStrategy
 
-    db = db_factory([Parameter, ProviderSpend, GtmLead, Batch, Company, Contact, CampaignPush, GtmSignal, Opportunity, MessageDraft])
+    db = db_factory([Parameter, ProviderSpend, GtmLead, Batch, Company, Contact, CampaignPush, GtmSignal,
+                     ProblemHypothesis, DemandHypothesis, Opportunity, GtmStrategy, MessageDraft])
     config = copy.deepcopy(DEFAULT_GTM_OS_CONTROL_CONFIG)
     config["spend"] = {"daily_cap_usd": 1.0, "run_cap_usd": 0.5}
     set_control_config(db, BILLING, config)
@@ -165,3 +169,27 @@ def test_free_size_band_inconclusive_falls_through_to_paid_lookup(db, monkeypatc
     with spend_scope(db, BILLING, "icp_filters", run_cap_usd=0.5):
         play.search(db, PARTNER, ICP)
     assert called == ["good"]
+
+
+def test_qualified_lead_gets_a_real_opportunity_visible_in_the_pipeline(db, monkeypatch):
+    """Real gap fixed 2026-09-28: a qualified lead used to just flip state, with no
+    Opportunity/Strategy ever written -- invisible to the Pipeline/Accounts dashboard."""
+    from app.gtm_os.opportunity.opportunity import Opportunity
+    from app.gtm_os.strategy.strategy import GtmStrategy
+
+    monkeypatch.setattr(h, "search_leads", lambda page=1, **f: [_person(1, "Good")])
+    monkeypatch.setattr(h, "get_company", lambda u: {"name": "Good", "employee_count": 60, "industry": "Manufacturing",
+                                                     "hq_text": "", "website": "https://good.com", "description": "", "linkedin_url": None})
+    monkeypatch.setattr(llm_client, "generate_json", lambda prompt, db, t, max_tokens=0: {
+        "qualified": True, "icp_fit_score": 80, "reason": "fits", "problem_statement": "No dedicated sales leader.",
+        "demand_statement": "Wants help scaling sales.", "positioning_angle": "Ask about their sales process."})
+    with spend_scope(db, BILLING, "icp_filters", run_cap_usd=0.5):
+        play.search(db, PARTNER, ICP)
+    play.qualify(db, PARTNER, ICP)
+
+    lead = db.query(GtmLead).one()
+    assert lead.state == "contact_found" and lead.opportunity_id is not None
+    opportunity = db.get(Opportunity, lead.opportunity_id)
+    assert opportunity.tenant_id == PARTNER and opportunity.status == "qualified"
+    strategy = db.query(GtmStrategy).filter(GtmStrategy.opportunity_id == opportunity.id).one()
+    assert strategy.positioning_angle == "Ask about their sales process."
