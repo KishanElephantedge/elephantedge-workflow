@@ -5108,6 +5108,33 @@ def post_gtm_os_message_review(message_draft_id: int, payload: dict = Body(...),
     }
 
 
+@router.post("/gtm-os/messages/{message_draft_id}/send")
+def post_gtm_os_message_send(message_draft_id: int, db: Session = Depends(get_db)):
+    """Sends one already-approved MessageDraft right now, instead of waiting for the once-daily
+    sweep or the 2-hour unattended auto-approval window (app/gtm_os/send/auto_approval.py) to
+    reach it. Real gap found live 2026-09-28: a draft approved earlier (via an older, pre-
+    immediate-push flow) had no on-demand way to be sent -- POST .../review only sends as a side
+    effect of a FRESH approval (action=approve), and re-running that on an already-approved
+    draft is correctly refused by approve_message_draft()'s own 'must be ready_for_review'
+    precondition. This route is for exactly that gap: a draft that is already approved and
+    still needs pushing.
+
+    Reuses send_approved_draft() verbatim -- same real safety gates as every other send
+    (control-plane state, cooldowns, daily limits, business hours, dedup against an existing
+    successful send), no new send logic here. Calling this twice on an already-sent draft is
+    safe: send_message_draft()'s own has_successful_send() check turns the second call into a
+    no-op 'already successfully sent' skip, never a duplicate push."""
+    from app.gtm_os.learning.message_draft import MessageDraft
+    from app.gtm_os.send.auto_approval import send_approved_draft
+
+    draft = db.get(MessageDraft, message_draft_id)
+    if draft is None or draft.tenant_id != ELEPHANT_EDGE_TENANT_ID:
+        raise HTTPException(status_code=404, detail=f"no MessageDraft {message_draft_id}")
+
+    result = send_approved_draft(db, ELEPHANT_EDGE_TENANT_ID, draft)
+    return {"id": draft.id, "status": draft.status, "send": result}
+
+
 @router.post("/gtm-os/messages/{message_draft_id}/regenerate")
 def post_gtm_os_message_regenerate(message_draft_id: int, payload: dict = Body(default={}), db: Session = Depends(get_db)):
     """V2 Frontend Phase (Message Workspace) -- the real single-draft regeneration V2 never had.

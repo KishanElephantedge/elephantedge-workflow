@@ -106,3 +106,33 @@ def test_reject_still_returns_the_draft_unchanged_in_shape(db, monkeypatch):
     body = response.json()
     assert body["status"] == "rejected"
     assert body["send"] is None
+
+
+# ------------------------------------------------------------------ POST .../messages/{id}/send
+
+def test_send_pushes_an_already_approved_draft(db, monkeypatch):
+    draft = _draft(db, status="approved")
+
+    def fake_send_message_draft(db_, tenant_id, draft_):
+        return {"status": "enrolled", "provider": "salesrobot", "provider_ref": "campaign-uuid", "attempt_id": 1}
+
+    import app.gtm_os.send.auto_approval as auto_approval
+    monkeypatch.setattr(auto_approval, "send_message_draft", fake_send_message_draft)
+
+    response = client.post(f"/api/gtm-os/messages/{draft.id}/send")
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["id"] == draft.id
+    assert body["send"]["status"] == "enrolled"
+
+
+def test_send_refuses_a_draft_that_is_not_yet_approved(db):
+    draft = _draft(db, status="ready_for_review")
+    response = client.post(f"/api/gtm-os/messages/{draft.id}/send")
+    assert response.status_code == 200, response.text
+    assert response.json()["send"]["status"] == "skipped"
+
+
+def test_send_404s_on_an_unknown_draft(db):
+    response = client.post("/api/gtm-os/messages/999999/send")
+    assert response.status_code == 404
