@@ -518,6 +518,39 @@ def on_shutdown():
     scheduler.shutdown(wait=False)
 
 
+@app.get("/api/webinar-click/{token}")
+def webinar_click(token: str):
+    """Redirect-and-log for scripts/send_webinar_invites.py's tracked links (2026-09-29). A row
+    for this token already exists (inserted before the email was sent) -- this route only ever
+    reads it and increments the click count, never creates one, so a bad/expired token fails
+    safe (falls back to the real Luma link) rather than 404ing a real recipient mid-click."""
+    from sqlalchemy import text
+
+    from app.db.session import SessionLocal
+    from fastapi.responses import RedirectResponse
+
+    FALLBACK_URL = "https://luma.com/446gknyz"
+
+    db = SessionLocal()
+    try:
+        row = db.execute(
+            text("SELECT destination_url FROM webinar_link_clicks WHERE token = :t"), {"t": token}
+        ).fetchone()
+        if row is None:
+            return RedirectResponse(FALLBACK_URL, status_code=302)
+        db.execute(
+            text(
+                "UPDATE webinar_link_clicks SET click_count = click_count + 1, "
+                "first_clicked_at = COALESCE(first_clicked_at, now()) WHERE token = :t"
+            ),
+            {"t": token},
+        )
+        db.commit()
+        return RedirectResponse(row[0], status_code=302)
+    finally:
+        db.close()
+
+
 @app.get("/api/health")
 def health():
     """RENDER_GIT_COMMIT is set automatically by Render on every deploy -- exposed here because

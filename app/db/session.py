@@ -1085,3 +1085,22 @@ def ensure_indexes():
         conn.execute(text("DROP INDEX IF EXISTS ux_gtm_leads_person"))
         conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ux_gtm_leads_key ON gtm_leads (tenant_id, play, lead_key)"))
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_gtm_leads_state ON gtm_leads (tenant_id, play, state)"))
+        # Webinar invite click-tracking (2026-09-29) -- one row per recipient of a manual email
+        # campaign (scripts/send_webinar_invites.py), created before the send so the redirect
+        # route just has to look a token up, never invent one. Deliberately its own tiny table,
+        # not tied to any tenant -- this is Majji's own personal outbound, not GTM-OS pipeline
+        # data, and forcing it through the tenant-scoped Company/Contact model would misrepresent
+        # who these people are (many aren't in any tenant's pipeline at all).
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS webinar_link_clicks (
+                id SERIAL PRIMARY KEY,
+                token VARCHAR NOT NULL UNIQUE,
+                campaign VARCHAR NOT NULL,
+                email VARCHAR NOT NULL,
+                variant VARCHAR,
+                destination_url TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT now(),
+                first_clicked_at TIMESTAMP,
+                click_count INTEGER NOT NULL DEFAULT 0
+            )
+        """))
