@@ -6067,6 +6067,41 @@ def get_partner_webinar_detail(webinar_id: int, request: Request, db: Session = 
     }
 
 
+@router.get("/gtm-os/partner/webinars/{webinar_id}/recipients")
+def get_partner_webinar_recipients(webinar_id: int, request: Request, clicked_only: bool = False, db: Session = Depends(get_db)):
+    """Real, per-person send/click detail behind the stat cards -- who was sent what, who
+    clicked, how many times, and when. Same webinar_link_clicks rows the stat cards already
+    aggregate from; this is the itemized view a human asks for after seeing a count ("who are
+    those 6?")."""
+    from sqlalchemy import text as sql_text
+
+    tenant_id = _resolve_tenant_id(request)
+    webinar = db.execute(
+        sql_text("SELECT campaign_key FROM webinars WHERE id = :id AND tenant_id = :t"),
+        {"id": webinar_id, "t": tenant_id},
+    ).fetchone()
+    if webinar is None:
+        raise HTTPException(status_code=404, detail="Webinar not found")
+    if not webinar.campaign_key:
+        return {"recipients": []}
+
+    query = "SELECT email, variant, click_count, first_clicked_at, created_at FROM webinar_link_clicks WHERE campaign = :c"
+    if clicked_only:
+        query += " AND click_count > 0"
+    query += " ORDER BY COALESCE(first_clicked_at, created_at) DESC"
+
+    rows = db.execute(sql_text(query), {"c": webinar.campaign_key}).fetchall()
+    return {
+        "recipients": [
+            {
+                "email": r.email, "variant": r.variant, "click_count": r.click_count,
+                "first_clicked_at": r.first_clicked_at, "sent_at": r.created_at,
+            }
+            for r in rows
+        ]
+    }
+
+
 @router.put("/gtm-os/partner/icp")
 def put_partner_icp(request: Request, body: dict = Body(...), db: Session = Depends(get_db)):
     """Accepts the same shape run_partner_discovery/_jobo already take as their icp= override
