@@ -1090,7 +1090,10 @@ def ensure_indexes():
         # route just has to look a token up, never invent one. Deliberately its own tiny table,
         # not tied to any tenant -- this is Majji's own personal outbound, not GTM-OS pipeline
         # data, and forcing it through the tenant-scoped Company/Contact model would misrepresent
-        # who these people are (many aren't in any tenant's pipeline at all).
+        # who these people are (many aren't in any tenant's pipeline at all). Doubles as the real
+        # "who was sent what" send-log for the Webinars tab's stats -- one row per real send
+        # already exists here, so sent/clicked counts by variant are a live query, not a second
+        # copy of the same fact.
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS webinar_link_clicks (
                 id SERIAL PRIMARY KEY,
@@ -1102,5 +1105,26 @@ def ensure_indexes():
                 created_at TIMESTAMP DEFAULT now(),
                 first_clicked_at TIMESTAMP,
                 click_count INTEGER NOT NULL DEFAULT 0
+            )
+        """))
+        # Webinars tab (2026-09-29) -- real event metadata for the partner-facing Webinars tab.
+        # campaign_key joins to webinar_link_clicks.campaign for live sent/clicked stats -- no
+        # attendee/RSVP data yet (Luma's free tier has no API access for that), status is set by
+        # a human (upcoming/live/past), never auto-derived from a date this table doesn't
+        # reliably have for every real webinar entered by hand.
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS webinars (
+                id SERIAL PRIMARY KEY,
+                tenant_id INTEGER NOT NULL,
+                title VARCHAR NOT NULL,
+                speaker_name VARCHAR,
+                speaker_bio TEXT,
+                description TEXT,
+                agenda JSON,
+                status VARCHAR NOT NULL DEFAULT 'upcoming',
+                event_url TEXT NOT NULL,
+                scheduled_at TIMESTAMP,
+                campaign_key VARCHAR,
+                created_at TIMESTAMP DEFAULT now()
             )
         """))

@@ -5970,6 +5970,103 @@ def get_partner_icp(request: Request, db: Session = Depends(get_db)):
     return param.value if param else None
 
 
+# ---- Webinars tab (2026-09-29) ----
+# Real event metadata (webinars table) + live sent/click stats computed straight from
+# webinar_link_clicks -- that table already holds one row per real send (email, variant,
+# click_count), created by scripts/send_webinar_invites.py BEFORE each send, so "how many sent /
+# clicked by variant" is a live read of real data, never a second copy someone has to remember to
+# update. No attendee/RSVP data yet -- Luma's free tier has no API access for that; the detail
+# response says so explicitly rather than silently omitting the section.
+def _webinar_stats(db: Session, campaign_key: str | None) -> dict:
+    if not campaign_key:
+        return {"total_sent": 0, "total_clicked": 0, "click_rate": None, "by_variant": {}}
+    from sqlalchemy import text as sql_text
+
+    rows = db.execute(
+        sql_text(
+            "SELECT variant, count(*) as sent, sum(CASE WHEN click_count > 0 THEN 1 ELSE 0 END) as clicked "
+            "FROM webinar_link_clicks WHERE campaign = :c GROUP BY variant"
+        ),
+        {"c": campaign_key},
+    ).fetchall()
+    by_variant = {}
+    total_sent = 0
+    total_clicked = 0
+    for variant, sent, clicked in rows:
+        sent, clicked = int(sent), int(clicked or 0)
+        total_sent += sent
+        total_clicked += clicked
+        by_variant[variant or "unspecified"] = {
+            "sent": sent, "clicked": clicked,
+            "click_rate": round(clicked / sent, 3) if sent else None,
+        }
+    return {
+        "total_sent": total_sent,
+        "total_clicked": total_clicked,
+        "click_rate": round(total_clicked / total_sent, 3) if total_sent else None,
+        "by_variant": by_variant,
+    }
+
+
+def _webinar_summary(w) -> dict:
+    return {
+        "id": w.id, "title": w.title, "speaker_name": w.speaker_name, "status": w.status,
+        "event_url": w.event_url, "scheduled_at": w.scheduled_at, "created_at": w.created_at,
+    }
+
+
+@router.get("/gtm-os/partner/webinars")
+def list_partner_webinars(request: Request, db: Session = Depends(get_db)):
+    from sqlalchemy import text as sql_text
+
+    tenant_id = _resolve_tenant_id(request)
+    rows = db.execute(
+        sql_text(
+            "SELECT id, title, speaker_name, status, event_url, scheduled_at, created_at, campaign_key "
+            "FROM webinars WHERE tenant_id = :t ORDER BY created_at DESC"
+        ),
+        {"t": tenant_id},
+    ).fetchall()
+
+    buckets = {"live": [], "upcoming": [], "past": []}
+    for r in rows:
+        item = {
+            "id": r.id, "title": r.title, "speaker_name": r.speaker_name, "status": r.status,
+            "event_url": r.event_url, "scheduled_at": r.scheduled_at, "created_at": r.created_at,
+        }
+        stats = _webinar_stats(db, r.campaign_key)
+        item["total_sent"] = stats["total_sent"]
+        item["total_clicked"] = stats["total_clicked"]
+        buckets.get(r.status, buckets["upcoming"]).append(item)
+
+    return buckets
+
+
+@router.get("/gtm-os/partner/webinars/{webinar_id}")
+def get_partner_webinar_detail(webinar_id: int, request: Request, db: Session = Depends(get_db)):
+    from sqlalchemy import text as sql_text
+
+    tenant_id = _resolve_tenant_id(request)
+    row = db.execute(
+        sql_text(
+            "SELECT id, title, speaker_name, speaker_bio, description, agenda, status, event_url, "
+            "scheduled_at, campaign_key, created_at FROM webinars WHERE id = :id AND tenant_id = :t"
+        ),
+        {"id": webinar_id, "t": tenant_id},
+    ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Webinar not found")
+
+    return {
+        "id": row.id, "title": row.title, "speaker_name": row.speaker_name, "speaker_bio": row.speaker_bio,
+        "description": row.description, "agenda": row.agenda, "status": row.status, "event_url": row.event_url,
+        "scheduled_at": row.scheduled_at, "created_at": row.created_at,
+        "stats": _webinar_stats(db, row.campaign_key),
+        "attendee_data_available": False,
+        "attendee_data_note": "Not available yet -- requires a paid Luma tier with API access. Sent/click stats above are real; who actually joined isn't trackable from this side yet.",
+    }
+
+
 @router.put("/gtm-os/partner/icp")
 def put_partner_icp(request: Request, body: dict = Body(...), db: Session = Depends(get_db)):
     """Accepts the same shape run_partner_discovery/_jobo already take as their icp= override
