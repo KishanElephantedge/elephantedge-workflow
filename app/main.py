@@ -518,6 +518,34 @@ def on_shutdown():
     scheduler.shutdown(wait=False)
 
 
+@app.get("/api/webinar-click-debug/{token}")
+def webinar_click_debug(token: str):
+    """TEMPORARY diagnostic (2026-09-29) -- isolating why webinar_link_clicks.click_count isn't
+    incrementing on a real click despite the redirect itself landing correctly. Returns raw state
+    instead of redirecting, so we can see exactly what this live process's own DB connection
+    sees. Delete once the real bug is found."""
+    from sqlalchemy import text
+
+    from app.db.session import SessionLocal, engine
+
+    db = SessionLocal()
+    try:
+        row = db.execute(
+            text("SELECT token, email, variant, click_count, first_clicked_at FROM webinar_link_clicks WHERE token = :t"),
+            {"t": token},
+        ).fetchone()
+        total = db.execute(text("SELECT count(*) FROM webinar_link_clicks")).fetchone()
+        return {
+            "engine_url_host": str(engine.url.host),
+            "engine_url_database": str(engine.url.database),
+            "row_found": row is not None,
+            "row": dict(row._mapping) if row else None,
+            "total_rows_in_table": total[0] if total else None,
+        }
+    finally:
+        db.close()
+
+
 @app.get("/api/webinar-click/{token}")
 def webinar_click(token: str):
     """Redirect-and-log for scripts/send_webinar_invites.py's tracked links (2026-09-29). A row
