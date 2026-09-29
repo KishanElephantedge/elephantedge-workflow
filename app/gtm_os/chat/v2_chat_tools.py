@@ -154,16 +154,20 @@ V2_CHAT_TOOLS = [
             "Before a call: what was agreed with this person last time, what WE still owe them, "
             "what THEY still owe us, and what to focus on. Built from real Granola transcripts of "
             "past meetings, not from memory. Use this whenever the user says they have a call "
-            "coming up, or asks what to discuss with someone. IMPORTANT: person_email and "
-            "booking_id are both OPTIONAL -- call with NO arguments to get a brief across the "
-            "most recent meetings overall (e.g. for 'what have my last few calls been about', "
-            "'write a LinkedIn post from my recent meetings', or any request that isn't about "
-            "one specific person). Never ask the user for an email or booking id first -- call "
-            "the tool with no arguments and see what comes back before asking anything."
+            "coming up, or asks what to discuss with someone. IMPORTANT: person_email, "
+            "booking_id, and person_name are all OPTIONAL -- call with NO arguments to get a "
+            "brief across the most recent meetings overall (e.g. for 'what have my last few "
+            "calls been about', 'write a LinkedIn post from my recent meetings', or any request "
+            "that isn't about one specific person). When the user names a specific person (e.g. "
+            "'Jeff Ballard's latest meeting transcript') and you don't already have their email "
+            "or a booking id, pass person_name -- NEVER ask the user for an email or booking id "
+            "first just because you only have a name; that information may not exist in this "
+            "system for a real 1:1 meeting synced straight from Granola."
         ),
         "input_schema": {"type": "object", "properties": {
             "person_email": {"type": "string", "description": "Optional -- one specific person's email address"},
-            "booking_id": {"type": "integer", "description": "Optional -- one specific calendar booking id instead"}}},
+            "booking_id": {"type": "integer", "description": "Optional -- one specific calendar booking id instead"},
+            "person_name": {"type": "string", "description": "Optional -- search by the person's name (matches meeting title/owner) when their email or a booking id isn't already known"}}},
     },
     {
         "name": "draft_meeting_outcome",
@@ -446,7 +450,7 @@ def execute_v2_chat_tool(name: str, tool_input: dict, db: Session, tenant_id: in
     if name == "get_meeting_brief":
         from app.gtm_os.meetings.meeting_intelligence import get_meeting_brief
         return get_meeting_brief(db, tenant_id, person_email=tool_input.get("person_email"),
-                                 booking_id=tool_input.get("booking_id"))
+                                 booking_id=tool_input.get("booking_id"), person_name=tool_input.get("person_name"))
 
     if name == "draft_meeting_outcome":
         from app.gtm_os.meetings.meeting_intelligence import draft_outcome_for_booking

@@ -17,6 +17,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime
 
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from app.db.models import CalendarBooking
@@ -113,19 +114,29 @@ RULES, and they matter more than completeness:
 
 
 def get_meeting_brief(db: Session, tenant_id: int, person_email: str | None = None,
-                      booking_id: int | None = None) -> dict:
+                      booking_id: int | None = None, person_name: str | None = None) -> dict:
     """What you need in your head before walking into the next call with this person.
 
     Answers the real question -- "what did we agree last time and what do I still owe them" --
     from actual transcripts rather than memory.
-    """
+
+    person_name (2026-09-25, real gap found live -- "Jeff Ballard's latest meeting transcript"
+    had no way to resolve without already knowing his email or booking id, which defeats the
+    point of asking a chatbot at all). Matches directly against MeetingNote.title/owner_name,
+    INDEPENDENT of CalendarBooking -- a real 1:1 synced straight from Granola (like the Majji/Jeff
+    Ballard meetings) often has no linked CalendarBooking at all (that table is only populated for
+    calls booked through the public Google Calendar appointment scheduler), so requiring that join
+    would silently miss real meeting history person_email's own path already depends on."""
     q = db.query(MeetingNote).filter(MeetingNote.tenant_id == tenant_id)
     if booking_id is not None:
         booking = db.get(CalendarBooking, booking_id)
         if booking is None:
             return {"status": "failed", "reason": f"booking {booking_id} not found"}
         person_email = person_email or booking.booker_email
-    if person_email:
+    if person_name:
+        needle = f"%{person_name.strip()}%"
+        q = q.filter(or_(MeetingNote.title.ilike(needle), MeetingNote.owner_name.ilike(needle)))
+    elif person_email:
         bookings = [b.id for b in db.query(CalendarBooking)
                     .filter(CalendarBooking.booker_email == person_email).all()]
         if not bookings:
@@ -133,6 +144,9 @@ def get_meeting_brief(db: Session, tenant_id: int, person_email: str | None = No
                     "reason": "no past meeting with this email"}
         q = q.filter(MeetingNote.calendar_booking_id.in_(bookings))
     notes = q.order_by(MeetingNote.note_created_at.desc()).limit(5).all()
+    if person_name and not notes:
+        return {"status": "no_history", "person": person_name,
+                "reason": f"no meeting title or owner name matches {person_name!r}"}
     if not notes:
         return {"status": "no_history", "person": person_email,
                 "reason": "meetings exist but no Granola note is linked to them"}
