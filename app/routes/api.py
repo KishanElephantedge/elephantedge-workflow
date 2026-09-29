@@ -6147,6 +6147,64 @@ def put_partner_icp(request: Request, body: dict = Body(...), db: Session = Depe
     return param.value
 
 
+@router.post("/gtm-os/partner/icp/parse")
+def parse_partner_icp(request: Request, body: dict = Body(...), db: Session = Depends(get_db)):
+    """Free-text (or pasted-document-text) -> the exact structured shape put_partner_icp() above
+    stores (2026-09-29, explicit instruction: a prompt box / doc upload for describing an ICP in
+    plain language, instead of only a rigid multi-field form). Read-only: returns the parsed
+    fields as a PREVIEW for the partner to review/edit in the same structured form and save
+    themselves via the existing PUT -- never auto-saves. That matters because put_partner_icp does
+    a full replace and an LLM misread (e.g. "small sales team" -> what number?) must not silently
+    overwrite a partner's real filters, same failure mode as the form bug this feature sits next
+    to. One on-demand call per click, not a per-item loop, so the LLM budget gate is a formality
+    here, not a real constraint."""
+    text = (body.get("text") or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="No text to parse.")
+    tenant_id = _resolve_tenant_id(request)
+
+    from app.llm_client import generate_json
+
+    prompt = f"""Extract a company Ideal Customer Profile (ICP) from the text below into this exact JSON shape. Use null (not a guess) for any field the text doesn't actually specify -- never invent a number or industry that isn't there.
+
+{{
+  "industries": [string],
+  "geographies": [string],
+  "revenue_min_usd": number or null,
+  "revenue_max_usd": number or null,
+  "employee_min": number or null,
+  "employee_max": number or null,
+  "sales_team_size_min": number or null,
+  "sales_team_size_max": number or null,
+  "decision_maker_titles": [string],
+  "notes": string or null
+}}
+
+"employee_min/max" is the whole company's headcount. "sales_team_size_min/max" is specifically the size of their sales/marketing department, only set this if the text distinguishes it from overall headcount. "decision_maker_titles" are the job titles to target (e.g. Owner, Founder, CEO) -- only include titles the text actually implies. "notes" is a short free-text summary of anything else meaningful (buying triggers, disqualifiers, tone) that doesn't fit the structured fields above.
+
+Text to extract from:
+\"\"\"
+{text[:8000]}
+\"\"\"
+
+Return ONLY the JSON object, no other text."""
+
+    parsed = generate_json(prompt, db, tenant_id, max_tokens=1000)
+
+    return {
+        "industries": [s for s in (parsed.get("industries") or []) if isinstance(s, str)],
+        "geographies": [s for s in (parsed.get("geographies") or []) if isinstance(s, str)],
+        "revenue_min_usd": parsed.get("revenue_min_usd"),
+        "revenue_max_usd": parsed.get("revenue_max_usd"),
+        "employee_min": parsed.get("employee_min"),
+        "employee_max": parsed.get("employee_max"),
+        "sales_team_size_min": parsed.get("sales_team_size_min"),
+        "sales_team_size_max": parsed.get("sales_team_size_max"),
+        "decision_maker_titles": [s for s in (parsed.get("decision_maker_titles") or []) if isinstance(s, str)],
+        "notes": parsed.get("notes"),
+    }
+
+
 # ---- Partner discovery (2026-09-16) -- the real gap this closes: every partner's companies so
 # far were fetched by an FDE running app/phases/partner_pipeline.py's functions by hand, once, in
 # a local script. That is not a feature of this app, it's a workaround for one not existing. This
