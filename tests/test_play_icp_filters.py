@@ -213,6 +213,50 @@ def test_icypeas_filters_use_exact_headcount_and_exclude_vendors_and_non_compani
     assert "Staffing and Recruiting" in filters["industry"]["exclude"]
     assert "Educational Institution" in filters["type"]["exclude"]
     assert filters["location"] == {"include": ["United States"]}
+    # ICP fixture has no 'industries' set -- no include key should be added.
+    assert "include" not in filters["industry"]
+
+
+def test_icypeas_filters_include_the_partners_own_industries_when_set():
+    # Real bug, 2026-10-04: a partner's stated industries was silently dropped from the real
+    # search -- found live when Majji's "Professional Services" ICP returned hospitals, law
+    # firms, construction, and manufacturing because nothing told Icypeas to only include it.
+    icp = {**ICP, "industries": ["Professional Services"]}
+    filters = play.icypeas_filters_for_icp(icp)
+    assert filters["industry"]["include"] == ["Professional Services"]
+    # The vendor-exclude safety net must still apply underneath a partner's own industry list.
+    assert "Staffing and Recruiting" in filters["industry"]["exclude"]
+
+
+def test_looks_like_government_or_education_catches_real_leaked_examples():
+    # Real leak, found live 2026-10-03: these three slipped past Icypeas' own type.exclude
+    # despite Government Agency/Educational Institution being excluded server-side.
+    assert play._looks_like_government_or_education("Town of Rockport", None) is True
+    assert play._looks_like_government_or_education("Longboat Key Fire Rescue", "Public Safety") is True
+    assert play._looks_like_government_or_education("Lakeland Elementary Schools", "Education Management") is True
+    # A real target company must not get caught by either signal.
+    assert play._looks_like_government_or_education("Acme Consulting Group", "Law Practice") is False
+    assert play._looks_like_government_or_education("Westfield Partners LLC", None) is False
+
+
+def test_search_icypeas_rejects_government_and_education_bodies_before_any_paid_lookup(db, monkeypatch):
+    import app.deepline_client as dc
+
+    page = {"toolResponse": {"raw": {"leads": [
+        {"url": "https://www.linkedin.com/company/townofrockport", "name": "Town of Rockport"},
+        {"url": "https://www.linkedin.com/company/lakelandschools", "name": "Lakeland Elementary Schools",
+         "industry": "Education Management"},
+    ], "pagination": {}}}}
+    monkeypatch.setattr(dc, "execute_tool", lambda tool, payload: page)
+
+    result = play.search_icypeas(db, PARTNER, ICP, pages=1)
+
+    assert result["outcomes"].get("government_or_education") == 2
+    assert db.query(Company).count() == 0
+    rejected = db.query(GtmLead).filter(GtmLead.state == play.STATE_REJECTED).all()
+    assert len(rejected) == 2
+    assert all("government/education" in (r.qualifier_reason or "") for r in rejected)
+
 
 
 def test_search_icypeas_creates_a_lead_with_the_free_jobo_decision_maker(db, monkeypatch):

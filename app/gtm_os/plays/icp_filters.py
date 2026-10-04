@@ -76,6 +76,33 @@ def _looks_like_a_vendor(company_name: str | None) -> bool:
     return bool(company_name) and bool(_VENDOR_NAME_PATTERN.search(company_name))
 
 
+# Free safety net, 2026-10-04: Icypeas' query-level `type.exclude` (NON_COMPANY_TYPES, below)
+# clearly isn't catching everything -- "Town of Rockport" (type/industry came back blank),
+# "Longboat Key Fire Rescue" (industry "Public Safety"), and "Lakeland Elementary Schools"
+# (industry "Education Management") all slipped through a live run despite Government Agency/
+# Educational Institution being excluded. Rather than trust the provider's own type field alone,
+# catch the same obvious cases for free, the same way _looks_like_a_vendor() already does by
+# name -- a municipal government or school's own name almost always says so.
+_GOVERNMENT_EDUCATION_NAME_PATTERN = re.compile(
+    r"\b(town of|city of|county of|township of|village of|borough of|municipal(?:ity)?|"
+    r"fire (?:rescue|department)|police department|sheriff'?s? (?:office|department)|"
+    r"elementary school|middle school|high school|school district|public schools?|"
+    r"independent school district)\b",
+    re.IGNORECASE,
+)
+_GOVERNMENT_EDUCATION_INDUSTRIES = {
+    "Government Administration", "Public Safety", "Law Enforcement",
+    "Primary and Secondary Education", "Primary/Secondary Education", "Education Management",
+    "Higher Education", "Education Administration Programs", "Military", "Judiciary",
+}
+
+
+def _looks_like_government_or_education(company_name: str | None, industry: str | None) -> bool:
+    if company_name and _GOVERNMENT_EDUCATION_NAME_PATTERN.search(company_name):
+        return True
+    return bool(industry) and industry in _GOVERNMENT_EDUCATION_INDUSTRIES
+
+
 def _size_fits(band: tuple[int, int | None] | None, lo: int, hi: int) -> bool | None:
     """False (confident reject) only when the band is CONFIRMED TOO BIG -- its whole declared
     range sits above the ICP's max. Never rejects on "too small": real bug found live
@@ -143,11 +170,25 @@ NON_BUYER_INDUSTRIES = ["Staffing and Recruiting", "Management Consulting", "Mar
 
 
 def icypeas_filters_for_icp(icp: dict) -> dict:
+    """REAL FIX, 2026-10-04: the partner's own stated `industries` was never read here -- the
+    search only ever enforced headcount/geography plus a fixed vendor-exclude list, regardless
+    of what industry the partner actually told us to target. Found live against Majji's new
+    Professional Services ICP: 21/21 companies returned were hospitals, law firms, construction,
+    manufacturing, insurance, a fire department, a school district -- everything BUT Professional
+    Services, because nothing ever told Icypeas to only include it. `industry.include` is now
+    built from the partner's own icp['industries'] whenever set, same as `location.include`
+    already reads icp['geographies'] -- so the search is actually driven by that specific
+    partner's ICP, not a hardcoded assumption. The vendor-exclude list stays on unconditionally
+    underneath it (never show an agency/staffing firm even if a partner's broad industry list
+    would technically include it)."""
     lo, hi = icp.get("employee_min") or 1, icp.get("employee_max") or 10**9
+    industry_filter = {"exclude": NON_BUYER_INDUSTRIES}
+    if icp.get("industries"):
+        industry_filter["include"] = icp["industries"]
     return {
         "headcount": {">=": lo, "<=": hi},
         "location": {"include": icp.get("geographies") or ["United States"]},
-        "industry": {"exclude": NON_BUYER_INDUSTRIES},
+        "industry": industry_filter,
         "type": {"exclude": NON_COMPANY_TYPES},
     }
 
@@ -263,11 +304,17 @@ def _process_icypeas_company(db: Session, tenant_id: int, co: dict, known_leads:
     known_leads.add(key)
 
     name = co.get("name") or ""
+    industry_label = co.get("industry")
     if _looks_like_a_vendor(name):
         db.add(GtmLead(tenant_id=tenant_id, play=PLAY, lead_key=key, state=STATE_REJECTED,
                        qualifier_reason=f"company name matches a vendor/agency/recruiter pattern: {name!r}"))
         db.commit()
         return "vendor_name_match"
+    if _looks_like_government_or_education(name, industry_label):
+        db.add(GtmLead(tenant_id=tenant_id, play=PLAY, lead_key=key, state=STATE_REJECTED,
+                       qualifier_reason=f"government/education body, not a real buyer: {name!r} (industry: {industry_label!r})"))
+        db.commit()
+        return "government_or_education"
 
     company = (db.query(Company).join(Batch, Company.batch_id == Batch.id)
                .filter(Batch.tenant_id == tenant_id, Company.linkedin_url == url).first())
