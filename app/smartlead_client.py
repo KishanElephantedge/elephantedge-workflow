@@ -94,6 +94,28 @@ def list_campaigns(db: Session, tenant_id: int) -> list[dict]:
     return response.json()
 
 
+def get_campaign(campaign_id: int, db: Session, tenant_id: int) -> dict:
+    """GET /campaigns/{id} -- campaign config (name/status/schedule/track_settings). Needed
+    specifically for track_settings: a campaign with DONT_EMAIL_OPEN/DONT_LINK_CLICK set will
+    always report open_count/click_count as 0 from get_campaign_analytics, and a caller showing
+    that number without this context would misread "tracking off" as "nobody opened"."""
+    api_key = _get_api_key(db, tenant_id)
+    response = httpx.get(f"{BASE_URL}/campaigns/{campaign_id}", params={"api_key": api_key}, timeout=30)
+    if response.status_code != 200:
+        raise SmartleadError(f"campaigns/{campaign_id} failed ({response.status_code}): {response.text}")
+    return response.json()
+
+
+def get_campaign_sequences(campaign_id: int, db: Session, tenant_id: int) -> list[dict]:
+    """GET /campaigns/{id}/sequences -- the actual email template(s) sent (subject/body per
+    step), confirmed live. Lets a detail view show what was actually sent, not just the counts."""
+    api_key = _get_api_key(db, tenant_id)
+    response = httpx.get(f"{BASE_URL}/campaigns/{campaign_id}/sequences", params={"api_key": api_key}, timeout=30)
+    if response.status_code != 200:
+        raise SmartleadError(f"campaigns/{campaign_id}/sequences failed ({response.status_code}): {response.text}")
+    return response.json()
+
+
 def get_campaign_leads(campaign_id: int, db: Session, tenant_id: int, offset: int = 0, limit: int = 100) -> dict:
     """Real, confirmed-live endpoint: GET /campaigns/{id}/leads returns total_leads plus each
     lead's own send status (COMPLETED/etc.) and email -- this is the email-channel equivalent

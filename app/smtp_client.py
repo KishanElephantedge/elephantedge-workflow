@@ -48,15 +48,24 @@ class SmtpError(Exception):
     pass
 
 
-def send_email(sender_email: str, app_password: str, to_email: str, subject: str, body: str, to_name: str | None = None) -> None:
+def send_email(sender_email: str, app_password: str, to_email: str, subject: str, body: str,
+                to_name: str | None = None, html_body: str | None = None) -> None:
     """Sends ONE real email via Gmail SMTP (STARTTLS). Raises SmtpError on any failure -- the
     caller (send_via_smtp in app/gtm_os/send/channels.py) is responsible for classifying
-    retryable vs. not. No retry logic here -- this is a single, real attempt only."""
-    message = MIMEMultipart()
+    retryable vs. not. No retry logic here -- this is a single, real attempt only.
+
+    html_body (2026-09-29, optional, defaults to None -- every existing caller keeps sending
+    plain-text-only, byte-for-byte unchanged): when given, sent as a real multipart/alternative
+    part alongside `body`, so a real link can show clean anchor text instead of a raw, long
+    tracking URL a plain-text email has no way to hide. `body` should still be a full,
+    readable plain-text fallback for clients that don't render HTML, not a stub."""
+    message = MIMEMultipart("alternative" if html_body else "mixed")
     message["From"] = sender_email
     message["To"] = f"{to_name} <{to_email}>" if to_name else to_email
     message["Subject"] = subject
     message.attach(MIMEText(body, "plain"))
+    if html_body:
+        message.attach(MIMEText(html_body, "html"))
 
     try:
         with _Ipv4OnlySMTP(SMTP_HOST, SMTP_PORT, timeout=30) as server:

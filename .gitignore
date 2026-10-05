@@ -20,3 +20,5 @@ sandy_contacts_to_fill.tsv
 gtm_partners_slack_export.csv
 TODO.md
 webinar_smtp_credentials.env
+email_finder_credentials.env
+smartlead_credentials.env

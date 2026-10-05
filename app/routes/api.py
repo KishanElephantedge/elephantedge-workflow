@@ -53,6 +53,8 @@ from app.smartlead_client import add_lead as smartlead_add_lead
 from app.smartlead_client import get_campaign_analytics as smartlead_get_campaign_analytics
 from app.smartlead_client import list_campaigns as smartlead_list_campaigns
 from app.smartlead_client import get_campaign_leads as smartlead_get_campaign_leads
+from app.smartlead_client import get_campaign as smartlead_get_campaign
+from app.smartlead_client import get_campaign_sequences as smartlead_get_campaign_sequences
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -6923,3 +6925,116 @@ def get_partner_company_detail(company_id: int, request: Request, db: Session = 
     """Kept for compatibility with any old bookmarked/cached URL -- get_partner_account_detail
     (the "company:"/"engagement:" prefixed route above) is what the frontend calls now."""
     return _company_detail_payload(db, company_id, _resolve_tenant_id(request))
+
+
+# ---- Email campaigns tab (2026-10-05, explicit instruction for partner Majji) ----
+# The Smartlead API key the user pasted belongs to Elephant Edge's MASTER Smartlead account --
+# it can see 80+ campaigns spanning every client/internal list ever run, not just Majji's two.
+# Deliberately NOT exposing a "list all campaigns" passthrough here: this route only ever
+# fetches these two hardcoded campaign IDs, so a partner can never see another client's
+# campaign by guessing an id. The credential itself is stored under tenant_id=15 (Majji), a
+# separate row from Elephant Edge's own tenant_id=2 smartlead_api_key (used by live lead-adding
+# automation elsewhere) -- so this never touches that credential.
+MAJJI_TENANT_ID = 15
+MAJJI_EMAIL_CAMPAIGNS = [
+    {"id": 4037761, "label": "Fractional Partner - Cost Saving Angle"},
+    {"id": 4037472, "label": "Fractional Partner - Revenue Growth Angle"},
+]
+
+
+def _require_majji_tenant(request: Request) -> int:
+    tenant_id = _resolve_tenant_id(request)
+    if tenant_id != MAJJI_TENANT_ID:
+        raise HTTPException(status_code=404, detail="Not found")
+    return tenant_id
+
+
+def _email_campaign_summary(campaign_id: int, label: str, db: Session, tenant_id: int) -> dict:
+    analytics = smartlead_get_campaign_analytics(campaign_id, db, tenant_id)
+    campaign = smartlead_get_campaign(campaign_id, db, tenant_id)
+    track_settings = campaign.get("track_settings") or []
+    return {
+        "id": campaign_id,
+        "label": label,
+        "status": analytics.get("status"),
+        "sent_count": int(analytics.get("sent_count") or 0),
+        "unique_sent_count": int(analytics.get("unique_sent_count") or 0),
+        "reply_count": int(analytics.get("reply_count") or 0),
+        "bounce_count": int(analytics.get("bounce_count") or 0),
+        "unsubscribed_count": int(analytics.get("unsubscribed_count") or 0),
+        # Real, not derived -- a campaign with open/click tracking OFF always reports these as 0
+        # regardless of actual opens/clicks, so the frontend must show "tracking off" rather than
+        # a misleading "0 opens".
+        "open_tracking_enabled": "DONT_EMAIL_OPEN" not in track_settings,
+        "click_tracking_enabled": "DONT_LINK_CLICK" not in track_settings,
+        "open_count": int(analytics.get("open_count") or 0),
+        "click_count": int(analytics.get("click_count") or 0),
+        "lead_stats": analytics.get("campaign_lead_stats") or {},
+    }
+
+
+@router.get("/gtm-os/partner/email-campaigns")
+def list_partner_email_campaigns(request: Request, db: Session = Depends(get_db)):
+    tenant_id = _require_majji_tenant(request)
+    campaigns = []
+    for c in MAJJI_EMAIL_CAMPAIGNS:
+        try:
+            campaigns.append(_email_campaign_summary(c["id"], c["label"], db, tenant_id))
+        except SmartleadError as e:
+            logger.warning("smartlead campaign %s failed: %s", c["id"], e)
+            campaigns.append({"id": c["id"], "label": c["label"], "status": "error", "error": str(e)})
+    return {"campaigns": campaigns}
+
+
+@router.get("/gtm-os/partner/email-campaigns/{campaign_id}")
+def get_partner_email_campaign_detail(campaign_id: int, request: Request, db: Session = Depends(get_db)):
+    tenant_id = _require_majji_tenant(request)
+    match = next((c for c in MAJJI_EMAIL_CAMPAIGNS if c["id"] == campaign_id), None)
+    if match is None:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+
+    try:
+        summary = _email_campaign_summary(campaign_id, match["label"], db, tenant_id)
+        sequences = smartlead_get_campaign_sequences(campaign_id, db, tenant_id)
+    except SmartleadError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+    return {
+        **summary,
+        "sequences": [
+            {
+                "seq_number": s.get("seq_number"),
+                "subject": s.get("subject"),
+                "email_body": s.get("email_body"),
+            }
+            for s in sorted(sequences, key=lambda s: s.get("seq_number") or 0)
+        ],
+    }
+
+
+@router.get("/gtm-os/partner/email-campaigns/{campaign_id}/leads")
+def get_partner_email_campaign_leads(campaign_id: int, request: Request, offset: int = 0, limit: int = 100, db: Session = Depends(get_db)):
+    tenant_id = _require_majji_tenant(request)
+    match = next((c for c in MAJJI_EMAIL_CAMPAIGNS if c["id"] == campaign_id), None)
+    if match is None:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+
+    try:
+        result = smartlead_get_campaign_leads(campaign_id, db, tenant_id, offset=offset, limit=limit)
+    except SmartleadError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+    leads = []
+    for row in result.get("data", []):
+        lead = row.get("lead") or {}
+        leads.append({
+            "email": lead.get("email"),
+            "first_name": lead.get("first_name"),
+            "last_name": lead.get("custom_fields", {}).get("last_name") or lead.get("last_name"),
+            "company_name": lead.get("company_name"),
+            "title": lead.get("custom_fields", {}).get("title"),
+            "status": row.get("status"),
+            "created_at": row.get("created_at"),
+        })
+
+    return {"total_leads": int(result.get("total_leads") or 0), "leads": leads}
