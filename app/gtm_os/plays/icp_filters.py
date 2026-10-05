@@ -405,6 +405,39 @@ def search_icypeas(db: Session, tenant_id: int, icp: dict, pages: int = 1) -> di
             return {"companies": 0, "created": 0, "outcomes": {}, "exhausted_until": cooldown_until.isoformat(),
                    "stopped": f"pool exhausted for these filters as of {exhausted_at}; next check {cooldown_until.date()}"}
 
+    # REAL FIX, 2026-10-05: icypeas_count_companies is priced FREE ($0, deepline_client.py) for
+    # exactly this reason -- verify a filter set actually matches something before ever paying
+    # for a page -- but nothing in this function ever called it, so a filter value that doesn't
+    # match Icypeas' real taxonomy (e.g. a partner's own wording like "Professional Services"
+    # that isn't literally how Icypeas categorizes companies) was only discovered AFTER paying
+    # $0.175 for an empty page. This is intentionally generic, not a one-off fix for that one
+    # value: ANY partner's ICP wording, from any source/platform, gets validated for free before
+    # the first real spend, every time the filter fingerprint changes. If the count can't be
+    # parsed with confidence, this does NOT block the run -- a false "looks empty" must never
+    # silently stop a real, paying search; it only blocks on a CONFIRMED zero.
+    if token is None:
+        # Only on a genuinely fresh start for this filter fingerprint, never mid-pagination --
+        # a resumed page already proved the filter matches something real. If this count check
+        # itself finds zero, it writes exhausted_at below, so the existing cooldown check above
+        # (at the top of this function) naturally prevents re-checking the same empty filter set
+        # again within EXHAUSTION_COOLDOWN_DAYS -- no separate "already checked" flag needed.
+        try:
+            count_response = execute_tool("icypeas_count_companies", {"query": filters})
+        except (DeeplineSpendBlocked, DeeplineError):
+            count_response = None
+        if count_response is not None:
+            raw = (count_response.get("toolResponse") or {}).get("raw") or {}
+            real_count = None
+            for key in ("count", "total", "totalCount", "resultsCount", "nbResults"):
+                if isinstance(raw.get(key), int):
+                    real_count = raw[key]
+                    break
+            if real_count == 0:
+                cursor.value = {"filters": fingerprint, "exhausted_at": datetime.utcnow().isoformat()}
+                db.commit()
+                return {"companies": 0, "created": 0, "outcomes": {}, "stopped": None,
+                       "free_count_checked": 0, "exhausted": True}
+
     known_leads = {k for (k,) in db.query(GtmLead.lead_key).filter(GtmLead.tenant_id == tenant_id, GtmLead.play == PLAY)}
     result = {"companies": 0, "created": 0, "outcomes": {}, "stopped": None}
 

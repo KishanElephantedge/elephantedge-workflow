@@ -344,6 +344,55 @@ def test_search_icypeas_rejects_a_vendor_name_before_any_jobo_lookup(db, monkeyp
     assert db.query(GtmLead).one().state == "rejected"
 
 
+def test_search_icypeas_free_count_check_stops_before_any_paid_page_on_a_confirmed_zero(db, monkeypatch):
+    # Real gap, found live 2026-10-04: a filter set that doesn't actually match Icypeas' real
+    # taxonomy (e.g. a partner's own wording for an industry) was only ever discovered by paying
+    # $0.175 for an empty page. icypeas_count_companies is priced free for exactly this check.
+    import app.deepline_client as dc
+
+    calls = []
+
+    def fake_cli(tool, payload):
+        calls.append(tool)
+        if tool == "icypeas_count_companies":
+            return {"toolResponse": {"raw": {"count": 0}}}
+        raise AssertionError(f"must not call a paid tool after a confirmed-zero free count: {tool}")
+
+    monkeypatch.setattr(dc, "_call_deepline_cli", fake_cli)
+
+    with spend_scope(db, BILLING, "icp_filters", run_cap_usd=0.5):
+        result = play.search_icypeas(db, PARTNER, ICP)
+
+    assert calls == ["icypeas_count_companies"]
+    assert result["exhausted"] is True
+    assert result["free_count_checked"] == 0
+    assert db.query(Company).count() == 0
+
+
+def test_search_icypeas_free_count_check_never_blocks_on_an_unparseable_response(db, monkeypatch):
+    """An unexpected response SHAPE from the free count check must never be read as zero and
+    silently stop a real search -- it falls through to the real, paid page exactly as before."""
+    import app.deepline_client as dc
+    import app.phases.decision_maker_reasoning as dmr
+    import app.phases.free_decision_maker as fdm
+
+    def fake_cli(tool, payload):
+        if tool == "icypeas_count_companies":
+            return {"toolResponse": {"raw": {"somethingElse": 42}}}
+        return {"toolResponse": {"raw": {"leads": [_icypeas_company(1)], "pagination": {"token": None}}}}
+
+    monkeypatch.setattr(dc, "_call_deepline_cli", fake_cli)
+    monkeypatch.setattr(fdm, "_jobo_leadership_candidates", lambda db_, t, company: [_jobo_person()])
+    monkeypatch.setattr(dmr, "select_best_decision_makers",
+                        lambda db_, t, company, cands, n, offering_name=None: [{"name": "Jane Doe", "thread_role": "founder_ceo", "reasoning": "CEO"}])
+
+    with spend_scope(db, BILLING, "icp_filters", run_cap_usd=0.5):
+        result = play.search_icypeas(db, PARTNER, ICP)
+
+    assert result["outcomes"] == {"created": 1}
+    assert db.query(Company).count() == 1
+
+
 def test_search_icypeas_stores_the_real_revenue_estimate_for_free(db, monkeypatch):
     import app.deepline_client as dc
     import app.phases.decision_maker_reasoning as dmr
@@ -405,7 +454,11 @@ def test_search_icypeas_stops_paying_once_the_pool_is_genuinely_exhausted(db, mo
         second = play.search_icypeas(db, PARTNER, ICP)
 
     assert first["exhausted"] is True
-    assert len(calls) == 1, "the second run must not spend anything re-fetching an exhausted pool"
+    # 2, not 1: the first run now makes one real FREE icypeas_count_companies pre-check (2026-10-05
+    # fix) before its one real paid page -- the mock doesn't distinguish tool name, so both land in
+    # `calls`. The real invariant this test protects is still intact: the SECOND run makes zero
+    # further calls of either kind, since it hits the pagination-exhaustion cooldown up front.
+    assert len(calls) == 2, "the second run must not spend anything re-fetching an exhausted pool"
     assert second["stopped"] and "exhausted" in second["stopped"]
     cursor = db.query(Parameter).filter(Parameter.tenant_id == PARTNER, Parameter.key == play.CURSOR_KEY).one()
     assert "exhausted_at" in cursor.value
