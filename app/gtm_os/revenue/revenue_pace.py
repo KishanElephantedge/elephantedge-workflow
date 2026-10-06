@@ -319,6 +319,20 @@ def get_revenue_pace(db: Session, tenant_id: int, month: str | None = None) -> d
         )
         .all()
     )
+    # Elephant Edge's own calendar has no other tenant to belong to, so a won deal recorded
+    # without a company (e.g. an offline meeting not tied to a company record yet) still
+    # counts toward its revenue. Partner tenants keep the company-scoped rule above.
+    if tenant_id == 2:  # Elephant Edge tenant
+        closed_this_month += (
+            db.query(CalendarBooking)
+            .filter(
+                CalendarBooking.outcome_company_id.is_(None),
+                CalendarBooking.outcome_status.isnot(None),
+                CalendarBooking.outcome_recorded_at >= period_start,
+                CalendarBooking.outcome_recorded_at < period_end,
+            )
+            .all()
+        )
     won = [b for b in closed_this_month if b.outcome_status == "won"]
     lost = [b for b in closed_this_month if b.outcome_status == "lost"]
     actual = sum(b.outcome_amount_usd or 0 for b in won)
