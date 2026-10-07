@@ -131,3 +131,24 @@ def decompose_icp(icp: dict) -> IcpAtoms:
         atoms.append(Atom(DECISION_MAKER_TITLE, INCLUDE, list(titles), necessity=SHOULD_HAVE))
 
     return IcpAtoms(atoms=atoms, unstructured_notes=icp.get("notes"))
+
+
+def fingerprint(icp: dict) -> str:
+    """A stable identifier for one ICP's SHAPE, independent of which provider it is sent to.
+
+    Used to group route_attempts and scorecards by "this same requirement set", so drift
+    detection can ask "did this exact filter shape used to work and now doesn't" rather than
+    only the coarser "is this provider healthy overall". Deliberately hashes the atoms, not the
+    raw icp dict or the rendered provider filters: two differently-worded ICPs that decompose to
+    the same atoms (same bounds, same necessity) are the same shape for this purpose, and the
+    same atoms rendered differently by two providers must still be recognized as one shape.
+    """
+    import hashlib
+    import json
+
+    decomposed = decompose_icp(icp)
+    canonical = sorted(
+        (a.key, a.operator, a.necessity, a.qualifier, json.dumps(a.value, sort_keys=True, default=str))
+        for a in decomposed.atoms
+    )
+    return hashlib.sha1(json.dumps(canonical).encode()).hexdigest()[:12]

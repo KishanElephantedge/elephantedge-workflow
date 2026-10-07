@@ -6360,6 +6360,46 @@ def admin_provider_registry(request: Request):
     }
 
 
+@router.get("/gtm-os/admin/providers/scorecard")
+def admin_provider_scorecard(request: Request, provider: str, db: Session = Depends(get_db)):
+    """A provider's observed health, overall and broken down by which ICP shapes have drifted.
+
+    Added 2026-10-07 (phase 8). Read-only, free -- it reads route_attempts, nothing is called.
+    `drift` is a FLAG for a human to look at, never an action taken on its own: "a prior may only
+    re-order candidates; it may never substitute for this run's free pre-flight" still holds.
+    """
+    _require_admin(request)
+    from app.gtm_os.sourcing.scorecard import provider_scorecard, sweep_drift
+
+    overall = provider_scorecard(db, provider)
+    drift = sweep_drift(db, provider)
+    return {
+        "provider": provider,
+        "overall": {"attempts": overall.attempts, "success_rate": overall.success_rate,
+                   "cost_per_row": overall.cost_per_row, "outcome_counts": overall.outcome_counts,
+                   "conclusive": overall.conclusive},
+        "drift": [
+            {"icp_fingerprint": f.icp_fingerprint, "reason": f.reason,
+             "baseline_success_rate": f.baseline.success_rate,
+             "recent_success_rate": f.recent.success_rate}
+            for f in drift
+        ],
+    }
+
+
+@router.get("/gtm-os/partner/sourcing-explanation")
+def partner_sourcing_explanation(request: Request, db: Session = Depends(get_db)):
+    """Plain-language: why did recent companies come from the tool they came from.
+
+    Partner-visible on purpose, per the design doc's own goal for this phase -- a partner asking
+    "why these companies" should get an answer, not a table of internal outcome codes.
+    """
+    tenant_id = _resolve_tenant_id(request)
+    from app.gtm_os.sourcing.scorecard import explain_run
+
+    return {"tenant_id": tenant_id, "recent_runs": explain_run(db, tenant_id)}
+
+
 @router.get("/gtm-os/admin/partners/{partner_tenant_id}/features")
 def get_partner_features(partner_tenant_id: int, request: Request, db: Session = Depends(get_db)):
     """Every feature the platform offers and where this partner stands on each.

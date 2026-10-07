@@ -123,6 +123,12 @@ class RouteAttempt(Base):
     tenant_id = Column(Integer, nullable=False, index=True)
     provider = Column(String, nullable=False, index=True)
     endpoint = Column(String, nullable=True)
+    # The ICP's SHAPE (app.gtm_os.sourcing.atoms.fingerprint), not which tenant asked -- this is
+    # what lets a scorecard say "this exact filter set used to work and stopped", which a
+    # provider-wide average cannot: a provider can be perfectly healthy for most ICPs while one
+    # specific shape has drifted (a taxonomy value quietly deprecated, a bound the provider
+    # tightened). Nullable because not every call site threads an ICP through yet.
+    icp_fingerprint = Column(String, nullable=True, index=True)
     outcome = Column(String, nullable=False)
     detail = Column(Text, nullable=True)
     rows = Column(Integer, nullable=True)

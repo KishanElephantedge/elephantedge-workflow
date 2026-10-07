@@ -1006,7 +1006,19 @@ def run_icp_filters(db: Session, tenant_id: int, pages: int = 1, run_cap_usd: fl
             "not_supported_here": [a.name for a in coverage.unsupported],
             "unenforced_must_haves": [a.name for a in coverage.must_have_gap],
         }
-        result["search"] = search_icypeas(db, tenant_id, icp, pages=pages)
+        # REAL GAP CLOSED, 2026-10-07: this used to call search_icypeas() directly, bypassing the
+        # planner entirely -- phase 6's ranking/failover/circuit-breaking was built and tested but
+        # never actually ran in production, and route_attempts stayed empty. Only one adapter
+        # (icypeas) is executable today, so this is a same-behavior change right now; it is what
+        # makes failover real the moment a second provider is registered, and what gives phase 8's
+        # scorecards something real to aggregate.
+        from app.gtm_os.sourcing.planner import execute as route_execute
+
+        routed = route_execute(db, tenant_id, icp, pages=pages)
+        result["search"] = routed.result or {"companies": 0, "created": 0, "outcomes": {},
+                                             "stopped": routed.stopped}
+        result["routing"] = {"provider": routed.provider, "attempts": routed.attempts,
+                             "considered": routed.considered, "stopped": routed.stopped}
         result["qualify"] = qualify(db, tenant_id, icp)
         result["spent_usd"] = round(scope.spent_usd, 4)
     return result

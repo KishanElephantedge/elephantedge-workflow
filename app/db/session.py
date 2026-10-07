@@ -1196,6 +1196,10 @@ def ensure_indexes():
             )
         """))
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_route_attempts_provider_time ON route_attempts (provider, attempted_at)"))
+        # Phase 8, 2026-10-07: the table above already exists in production (phase 6), so the
+        # CREATE above is a no-op there -- this column needs its own additive statement.
+        conn.execute(text("ALTER TABLE route_attempts ADD COLUMN IF NOT EXISTS icp_fingerprint VARCHAR"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_route_attempts_fingerprint ON route_attempts (icp_fingerprint)"))
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS company_pool (
                 id SERIAL PRIMARY KEY,

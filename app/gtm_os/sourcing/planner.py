@@ -66,6 +66,7 @@ class Candidate:
     recent_failures: int = 0
     executable: bool = False
     score: float = 0.0
+    shape_success_rate: float | None = None
     why: str = ""
 
     @property
@@ -110,7 +111,20 @@ def rank(db: Session, icp: dict, now: datetime | None = None) -> list[Candidate]
         enforced = len([a for a in coverage.enforced if a.necessity == A.MUST_HAVE])
         candidate.score = enforced / len(must_haves)
 
+        # Phase 8: a bounded, OPTIONAL nudge from this exact filter shape's own track record.
+        # Deliberately a tie-breaker, never a term that can move a candidate past one with better
+        # coverage -- "a prior may only re-order candidates; it may never substitute for this
+        # run's free pre-flight" (provider-router-design.md). Inconclusive history (too few
+        # attempts) is treated as neutral, not penalized -- a new shape is not a bad one.
+        from app.gtm_os.sourcing.scorecard import shape_scorecard
+
+        shape_card = shape_scorecard(db, endpoint.provider, A.fingerprint(icp))
+        candidate.shape_success_rate = shape_card.success_rate if shape_card.conclusive else None
+
         reasons = [f"enforces {enforced}/{len(must_haves)} must-haves"]
+        if candidate.shape_success_rate is not None:
+            reasons.append(f"this exact filter shape succeeded {candidate.shape_success_rate:.0%} "
+                           f"of {shape_card.attempts} recent attempts")
         if candidate.must_have_gap:
             reasons.append(f"cannot enforce {', '.join(a.name for a in candidate.must_have_gap)}")
         if not candidate.executable:
@@ -122,15 +136,30 @@ def rank(db: Session, icp: dict, now: datetime | None = None) -> list[Candidate]
 
     # Unhealthy and non-executable providers sink to the bottom but are never dropped -- a run
     # that cannot proceed must be able to say exactly which routes it considered and why.
-    candidates.sort(key=lambda c: (c.executable and c.healthy, c.score, -c.recent_failures),
-                    reverse=True)
+    candidates.sort(key=_sort_key, reverse=True)
     return candidates
 
 
+def _sort_key(c: Candidate) -> tuple:
+    """executable+healthy, then COVERAGE SCORE (primary -- must-have enforcement always wins),
+    then this shape's own track record as a tie-breaker ONLY, then recent health.
+
+    A separate, directly-testable function on purpose: the one invariant this whole phase exists
+    to protect -- "a prior may only re-order candidates; it may never substitute for this run's
+    free pre-flight" -- should be checkable without needing two providers to happen to have
+    different real coverage today, which they may not (Icypeas and Prospeo currently tie on
+    every atom either has verified support for)."""
+    return (c.executable and c.healthy, c.score,
+           c.shape_success_rate if c.shape_success_rate is not None else -1,
+           -c.recent_failures)
+
+
 def record_attempt(db: Session, tenant_id: int, provider: str, endpoint: str, outcome: str,
-                   detail: str | None = None, rows: int = 0, cost_usd: float | None = None) -> None:
+                   detail: str | None = None, rows: int = 0, cost_usd: float | None = None,
+                   icp_fingerprint: str | None = None) -> None:
     db.add(RouteAttempt(tenant_id=tenant_id, provider=provider, endpoint=endpoint,
-                        outcome=outcome, detail=(detail or "")[:500], rows=rows, cost_usd=cost_usd))
+                        outcome=outcome, detail=(detail or "")[:500], rows=rows, cost_usd=cost_usd,
+                        icp_fingerprint=icp_fingerprint))
     db.commit()
 
 
@@ -150,6 +179,7 @@ def execute(db: Session, tenant_id: int, icp: dict, max_providers: int = 2, **kw
     provider on a bad day turns one failed run into several paid ones.
     """
     run = RoutedRun()
+    shape = A.fingerprint(icp)
     candidates = rank(db, icp)
     run.considered = [{"provider": c.provider, "score": round(c.score, 2), "healthy": c.healthy,
                        "executable": c.executable, "why": c.why} for c in candidates]
@@ -171,7 +201,7 @@ def execute(db: Session, tenant_id: int, icp: dict, max_providers: int = 2, **kw
 
         record_attempt(db, tenant_id, candidate.provider, candidate.endpoint.endpoint, outcome,
                        detail=(result or {}).get("stopped"), rows=(result or {}).get("companies", 0),
-                       cost_usd=(result or {}).get("spent_usd"))
+                       cost_usd=(result or {}).get("spent_usd"), icp_fingerprint=shape)
         run.attempts.append({"provider": candidate.provider, "outcome": outcome,
                              "detail": (result or {}).get("stopped")})
 

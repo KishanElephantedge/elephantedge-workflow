@@ -28,6 +28,12 @@ def db(db_factory):
 
 @pytest.fixture(autouse=True)
 def _clean_adapters():
+    # Force the real registration side-effect to have happened before snapshotting, so "original"
+    # is never an empty dict just because this is the first test in the session to touch adapters
+    # -- an empty snapshot here would permanently wipe the real "icypeas" registration for every
+    # other test file that runs afterward, rather than only for the duration of this test.
+    import app.gtm_os.plays.icp_filters  # noqa: F401
+
     original = dict(P._ADAPTERS)
     P._ADAPTERS.clear()
     yield
