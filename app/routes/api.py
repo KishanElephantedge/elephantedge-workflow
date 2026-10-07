@@ -6290,6 +6290,76 @@ def _require_admin(request: Request) -> int:
     return tenant_id
 
 
+@router.get("/gtm-os/admin/providers/catalog")
+def admin_search_provider_tools(request: Request, q: str, categories: str | None = None,
+                                limit: int = 10):
+    """Find candidate provider tools by intent. FREE -- catalog metadata, nothing is executed.
+
+    Added 2026-10-07. We have paid to try a lot of providers over the last three months, and the
+    registry should be built from that rather than from guesses: this is how a new company-search
+    tool is found without spending anything to discover it exists.
+    """
+    _require_admin(request)
+    from app.deepline_client import DeeplineError, search_tools
+
+    try:
+        return search_tools(q, categories=categories, limit=limit)
+    except DeeplineError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+@router.get("/gtm-os/admin/providers/schema")
+def admin_describe_provider_tool(request: Request, tool_id: str):
+    """One tool's real input schema -- filter names, types, enums. FREE, nothing is executed.
+
+    This is what a capability registry entry must be built from. A filter documented in a vendor's
+    UI or blog is not an API contract, and registering one from documentation alone is exactly the
+    mistake that sent an industry value Icypeas does not have and cost $0.175 to discover.
+    """
+    _require_admin(request)
+    from app.deepline_client import DeeplineError, describe_tool
+
+    try:
+        return describe_tool(tool_id)
+    except DeeplineError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+@router.get("/gtm-os/admin/providers/registry")
+def admin_provider_registry(request: Request):
+    """What the router currently knows about every provider, and what still needs verifying.
+
+    The `unverified` list is the work queue for registering a new tool: each entry is an atom we
+    have not confirmed a real filter for, which /providers/schema can answer for free.
+    """
+    _require_admin(request)
+    from app.gtm_os.sourcing import registry as sourcing_registry
+    from app.gtm_os.sourcing.planner import has_adapter
+
+    return {
+        "providers": [
+            {
+                "provider": e.provider,
+                "endpoint": e.endpoint,
+                "job": e.job,
+                "executable": has_adapter(e.provider),
+                "cost": {"unit": e.cost_unit, "amount": e.cost_amount,
+                         "billed_on_miss": e.billed_on_miss},
+                "free_count_endpoint": e.count_endpoint,
+                "page_size_max": e.page_size_max,
+                "source": e.source,
+                "supported": sorted(k for k, c in e.capabilities.items()
+                                    if c.state == sourcing_registry.SUPPORTED),
+                "verified_absent": sorted(k for k, c in e.capabilities.items()
+                                          if c.state == sourcing_registry.ABSENT),
+                "unverified": sorted(k for k, c in e.capabilities.items()
+                                     if c.state == sourcing_registry.UNVERIFIED),
+            }
+            for e in sourcing_registry.REGISTRY
+        ],
+    }
+
+
 @router.get("/gtm-os/admin/partners/{partner_tenant_id}/features")
 def get_partner_features(partner_tenant_id: int, request: Request, db: Session = Depends(get_db)):
     """Every feature the platform offers and where this partner stands on each.

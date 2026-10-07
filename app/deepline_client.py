@@ -394,3 +394,44 @@ def extract_rows(response: dict, *keys: str) -> list[dict]:
             if isinstance(value, list):
                 return value
     return []
+
+
+# ---- FREE metadata: discovering and verifying tools without executing any of them ----
+# `tools search` and `tools describe` return catalog metadata and input schemas. They run no
+# provider query and bill nothing, which is what makes registering a new provider free: the
+# capability registry (app/gtm_os/sourcing/registry.py) must never record a filter name taken
+# from a vendor's marketing page or a blog post, and this is how it gets the real one instead.
+#
+# Deliberately NOT routed through execute_tool(): that function reserves spend against the ledger
+# and refuses any tool it cannot price, both of which are correct for a billable call and wrong
+# for reading a schema.
+def search_tools(query: str, categories: str | None = None, limit: int = 10) -> dict:
+    """Find candidate tools by intent. Free."""
+    args = [settings.deepline_cli_path, "tools", "search", query, "--json"]
+    if categories:
+        args += ["--categories", categories]
+    result = _run_deepline_cli(args, timeout_seconds=60)
+    if result.returncode != 0:
+        raise DeeplineError(f"tools search failed: {(result.stderr or result.stdout)[:400]}")
+    try:
+        payload = json.loads(result.stdout)
+    except ValueError as e:
+        raise DeeplineError(f"tools search returned non-JSON: {result.stdout[:300]}") from e
+    items = payload.get("tools") or payload.get("results") or payload
+    return {"query": query, "tools": items[:limit] if isinstance(items, list) else items}
+
+
+def describe_tool(tool_id: str) -> dict:
+    """The real input schema for one tool -- filter names, types, enums. Free.
+
+    This is the authoritative source for a capability registry entry. A filter documented in a
+    provider's UI is not an API contract; this is.
+    """
+    result = _run_deepline_cli(
+        [settings.deepline_cli_path, "tools", "describe", tool_id, "--json"], timeout_seconds=60)
+    if result.returncode != 0:
+        raise DeeplineError(f"tools describe failed for {tool_id}: {(result.stderr or result.stdout)[:400]}")
+    try:
+        return json.loads(result.stdout)
+    except ValueError as e:
+        raise DeeplineError(f"tools describe returned non-JSON: {result.stdout[:300]}") from e
