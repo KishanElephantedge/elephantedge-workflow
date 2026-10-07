@@ -16,7 +16,7 @@ from sqlalchemy import func, or_
 
 from app.cache import active_keys, bump_batch_version, cache_get, cache_set, get_batch_version, mark_active
 from app.claude_client import DEFAULT_MODEL as DEFAULT_CHAT_MODEL, ClaudeError, call_claude_messages
-from app.db.models import AutonomousRun, Batch, CalendarBooking, CampaignEvent, CampaignPush, ChatConversation, ChatMessage, Company, Contact, CrmLead, Credential, DailyReview, LinkedinMonitorProfile, LinkedinMonitorSignal, Notification, Parameter, PartnerCompanyRecommendation, PartnerRecommendationMessage, PersonalizedMessage, Proposal, ReverseDiscoveryCandidate, ReviewComment, Score
+from app.db.models import AutonomousRun, Batch, Tenant, CalendarBooking, CampaignEvent, CampaignPush, ChatConversation, ChatMessage, Company, Contact, CrmLead, Credential, DailyReview, LinkedinMonitorProfile, LinkedinMonitorSignal, Notification, Parameter, PartnerCompanyRecommendation, PartnerRecommendationMessage, PersonalizedMessage, Proposal, ReverseDiscoveryCandidate, ReviewComment, Score
 from app.notifications import create_notification, delete_expired_notifications
 from app.google_calendar_client import GoogleCalendarError
 from app.phases.hiring_signal import has_qualifying_hiring_signal
@@ -5962,6 +5962,8 @@ def delete_proposal(proposal_id: int, db: Session = Depends(get_db)):
 # Canonical definition lives in partner_icp.py (2026-09-11) so the daily discovery engine can read
 # a partner's ICP without importing the route layer -- re-exported here rather than redeclared,
 # since two copies of a Parameter key silently drift into two different stores.
+from app.gtm_os.features import config as feature_config  # noqa: E402
+from app.gtm_os.features import registry as feature_registry  # noqa: E402
 from app.phases.partner_icp import PARTNER_ICP_PARAMETER_KEY  # noqa: E402
 
 
@@ -6277,6 +6279,82 @@ def run_partner_discovery_route(request: Request, payload: PartnerDiscoveryReque
     thread.start()
 
     return {"batch_id": batch.id, "status": "in_progress", "poll": f"/api/gtm-os/partner/discover/{batch.id}"}
+
+
+def _require_admin(request: Request) -> int:
+    """Elephant Edge's own tenant only. Partner-facing routes resolve their own tenant from the
+    gateway; these configure OTHER tenants, so they must never be reachable by a partner."""
+    tenant_id = _resolve_tenant_id(request)
+    if tenant_id != ELEPHANT_EDGE_TENANT_ID:
+        raise HTTPException(status_code=404, detail="Not found")
+    return tenant_id
+
+
+@router.get("/gtm-os/admin/partners/{partner_tenant_id}/features")
+def get_partner_features(partner_tenant_id: int, request: Request, db: Session = Depends(get_db)):
+    """Every feature the platform offers and where this partner stands on each.
+
+    Added 2026-10-07. This is both the admin settings screen and the onboarding checklist: a
+    feature is no longer switched on and then found to be half-working because something it needed
+    was never set -- `ready` and `missing_config` answer that from data, before a run.
+
+    Admin-side on purpose. Partners will configure their own features once the product becomes
+    subscription-based; until then this is run for them, which is what "we run their back office"
+    means in practice.
+    """
+    _require_admin(request)
+    from app.gtm_os.features import config as fc
+
+    tenant = db.get(Tenant, partner_tenant_id)
+    if tenant is None:
+        raise HTTPException(status_code=404, detail=f"tenant {partner_tenant_id} not found")
+
+    statuses = fc.all_statuses(db, partner_tenant_id)
+    return {
+        "tenant_id": partner_tenant_id,
+        "tenant_name": tenant.name,
+        "enabled_features": fc.enabled_features(db, partner_tenant_id),
+        "features": [
+            {
+                "key": s.key, "label": s.label, "description": s.description, "note": s.note,
+                "enabled": s.enabled, "ready": s.ready,
+                "missing_config": s.missing_config, "missing_credentials": s.missing_credentials,
+                "config": s.config,
+                "config_schema": [
+                    {"key": c.key, "label": c.label, "type": c.type, "required": c.required,
+                     "help": c.help, "example": c.example}
+                    for c in (feature_registry.get_feature(s.key).config or ())
+                ],
+            }
+            for s in statuses
+        ],
+    }
+
+
+@router.put("/gtm-os/admin/partners/{partner_tenant_id}/features")
+def put_partner_features(partner_tenant_id: int, request: Request, body: dict = Body(...),
+                         db: Session = Depends(get_db)):
+    """Turn features on/off and set their configuration for one partner.
+
+    Config is a PARTIAL update -- only the keys supplied are written. A full replace is what let a
+    form that didn't know about a field wipe it on save, which happened with the partner ICP.
+    """
+    _require_admin(request)
+    from app.gtm_os.features import config as fc
+
+    if db.get(Tenant, partner_tenant_id) is None:
+        raise HTTPException(status_code=404, detail=f"tenant {partner_tenant_id} not found")
+    try:
+        if "enabled_features" in body:
+            fc.set_enabled_features(db, partner_tenant_id, list(body["enabled_features"] or []))
+        for feature_key, values in (body.get("config") or {}).items():
+            fc.set_config(db, partner_tenant_id, feature_key, values or {})
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except LookupError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+    return get_partner_features(partner_tenant_id, request, db)
 
 
 @router.get("/gtm-os/partner/icp-preview")
@@ -6974,18 +7052,33 @@ def get_partner_company_detail(company_id: int, request: Request, db: Session = 
 # campaign by guessing an id. The credential itself is stored under tenant_id=15 (Majji), a
 # separate row from Elephant Edge's own tenant_id=2 smartlead_api_key (used by live lead-adding
 # automation elsewhere) -- so this never touches that credential.
-MAJJI_TENANT_ID = 15
-MAJJI_EMAIL_CAMPAIGNS = [
-    {"id": 4037761, "label": "Fractional Partner - Cost Saving Angle"},
-    {"id": 4037472, "label": "Fractional Partner - Revenue Growth Angle"},
-]
-
-
-def _require_majji_tenant(request: Request) -> int:
+# GENERALISED 2026-10-07. This used to be MAJJI_TENANT_ID = 15 plus a hardcoded list of two
+# campaign ids, with _require_majji_tenant() 404ing everyone else -- so the second partner wanting
+# email reporting needed a code change and a deploy. The campaigns are now per-tenant
+# configuration (feature "email_campaigns", key `smartlead_campaign_ids`) and access is gated on
+# the enabled_features flag that already drives the partner's nav.
+#
+# The reason this feature needs explicit per-tenant config at all, rather than listing whatever
+# the API returns: one Smartlead key can see every campaign in the account, so a partner must only
+# ever be shown the campaigns we have deliberately assigned to them.
+def _require_email_campaigns(request: Request, db: Session) -> int:
     tenant_id = _resolve_tenant_id(request)
-    if tenant_id != MAJJI_TENANT_ID:
+    try:
+        feature_config.require_enabled(db, tenant_id, "email_campaigns")
+    except LookupError:
         raise HTTPException(status_code=404, detail="Not found")
     return tenant_id
+
+
+def _partner_email_campaigns(db: Session, tenant_id: int) -> list[dict]:
+    configured = feature_config.get_config(db, tenant_id, "email_campaigns").get("smartlead_campaign_ids") or []
+    campaigns = []
+    for entry in configured:
+        if isinstance(entry, dict) and entry.get("id") is not None:
+            campaigns.append({"id": int(entry["id"]), "label": entry.get("label") or f"Campaign {entry['id']}"})
+        elif isinstance(entry, (int, str)) and str(entry).isdigit():
+            campaigns.append({"id": int(entry), "label": f"Campaign {entry}"})
+    return campaigns
 
 
 def _email_campaign_summary(campaign_id: int, label: str, db: Session, tenant_id: int) -> dict:
@@ -7014,9 +7107,9 @@ def _email_campaign_summary(campaign_id: int, label: str, db: Session, tenant_id
 
 @router.get("/gtm-os/partner/email-campaigns")
 def list_partner_email_campaigns(request: Request, db: Session = Depends(get_db)):
-    tenant_id = _require_majji_tenant(request)
+    tenant_id = _require_email_campaigns(request, db)
     campaigns = []
-    for c in MAJJI_EMAIL_CAMPAIGNS:
+    for c in _partner_email_campaigns(db, tenant_id):
         try:
             campaigns.append(_email_campaign_summary(c["id"], c["label"], db, tenant_id))
         except SmartleadError as e:
@@ -7027,8 +7120,8 @@ def list_partner_email_campaigns(request: Request, db: Session = Depends(get_db)
 
 @router.get("/gtm-os/partner/email-campaigns/{campaign_id}")
 def get_partner_email_campaign_detail(campaign_id: int, request: Request, db: Session = Depends(get_db)):
-    tenant_id = _require_majji_tenant(request)
-    match = next((c for c in MAJJI_EMAIL_CAMPAIGNS if c["id"] == campaign_id), None)
+    tenant_id = _require_email_campaigns(request, db)
+    match = next((c for c in _partner_email_campaigns(db, tenant_id) if c["id"] == campaign_id), None)
     if match is None:
         raise HTTPException(status_code=404, detail="Campaign not found")
 
@@ -7053,8 +7146,8 @@ def get_partner_email_campaign_detail(campaign_id: int, request: Request, db: Se
 
 @router.get("/gtm-os/partner/email-campaigns/{campaign_id}/leads")
 def get_partner_email_campaign_leads(campaign_id: int, request: Request, offset: int = 0, limit: int = 100, db: Session = Depends(get_db)):
-    tenant_id = _require_majji_tenant(request)
-    match = next((c for c in MAJJI_EMAIL_CAMPAIGNS if c["id"] == campaign_id), None)
+    tenant_id = _require_email_campaigns(request, db)
+    match = next((c for c in _partner_email_campaigns(db, tenant_id) if c["id"] == campaign_id), None)
     if match is None:
         raise HTTPException(status_code=404, detail="Campaign not found")
 

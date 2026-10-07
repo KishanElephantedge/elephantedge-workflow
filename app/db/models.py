@@ -37,6 +37,12 @@ class Tenant(Base):
     name = Column(String, nullable=False)
     slug = Column(String, nullable=False, unique=True)
     backend_url = Column(String, nullable=True)
+    # Mirrored from the gateway, which owns this column (gateway/app/db.py creates it). Same
+    # intentional-duplication pattern as the rest of this shared schema: the database is the
+    # contract between two independently deployed codebases. The backend needs to read it so a
+    # partner-facing feature can be gated on the flag rather than on a hardcoded tenant id, and to
+    # write it so features can be switched on per partner from the admin screen.
+    enabled_features = Column(JSON, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
