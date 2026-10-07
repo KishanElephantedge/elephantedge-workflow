@@ -16,7 +16,7 @@ Why this has to be stored rather than recomputed per run:
 """
 from datetime import datetime
 
-from sqlalchemy import Column, DateTime, Float, Integer, String, Text, UniqueConstraint
+from sqlalchemy import Column, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint
 
 from app.db.models import Base
 
@@ -128,3 +128,66 @@ class RouteAttempt(Base):
     rows = Column(Integer, nullable=True)
     cost_usd = Column(Float, nullable=True)
     attempted_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+
+class CompanyPool(Base):
+    """One real company, shared across every tenant -- bought once, usable by anyone whose ICP
+    matches it.
+
+    WHY THIS EXISTS. We have ~10-15 partners today and growing, and professional-services/B2B-SaaS
+    ICPs overlap heavily. A company bought for one partner is free for the next one whose ICP it
+    also matches, but today we would re-buy it. The first step of any sourcing run should be a
+    query against OUR OWN data, not a provider.
+
+    `identity_key` is how a company already in the pool is recognized again:
+    linkedin_company_id > domain (shortener-stripped, matching the same normalization already
+    applied to per-tenant Company rows) > normalized name, in that preference order, because
+    LinkedIn URL is the most stable identity Icypeas/HarvestAPI both key on.
+
+    This table is intentionally SEPARATE from `companies`: `companies` rows are tenant-scoped
+    (via batch_id -> Batch.tenant_id) and carry tenant-specific pipeline state (decision_maker_
+    searched_at, icp_evaluation_attempts, outreach). The pool carries only the shared facts about
+    the company itself, so one company can be the source of many different tenants' own `companies`
+    rows without those tenants' pipeline state ever leaking into each other.
+    """
+
+    __tablename__ = "company_pool"
+    __table_args__ = (UniqueConstraint("identity_key", name="uq_company_pool_identity"),)
+
+    id = Column(Integer, primary_key=True)
+    identity_key = Column(String, nullable=False)
+    linkedin_company_id = Column(String, nullable=True, index=True)
+    linkedin_url = Column(String, nullable=True)
+    domain = Column(String, nullable=True, index=True)
+    name = Column(String, nullable=False)
+    industry_raw = Column(String, nullable=True)
+    headcount = Column(Integer, nullable=True)
+    revenue_low_usd = Column(Integer, nullable=True)
+    revenue_high_usd = Column(Integer, nullable=True)
+    location = Column(String, nullable=True)
+    country = Column(String, nullable=True)
+    source_provider = Column(String, nullable=True)
+    source_endpoint = Column(String, nullable=True)
+    fetched_at = Column(DateTime, default=datetime.utcnow)
+    cost_usd = Column(Float, nullable=True)
+    last_verified_at = Column(DateTime, default=datetime.utcnow)
+
+
+class PoolDelivery(Base):
+    """Which pool company has already been given to which tenant.
+
+    This is what keeps the pool shareable WITHOUT breaking tenant isolation: the company fact
+    lives once in company_pool, but each tenant's own GtmLead/Company/Opportunity rows (their real
+    pipeline, never shared) are created fresh from it on first delivery, and this row is what stops
+    the same company being "discovered" for that tenant a second time by a later run.
+    """
+
+    __tablename__ = "pool_deliveries"
+    __table_args__ = (UniqueConstraint("tenant_id", "company_pool_id", "play",
+                                       name="uq_pool_delivery"),)
+
+    id = Column(Integer, primary_key=True)
+    tenant_id = Column(Integer, nullable=False, index=True)
+    company_pool_id = Column(Integer, ForeignKey("company_pool.id"), nullable=False, index=True)
+    play = Column(String, nullable=False)
+    delivered_at = Column(DateTime, default=datetime.utcnow)

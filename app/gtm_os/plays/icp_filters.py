@@ -405,6 +405,25 @@ def _process_icypeas_company(db: Session, tenant_id: int, co: dict, known_leads:
         db.add(company)
         db.commit()
 
+        # Phase 5, 2026-10-07: every company we create goes into the SHARED pool too, for free --
+        # it is data we already paid for (or, when this row came from the pool itself, data we
+        # already had). A later run for a different partner whose ICP also matches this company
+        # costs them nothing. Per-row cost is not attributed here (the page price is flat across
+        # however many rows it returns), so cost_usd is left honest rather than invented.
+        try:
+            from app.gtm_os.sourcing import pool as sourcing_pool
+
+            sourcing_pool.record(
+                db, linkedin_url=url, domain=None, name=name, industry=co.get("industry"),
+                headcount=co.get("numberOfEmployees"),
+                revenue_low_usd=company.estimated_revenue_lower_usd,
+                revenue_high_usd=company.estimated_revenue_higher_usd,
+                location=co.get("address"), country=None,
+                source_provider="icypeas", source_endpoint="find-companies", cost_usd=None,
+            )
+        except Exception as e:  # noqa: BLE001 -- pool-building must never break a paid run
+            logger.warning("pool recording skipped: %s: %s", type(e).__name__, e)
+
     # Free -- Jobo's own leadership list, an agent picks the buyer, only Jobo's genuine (not
     # Crunchbase) LinkedIn URL is usable for outreach.
     leadership = _jobo_leadership_candidates(db, tenant_id, company)
@@ -502,6 +521,52 @@ def search_icypeas(db: Session, tenant_id: int, icp: dict, pages: int = 1) -> di
                 "quota": {"target": quota.target, "delivered_today": quota.delivered_today,
                           "remaining": 0, "page_size": 0}}
 
+    known_leads = {k for (k,) in db.query(GtmLead.lead_key).filter(GtmLead.tenant_id == tenant_id, GtmLead.play == PLAY)}
+    result = {"companies": 0, "created": 0, "outcomes": {}, "stopped": None}
+
+    def count(outcome):
+        result["outcomes"][outcome] = result["outcomes"].get(outcome, 0) + 1
+
+    pending: list = []
+
+    # POOL-FIRST, phase 5 (2026-10-07). Before paying any provider, check our OWN data: a company
+    # bought for a different partner is free for this one if it genuinely matches their ICP. Only
+    # headcount/revenue/geography are checked (see pool.py for why industry is deliberately
+    # excluded from pool matching), and only fresh rows are delivered -- a stale pool row is left
+    # for a real run to re-verify rather than silently handed out as a current match.
+    try:
+        from app.gtm_os.sourcing import pool as sourcing_pool
+
+        pool_matches = sourcing_pool.find_matches(db, tenant_id, PLAY, icp, limit=quota.remaining)
+        for match in pool_matches:
+            if not match.fresh:
+                continue
+            outcome = _process_icypeas_company(db, tenant_id, sourcing_pool.to_search_row(match.row),
+                                               known_leads, pending)
+            sourcing_pool.mark_delivered(db, tenant_id, match.row.id, PLAY)
+            if outcome is not None:
+                count(f"pool:{outcome}")
+                if outcome == "created":
+                    result["created"] += 1
+    except OperationalError:
+        db.rollback()
+    except Exception as e:  # noqa: BLE001 -- the pool is an optimization, never a dependency
+        logger.warning("pool-first lookup skipped: %s: %s", type(e).__name__, e)
+
+    # Shrink what we still need to BUY by whatever the pool just delivered for free. The pool
+    # deliveries just created real GtmLead rows for this tenant, so re-running the SAME plan
+    # naturally sees them in delivered_today and recomputes a correct remaining/page_size from
+    # scratch -- cheaper and less error-prone than patching the arithmetic by hand.
+    delivered_from_pool = result["created"]
+    if delivered_from_pool:
+        quota = plan_quota(db, tenant_id, PLAY, _ICYPEAS.page_size_max or 200)
+    result["quota"] = {"target": quota.target, "delivered_today": quota.delivered_today,
+                       "remaining": quota.remaining, "page_size": quota.page_size,
+                       "delivered_from_pool": delivered_from_pool}
+    if quota.satisfied:
+        result["stopped"] = result["stopped"] or f"daily target met using {delivered_from_pool} from the shared pool"
+        return result
+
     # REAL FIX, 2026-10-05: icypeas_count_companies is priced FREE ($0, deepline_client.py) for
     # exactly this reason -- verify a filter set actually matches something before ever paying
     # for a page -- but nothing in this function ever called it, so a filter value that doesn't
@@ -532,18 +597,10 @@ def search_icypeas(db: Session, tenant_id: int, icp: dict, pages: int = 1) -> di
             if real_count == 0:
                 cursor.value = {"filters": fingerprint, "exhausted_at": datetime.utcnow().isoformat()}
                 db.commit()
-                return {"companies": 0, "created": 0, "outcomes": {}, "stopped": None,
-                       "free_count_checked": 0, "exhausted": True}
+                result["free_count_checked"] = 0
+                result["exhausted"] = True
+                return result
 
-    known_leads = {k for (k,) in db.query(GtmLead.lead_key).filter(GtmLead.tenant_id == tenant_id, GtmLead.play == PLAY)}
-    result = {"companies": 0, "created": 0, "outcomes": {}, "stopped": None,
-              "quota": {"target": quota.target, "delivered_today": quota.delivered_today,
-                        "remaining": quota.remaining, "page_size": quota.page_size}}
-
-    def count(outcome):
-        result["outcomes"][outcome] = result["outcomes"].get(outcome, 0) + 1
-
-    pending: list = []
     for _ in range(pages):
         payload = {"query": filters,
                    "pagination": {"size": quota.page_size, **({"token": token} if token else {})}}

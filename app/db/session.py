@@ -1196,3 +1196,38 @@ def ensure_indexes():
             )
         """))
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_route_attempts_provider_time ON route_attempts (provider, attempted_at)"))
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS company_pool (
+                id SERIAL PRIMARY KEY,
+                identity_key VARCHAR NOT NULL,
+                linkedin_company_id VARCHAR,
+                linkedin_url VARCHAR,
+                domain VARCHAR,
+                name VARCHAR NOT NULL,
+                industry_raw VARCHAR,
+                headcount INTEGER,
+                revenue_low_usd INTEGER,
+                revenue_high_usd INTEGER,
+                location VARCHAR,
+                country VARCHAR,
+                source_provider VARCHAR,
+                source_endpoint VARCHAR,
+                fetched_at TIMESTAMP DEFAULT now(),
+                cost_usd DOUBLE PRECISION,
+                last_verified_at TIMESTAMP DEFAULT now(),
+                CONSTRAINT uq_company_pool_identity UNIQUE (identity_key)
+            )
+        """))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_company_pool_domain ON company_pool (domain)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_company_pool_li_id ON company_pool (linkedin_company_id)"))
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS pool_deliveries (
+                id SERIAL PRIMARY KEY,
+                tenant_id INTEGER NOT NULL,
+                company_pool_id INTEGER NOT NULL REFERENCES company_pool(id),
+                play VARCHAR NOT NULL,
+                delivered_at TIMESTAMP DEFAULT now(),
+                CONSTRAINT uq_pool_delivery UNIQUE (tenant_id, company_pool_id, play)
+            )
+        """))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_pool_deliveries_tenant ON pool_deliveries (tenant_id)"))
