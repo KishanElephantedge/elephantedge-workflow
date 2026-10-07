@@ -164,7 +164,13 @@ def _keyword_capability(endpoint: R.ProviderEndpoint) -> R.Capability | None:
 def _keyword_resolution(db: Session, endpoint: R.ProviderEndpoint, atom: A.Atom,
                         keyword: R.Capability, tenant_id: int | None,
                         note: str | None = None) -> Resolution:
-    terms = _as_list(atom.partner_term or atom.value)
+    # The atom's VALUE list, never partner_term. partner_term is the partner's wording kept for
+    # provenance and is joined for display ("B2B technology, SaaS, software, ..."), so using it as
+    # the search value sent one comma-joined phrase instead of nine separate keywords -- which
+    # matches nothing. Found 2026-10-07 by running the preview across every partner tenant:
+    # Majji has a single industry so his looked correct, and every multi-industry partner was
+    # broken. A partner-specific test would never have caught it.
+    terms = _as_list(atom.value)
     fragment = keyword.render(_with_value(atom, terms))
     return _store(db, tenant_id, endpoint, atom,
                   Resolution(atom=atom, method=METHOD_KEYWORD_FALLBACK, values=terms,

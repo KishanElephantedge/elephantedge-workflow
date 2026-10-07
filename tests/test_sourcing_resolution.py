@@ -59,6 +59,23 @@ def test_unknown_term_falls_back_to_free_text_instead_of_an_enum_that_matches_no
     assert "industry" not in resolved.filter_fragment
 
 
+def test_multi_industry_partners_get_separate_keywords_not_one_joined_phrase(db):
+    """Real bug, found 2026-10-07 by previewing EVERY partner rather than the one in front of me.
+
+    partner_term is the partner's wording kept for provenance, and it is joined for display. Using
+    it as the search value sent one comma-joined phrase as a single keyword, which matches nothing.
+    The partner we had been testing with has exactly one industry, so his output looked correct
+    while every multi-industry partner was broken.
+    """
+    atom = A.Atom(A.INDUSTRY, A.INCLUDE,
+                  ["B2B technology", "SaaS", "cybersecurity"],
+                  partner_term="B2B technology, SaaS, cybersecurity")
+    resolved = RES.resolve_atom(db, ICYPEAS, atom, tenant_id=PARTNER, use_llm=False)
+    assert resolved.filter_fragment == {
+        "keyword": {"include": ["B2B technology", "SaaS", "cybersecurity"]}
+    }
+
+
 def test_a_broad_concept_expands_to_several_real_values(db, monkeypatch):
     import app.llm_client as llm
 
