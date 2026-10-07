@@ -180,17 +180,42 @@ def icypeas_filters_for_icp(icp: dict) -> dict:
     already reads icp['geographies'] -- so the search is actually driven by that specific
     partner's ICP, not a hardcoded assumption. The vendor-exclude list stays on unconditionally
     underneath it (never show an agency/staffing firm even if a partner's broad industry list
-    would technically include it)."""
-    lo, hi = icp.get("employee_min") or 1, icp.get("employee_max") or 10**9
-    industry_filter = {"exclude": NON_BUYER_INDUSTRIES}
-    if icp.get("industries"):
-        industry_filter["include"] = icp["industries"]
-    return {
-        "headcount": {">=": lo, "<=": hi},
-        "location": {"include": icp.get("geographies") or ["United States"]},
-        "industry": industry_filter,
-        "type": {"exclude": NON_COMPANY_TYPES},
-    }
+    would technically include it).
+
+    REGISTRY-DRIVEN, 2026-10-07: the filter payload is no longer hand-built here. It is rendered
+    from app/gtm_os/sourcing/registry.py, which holds the exact filter expression Icypeas accepts
+    for each ICP atom, taken from its published schema. A call site can no longer invent a field
+    name or quietly forget one -- forgetting `industries` is precisely what sent 21 hospitals and
+    law firms into a Professional Services ICP. Anything the provider cannot enforce comes back
+    from icp_coverage() as a residual/unsupported atom instead of vanishing.
+
+    The two exclude lists below are OUR policy, not the partner's ICP, so they are applied on top
+    of the rendered atoms rather than living in the registry: we never want an agency or a
+    government body regardless of what any partner asks for.
+    """
+    from app.gtm_os.sourcing.atoms import decompose_icp
+    from app.gtm_os.sourcing.registry import ICYPEAS_FIND_COMPANIES, coverage_for
+
+    filters = dict(coverage_for(ICYPEAS_FIND_COMPANIES, decompose_icp(icp)).filters)
+    filters.setdefault("location", {"include": ["United States"]})
+    industry = dict(filters.get("industry") or {})
+    industry["exclude"] = NON_BUYER_INDUSTRIES
+    filters["industry"] = industry
+    filters["type"] = {"exclude": NON_COMPANY_TYPES}
+    return filters
+
+
+def icp_coverage(icp: dict):
+    """Which ICP requirements this play's provider actually enforces, and which it does not.
+
+    Exposed so a run can REPORT its unsupported atoms instead of silently ignoring them -- the
+    failure mode that let "no dedicated marketing hire" sit in Majji's ICP for days, enforced by
+    nothing while looking configured.
+    """
+    from app.gtm_os.sourcing.atoms import decompose_icp
+    from app.gtm_os.sourcing.registry import ICYPEAS_FIND_COMPANIES, coverage_for
+
+    return coverage_for(ICYPEAS_FIND_COMPANIES, decompose_icp(icp))
 
 
 def _resolve_decision_makers_batch(db: Session, tenant_id: int, companies: list, titles: list[str]) -> dict:
@@ -763,7 +788,18 @@ def run_icp_filters(db: Session, tenant_id: int, pages: int = 1, run_cap_usd: fl
     if not icp:
         return {"status": "skipped", "reason": "no partner ICP configured"}
     with spend_scope(db, BILLING_TENANT_ID, f"{PLAY}:tenant_{tenant_id}", run_cap_usd=run_cap_usd) as scope:
+        coverage = icp_coverage(icp)
         result = {"status": "completed", "play": PLAY, "tenant_id": tenant_id, "filters": icypeas_filters_for_icp(icp)}
+        # Every ICP requirement, and what actually happened to it. Reported on every run so a
+        # requirement can never again be stored, look configured, and be enforced by nothing --
+        # "no dedicated marketing hire" sat in Majji's ICP for days in exactly that state.
+        result["icp_coverage"] = {
+            "enforced_by_provider": [a.name for a in coverage.enforced],
+            "checked_after_fetch": [a.name for a in coverage.residual],
+            "needs_provider_research": [a.name for a in coverage.unverified],
+            "not_supported_here": [a.name for a in coverage.unsupported],
+            "unenforced_must_haves": [a.name for a in coverage.must_have_gap],
+        }
         result["search"] = search_icypeas(db, tenant_id, icp, pages=pages)
         result["qualify"] = qualify(db, tenant_id, icp)
         result["spent_usd"] = round(scope.spent_usd, 4)
