@@ -125,3 +125,33 @@ def test_search_spends_nothing_once_the_partner_has_what_they_need(db, monkeypat
     assert result["companies"] == 0
     assert result["quota"]["remaining"] == 0
     assert "already met" in result["stopped"]
+
+
+def test_a_wrong_fit_page_stops_the_run_instead_of_buying_more(db, monkeypatch):
+    """Phase 4, end to end: 200 OK with rows that do not match the ICP must stop the run.
+
+    This is the 2026-10-03 batch -- every company far outside the 11-50 headcount band. Before
+    verification the run processed all of them and would have paged on for more.
+    """
+    import app.deepline_client as dc
+    from app.gtm_os.plays import icp_filters as play
+
+    pages = []
+
+    def fake_cli(tool, payload):
+        pages.append(tool)
+        if tool == "icypeas_count_companies":
+            return {"toolResponse": {"raw": {"count": 500}}}
+        rows = [{"url": f"https://www.linkedin.com/company/wrong{i}", "name": f"Wrong {i}",
+                 "numberOfEmployees": 400} for i in range(8)]
+        return {"toolResponse": {"raw": {"leads": rows, "pagination": {"token": "next"}}}}
+
+    monkeypatch.setattr(dc, "_call_deepline_cli", fake_cli)
+    feature_config.set_config(db, PARTNER_A, "accounts", {"daily_account_target": 20})
+
+    result = play.search_icypeas(db, PARTNER_A, {"employee_min": 11, "employee_max": 50}, pages=5)
+
+    assert result["verification"]["match_rate"] == 0.0
+    assert "quality" in (result["stopped"] or "")
+    # Only ONE search page was bought, not the five it was asked for.
+    assert pages.count("icypeas_find_companies") == 1

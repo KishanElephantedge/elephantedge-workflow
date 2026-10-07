@@ -448,6 +448,21 @@ def search_icypeas(db: Session, tenant_id: int, icp: dict, pages: int = 1) -> di
             return {"companies": 0, "created": 0, "outcomes": {}, "exhausted_until": cooldown_until.isoformat(),
                    "stopped": f"pool exhausted for these filters as of {exhausted_at}; next check {cooldown_until.date()}"}
 
+    # What the partner actually asked for, and -- separately -- which of those requirements this
+    # search genuinely enforced. Verification below may only judge the rows against the second
+    # list: an industry searched by free-text keyword was never promised as a classification, so
+    # scoring the returned industry label against it would manufacture false failures.
+    from app.gtm_os.sourcing.atoms import HEADCOUNT as A_HEADCOUNT
+    from app.gtm_os.sourcing.atoms import INDUSTRY as A_INDUSTRY
+    from app.gtm_os.sourcing.atoms import REVENUE as A_REVENUE
+    from app.gtm_os.sourcing.atoms import decompose_icp
+    from app.gtm_os.sourcing.outcomes import QUALITY_FAIL as OUTCOME_QUALITY_FAIL
+
+    icp_atoms = decompose_icp(icp)
+    enforced_industry_names = (
+        {a.name for a in icp_atoms.by_key(A_INDUSTRY)} if (filters.get("industry") or {}).get("include") else set()
+    )
+
     # QUOTA, phase 3 (2026-10-07). Icypeas bills per REQUESTED result, so a fixed page of 25 cost
     # $0.175 whether the partner needed 25 more accounts or 3 -- and it charged again the next day
     # even when their target was already met. Buy the shortfall and nothing more.
@@ -533,6 +548,28 @@ def search_icypeas(db: Session, tenant_id: int, icp: dict, pages: int = 1) -> di
             db.rollback()
         except Exception as e:  # noqa: BLE001 -- learning must never break a paid run
             logger.warning("taxonomy learning skipped: %s: %s", type(e).__name__, e)
+
+        # SAMPLE VERIFICATION, phase 4 (2026-10-07). A search can return 200 OK, with rows, and be
+        # completely wrong -- on 2026-10-03 this ICP produced 21 hospitals, law firms and a fire
+        # department, and nothing noticed because the only thing checked was that the call
+        # succeeded. Judge the rows, not the filter we believe we sent. Missing values never count
+        # as violations (see verification.py for why that asymmetry is load-bearing).
+        try:
+            from app.gtm_os.sourcing.verification import verify_sample
+
+            checkable = [a for a in icp_atoms.must_haves()
+                         if a.key in (A_HEADCOUNT, A_REVENUE) or a.name in enforced_industry_names]
+            verification = verify_sample(leads, icp_atoms, checkable_atoms=checkable)
+            result["verification"] = verification.summary()
+            if not verification.passed():
+                result["stopped"] = (
+                    f"quality: only {verification.match_rate:.0%} of a {verification.checked}-row "
+                    f"sample matched the ICP ({verification.violations}). Stopping before buying "
+                    f"more of the same.")
+                result["outcome"] = OUTCOME_QUALITY_FAIL
+                break
+        except Exception as e:  # noqa: BLE001 -- verification must never break a paid run
+            logger.warning("sample verification skipped: %s: %s", type(e).__name__, e)
 
         # Real bug found live 2026-09-28: a mid-run Neon connection drop (this codebase's own
         # documented recurring failure mode, see app/db/session.py) crashed the per-company loop
