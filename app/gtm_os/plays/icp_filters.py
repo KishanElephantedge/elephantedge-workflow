@@ -448,6 +448,19 @@ def search_icypeas(db: Session, tenant_id: int, icp: dict, pages: int = 1) -> di
             return {"companies": 0, "created": 0, "outcomes": {}, "exhausted_until": cooldown_until.isoformat(),
                    "stopped": f"pool exhausted for these filters as of {exhausted_at}; next check {cooldown_until.date()}"}
 
+    # QUOTA, phase 3 (2026-10-07). Icypeas bills per REQUESTED result, so a fixed page of 25 cost
+    # $0.175 whether the partner needed 25 more accounts or 3 -- and it charged again the next day
+    # even when their target was already met. Buy the shortfall and nothing more.
+    from app.gtm_os.sourcing.quota import plan as plan_quota
+    from app.gtm_os.sourcing.registry import ICYPEAS_FIND_COMPANIES as _ICYPEAS
+
+    quota = plan_quota(db, tenant_id, PLAY, _ICYPEAS.page_size_max or 200)
+    if quota.satisfied:
+        # The cheapest possible outcome: the partner has what they need today, so this costs $0.
+        return {"companies": 0, "created": 0, "outcomes": {}, "stopped": quota.reason,
+                "quota": {"target": quota.target, "delivered_today": quota.delivered_today,
+                          "remaining": 0, "page_size": 0}}
+
     # REAL FIX, 2026-10-05: icypeas_count_companies is priced FREE ($0, deepline_client.py) for
     # exactly this reason -- verify a filter set actually matches something before ever paying
     # for a page -- but nothing in this function ever called it, so a filter value that doesn't
@@ -482,14 +495,17 @@ def search_icypeas(db: Session, tenant_id: int, icp: dict, pages: int = 1) -> di
                        "free_count_checked": 0, "exhausted": True}
 
     known_leads = {k for (k,) in db.query(GtmLead.lead_key).filter(GtmLead.tenant_id == tenant_id, GtmLead.play == PLAY)}
-    result = {"companies": 0, "created": 0, "outcomes": {}, "stopped": None}
+    result = {"companies": 0, "created": 0, "outcomes": {}, "stopped": None,
+              "quota": {"target": quota.target, "delivered_today": quota.delivered_today,
+                        "remaining": quota.remaining, "page_size": quota.page_size}}
 
     def count(outcome):
         result["outcomes"][outcome] = result["outcomes"].get(outcome, 0) + 1
 
     pending: list = []
     for _ in range(pages):
-        payload = {"query": filters, "pagination": {"size": 25, **({"token": token} if token else {})}}
+        payload = {"query": filters,
+                   "pagination": {"size": quota.page_size, **({"token": token} if token else {})}}
         try:
             response = execute_tool("icypeas_find_companies", payload)
         except DeeplineSpendBlocked as e:
@@ -543,6 +559,19 @@ def search_icypeas(db: Session, tenant_id: int, icp: dict, pages: int = 1) -> di
                 count(outcome)
                 if outcome == "created":
                     result["created"] += 1
+
+        if pending:
+            # Only resolve decision makers for as many companies as the partner still needs.
+            # The search page is already bought and every company on it is persisted either way,
+            # but decision-maker resolution is a SEPARATE paid call ($0.07/page of names), so
+            # resolving 25 when 3 are needed is the expensive half of over-fetching. The surplus
+            # stays in `pending` and its companies remain in the database for a later run.
+            still_needed = max(0, quota.remaining - result["created"])
+            deferred = pending[still_needed:]
+            pending = pending[:still_needed]
+            if deferred:
+                result["outcomes"]["deferred_over_quota"] = \
+                    result["outcomes"].get("deferred_over_quota", 0) + len(deferred)
 
         if pending:
             try:

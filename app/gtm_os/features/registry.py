@@ -74,6 +74,11 @@ ACCOUNTS = Feature(
                   help="The partner's ideal customer profile. Edited on the partner's own Settings "
                        "page or parsed from a document; drives every sourcing run.",
                   example='{"employee_min": 11, "employee_max": 50, "geographies": ["United States"]}'),
+        ConfigKey("daily_account_target", "Accounts per day", INTEGER, required=False,
+                  help="How many new accounts this partner should receive per day. We buy each "
+                       "row, so this is what the run spends against: it buys the shortfall and "
+                       "nothing more, and spends nothing once the target is met. Defaults to 10.",
+                  example="10"),
     ),
 )
 
