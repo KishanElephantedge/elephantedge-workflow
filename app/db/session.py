@@ -1128,3 +1128,41 @@ def ensure_indexes():
                 created_at TIMESTAMP DEFAULT now()
             )
         """))
+        # Provider router phase 2 (2026-10-07) -- what the router LEARNS, as opposed to the
+        # authored capability facts that live in app/gtm_os/sourcing/registry.py.
+        # provider_taxonomy_values is how we discover a provider's real value space when its
+        # published list is unavailable (Icypeas' 404s), by keeping the values that came back on
+        # rows we already paid for. icp_term_resolutions records how each partner's wording was
+        # read, so a surprising result is traceable and a partner can correct it.
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS provider_taxonomy_values (
+                id SERIAL PRIMARY KEY,
+                provider VARCHAR NOT NULL,
+                atom VARCHAR NOT NULL,
+                value VARCHAR NOT NULL,
+                normalized_value VARCHAR NOT NULL,
+                source VARCHAR NOT NULL,
+                observed_count INTEGER NOT NULL DEFAULT 0,
+                first_seen_at TIMESTAMP DEFAULT now(),
+                last_seen_at TIMESTAMP DEFAULT now(),
+                CONSTRAINT uq_provider_taxonomy_value UNIQUE (provider, atom, normalized_value)
+            )
+        """))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_provider_taxonomy_provider_atom ON provider_taxonomy_values (provider, atom)"))
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS icp_term_resolutions (
+                id SERIAL PRIMARY KEY,
+                tenant_id INTEGER NOT NULL,
+                provider VARCHAR NOT NULL,
+                atom VARCHAR NOT NULL,
+                partner_term VARCHAR NOT NULL,
+                resolved_values TEXT,
+                target_filter VARCHAR,
+                method VARCHAR NOT NULL,
+                validated_count INTEGER,
+                resolved_at TIMESTAMP DEFAULT now(),
+                approved_by_human VARCHAR,
+                CONSTRAINT uq_icp_term_resolution UNIQUE (tenant_id, provider, atom, partner_term)
+            )
+        """))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_icp_term_resolutions_tenant ON icp_term_resolutions (tenant_id)"))

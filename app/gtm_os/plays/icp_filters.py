@@ -169,7 +169,7 @@ NON_BUYER_INDUSTRIES = ["Staffing and Recruiting", "Management Consulting", "Mar
                         "Business Consulting and Services", "Human Resources Services", "IT Services and IT Consulting"]
 
 
-def icypeas_filters_for_icp(icp: dict) -> dict:
+def icypeas_filters_for_icp(icp: dict, db: Session | None = None, tenant_id: int | None = None) -> dict:
     """REAL FIX, 2026-10-04: the partner's own stated `industries` was never read here -- the
     search only ever enforced headcount/geography plus a fixed vendor-exclude list, regardless
     of what industry the partner actually told us to target. Found live against Majji's new
@@ -193,10 +193,28 @@ def icypeas_filters_for_icp(icp: dict) -> dict:
     of the rendered atoms rather than living in the registry: we never want an agency or a
     government body regardless of what any partner asks for.
     """
-    from app.gtm_os.sourcing.atoms import decompose_icp
+    from app.gtm_os.sourcing.atoms import INDUSTRY, decompose_icp
     from app.gtm_os.sourcing.registry import ICYPEAS_FIND_COMPANIES, coverage_for
 
-    filters = dict(coverage_for(ICYPEAS_FIND_COMPANIES, decompose_icp(icp)).filters)
+    icp_atoms = decompose_icp(icp)
+    coverage = coverage_for(ICYPEAS_FIND_COMPANIES, icp_atoms)
+    filters = dict(coverage.filters)
+
+    # Phase 2, 2026-10-07: resolve the partner's words against Icypeas' REAL value space before
+    # searching. "Professional Services" is not a value Icypeas has, so sending it as an industry
+    # enum matched zero companies and cost $0.175 to discover. With a db session we can do better,
+    # for free: use confirmed taxonomy values when we have learned any, and otherwise fall back to
+    # Icypeas' own free-text `keyword` filter rather than a classification that matches nothing.
+    # Without a session (unit tests, pure filter inspection) behaviour is unchanged.
+    if db is not None:
+        from app.gtm_os.sourcing.resolution import resolve_atom
+
+        for atom in icp_atoms.by_key(INDUSTRY):
+            resolved = resolve_atom(db, ICYPEAS_FIND_COMPANIES, atom, tenant_id=tenant_id)
+            if resolved.resolved:
+                filters.pop("industry", None)
+                filters.update(resolved.filter_fragment)
+
     filters.setdefault("location", {"include": ["United States"]})
     industry = dict(filters.get("industry") or {})
     industry["exclude"] = NON_BUYER_INDUSTRIES
@@ -408,7 +426,7 @@ def search_icypeas(db: Session, tenant_id: int, icp: dict, pages: int = 1) -> di
 
     from app.deepline_client import DeeplineError, DeeplineSpendBlocked, execute_tool
 
-    filters = icypeas_filters_for_icp(icp)
+    filters = icypeas_filters_for_icp(icp, db=db, tenant_id=tenant_id)
     fingerprint = hashlib.sha1(json.dumps(filters, sort_keys=True).encode()).hexdigest()[:12]
     cursor = _cursor(db, tenant_id)
     saved = dict(cursor.value or {})
@@ -484,6 +502,21 @@ def search_icypeas(db: Session, tenant_id: int, icp: dict, pages: int = 1) -> di
         leads = raw.get("leads") or []
         token = (raw.get("pagination") or {}).get("token")
         result["companies"] += len(leads)
+
+        # Learn Icypeas' real industry taxonomy from rows we have already paid for. Its published
+        # value list 404s, so this is the only source of truth we have -- and it is free. Each run
+        # makes the next resolution better: the 21 wrong companies on 2026-10-03 are exactly how
+        # we learned that "Law Practice" and "Facilities Services" are real values while
+        # "Professional Services" is not.
+        try:
+            from app.gtm_os.sourcing.atoms import INDUSTRY
+            from app.gtm_os.sourcing.resolution import record_observed_values
+
+            record_observed_values(db, "icypeas", INDUSTRY, [c.get("industry") for c in leads])
+        except OperationalError:
+            db.rollback()
+        except Exception as e:  # noqa: BLE001 -- learning must never break a paid run
+            logger.warning("taxonomy learning skipped: %s: %s", type(e).__name__, e)
 
         # Real bug found live 2026-09-28: a mid-run Neon connection drop (this codebase's own
         # documented recurring failure mode, see app/db/session.py) crashed the per-company loop
@@ -789,7 +822,7 @@ def run_icp_filters(db: Session, tenant_id: int, pages: int = 1, run_cap_usd: fl
         return {"status": "skipped", "reason": "no partner ICP configured"}
     with spend_scope(db, BILLING_TENANT_ID, f"{PLAY}:tenant_{tenant_id}", run_cap_usd=run_cap_usd) as scope:
         coverage = icp_coverage(icp)
-        result = {"status": "completed", "play": PLAY, "tenant_id": tenant_id, "filters": icypeas_filters_for_icp(icp)}
+        result = {"status": "completed", "play": PLAY, "tenant_id": tenant_id, "filters": icypeas_filters_for_icp(icp, db=db, tenant_id=tenant_id)}
         # Every ICP requirement, and what actually happened to it. Reported on every run so a
         # requirement can never again be stored, look configured, and be enforced by nothing --
         # "no dedicated marketing hire" sat in Majji's ICP for days in exactly that state.

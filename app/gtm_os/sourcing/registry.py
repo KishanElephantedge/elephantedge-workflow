@@ -115,6 +115,10 @@ def _icypeas_industry(atom: A.Atom) -> dict:
     return {"industry": {"include": list(atom.value)}}
 
 
+def _icypeas_keyword(atom: A.Atom) -> dict:
+    return {"keyword": {"include": list(atom.value)}}
+
+
 ICYPEAS_FIND_COMPANIES = ProviderEndpoint(
     provider="icypeas",
     endpoint="find-companies",
@@ -147,6 +151,11 @@ ICYPEAS_FIND_COMPANIES = ProviderEndpoint(
                  "free-text `keyword` filter is the fallback ONLY when a concept has no taxonomy "
                  "value, never as a shortcut past resolving one that does.",
         ),
+        # Free-text, documented as an Include/Exclude filter. Registered as its own capability so
+        # resolution can fall back to it ONLY when a concept has no structured filter -- never as
+        # a shortcut past resolving one that does.
+        "keyword": Capability("keyword", SUPPORTED, FREE_TEXT, _icypeas_keyword,
+                              note="Free-text Include/Exclude over company text."),
         # Verified absent: the documented filter set is name, lid, urn, companyId, type, industry,
         # location, headcount, headcountGrowth, revenue, keyword, domain. No department headcount.
         A.DEPARTMENT_HEADCOUNT: Capability(

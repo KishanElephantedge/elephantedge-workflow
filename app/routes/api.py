@@ -6279,6 +6279,45 @@ def run_partner_discovery_route(request: Request, payload: PartnerDiscoveryReque
     return {"batch_id": batch.id, "status": "in_progress", "poll": f"/api/gtm-os/partner/discover/{batch.id}"}
 
 
+@router.get("/gtm-os/partner/icp-preview")
+def preview_partner_icp_routing(request: Request, db: Session = Depends(get_db)):
+    """What WOULD be searched for this partner, and what happens to each of their requirements.
+
+    Costs nothing: no provider call, no spend reservation. Added 2026-10-07 because every way of
+    answering "what will this ICP actually search for?" previously required triggering a real,
+    paid run -- which is how $0.175 was spent discovering that "Professional Services" matched
+    zero companies. Resolution and coverage are both free, so they should be inspectable for free.
+    """
+    tenant_id = _resolve_tenant_id(request)
+    icp_param = db.query(Parameter).filter(Parameter.tenant_id == tenant_id,
+                                           Parameter.key == PARTNER_ICP_PARAMETER_KEY).first()
+    if not icp_param or not icp_param.value:
+        raise HTTPException(status_code=400, detail="No ICP configured for this tenant yet.")
+
+    from app.gtm_os.plays.icp_filters import icp_coverage, icypeas_filters_for_icp
+    from app.gtm_os.sourcing.atoms import decompose_icp
+
+    icp = icp_param.value
+    coverage = icp_coverage(icp)
+    return {
+        "tenant_id": tenant_id,
+        "requirements": [
+            {"requirement": a.name, "operator": a.operator, "value": a.value,
+             "necessity": a.necessity, "partner_wording": a.partner_term}
+            for a in decompose_icp(icp).atoms
+        ],
+        "coverage": {
+            "enforced_by_provider": [a.name for a in coverage.enforced],
+            "checked_after_fetch": [a.name for a in coverage.residual],
+            "needs_provider_research": [a.name for a in coverage.unverified],
+            "not_supported_here": [a.name for a in coverage.unsupported],
+            "unenforced_must_haves": [a.name for a in coverage.must_have_gap],
+        },
+        "filters_that_would_be_sent": icypeas_filters_for_icp(icp, db=db, tenant_id=tenant_id),
+        "notes_not_enforced_as_filters": icp.get("notes"),
+    }
+
+
 @router.post("/gtm-os/partner/icp-filters-run")
 def run_partner_icp_filters_route(request: Request, pages: int = 1, run_cap_usd: float = 0.25, db: Session = Depends(get_db)):
     """Runs Play F (ICP-filter LinkedIn people search -- no signal, filters built straight from
