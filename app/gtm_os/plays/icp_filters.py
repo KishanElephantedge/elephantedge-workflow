@@ -252,81 +252,19 @@ def icp_coverage(icp: dict):
 
 
 def _resolve_decision_makers_batch(db: Session, tenant_id: int, companies: list, titles: list[str]) -> dict:
-    """Real fix, 2026-09-28: the free Jobo leadership lookup found a usable (non-Crunchbase)
-    LinkedIn URL for 0 of 25 real, exact-headcount-matched companies in the first live test of
-    search_icypeas() -- Jobo's leadership index rarely has one. One HarvestAPI LinkedIn people
-    search covers up to 50 companies at once ($0.07/page of 25 results), so this is paid but
-    still cheap and bounded -- the same batched pattern already proven for the hiring play
-    (app/gtm_os/plays/hiring.py's _harvest_decision_makers), reimplemented here without
-    requiring an already-created GtmLead (this play is company-first, no signal, so there is
-    no lead yet at the point a decision maker needs resolving). Returns {company_id: Contact
-    or None}. Never raises on a budget refusal or provider error -- stops paging/chunking at
-    that point and returns whatever was already found for the pages actually paid for, rather
-    than discarding it (see the real bug this fixed, in the comment below)."""
-    from app import harvestapi
-    from app.gtm_os.plays.hiring import _norm
-    from app.phases.decision_maker_reasoning import select_best_decision_makers
+    """Phase 9, 2026-10-07: now a thin wrapper over the SHARED resolver
+    (app/gtm_os/sourcing/decision_maker.py), which hiring.py's own decision-maker resolution also
+    calls. This play used to have its own copy of this logic -- see that module's docstring for
+    the two real bugs that drifted between the two copies before they were unified. Kept as a
+    named function here (rather than inlining the shared call at each site in this file) so the
+    rest of this play's code and its existing tests do not need to change shape."""
+    from app.gtm_os.sourcing.decision_maker import resolve_decision_makers_batch
 
-    # Real bug found live 2026-09-28: batching MULTIPLE company LinkedIn URLs together in one
-    # currentCompanies request silently returned 0 people, even for 3 real, correctly-sized
-    # companies with confirmed active LinkedIn pages -- while the identical request using
-    # company NAMES instead returned real matches (David Lynch, CEO of Klir; Ewen Rainer, CEO
-    # of Doorstead), and a SINGLE url also worked. So multi-URL batching specifically is what's
-    # broken, not the search or the matching logic. Switched to names.
-    #
-    # Trade-off, not hidden: name search is a broader match (returns unrelated companies with
-    # a similar name worldwide -- "Klir" also matched "Klir Online", "KLIR Sky, Ltd.", etc. in
-    # the same live test), so a smaller batch size here than the URL-based hiring play uses,
-    # to keep real matches from being buried in noise within the pages actually checked.
-    from app.deepline_client import DeeplineError, DeeplineSpendBlocked
-
-    out: dict = {}
-    budget_stopped = False
-    for start in range(0, len(companies), NAME_BATCH_SIZE):
-        if budget_stopped:
-            break
-        chunk = [c for c in companies[start:start + NAME_BATCH_SIZE] if c.name]
-        if not chunk:
-            continue
-        by_universal = {harvestapi.universal_name(c.linkedin_url): c for c in chunk if c.linkedin_url}
-        by_name = {_norm(c.name): c for c in chunk}
-        people: dict[int, list] = {}
-        for page in range(1, NAME_SEARCH_PAGES + 1):
-            # Real bug found live 2026-09-28: a budget/provider error on a LATER page used to
-            # crash the whole function, discarding whatever EARLIER pages in this same chunk
-            # had already been paid for and found -- the exact "buy it, then throw it away"
-            # pattern this whole build has been fixing everywhere else. Now: stop paging, but
-            # still use whatever was already found for this chunk below.
-            try:
-                found = harvestapi.search_leads(page=page, currentCompanies=",".join(c.name for c in chunk),
-                                                currentJobTitles=",".join(titles))
-            except (DeeplineSpendBlocked, DeeplineError):
-                budget_stopped = True
-                break
-            for person in found:
-                target = by_name.get(_norm(person.get("company_name"))) or by_universal.get(harvestapi.universal_name(person.get("company_linkedin_url")))
-                if target is not None and person.get("linkedin_url"):
-                    people.setdefault(target.id, []).append(person)
-            if len(found) < 25 or all(c.id in people for c in chunk):
-                break
-        for company in chunk:
-            candidates = people.get(company.id) or []
-            if not candidates:
-                out[company.id] = None
-                continue
-            named = {f"{p['first_name'] or ''} {p['last_name'] or ''}".strip(): p for p in candidates}
-            picks = select_best_decision_makers(db, tenant_id, company, [{"name": n, "title": p["title"]} for n, p in named.items()], 1)
-            pick = named.get(picks[0]["name"]) if picks else None
-            if pick is None:
-                out[company.id] = None
-                continue
-            contact = Contact(company_id=company.id, first_name=pick["first_name"], last_name=pick["last_name"], title=pick["title"],
-                              linkedin_url=pick["linkedin_url"], thread_role="icp_filter_decision_maker",
-                              matched_title_reasoning=f"HarvestAPI LinkedIn search (batched); agent: {picks[0].get('reasoning') or ''}"[:1000])
-            db.add(contact)
-            db.commit()
-            out[company.id] = contact
-    return out
+    return resolve_decision_makers_batch(
+        db, tenant_id, companies, titles,
+        default_thread_role="icp_filter_decision_maker",
+        reasoning_label="HarvestAPI LinkedIn search (batched)",
+    )
 
 
 def _create_icypeas_lead(db: Session, tenant_id: int, key: str, company: Company, contact: Contact,

@@ -238,46 +238,41 @@ def _norm(name: str | None) -> str:
 
 
 def _harvest_decision_makers(db: Session, tenant_id: int, pairs: list) -> dict:
-    """One LinkedIn people search for up to 50 companies at once ($0.07 a page of 25), then the
-    agent picks the buyer at each company from the people found. HarvestAPI matches companies by
-    NAME, so every person is checked back against the company they were searched for.
-    Returns {company_id: Contact or None}. Raises DeeplineSpendBlocked when the budget refuses."""
-    from app import harvestapi
-    from app.phases.decision_maker_reasoning import select_best_decision_makers
+    """Phase 9, 2026-10-07: now a thin wrapper over the SHARED resolver
+    (app/gtm_os/sourcing/decision_maker.py). This used to be a separate implementation that
+    batched companies by LinkedIn URL -- a real, confirmed-live bug: batching MULTIPLE company
+    URLs together in one currentCompanies request silently returns ZERO people, even for real,
+    correctly-sized companies with active LinkedIn pages. icp_filters.py's own copy of this logic
+    hit and fixed that exact bug on 2026-09-28/10-04 by switching to company NAME batching; this
+    play's copy never got the fix, so it has almost certainly been returning 0 decision makers in
+    production the same way icp_filters.py silently was before its fix. It also never adopted the
+    OTHER fix made alongside that one: a budget/provider error on a later page used to crash the
+    whole batch here, discarding whatever earlier pages had already been paid for and found.
 
-    out: dict = {}
-    for start in range(0, len(pairs), LEADS_PER_CALL):
-        chunk = pairs[start:start + LEADS_PER_CALL]
-        by_universal = {harvestapi.universal_name(c.linkedin_url): (lead, c) for lead, c in chunk}
-        by_name = {_norm(c.name): (lead, c) for lead, c in chunk}
-        people: dict[int, list] = {}
-        for page in (1, 2):
-            found = harvestapi.search_leads(page=page, currentCompanies=",".join(c.linkedin_url for _, c in chunk),
-                                            currentJobTitles=",".join(DECISION_MAKER_TITLES))
-            for person in found:
-                target = by_universal.get(harvestapi.universal_name(person.get("company_linkedin_url"))) or by_name.get(_norm(person.get("company_name")))
-                if target and person.get("linkedin_url"):
-                    people.setdefault(target[1].id, []).append(person)
-            if len(found) < 25 or all(c.id in people for _, c in chunk):
-                break
-        for lead, company in chunk:
-            candidates = people.get(company.id) or []
-            if not candidates:
-                out[company.id] = None
-                continue
-            named = {f"{p['first_name'] or ''} {p['last_name'] or ''}".strip(): p for p in candidates}
-            picks = select_best_decision_makers(db, tenant_id, company, [{"name": n, "title": p["title"]} for n, p in named.items()], 1,
-                                                offering_name=(lead.qualifier_output or {}).get("matched_offering"))
-            pick = named.get(picks[0]["name"]) if picks else None
-            if pick is None:
-                out[company.id] = None
-                continue
-            contact = Contact(company_id=company.id, first_name=pick["first_name"], last_name=pick["last_name"], title=pick["title"],
-                              linkedin_url=pick["linkedin_url"], thread_role=picks[0].get("thread_role") or "decision_maker",
-                              matched_title_reasoning=f"HarvestAPI LinkedIn search; agent: {picks[0].get('reasoning') or ''}"[:1000])
-            db.add(contact)
-            db.commit()
-            out[company.id] = contact
+    Returns {company_id: Contact or None}. Raises DeeplineSpendBlocked -- unlike the shared
+    resolver, which never raises -- ONLY because this function's own caller (find_contacts, just
+    below) already has an existing, tested contract of catching that exception itself and
+    returning a clean {"stopped": "budget: ..."} response; changing that contract is out of scope
+    for this fix. The shared resolver's own no-raise behavior already protects what matters most
+    (earlier pages/chunks are never discarded by a later failure); this re-raises afterward purely
+    to preserve find_contacts' existing external behavior unchanged."""
+    from app.deepline_client import DeeplineSpendBlocked
+    from app.gtm_os.sourcing.decision_maker import resolve_decision_makers_batch
+
+    companies = [c for _, c in pairs]
+    offering_name_for = {c.id: (lead.qualifier_output or {}).get("matched_offering") for lead, c in pairs}
+
+    out = resolve_decision_makers_batch(
+        db, tenant_id, companies, DECISION_MAKER_TITLES,
+        default_thread_role="decision_maker", reasoning_label="HarvestAPI LinkedIn search",
+        offering_name_for=offering_name_for,
+    )
+    # Preserve this function's existing contract: a budget refusal anywhere in the batch still
+    # surfaces as DeeplineSpendBlocked to find_contacts, which already handles it. The shared
+    # resolver itself never discards what it already found before that point -- only this
+    # call site's external contract is being kept the same, not its internal safety.
+    if len(out) < len(companies):
+        raise DeeplineSpendBlocked("decision-maker batch stopped early (budget or provider error)")
     return out
 
 

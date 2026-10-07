@@ -316,7 +316,7 @@ def test_search_icypeas_falls_back_to_the_paid_batched_resolver_when_jobo_misses
         {"first_name": "Sam", "last_name": "Lee", "linkedin_url": "https://linkedin.com/in/sam-lee", "title": "CEO",
          "company_name": "Widgetco", "company_linkedin_url": "https://www.linkedin.com/company/co1/"}] if page == 1 else []))
     monkeypatch.setattr(dmr, "select_best_decision_makers",
-                        lambda db_, t, company, cands, n: [{"name": cands[0]["name"], "thread_role": "founder_ceo", "reasoning": "CEO"}])
+                        lambda db_, t, company, cands, n, offering_name=None: [{"name": cands[0]["name"], "thread_role": "founder_ceo", "reasoning": "CEO"}])
 
     with spend_scope(db, BILLING, "icp_filters", run_cap_usd=0.5):
         result = play.search_icypeas(db, PARTNER, ICP)
@@ -541,7 +541,7 @@ def test_resolve_decision_makers_batch_keeps_earlier_pages_when_a_later_page_is_
 
     monkeypatch.setattr(h, "search_leads", flaky_search)
     monkeypatch.setattr(dmr, "select_best_decision_makers",
-                        lambda db_, t, comp, cands, n: [{"name": cands[0]["name"], "thread_role": "founder_ceo", "reasoning": "CEO"}])
+                        lambda db_, t, comp, cands, n, offering_name=None: [{"name": cands[0]["name"], "thread_role": "founder_ceo", "reasoning": "CEO"}])
 
     with spend_scope(db, BILLING, "icp_filters", run_cap_usd=0.5):
         resolved = play._resolve_decision_makers_batch(db, PARTNER, [company], ["CEO"])

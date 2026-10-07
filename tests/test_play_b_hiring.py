@@ -276,7 +276,10 @@ def test_harvest_contacts_one_search_for_many_companies_agent_picks(db, monkeypa
     with spend_scope(db, TENANT, "hiring", run_cap_usd=0.5):
         result = play.find_contacts(db, TENANT, channels=["linkedin"])
 
-    assert len(calls) == 1 and "alpha" in calls[0]["currentCompanies"] and "beta" in calls[0]["currentCompanies"]
+    # Phase 9, 2026-10-07: batched by company NAME now, not URL -- a confirmed live bug where
+    # batching multiple company LinkedIn URLs together in one currentCompanies request silently
+    # returned zero people. "Alpha,Beta" (names), not "alpha,beta" (URL slugs).
+    assert len(calls) == 1 and "Alpha" in calls[0]["currentCompanies"] and "Beta" in calls[0]["currentCompanies"]
     assert (result["found"], result["missing"]) == (1, 1)
     alpha_lead = next(l for l in db.query(GtmLead) if db.get(Company, l.company_id).name == "Alpha")
     assert db.get(Contact, alpha_lead.contact_id).linkedin_url == "https://linkedin.com/in/ann"  # never Ned at a look-alike company
@@ -319,3 +322,86 @@ def test_harvest_discovery_survives_a_write_failure_mid_run_and_retries_that_com
     seen = db.query(Parameter).filter(Parameter.key == play.HARVEST_SEEN_KEY).one()
     assert seen.value["first"] == "kept" and seen.value["third"] == "kept"
     assert "second" not in seen.value, "the failed company is not marked checked, so it's retried"
+
+
+def test_harvest_decision_makers_keeps_earlier_pages_when_a_later_page_is_budget_blocked(db, monkeypatch):
+    """Phase 9, 2026-10-07: this play's own decision-maker resolver never had the fix
+    icp_filters.py's got on 2026-09-28 -- a budget refusal on a later page used to crash the whole
+    batch here, discarding whatever earlier pages had already been paid for and found. Now routed
+    through the shared resolver (app/gtm_os/sourcing/decision_maker.py), which already keeps them."""
+    import app.deepline_client as dc
+    import app.harvestapi as h
+    import app.phases.decision_maker_reasoning as dmr
+
+    company = _company(db, "Good", "good.io")
+    company.linkedin_url = "https://www.linkedin.com/company/good/"
+    db.commit()
+    lead = GtmLead(tenant_id=TENANT, play="hiring", lead_key=f"company:{company.id}",
+                   state="qualified", company_id=company.id, qualifier_output={"matched_offering": "Sales OS"})
+    db.add(lead)
+    db.commit()
+
+    def flaky_search(page=1, **f):
+        if page == 1:
+            return [{"first_name": "Sam", "last_name": "Lee", "linkedin_url": "https://linkedin.com/in/sam-lee",
+                     "title": "CEO", "company_name": "Good", "company_linkedin_url": "https://www.linkedin.com/company/good/"}]
+        raise dc.DeeplineSpendBlocked("run cap reached")
+
+    monkeypatch.setattr(h, "search_leads", flaky_search)
+    monkeypatch.setattr(dmr, "select_best_decision_makers",
+                        lambda db_, t, comp, cands, n, offering_name=None: [
+                            {"name": cands[0]["name"], "thread_role": "founder_ceo", "reasoning": "CEO"}])
+
+    # A second company in the SAME batch (both well under NAME_BATCH_SIZE) with no candidates on
+    # page 1. Both companies are still in the one chunk the page-2 failure interrupted, so the
+    # shared resolver processes both with whatever partial data page 1 already gave it -- no
+    # company is skipped entirely, so this must NOT raise. (A genuinely skipped LATER CHUNK, which
+    # this function's own docstring says re-raises to preserve find_contacts' existing contract,
+    # would need more than NAME_BATCH_SIZE companies to reproduce -- a different scenario.)
+    other = _company(db, "Other", "other.io")
+    other.linkedin_url = "https://www.linkedin.com/company/other-co/"
+    db.commit()
+    other_lead = GtmLead(tenant_id=TENANT, play="hiring", lead_key=f"company:{other.id}", state="qualified",
+                         company_id=other.id)
+    db.add(other_lead)
+    db.commit()
+
+    with spend_scope(db, TENANT, "hiring", run_cap_usd=0.5):
+        result = play._harvest_decision_makers(db, TENANT, [(lead, company), (other_lead, other)])
+
+    # The page-1 result for "Good" was already committed inside the shared resolver before the
+    # page-2 failure -- this is the actual bug: it used to be discarded by the crash that followed.
+    contact = db.query(Contact).filter(Contact.company_id == company.id).one()
+    assert contact.linkedin_url == "https://linkedin.com/in/sam-lee"
+    assert result[company.id].id == contact.id
+    assert result[other.id] is None   # genuinely attempted (same chunk), genuinely found nothing
+
+
+def test_harvest_decision_makers_reraises_when_a_later_chunk_is_never_attempted(db, monkeypatch):
+    """A genuinely skipped LATER CHUNK (beyond NAME_BATCH_SIZE=15 companies, so budget_stopped
+    breaks the outer loop before that chunk is ever sliced/processed) still surfaces as
+    DeeplineSpendBlocked -- find_contacts already has a tested, working contract for that."""
+    import app.deepline_client as dc
+    import app.harvestapi as h
+    import app.phases.decision_maker_reasoning as dmr
+
+    pairs = []
+    for i in range(16):   # one more than NAME_BATCH_SIZE -- guarantees a second chunk
+        c = _company(db, f"Co{i}", f"co{i}.io")
+        c.linkedin_url = f"https://www.linkedin.com/company/co{i}/"
+        db.commit()
+        lead = GtmLead(tenant_id=TENANT, play="hiring", lead_key=f"company:{c.id}", state="qualified",
+                       company_id=c.id)
+        db.add(lead)
+        db.commit()
+        pairs.append((lead, c))
+
+    def always_blocked(page=1, **f):
+        raise dc.DeeplineSpendBlocked("run cap reached")
+
+    monkeypatch.setattr(h, "search_leads", always_blocked)
+    monkeypatch.setattr(dmr, "select_best_decision_makers", lambda *a, **k: [])
+
+    with spend_scope(db, TENANT, "hiring", run_cap_usd=0.5):
+        with pytest.raises(dc.DeeplineSpendBlocked):
+            play._harvest_decision_makers(db, TENANT, pairs)
