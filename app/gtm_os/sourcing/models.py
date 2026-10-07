@@ -16,7 +16,7 @@ Why this has to be stored rather than recomputed per run:
 """
 from datetime import datetime
 
-from sqlalchemy import Column, DateTime, Integer, String, Text, UniqueConstraint
+from sqlalchemy import Column, DateTime, Float, Integer, String, Text, UniqueConstraint
 
 from app.db.models import Base
 
@@ -74,3 +74,57 @@ class IcpTermResolution(Base):
     validated_count = Column(Integer, nullable=True)
     resolved_at = Column(DateTime, default=datetime.utcnow)
     approved_by_human = Column(String, nullable=True)
+
+
+class IcpExclusion(Base):
+    """A value this partner's runs keep rejecting, pushed back into the provider query.
+
+    Per tenant AND per provider: "Public Safety" may be a real Icypeas industry label and spelled
+    differently (or absent) at another provider, so an exclusion learned against one cannot be
+    assumed valid at another.
+
+    `rejection_count` is the evidence threshold -- one bad company is not a verdict on its whole
+    industry. `suppressed_at` is the human override for an inference we got wrong, which keeps the
+    evidence while stopping it being acted on.
+    """
+
+    __tablename__ = "icp_exclusions"
+    __table_args__ = (UniqueConstraint("tenant_id", "provider", "atom", "normalized_value",
+                                       name="uq_icp_exclusion"),)
+
+    id = Column(Integer, primary_key=True)
+    tenant_id = Column(Integer, nullable=False, index=True)
+    provider = Column(String, nullable=False)
+    atom = Column(String, nullable=False)
+    value = Column(String, nullable=False)
+    normalized_value = Column(String, nullable=False)
+    rejection_count = Column(Integer, nullable=False, default=0)
+    reason = Column(String, nullable=True)
+    first_rejected_at = Column(DateTime, default=datetime.utcnow)
+    last_rejected_at = Column(DateTime, default=datetime.utcnow)
+    suppressed_at = Column(DateTime, nullable=True)
+
+
+class RouteAttempt(Base):
+    """One provider call and how it ended, in the closed vocabulary of outcomes.py.
+
+    This is the memory the planner ranks by: a provider that just failed three times is skipped
+    rather than retried, and a provider nobody has called is not assumed broken. It is also the
+    audit trail for "why did this partner get these companies from that tool today".
+
+    Health is OBSERVED here rather than configured, which is what separates an adaptive router
+    from a fixed waterfall -- but it only ever reorders candidates. It never replaces the free
+    pre-flight checks, because how a provider behaved an hour ago is not evidence about now.
+    """
+
+    __tablename__ = "route_attempts"
+
+    id = Column(Integer, primary_key=True)
+    tenant_id = Column(Integer, nullable=False, index=True)
+    provider = Column(String, nullable=False, index=True)
+    endpoint = Column(String, nullable=True)
+    outcome = Column(String, nullable=False)
+    detail = Column(Text, nullable=True)
+    rows = Column(Integer, nullable=True)
+    cost_usd = Column(Float, nullable=True)
+    attempted_at = Column(DateTime, default=datetime.utcnow, index=True)

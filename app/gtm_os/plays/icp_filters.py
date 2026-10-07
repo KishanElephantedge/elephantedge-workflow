@@ -217,7 +217,22 @@ def icypeas_filters_for_icp(icp: dict, db: Session | None = None, tenant_id: int
 
     filters.setdefault("location", {"include": ["United States"]})
     industry = dict(filters.get("industry") or {})
-    industry["exclude"] = NON_BUYER_INDUSTRIES
+    # Our standing policy excludes, plus whatever THIS partner's own runs have repeatedly
+    # rejected. The partner's include list is protected: their stated intent outranks our
+    # inference, so a value they asked for is never excluded by something we learned.
+    excludes = list(NON_BUYER_INDUSTRIES)
+    if db is not None and tenant_id is not None:
+        try:
+            from app.gtm_os.sourcing.atoms import INDUSTRY as _INDUSTRY
+            from app.gtm_os.sourcing.exclusions import learned_exclusions
+
+            protected = set(icp.get("industries") or []) | set(industry.get("include") or [])
+            for value in learned_exclusions(db, tenant_id, "icypeas", _INDUSTRY, protected=protected):
+                if value not in excludes:
+                    excludes.append(value)
+        except Exception as e:  # noqa: BLE001 -- never block a run on the exclusion lookup
+            logger.warning("learned exclusions skipped: %s: %s", type(e).__name__, e)
+    industry["exclude"] = excludes
     filters["industry"] = industry
     filters["type"] = {"exclude": NON_COMPANY_TYPES}
     return filters
@@ -357,6 +372,17 @@ def _process_icypeas_company(db: Session, tenant_id: int, co: dict, known_leads:
         db.add(GtmLead(tenant_id=tenant_id, play=PLAY, lead_key=key, state=STATE_REJECTED,
                        qualifier_reason=f"government/education body, not a real buyer: {name!r} (industry: {industry_label!r})"))
         db.commit()
+        # Push this back into the QUERY so we stop paying for the category. Icypeas bills per
+        # returned result, so a rejection we only apply locally is a row we bought for nothing --
+        # and the next run buys it again. See exclusions.py for the two safeguards.
+        try:
+            from app.gtm_os.sourcing.atoms import INDUSTRY
+            from app.gtm_os.sourcing.exclusions import record_rejection
+
+            record_rejection(db, tenant_id, "icypeas", INDUSTRY, industry_label,
+                             reason="government/education body")
+        except Exception as e:  # noqa: BLE001 -- learning must never break a paid run
+            logger.warning("exclusion learning skipped: %s: %s", type(e).__name__, e)
         return "government_or_education"
 
     company = (db.query(Company).join(Batch, Company.batch_id == Batch.id)
@@ -903,3 +929,15 @@ def run_icp_filters(db: Session, tenant_id: int, pages: int = 1, run_cap_usd: fl
         result["qualify"] = qualify(db, tenant_id, icp)
         result["spent_usd"] = round(scope.spent_usd, 4)
     return result
+
+
+# Register this play's Icypeas search as a routable adapter (2026-10-07). Adding another provider
+# is now exactly this: write its search function and register it. The ranking, failover and
+# recording in planner.py never change, and no call site learns a new provider's name.
+def _register_sourcing_adapters() -> None:
+    from app.gtm_os.sourcing.planner import register_adapter
+
+    register_adapter("icypeas", lambda db, tenant_id, icp, **kw: search_icypeas(db, tenant_id, icp, **kw))
+
+
+_register_sourcing_adapters()

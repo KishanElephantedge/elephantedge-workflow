@@ -1166,3 +1166,33 @@ def ensure_indexes():
             )
         """))
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_icp_term_resolutions_tenant ON icp_term_resolutions (tenant_id)"))
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS icp_exclusions (
+                id SERIAL PRIMARY KEY,
+                tenant_id INTEGER NOT NULL,
+                provider VARCHAR NOT NULL,
+                atom VARCHAR NOT NULL,
+                value VARCHAR NOT NULL,
+                normalized_value VARCHAR NOT NULL,
+                rejection_count INTEGER NOT NULL DEFAULT 0,
+                reason VARCHAR,
+                first_rejected_at TIMESTAMP DEFAULT now(),
+                last_rejected_at TIMESTAMP DEFAULT now(),
+                suppressed_at TIMESTAMP,
+                CONSTRAINT uq_icp_exclusion UNIQUE (tenant_id, provider, atom, normalized_value)
+            )
+        """))
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS route_attempts (
+                id SERIAL PRIMARY KEY,
+                tenant_id INTEGER NOT NULL,
+                provider VARCHAR NOT NULL,
+                endpoint VARCHAR,
+                outcome VARCHAR NOT NULL,
+                detail TEXT,
+                rows INTEGER,
+                cost_usd DOUBLE PRECISION,
+                attempted_at TIMESTAMP DEFAULT now()
+            )
+        """))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_route_attempts_provider_time ON route_attempts (provider, attempted_at)"))
