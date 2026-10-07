@@ -1,8 +1,8 @@
 # Handover — read this first if you are a new session
 
-*Last updated 2026-10-07. Written so that nothing below has to be re-explained from scratch.
-If you are a new Claude session: read `CLAUDE.md` for how to work here, then this file for where
-things actually stand, then the two design docs it points at.*
+*Last updated 2026-10-07 (end of day). Written so that nothing below has to be re-explained from
+scratch. If you are a new Claude session: read `CLAUDE.md` for how to work here, then this file
+for where things actually stand, then the two design docs it points at.*
 
 ---
 
@@ -12,10 +12,28 @@ Elephant Edge runs an autonomous GTM pipeline for itself **and as a back office 
 today ~10–15, growing. Each partner has their own ICP, their own enabled features, and their own
 data. The product is the platform; nothing may be built for one named partner.
 
-Right now we are part-way through replacing the hardcoded, single-provider account-sourcing layer
-with a **provider router** (design: `provider-router-design.md`). Phases 1 and 2 are live. Phase 3
-is next. Separately, a **feature registry** for per-partner feature configuration is agreed and
-not yet started.
+**The provider router (design: `provider-router-design.md`) is fully built — all 9 phases.**
+What a hardcoded, single-provider Icypeas search used to do is now: decompose the partner's ICP
+into atoms → resolve their wording against a provider's real taxonomy for free → check our own
+shared account pool before buying anything → buy only the shortfall → verify the actual rows
+against what was asked for → route through a ranked, failover-capable planner → record and learn
+from every attempt → one decision-maker resolution path shared by every play. Icypeas is still the
+only *executable* adapter (Prospeo/Apollo capabilities are registered but marked `unverified`,
+deliberately not promoted from documentation alone) — but the machinery that will fail over to a
+second provider the moment one is verified is real and tested, not aspirational.
+
+**The feature registry is also fully built.** Per-partner features (webinars, email campaigns,
+LinkedIn content…) are now configuration + an admin screen, not hardcoded tenant-id branches. The
+one real violation found (`MAJJI_EMAIL_CAMPAIGNS`, `_require_majji_tenant()`) is gone.
+
+**Push status matters here — it's a mix, not all-or-nothing.** Phases 1–4 of the router and the
+whole feature registry ARE already live (through commit `d770a18`). Phases 5–9 (pool, planner
++excludes, composition, scorecards, the shared decision-maker resolver) are committed locally but
+**not pushed** — the user's instruction partway through this session was "we will push all together
+later," so everything from the pool phase onward is sitting locally. See §4 for the exact commit
+list and §5 for what's genuinely blocked until that push happens. **Check `git log origin/main -1`
+against local `HEAD` before assuming what's live** — do not trust this paragraph's commit hash once
+time has passed; re-verify.
 
 ---
 
@@ -106,6 +124,70 @@ and Explorium/adaptive-routing patterns.
 - `GET /gtm-os/partner/icp-preview` — **free**: shows the filters that would be sent and what
   happens to each requirement, with no provider call. Use this instead of a paid run to inspect.
 
+### Phase 3 — quota-driven fetching (live, commit `8e440d8`)
+- `app/gtm_os/sourcing/quota.py` — buy the partner's shortfall against their own configurable
+  daily target (`accounts` feature's `daily_account_target`) and nothing more. Page size IS the
+  spend decision for a per-result provider. A target already met costs **$0**, where before it
+  cost $0.175 to re-discover that every single day.
+- Decision-maker resolution (the separately-billed, more expensive step) is capped at the same
+  remaining need, not the full page — surplus companies stay persisted for a later run.
+
+### Phase 4 — typed outcomes + sample verification (live, commit `d770a18`)
+- `app/gtm_os/sourcing/outcomes.py` — a closed set of outcomes (`ok`, `empty_validated`,
+  `empty_suspect`, `quality_fail`, `schema_error`, `auth_error`, `rate_limited`, `unavailable`,
+  `budget_blocked`), each with one documented policy (retry? switch provider? count against
+  health?) — the outcome drives the next move, not an exception string.
+- `app/gtm_os/sourcing/verification.py` — judges the actual returned ROWS against the ICP, not
+  the filter we believe we sent. Replays the real 2026-10-03 batch (21 hospitals/law firms/a fire
+  department) and catches it on row 1, not row 21. **The one asymmetry that matters**: missing
+  data is never a violation — a row only counts against a requirement when the provider gave a
+  value AND it clearly breaks it. Industry is only judged when the search actually used a real
+  taxonomy value, never when it fell back to free-text keyword (that path never promised a
+  classification).
+
+### Local-only from here — NOT pushed (user: "we will push all together later")
+
+- **Excludes + planner** (commit `70a21cb`) — `app/gtm_os/sourcing/exclusions.py` pushes a
+  repeatedly-rejected value (government bodies, etc.) back into the provider QUERY so it stops
+  being billable at all, with two safeguards (repetition required; the partner's own include list
+  is never excluded by our inference). `app/gtm_os/sourcing/planner.py` ranks every registered
+  provider for an ICP (coverage first, then observed health, then cost) and auto-switches on a
+  typed outcome whose policy says to — bounded (`max_providers`), with a per-provider circuit
+  breaker. **Icypeas is still the only executable adapter** — Prospeo/Apollo are registered but
+  their capabilities are `unverified`, deliberately not promoted from docs alone.
+- **Free provider-schema discovery** (commit `f763794`) — `deepline tools search` / `tools
+  describe` wired up as free, read-only admin routes (`/gtm-os/admin/providers/catalog`,
+  `/schema`, `/registry`). Registering a new provider no longer requires spending to discover its
+  real filter names — three admin-only routes do it for $0. **Needs a push to actually use**: the
+  working Deepline key lives on Render; the local CLI key is invalid.
+- **Phase 5 — account pool** (commit `b61dc20`) — `company_pool` + `pool_deliveries`: a company
+  bought for one partner is free for the next whose ICP also matches it (headcount/revenue/geo
+  only — deliberately NOT industry, see the module's own docstring for why). Positive evidence
+  required (unknown headcount never "matches"), 30-day freshness window.
+- **Phase 7 — composition** (commit `981aadc`) — `app/gtm_os/sourcing/compose.py`. Majji's "no
+  dedicated marketing hire" is now actually **enforced**, for the first time, using the free Jobo
+  leadership list already fetched for decision-maker resolution — no new paid integration. Same
+  asymmetry as phase 4: a title found there disconfirms the requirement; an absence never confirms
+  it (Jobo's index is partial). Also `intersect()` for two-provider composition, identity-keyed.
+- **Phase 8 — scorecards + drift detection** (commit `f641db0`) — closed a real gap first:
+  `run_icp_filters` (the actual production entry point) was calling `search_icypeas()` directly,
+  bypassing the planner entirely — `route_attempts` had been empty in production the whole time.
+  Now wired through `planner.execute()`. Scorecards are per **ICP shape**
+  (`atoms.fingerprint()`), not just per provider — a provider can be healthy on average while one
+  specific filter shape has quietly broken, which is exactly what happened on 2026-10-05. Drift
+  detection only flags a shape that reliably worked and has since collapsed; the planner's own
+  sort key is extracted into a standalone, directly-testable function proving history can only
+  break ties between equal coverage, never substitute for it.
+- **Phase 9 — one decision-maker path, not two** (commit `653bea2`) — `app/gtm_os/sourcing/
+  decision_maker.py`. `icp_filters.py` and `hiring.py` each had their own batched HarvestAPI
+  decision-maker resolver and had drifted: icp_filters.py's was fixed (2026-09-28/10-04) for the
+  real multi-URL-batching bug; **hiring.py's never was, and was almost certainly returning 0
+  decision-makers in production silently**. Both now call one shared resolver. Fixed two real
+  bugs in `hiring.py` in one move: the URL-vs-name batching bug, and the "later page fails, earlier
+  already-paid pages get discarded" bug.
+
+Test suite: **392 passing** (was 258 before this session).
+
 ### Bugs found and fixed today
 | Bug | How it was found |
 |---|---|
@@ -129,32 +211,42 @@ and Explorium/adaptive-routing patterns.
 
 ## 5. Open items
 
-**Agreed, not started — feature registry + admin feature config.** Partners get different features
-(webinars, email marketing, LinkedIn content) and sometimes the same feature configured
-differently. Decision: **configuration over code, adapters over branches.**
-- Three layers: `enabled_features` flag (exists) → per-tenant `Parameter` config (exists, 22 uses)
-  → **feature registry** declaring each feature's required config keys/credentials (missing).
-- Configuration UI goes in **Elephant Edge V2 admin → Settings, per partner** for now. Partner
-  self-serve comes later, when the model becomes subscription-based.
-- Build features **as requirements actually arrive**, then offer them to everyone as add-ons. Do
-  not build speculatively.
-- **The one hardcoding violation to remove**: `MAJJI_EMAIL_CAMPAIGNS` and `_require_majji_tenant()`
-  in `api.py` (~line 6978). The config key `smartlead_campaign_id` already exists in
-  `app/outreach/smartlead.py` — the route simply didn't use it.
+**Feature registry: DONE, live** (`e479e4a`, `0cf3a84`, pushed). `app/gtm_os/features/registry.py`
+declares each feature's required config/credentials; `app/gtm_os/features/config.py` computes
+readiness; admin routes read/write any partner's config; `synefi/dashboard` has a "Partner
+Features" tab in V2 Settings generated from the backend's own schema. `MAJJI_EMAIL_CAMPAIGNS` /
+`_require_majji_tenant()` are gone — email campaigns are now `smartlead_campaign_ids` config,
+gated on the `email_campaigns` feature flag, usable by any partner.
 
-**Provider router, remaining phases** (see design doc §12): 3 quota-driven fetching → 4 typed
-outcomes + sample verification → 5 account pool → 6 planner/failover → 7 composition →
-8 scorecards → 9 migrate other stages.
+**Provider router: all 9 phases built** (see design doc §12). What's real vs. what's still a gap:
+- Real and tested: atoms, registry, resolution, quota, typed outcomes, verification, exclusions,
+  planner/failover, the account pool, composition (enrich-to-decide + intersect), scorecards/drift,
+  one shared decision-maker resolver.
+- **Still only one executable adapter (Icypeas).** Prospeo and Apollo are registered with
+  `unverified` capabilities — the honest next step is pulling their REAL schemas via the new free
+  `/gtm-os/admin/providers/schema` route (needs the push — see below) and promoting only what's
+  confirmed, never from documentation.
+- **Not done, and not attempted**: migrating signal sourcing (hiring/engagement discovery itself,
+  as opposed to decision-maker resolution) onto the same router. Phase 9's scope was "decision-maker,
+  contact, signals" per the design doc; only decision-maker resolution was actually unified this
+  session. Contact-finding and signal sourcing still have their own bespoke paths.
 
 **Blocked / needs the user**
-- Frontend repo `synefi/dashboard` rejects pushes (403). A font-size change (`f37ffdf`) and any
-  Settings-form work are stuck behind this.
-- `department_headcount` on the ICP is read by the code but **not shippable** until the Settings
-  form carries it — the ICP save is a full replace, so a UI save would wipe it.
-- Majji's "marketing < 1" is still enforced by nothing; it is correctly surfaced as a note rather
-  than pretending to be a filter. Apollo is the route that could enforce it.
-- Icypeas taxonomy is still empty; it fills from the next paid run, after which "Professional
-  Services" maps onto real values instead of using the keyword fallback.
+- **The push.** Phases 5–9 (pool, planner+excludes, free schema discovery, composition,
+  scorecards, shared decision-maker resolver) are committed locally, not pushed. Until they are:
+  Majji's "no dedicated marketing hire" enforcement (phase 7) isn't live, the account pool isn't
+  compounding, and the free provider-schema routes can't actually be called (the working Deepline
+  key is on Render, not local).
+- Frontend repo `synefi/dashboard` rejects pushes from this machine (403). A font-size change
+  (`f37ffdf`) and the Partner Features screen (`3e4613d`) are both stuck behind this, on top of
+  whatever else accumulates.
+- Icypeas taxonomy (`provider_taxonomy_values`) is still thin — it fills from real paid runs, after
+  which "Professional Services"-style concepts resolve to real learned values instead of the
+  free-text keyword fallback.
+- Apollo's department-headcount filter is documented in its product UI but its real API parameter
+  name has never been verified — that verification (free, via the new schema-discovery routes) is
+  what would let phase 7's enrich-to-decide logic be replaced by an actual structured filter for
+  Majji's requirement, rather than the free-Jobo-leadership-list proxy it uses today.
 
 ---
 
@@ -174,7 +266,9 @@ curl -s -X POST "https://workflow-automation-1ujz.onrender.com/auth/login?email=
 curl -s https://elephantedge-workflow-1-7k9d.onrender.com/api/gtm-os/partner/icp-preview -H "X-Tenant-Id: 15"
 ```
 
-Tests: `./venv/bin/python -m pytest tests/ -q` — **283 passing** as of this commit.
+Tests: `./venv/bin/python -m pytest tests/ -q` — **392 passing** locally as of this commit.
+(`283` was passing in the last version of this file pushed to origin — if you're reading this
+from a fresh pull before the pending push lands, that's the number you'll actually see.)
 
 ---
 
