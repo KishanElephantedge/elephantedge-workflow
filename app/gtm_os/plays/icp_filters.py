@@ -343,7 +343,8 @@ def _create_icypeas_lead(db: Session, tenant_id: int, key: str, company: Company
     db.commit()
 
 
-def _process_icypeas_company(db: Session, tenant_id: int, co: dict, known_leads: set, pending: list) -> str | None:
+def _process_icypeas_company(db: Session, tenant_id: int, co: dict, known_leads: set, pending: list,
+                             department_atoms: list | None = None) -> str | None:
     """One search result -> a rejected lead, a created lead, or a deferral into `pending` for
     the batched paid decision-maker resolver. Returns the outcome label to count, or None when
     deferred (its real outcome is only known once the batch resolves). Raises OperationalError
@@ -427,6 +428,26 @@ def _process_icypeas_company(db: Session, tenant_id: int, co: dict, known_leads:
     # Free -- Jobo's own leadership list, an agent picks the buyer, only Jobo's genuine (not
     # Crunchbase) LinkedIn URL is usable for outreach.
     leadership = _jobo_leadership_candidates(db, tenant_id, company)
+
+    # ENRICH-TO-DECIDE, phase 7 (2026-10-07). "No dedicated marketing hire" (and any future
+    # department_headcount requirement) has no provider that can search it -- Icypeas: verified
+    # absent; Apollo: documented in its UI but its API parameter is unverified. It sat in free-text
+    # notes, enforced by nothing, since this requirement was first set. The leadership list above
+    # is already fetched for free for decision-maker resolution; deciding a department-presence
+    # atom from the SAME data costs nothing extra. Only a CONFIRMED violation rejects -- an empty
+    # or inconclusive leadership list is never read as "no marketing hire", the same asymmetry as
+    # sample verification, because Jobo's index missing a title is not proof the role is absent.
+    if department_atoms:
+        from app.gtm_os.sourcing.compose import enrich_to_decide
+
+        for atom in department_atoms:
+            decision = enrich_to_decide(atom, leadership)
+            if decision.satisfied is False:
+                db.add(GtmLead(tenant_id=tenant_id, play=PLAY, lead_key=key, state=STATE_REJECTED,
+                               qualifier_reason=f"{atom.name} requirement violated: {decision.evidence}"))
+                db.commit()
+                return f"department_requirement_failed:{atom.qualifier}"
+
     usable = [p for p in leadership if _real_linkedin_url_from_jobo(p)]
     person = None
     if usable:
@@ -497,6 +518,7 @@ def search_icypeas(db: Session, tenant_id: int, icp: dict, pages: int = 1) -> di
     # search genuinely enforced. Verification below may only judge the rows against the second
     # list: an industry searched by free-text keyword was never promised as a classification, so
     # scoring the returned industry label against it would manufacture false failures.
+    from app.gtm_os.sourcing.atoms import DEPARTMENT_HEADCOUNT as A_DEPARTMENT_HEADCOUNT
     from app.gtm_os.sourcing.atoms import HEADCOUNT as A_HEADCOUNT
     from app.gtm_os.sourcing.atoms import INDUSTRY as A_INDUSTRY
     from app.gtm_os.sourcing.atoms import REVENUE as A_REVENUE
@@ -542,7 +564,8 @@ def search_icypeas(db: Session, tenant_id: int, icp: dict, pages: int = 1) -> di
             if not match.fresh:
                 continue
             outcome = _process_icypeas_company(db, tenant_id, sourcing_pool.to_search_row(match.row),
-                                               known_leads, pending)
+                                               known_leads, pending,
+                                               department_atoms=icp_atoms.by_key(A_DEPARTMENT_HEADCOUNT))
             sourcing_pool.mark_delivered(db, tenant_id, match.row.id, PLAY)
             if outcome is not None:
                 count(f"pool:{outcome}")
@@ -668,7 +691,8 @@ def search_icypeas(db: Session, tenant_id: int, icp: dict, pages: int = 1) -> di
 
         for co in leads:
             try:
-                outcome = _process_icypeas_company(db, tenant_id, co, known_leads, pending)
+                outcome = _process_icypeas_company(db, tenant_id, co, known_leads, pending,
+                                                   department_atoms=icp_atoms.by_key(A_DEPARTMENT_HEADCOUNT))
             except OperationalError:
                 # One company's DB work hit a dropped connection -- must not lose the rest of
                 # an already-paid-for page. Retried on a future run (never added to known_leads

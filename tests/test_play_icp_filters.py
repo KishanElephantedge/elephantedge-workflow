@@ -498,11 +498,11 @@ def test_search_icypeas_survives_a_dropped_connection_mid_page_and_saves_the_cur
     real = icp_filters_module._process_icypeas_company
     calls = {"n": 0}
 
-    def flaky(db_, tenant_id, co, known_leads, pending):
+    def flaky(db_, tenant_id, co, known_leads, pending, department_atoms=None):
         calls["n"] += 1
         if calls["n"] == 2:
             raise OperationalError("SELECT", {}, Exception("SSL SYSCALL error: Operation timed out"))
-        return real(db_, tenant_id, co, known_leads, pending)
+        return real(db_, tenant_id, co, known_leads, pending, department_atoms=department_atoms)
 
     monkeypatch.setattr(icp_filters_module, "_process_icypeas_company", flaky)
 
