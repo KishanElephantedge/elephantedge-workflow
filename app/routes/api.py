@@ -6319,6 +6319,45 @@ def _require_admin(request: Request) -> int:
     return tenant_id
 
 
+@router.delete("/gtm-os/admin/companies")
+def delete_companies_admin(request: Request, body: dict = Body(...), db: Session = Depends(get_db)):
+    """Delete specific companies (and their Contact/GtmLead rows) from ANY tenant, by exact ID --
+    for when a batch sourced wrong-fit companies and they need to come off a partner's account.
+
+    Added 2026-10-08: the only existing deletion route (DELETE /batches/{id}/companies) was
+    hardcoded to Elephant Edge's own tenant and deletes everything in a batch, neither of which
+    fit here -- Jeff Ballard's 7 wrong-industry Crustdata matches (Adani Energy, ACC cement, same
+    "B2B tech ICP returned giant industrial conglomerates" shape that route's own docstring
+    already describes for a different tenant) needed removing from HIS tenant, by exact company
+    id, not "everything from today's batch" which could include good companies from a different
+    play run. CompanyPool/PoolDelivery (the cross-tenant shared pool) are deliberately untouched
+    -- that table has no FK on companies.id by design (see its own docstring), so another
+    partner's future match against the same real company is unaffected.
+
+    Refuses if ANY contact on these companies has already been pushed to a campaign -- a real
+    send cannot be un-sent by deleting the record of it.
+    """
+    _require_admin(request)
+    company_ids = body.get("company_ids") or []
+    if not company_ids:
+        raise HTTPException(status_code=400, detail="company_ids is required")
+
+    pushed = (db.query(Company.id).join(Contact, Contact.company_id == Company.id)
+             .join(CampaignPush, CampaignPush.contact_id == Contact.id)
+             .filter(Company.id.in_(company_ids), CampaignPush.status == "pushed").all())
+    if pushed:
+        raise HTTPException(status_code=409, detail=f"Refusing: {[p[0] for p in pushed]} already pushed to a campaign")
+
+    deleted_names = [c.name for c in db.query(Company).filter(Company.id.in_(company_ids)).all()]
+    from app.gtm_os.plays.lead import GtmLead as _GtmLead
+
+    db.query(_GtmLead).filter(_GtmLead.company_id.in_(company_ids)).delete(synchronize_session=False)
+    db.query(Contact).filter(Contact.company_id.in_(company_ids)).delete(synchronize_session=False)
+    db.query(Company).filter(Company.id.in_(company_ids)).delete(synchronize_session=False)
+    db.commit()
+    return {"deleted_count": len(company_ids), "deleted_names": deleted_names}
+
+
 @router.get("/gtm-os/admin/debug/crustdata-filters")
 def admin_crustdata_filters_debug(partner_tenant_id: int, request: Request, db: Session = Depends(get_db)):
     """The EXACT payload search_crustdata() would send for this partner's current ICP, built but
