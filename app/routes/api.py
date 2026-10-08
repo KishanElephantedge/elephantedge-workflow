@@ -6515,7 +6515,13 @@ def preview_partner_icp_routing(request: Request, db: Session = Depends(get_db))
     from app.gtm_os.sourcing.atoms import decompose_icp
 
     icp = icp_param.value
-    coverage = icp_coverage(icp)
+    coverage = icp_coverage(db, icp)
+    # icypeas_filters_for_icp() adds OUR policy excludes (NON_BUYER_INDUSTRIES, NON_COMPANY_TYPES)
+    # on top of the raw registry render -- richer than coverage.filters, but still Icypeas-
+    # specific. Shown only when Icypeas is actually the winning candidate; any other winner falls
+    # back to the generic registry render until that policy layer exists per-provider too.
+    filters_preview = (icypeas_filters_for_icp(icp, db=db, tenant_id=tenant_id)
+                       if coverage.winning_provider == "icypeas" else coverage.filters)
     return {
         "tenant_id": tenant_id,
         "requirements": [
@@ -6524,13 +6530,15 @@ def preview_partner_icp_routing(request: Request, db: Session = Depends(get_db))
             for a in decompose_icp(icp).atoms
         ],
         "coverage": {
-            "enforced_by_provider": [a.name for a in coverage.enforced],
-            "checked_after_fetch": [a.name for a in coverage.residual],
-            "needs_provider_research": [a.name for a in coverage.unverified],
-            "not_supported_here": [a.name for a in coverage.unsupported],
-            "unenforced_must_haves": [a.name for a in coverage.must_have_gap],
+            "enforced_by_provider": coverage.enforced,
+            "checked_after_fetch": coverage.residual,
+            "enforceable_pending_adapter": coverage.pending_adapter,
+            "needs_provider_research": coverage.unverified,
+            "not_supported_anywhere": coverage.unsupported,
+            "unenforced_must_haves": coverage.must_have_gap,
         },
-        "filters_that_would_be_sent": icypeas_filters_for_icp(icp, db=db, tenant_id=tenant_id),
+        "winning_provider": coverage.winning_provider,
+        "filters_that_would_be_sent": filters_preview,
         "notes_not_enforced_as_filters": icp.get("notes"),
     }
 

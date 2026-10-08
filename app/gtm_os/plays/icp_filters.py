@@ -238,17 +238,24 @@ def icypeas_filters_for_icp(icp: dict, db: Session | None = None, tenant_id: int
     return filters
 
 
-def icp_coverage(icp: dict):
-    """Which ICP requirements this play's provider actually enforces, and which it does not.
+def icp_coverage(db: Session, icp: dict):
+    """Which ICP requirements would ACTUALLY get enforced if this ICP ran today, across every
+    REGISTERED provider -- not Icypeas alone.
 
     Exposed so a run can REPORT its unsupported atoms instead of silently ignoring them -- the
     failure mode that let "no dedicated marketing hire" sit in Majji's ICP for days, enforced by
     nothing while looking configured.
-    """
-    from app.gtm_os.sourcing.atoms import decompose_icp
-    from app.gtm_os.sourcing.registry import ICYPEAS_FIND_COMPANIES, coverage_for
 
-    return coverage_for(ICYPEAS_FIND_COMPANIES, decompose_icp(icp))
+    FIXED 2026-10-08 (onboarding Nora): this used to hardcode ICYPEAS_FIND_COMPANIES, the exact
+    single-provider pattern the whole router was built to get away from. It would have reported
+    "needs provider research" for funding_stage and department_headcount FOREVER, even after
+    Crustdata's registry entry declared both SUPPORTED -- because this function structurally
+    could not see any provider but one. Now a thin wrapper over the planner's own
+    aggregate_coverage(), which checks the full registry the same way planner.execute() does.
+    """
+    from app.gtm_os.sourcing.planner import aggregate_coverage
+
+    return aggregate_coverage(db, icp)
 
 
 def _resolve_decision_makers_batch(db: Session, tenant_id: int, companies: list, titles: list[str]) -> dict:
@@ -932,17 +939,19 @@ def run_icp_filters(db: Session, tenant_id: int, pages: int = 1, run_cap_usd: fl
     if not icp:
         return {"status": "skipped", "reason": "no partner ICP configured"}
     with spend_scope(db, BILLING_TENANT_ID, f"{PLAY}:tenant_{tenant_id}", run_cap_usd=run_cap_usd) as scope:
-        coverage = icp_coverage(icp)
+        coverage = icp_coverage(db, icp)
         result = {"status": "completed", "play": PLAY, "tenant_id": tenant_id, "filters": icypeas_filters_for_icp(icp, db=db, tenant_id=tenant_id)}
         # Every ICP requirement, and what actually happened to it. Reported on every run so a
         # requirement can never again be stored, look configured, and be enforced by nothing --
         # "no dedicated marketing hire" sat in Majji's ICP for days in exactly that state.
         result["icp_coverage"] = {
-            "enforced_by_provider": [a.name for a in coverage.enforced],
-            "checked_after_fetch": [a.name for a in coverage.residual],
-            "needs_provider_research": [a.name for a in coverage.unverified],
-            "not_supported_here": [a.name for a in coverage.unsupported],
-            "unenforced_must_haves": [a.name for a in coverage.must_have_gap],
+            "enforced_by_provider": coverage.enforced,
+            "checked_after_fetch": coverage.residual,
+            "enforceable_pending_adapter": coverage.pending_adapter,
+            "needs_provider_research": coverage.unverified,
+            "not_supported_anywhere": coverage.unsupported,
+            "unenforced_must_haves": coverage.must_have_gap,
+            "winning_provider": coverage.winning_provider,
         }
         # REAL GAP CLOSED, 2026-10-07: this used to call search_icypeas() directly, bypassing the
         # planner entirely -- phase 6's ranking/failover/circuit-breaking was built and tested but

@@ -41,6 +41,70 @@ def _clean_adapters():
     P._ADAPTERS.update(original)
 
 
+# ---- aggregate_coverage: real multi-provider coverage, replacing icp_filters.py's old
+# icp_coverage() which hardcoded Icypeas alone and would have stayed wrong forever as new
+# providers were registered. Found 2026-10-08, onboarding Nora. ----
+
+NORA_ATOMS = {
+    "employee_min": 11, "employee_max": 50,
+    "department_headcount": {"marketing": {"min": 4}},
+    "funding_stages": ["Series B"],
+    "funding_recency_max_days": 180,
+    "leadership_change": {"titles": ["CMO"], "max_age_days": 180},
+    "technologies": {"include": ["HubSpot"]},
+}
+
+
+def test_with_no_adapters_at_all_nothing_is_enforced_only_pending(db):
+    coverage = P.aggregate_coverage(db, {"employee_min": 11, "employee_max": 50})
+    assert coverage.enforced == {}
+    assert coverage.winning_provider is None
+    assert "headcount" in coverage.pending_adapter
+
+
+def test_with_only_icypeas_adapter_crustdatas_known_fields_are_pending_not_unverified(db):
+    """The exact bug this replaces: the old function would report department_headcount and
+    technographics as 'needs provider research' forever, even though Crustdata's registry entry
+    already declares both SUPPORTED -- the real gap is a missing adapter, not missing research."""
+    P.register_adapter("icypeas", lambda *a, **k: {"companies": []})
+    coverage = P.aggregate_coverage(db, NORA_ATOMS)
+    assert coverage.pending_adapter["department_headcount(marketing)"] == "crustdata-v3"
+    assert coverage.pending_adapter["technographics"] == "crustdata-v3"
+    assert coverage.pending_adapter["funding_recency"] == "crustdata-v3"
+    # Genuinely unverified among COMPANY-SEARCH providers: Forager has the confirmed funding_types
+    # enum, but it is a people/role search (job != "company_search"), not ranked here at all --
+    # this atom really has no verified company-search route yet, which is a different, honest gap.
+    assert "funding_stage" in coverage.unverified
+    assert "leadership_change" in coverage.unverified
+    # department_headcount and funding_stage are real MUST_HAVE gaps today -- Nora's ICP
+    # genuinely cannot be fully enforced until an adapter exists. leadership_change is only
+    # SHOULD_HAVE (a later signal-detection pass can check it), so it's absent from this list
+    # even though it's also unresolved.
+    assert set(coverage.must_have_gap) == {"department_headcount(marketing)", "funding_stage"}
+
+
+def test_headcount_and_industry_are_enforced_by_the_only_live_adapter(db):
+    P.register_adapter("icypeas", lambda *a, **k: {"companies": []})
+    coverage = P.aggregate_coverage(db, NORA_ATOMS)
+    assert coverage.enforced["headcount"] == "icypeas"
+    assert coverage.winning_provider == "icypeas"
+    assert coverage.filters["headcount"] == {">=": 11, "<=": 50}
+
+
+def test_registering_a_second_adapter_moves_atoms_from_pending_to_enforced_automatically(db):
+    """The whole point of the pending_adapter bucket: writing an adapter must empty it out with
+    zero other code changes -- proving the PLANNER decides who serves an atom, not a person
+    picking a provider for a specific partner."""
+    P.register_adapter("icypeas", lambda *a, **k: {"companies": []})
+    before = P.aggregate_coverage(db, NORA_ATOMS)
+    assert "department_headcount(marketing)" in before.pending_adapter
+
+    P.register_adapter("crustdata-v3", lambda *a, **k: {"companies": []})
+    after = P.aggregate_coverage(db, NORA_ATOMS)
+    assert after.enforced["department_headcount(marketing)"] == "crustdata-v3"
+    assert "department_headcount(marketing)" not in after.pending_adapter
+
+
 # ---- exclusions: stop paying for what we keep rejecting ----
 
 def test_one_rejection_is_not_evidence_about_a_whole_industry(db):

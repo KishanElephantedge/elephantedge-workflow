@@ -154,6 +154,71 @@ def _sort_key(c: Candidate) -> tuple:
            -c.recent_failures)
 
 
+@dataclass
+class AggregateCoverage:
+    """What would ACTUALLY happen if this ICP ran today, across EVERY registered company-search
+    provider -- not one hardcoded choice. Replaces icp_filters.py's old icp_coverage(), which
+    checked Icypeas alone and would have stayed silently wrong forever as providers were added
+    to the registry without this ever being updated to see them (found 2026-10-08, onboarding
+    Nora: the preview endpoint still reported "needs provider research" for funding_stage and
+    department_headcount even after Crustdata's registry entry had both as SUPPORTED).
+
+    `pending_adapter` is the bucket that distinguishes a RESEARCH gap from a BUILD gap: an atom
+    some registered provider can enforce, but that provider has no adapter function yet, is a
+    materially different thing to report than "nobody has checked if any provider supports
+    this" -- one needs an engineer, the other needs a research session.
+    """
+
+    enforced: dict[str, str] = field(default_factory=dict)        # atom name -> provider
+    residual: dict[str, str] = field(default_factory=dict)
+    pending_adapter: dict[str, str] = field(default_factory=dict)
+    unverified: list[str] = field(default_factory=list)
+    unsupported: list[str] = field(default_factory=list)
+    must_have_gap: list[str] = field(default_factory=list)
+    winning_provider: str | None = None
+    filters: dict = field(default_factory=dict)
+
+
+def aggregate_coverage(db: Session, icp: dict) -> AggregateCoverage:
+    icp_atoms = A.decompose_icp(icp)
+    candidates = rank(db, icp)
+    result = AggregateCoverage()
+
+    live = [c for c in candidates if c.executable and c.healthy]
+    live_providers = {c.provider for c in live}
+    if live:
+        result.winning_provider = live[0].provider
+        result.filters = dict(live[0].coverage.filters)
+
+    for atom in icp_atoms.atoms:
+        name = atom.name
+        enforcers = [c.provider for c in live if atom in c.coverage.enforced]
+        if enforcers:
+            result.enforced[name] = enforcers[0]
+            continue
+        checkers = [c.provider for c in live if atom in c.coverage.residual]
+        if checkers:
+            result.residual[name] = checkers[0]
+            continue
+        pending = [c.provider for c in candidates
+                  if c.provider not in live_providers and atom in c.coverage.enforced]
+        if pending:
+            result.pending_adapter[name] = pending[0]
+            if atom.necessity == A.MUST_HAVE:
+                result.must_have_gap.append(name)
+            continue
+        if any(atom in c.coverage.unverified for c in candidates):
+            result.unverified.append(name)
+            if atom.necessity == A.MUST_HAVE:
+                result.must_have_gap.append(name)
+            continue
+        result.unsupported.append(name)
+        if atom.necessity == A.MUST_HAVE:
+            result.must_have_gap.append(name)
+
+    return result
+
+
 def record_attempt(db: Session, tenant_id: int, provider: str, endpoint: str, outcome: str,
                    detail: str | None = None, rows: int = 0, cost_usd: float | None = None,
                    icp_fingerprint: str | None = None) -> None:
