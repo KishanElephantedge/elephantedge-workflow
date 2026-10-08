@@ -137,6 +137,18 @@ def search_filters(icp: dict) -> dict:
     }
 
 
+def _parse_date(value) -> datetime | None:
+    """Same convention app/phases/discovery.py's own _parse_date uses, kept local rather than
+    importing a private helper cross-module. ISO date/datetime string -> naive datetime, or None
+    for anything unparseable -- never raises on a malformed provider value."""
+    if not value or not isinstance(value, str):
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).replace(tzinfo=None)
+    except ValueError:
+        return None
+
+
 def _cursor(db: Session, tenant_id: int, provider: str = "icypeas") -> Parameter:
     # Keyed per provider so a second adapter's pagination state can never clobber Icypeas'
     # already-live one -- "icypeas" keeps the ORIGINAL key unsuffixed so production rows that
@@ -281,10 +293,17 @@ def _resolve_decision_makers_batch(db: Session, tenant_id: int, companies: list,
 def _create_icypeas_lead(db: Session, tenant_id: int, key: str, company: Company, contact: Contact,
                          first_name: str | None, last_name: str | None, person_linkedin: str | None, co: dict) -> None:
     specialties = ", ".join(s.get("value") for s in (co.get("specialties") or []) if s.get("value"))[:300]
+    # Surface WHY this company matched when the ICP has a funding-recency requirement -- the
+    # filter was real and working (found live 2026-10-08), but the date it matched on was never
+    # shown anywhere, so a partner asking "why did this company qualify" had no answer for the
+    # one criterion that actually found it.
+    funding_note = (f"\nLast funding: {co.get('last_funding_round_type') or 'unknown round'} on "
+                    f"{co.get('last_funding_date')}" if co.get("last_funding_date") else "")
     evidence = (
         f"Person: {first_name or ''} {last_name or ''} -- {contact.title or ''}\n\n"
         f"Company: {co.get('name')} | {co.get('industry')} | {co.get('numberOfEmployees')} employees | "
-        f"HQ {co.get('address')} | {co.get('website') or ''}\nSpecialties: {specialties}\nAbout: {co.get('description') or ''}"
+        f"HQ {co.get('address')} | {co.get('website') or ''}{funding_note}\n"
+        f"Specialties: {specialties}\nAbout: {co.get('description') or ''}"
     )
     db.add(GtmLead(tenant_id=tenant_id, play=PLAY, lead_key=key, company_id=company.id, contact_id=contact.id,
                    person_name=f"{first_name or ''} {last_name or ''}".strip(), person_linkedin_url=person_linkedin,
@@ -361,7 +380,9 @@ def _process_icypeas_company(db: Session, tenant_id: int, co: dict, known_leads:
                           industry=co.get("industry"), employee_count=co.get("numberOfEmployees"),
                           location=co.get("address"), source=f"{source_provider}:{source_endpoint}",
                           estimated_revenue_lower_usd=int(rev_lo * rev_unit) if rev_lo is not None else None,
-                          estimated_revenue_higher_usd=int(rev_hi * rev_unit) if rev_hi is not None else None)
+                          estimated_revenue_higher_usd=int(rev_hi * rev_unit) if rev_hi is not None else None,
+                          last_funding_date=_parse_date(co.get("last_funding_date")),
+                          last_funding_round_type=co.get("last_funding_round_type"))
         db.add(company)
         db.commit()
 
@@ -754,6 +775,7 @@ def _normalize_crustdata_row(co: dict) -> dict:
     basic = co.get("basic_info") or {}
     headcount = co.get("headcount") or {}
     revenue = (co.get("revenue") or {}).get("estimated") or {}
+    funding = co.get("funding") or {}
     locations = co.get("locations") or {}
     industries = basic.get("industries") or []
     rev_lo, rev_hi = revenue.get("lower_bound_usd"), revenue.get("upper_bound_usd")
@@ -771,6 +793,14 @@ def _normalize_crustdata_row(co: dict) -> dict:
              "estimatedMaxRevenue": {"amount": rev_hi, "unit": "USD"}}
             if rev_lo is not None or rev_hi is not None else {}
         ),
+        # REAL FIX, 2026-10-08: funding_recency was being used as a genuine search filter (it's
+        # why a company qualified at all when that atom is set) but the actual date was never
+        # stored anywhere on the resulting Company/lead -- a partner asking "why did this company
+        # match" had no answer for the one criterion that found it. Company.last_funding_date/
+        # last_funding_round_type already exist (used by Elephant Edge's own V2 pipeline) but
+        # were never populated by this play. Reusing them, not inventing new columns.
+        "last_funding_date": funding.get("last_fundraise_date"),
+        "last_funding_round_type": funding.get("last_round_type"),
     }
 
 

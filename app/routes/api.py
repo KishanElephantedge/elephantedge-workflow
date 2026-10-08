@@ -6695,9 +6695,18 @@ def get_partner_accounts(
                 "employee_count": c.employee_count,
                 "estimated_revenue_lower_usd": c.estimated_revenue_lower_usd,
                 "estimated_revenue_higher_usd": c.estimated_revenue_higher_usd,
+                # REAL FIX, 2026-10-08: this column only ever read the hiring-signal/hot-lead
+                # fields (populated by the Apify/Jobo job-posting discovery path), so a company
+                # sourced via the ICP-filter play (icp_filters.py, e.g. Crustdata) always showed
+                # nothing here -- even when funding recency was the actual, working reason it
+                # qualified. Company.last_funding_date is now populated by that play too (see
+                # icp_filters.py's _process_icypeas_company); surfaced here as a real fallback
+                # signal, not just stored and never shown.
                 "signal": (
                     f"Hiring: {c.hiring_signal_role.replace('_', ' ')}" if c.hiring_signal_role
-                    else ("Hot lead" if c.hot_lead else None)
+                    else ("Hot lead" if c.hot_lead else
+                          (f"Raised funding {c.last_funding_date.date().isoformat()}"
+                           if c.last_funding_date else None))
                 ),
                 "source_label": objective["objective_label"],
                 "contact_count": contact_counts.get(c.id, 0),

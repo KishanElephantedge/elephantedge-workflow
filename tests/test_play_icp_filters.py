@@ -288,17 +288,21 @@ def test_search_icypeas_creates_a_lead_with_the_free_jobo_decision_maker(db, mon
 # ------------------------------------------------------------------ search_crustdata (2026-10-08, 2nd adapter)
 
 def _crustdata_company(n, name=None, industry="Medical Device", employees=60,
-                       revenue_lo=10_000_000, revenue_hi=50_000_000):
+                       revenue_lo=10_000_000, revenue_hi=50_000_000,
+                       last_funding_date=None, last_funding_round_type=None):
     """A realistic row in CRUSTDATA'S OWN field shape (basic_info/headcount/revenue/locations
     nesting), confirmed live 2026-10-08 -- deliberately NOT the Icypeas row shape, so this test
     exercises _normalize_crustdata_row's real translation rather than assuming it away."""
-    return {
+    row = {
         "basic_info": {"name": name or f"Co{n}", "professional_network_url": f"https://www.linkedin.com/company/co{n}/",
                        "industries": [industry], "website": f"https://co{n}.com"},
         "headcount": {"total": employees},
         "revenue": {"estimated": {"lower_bound_usd": revenue_lo, "upper_bound_usd": revenue_hi}},
         "locations": {"country": "United States", "headquarters": "Ohio, United States"},
     }
+    if last_funding_date:
+        row["funding"] = {"last_fundraise_date": last_funding_date, "last_round_type": last_funding_round_type}
+    return row
 
 
 NORA_ICP = {"employee_min": 11, "employee_max": 500, "industries": ["medical devices"],
@@ -364,6 +368,43 @@ def test_search_crustdata_resolves_industry_then_creates_a_lead(db, monkeypatch)
     assert company.employee_count == 60
     assert company.estimated_revenue_lower_usd == 10_000_000  # raw USD, unit multiplier stays 1x
     assert db.query(Batch).get(company.batch_id).tenant_id == PARTNER
+
+
+def test_search_crustdata_stores_the_real_funding_date_not_just_filters_on_it(db, monkeypatch):
+    """REAL FIX, 2026-10-08: funding_recency was already a genuine, working search filter --
+    confirmed live, it's why a company qualified at all for an ICP that sets it -- but the actual
+    date was never stored anywhere, so a partner asking "why did this match" had no answer for
+    the one criterion that found it. Company.last_funding_date/last_funding_round_type already
+    existed (used by Elephant Edge's own pipeline) but were never populated by this play."""
+    import app.deepline_client as dc
+    import app.phases.decision_maker_reasoning as dmr
+    import app.phases.free_decision_maker as fdm
+
+    def fake_cli(tool, payload):
+        if tool == "crustdata_v3_company_search_autocomplete":
+            return {"toolResponse": {"raw": {"suggestions": [{"value": "Medical Device"}]}}}
+        if tool == "crustdata_v3_company_search":
+            return {"toolResponse": {"raw": {
+                "companies": [_crustdata_company(1, last_funding_date="2026-06-01", last_funding_round_type="Series C")],
+                "next_cursor": None}}}
+        raise AssertionError(f"unexpected tool: {tool}")
+
+    monkeypatch.setattr(dc, "_call_deepline_cli", fake_cli)
+    monkeypatch.setattr(fdm, "_jobo_leadership_candidates", lambda db_, t, company: [_jobo_person()])
+    monkeypatch.setattr(dmr, "select_best_decision_makers",
+                        lambda db_, t, company, cands, n, offering_name=None: [
+                            {"name": "Jane Doe", "thread_role": "founder_ceo", "reasoning": "CEO"}])
+
+    icp = {**NORA_ICP, "industries": ["medical device"]}
+    with spend_scope(db, BILLING, "icp_filters", run_cap_usd=0.5):
+        play.search_crustdata(db, PARTNER, icp)
+
+    company = db.query(Company).filter(Company.name == "Co1").one()
+    assert company.last_funding_date.date().isoformat() == "2026-06-01"
+    assert company.last_funding_round_type == "Series C"
+
+    lead = db.query(GtmLead).one()
+    assert "Last funding: Series C on 2026-06-01" in lead.evidence
 
 
 def test_search_crustdata_sends_an_unresolved_industry_term_as_a_fuzzy_keyword_not_literal_enum(db, monkeypatch):
