@@ -359,22 +359,34 @@ def test_search_crustdata_resolves_industry_then_creates_a_lead(db, monkeypatch)
 
 def test_search_crustdata_sends_an_unresolved_industry_term_as_a_fuzzy_keyword_not_literal_enum(db, monkeypatch):
     """UPDATED 2026-10-08 (explicit instruction, a pattern confirmed to work on other
-    platforms): a term the structured taxonomy doesn't have (confirmed by the resolver itself,
-    not just unchecked) is no longer dropped -- it's sent as a `(.)` fuzzy-text condition on the
-    SAME field instead of the exact `in` enum, which several providers genuinely do match
-    against. It must never be sent as a literal `in` value, which is what matched zero
-    companies for "Professional Services" in the first place."""
+    platforms, then corrected again by comparing against Crustdata's own dashboard query): a
+    term the structured taxonomy doesn't have (confirmed by the resolver itself, not just
+    unchecked) is no longer dropped -- it's sent as a `(.)` fuzzy-text condition against
+    taxonomy.categories / taxonomy.professional_network_specialities (the broad, free-form tag
+    fields the provider's own query builder uses for a loosely-worded concept), never against
+    basic_info.industries (confirmed via its own generated query to be the wrong, narrow field
+    for this -- that one's for an exact classification, not a keyword search)."""
     import app.deepline_client as dc
 
     def fake_cli(tool, payload):
         if tool == "crustdata_v3_company_search_autocomplete":
             return {"toolResponse": {"raw": {"suggestions": []}}}  # confirmed real: no match
         if tool == "crustdata_v3_company_search":
-            conditions = payload["filters"]["conditions"]
-            industry_conds = [c for c in conditions if c.get("field") == "basic_info.industries"]
-            assert len(industry_conds) == 1
-            assert industry_conds[0]["type"] == "(.)"
-            assert industry_conds[0]["value"] == "life science"
+            def flatten(conds):
+                for c in conds:
+                    if "field" in c:
+                        yield c
+                    elif "conditions" in c:
+                        yield from flatten(c["conditions"])
+
+            leaves = list(flatten(payload["filters"]["conditions"]))
+            assert not [c for c in leaves if c["field"] == "basic_info.industries"]
+            fields = {c["field"] for c in leaves}
+            assert {"taxonomy.categories", "taxonomy.professional_network_specialities"} <= fields
+            for c in leaves:
+                if c["field"] in ("taxonomy.categories", "taxonomy.professional_network_specialities"):
+                    assert c["type"] == "(.)"
+                    assert c["value"] == "life science"
             return {"toolResponse": {"raw": {"companies": [], "next_cursor": None}}}
         raise AssertionError(f"unexpected tool: {tool}")
 

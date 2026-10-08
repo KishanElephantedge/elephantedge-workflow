@@ -332,6 +332,20 @@ def test_crustdata_now_also_covers_fundings_recency_and_technographics():
     assert R.CRUSTDATA_V3_COMPANY_SEARCH.capability(A.LEADERSHIP_CHANGE).state == R.ABSENT
 
 
+def test_crustdata_technographics_uses_token_match_not_array_equality():
+    # REAL FIX, 2026-10-08: `in` against an array-valued field (a company's tech stack) checks
+    # whether the WHOLE field equals one of our values, which it never does -- confirmed by
+    # comparing against Crustdata's own dashboard query, which uses `[.]` (token match) OR'd per
+    # technology instead. This was the live bug behind a confirmed-empty search for a real ICP.
+    coverage = R.coverage_for(R.CRUSTDATA_V3_COMPANY_SEARCH,
+                              A.decompose_icp({"technologies": {"include": ["HubSpot", "Marketo"]}}))
+    group = next(c for c in coverage.filters["conditions"] if "conditions" in c)
+    assert group["op"] == "or"
+    assert {c["type"] for c in group["conditions"]} == {"[.]"}
+    assert {c["value"] for c in group["conditions"]} == {"HubSpot", "Marketo"}
+    assert all(c["field"] == "technographics.technologies.name" for c in group["conditions"])
+
+
 def test_predictleads_financing_discovery_confirms_recency_absent_not_inherited():
     # The per-company predictleads endpoint (not registered here) takes a date filter; the bulk
     # discovery endpoint does not, despite sharing a provider. One must never be assumed to carry

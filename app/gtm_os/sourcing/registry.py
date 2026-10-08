@@ -341,9 +341,17 @@ def _crustdata_revenue(atom: A.Atom) -> dict:
 # whatever the partner wrote ("United States", "United Kingdom"). Only region NAMES need
 # expanding into the countries they mean; a real country name must pass through unchanged.
 CRUSTDATA_REGION_EXPANSIONS: dict[str, list[str]] = {
-    "europe": ["United Kingdom", "Germany", "France", "Netherlands", "Ireland", "Sweden",
-              "Switzerland", "Spain", "Italy", "Poland", "Belgium", "Denmark", "Norway",
-              "Finland", "Austria", "Portugal", "Czech Republic", "Romania"],
+    # Adopted wholesale from Crustdata's own dashboard query (2026-10-08), proven live to return
+    # real results for this exact ICP shape -- more complete than the first hand-built list
+    # (includes Eastern Europe/Caucasus), so reused rather than re-verified country-by-country.
+    "europe": ["United Kingdom", "Albania", "Andorra", "Armenia", "Austria", "Azerbaijan",
+              "Belarus", "Belgium", "Bosnia and Herzegovina", "Bulgaria", "Croatia", "Cyprus",
+              "Czech Republic", "Czechia", "Denmark", "Estonia", "Finland", "France", "Georgia",
+              "Germany", "Greece", "Hungary", "Iceland", "Ireland", "Italy", "Kosovo", "Latvia",
+              "Liechtenstein", "Lithuania", "Luxembourg", "Malta", "Moldova", "Monaco",
+              "Montenegro", "Netherlands", "North Macedonia", "Norway", "Poland", "Portugal",
+              "Romania", "Russia", "San Marino", "Serbia", "Slovakia", "Slovenia", "Spain",
+              "Sweden", "Switzerland", "Turkey", "Ukraine", "Vatican City"],
 }
 
 
@@ -386,16 +394,23 @@ def _crustdata_company_type(atom: A.Atom) -> dict:
     return _crustdata_cond("basic_info.company_type", "=", atom.value)
 
 
+# REAL FIX, 2026-10-08: comparing our rendered query against the one Crustdata's own dashboard
+# generated for the SAME ICP (found 37 real companies; ours found zero) showed it does NOT use
+# basic_info.industries for a loosely-worded concept at all -- that field is the narrow, closed
+# LinkedIn-style taxonomy ("Medical Device", "Hospitals and Health Care"). It fuzzy-matches
+# taxonomy.categories and taxonomy.professional_network_specialities instead -- broader,
+# free-form tag fields companies self-describe with, which is where a phrase like "health tech"
+# or "agentic workflows" actually has a chance of hitting. Both fields are searched, OR'd, per
+# term, rather than guessing which one single field is "the" right one.
+CRUSTDATA_KEYWORD_FIELDS: tuple[str, ...] = ("taxonomy.categories", "taxonomy.professional_network_specialities")
+
+
 def _crustdata_keyword(atom: A.Atom) -> dict:
-    # Crustdata's `(.)` operator ("fuzzy text search", confirmed in its own schema) applied to
-    # basic_info.industries -- the same field the structured `in` filter above uses, just a
-    # substring match instead of an exact enum lookup. Used as the fallback for terms the real
-    # taxonomy doesn't have (see resolve_atom()'s METHOD_MIXED), 2026-10-08. Multiple terms are
-    # OR'd via a nested SearchConditionGroup, which Crustdata's own schema supports recursively.
     terms = list(atom.value)
     if not terms:
         return {}
-    sub = [{"field": "basic_info.industries", "type": "(.)", "value": t} for t in terms]
+    sub = [{"field": field, "type": "(.)", "value": t}
+          for t in terms for field in CRUSTDATA_KEYWORD_FIELDS]
     return {"conditions": [sub[0] if len(sub) == 1 else {"op": "or", "conditions": sub}]}
 
 
@@ -413,8 +428,22 @@ def _crustdata_funding_recency(atom: A.Atom) -> dict:
 
 
 def _crustdata_technographics(atom: A.Atom) -> dict:
-    op = "in" if atom.operator == A.INCLUDE else "not_in"
-    return _crustdata_cond("technographics.technologies.name", op, list(atom.value))
+    # REAL FIX, 2026-10-08 (found by comparing against Crustdata's own dashboard, which found 37
+    # real matches for this exact query while our original `in` version found zero): a company's
+    # tech stack is an ARRAY per company, so `in` with our value array checks whether the WHOLE
+    # field equals one of our values -- which it never does. `[.]` (exact token match), OR'd one
+    # condition per technology, is what the provider's own query builder uses to ask "does this
+    # company's list CONTAIN this token", confirmed via its real generated query.
+    terms = list(atom.value)
+    if not terms:
+        return {}
+    if atom.operator == A.INCLUDE:
+        sub = [{"field": "technographics.technologies.name", "type": "[.]", "value": t} for t in terms]
+        return {"conditions": [sub[0] if len(sub) == 1 else {"op": "or", "conditions": sub}]}
+    # EXCLUDE: no negated-token operator exists in Crustdata's schema ("!= "/"not_in" are the
+    # closest, documented for scalar equality, not array-contains) -- left as the best available
+    # approximation since no partner ICP exercises this path yet; revisit with a live test first.
+    return _crustdata_cond("technographics.technologies.name", "not_in", terms)
 
 
 # Crustdata's own `roles.distribution.<function>` vocabulary (the full set the schema accepts),
