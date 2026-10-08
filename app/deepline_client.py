@@ -229,6 +229,11 @@ DEEPLINE_TOOL_COST_USD = {
     "icypeas_find_people": lambda p: 0.014 * int((p.get("pagination") or {}).get("size") or 25),
     "icypeas_count_companies": lambda p: 0.0,
     "icypeas_count_people": lambda p: 0.0,
+    # Crustdata v3 bills per RETURNED result at $0.002/row (deepline tools describe,
+    # 2026-10-08) -- same "requested, not returned" worst-case convention as Icypeas above.
+    # Empty result pages are free per the provider's own pricing note, which is the real
+    # upside case; this estimate is the conservative ceiling settled down afterwards.
+    "crustdata_v3_company_search": lambda p: 0.002 * int(p.get("limit") or 20),
 }
 
 
