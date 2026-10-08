@@ -400,6 +400,34 @@ def test_search_crustdata_sends_an_unresolved_industry_term_as_a_fuzzy_keyword_n
     assert result["exhausted"] is True
 
 
+def test_search_crustdata_requests_every_field_group_it_filters_on(db, monkeypatch):
+    """REAL FIX, 2026-10-08: the identical filter payload returned 0 companies via Deepline with
+    fields=[basic_info, headcount, revenue, locations] and 37 (matching Crustdata's own
+    dashboard and a raw, non-Deepline API call) once funding/taxonomy were added to `fields` --
+    confirmed by isolating the exact payload via `deepline tools execute` directly. Whatever
+    Deepline's wrapper does internally, every field group a query filters on must be requested
+    here too, not just the ones wanted back in the row data."""
+    import app.deepline_client as dc
+
+    captured = {}
+
+    def fake_cli(tool, payload):
+        if tool == "crustdata_v3_company_search_autocomplete":
+            return {"toolResponse": {"raw": {"suggestions": []}}}
+        if tool == "crustdata_v3_company_search":
+            captured["fields"] = payload["fields"]
+            return {"toolResponse": {"raw": {"companies": [], "next_cursor": None}}}
+        raise AssertionError(f"unexpected tool: {tool}")
+
+    monkeypatch.setattr(dc, "_call_deepline_cli", fake_cli)
+    icp = {**NORA_ICP, "industries": ["life science"], "funding_recency_max_days": 180}
+
+    with spend_scope(db, BILLING, "icp_filters", run_cap_usd=0.5):
+        play.search_crustdata(db, PARTNER, icp)
+
+    assert set(captured["fields"]) >= {"basic_info", "headcount", "revenue", "locations", "funding", "taxonomy"}
+
+
 def test_search_crustdata_pagination_uses_next_cursor_not_a_token(db, monkeypatch):
     # Crustdata's own pagination field is `next_cursor`, a different shape from Icypeas'
     # `pagination.token` -- pinned so a future edit can't silently merge the two cursor shapes.

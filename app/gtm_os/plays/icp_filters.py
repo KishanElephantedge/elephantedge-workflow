@@ -839,8 +839,16 @@ def search_crustdata(db: Session, tenant_id: int, icp: dict, pages: int = 1) -> 
         return result
 
     for _ in range(pages):
+        # REAL FIX, 2026-10-08: `fields` (which response groups come back) and filterability
+        # looked unrelated per Crustdata's own docs -- confirmed independently via a raw,
+        # non-Deepline call that filtering on `technographics` worked despite it never being
+        # requested in `fields`. But isolated via Deepline's CLI directly: the IDENTICAL filter
+        # payload returned 0 companies with fields=[basic_info, headcount, revenue, locations]
+        # and 37 (matching Crustdata's own dashboard exactly) with funding/taxonomy added --
+        # whatever Deepline's wrapper does internally, every field group this query filters on
+        # must also be requested here, not just the ones you want back in the row data.
         payload = {"filters": crustdata_filters, "limit": quota.page_size,
-                   "fields": ["basic_info", "headcount", "revenue", "locations"],
+                   "fields": ["basic_info", "headcount", "revenue", "locations", "funding", "taxonomy"],
                    **({"cursor": next_cursor} if next_cursor else {})}
         try:
             response = execute_tool("crustdata_v3_company_search", payload)
