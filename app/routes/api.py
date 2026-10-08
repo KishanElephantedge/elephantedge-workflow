@@ -6319,6 +6319,26 @@ def _require_admin(request: Request) -> int:
     return tenant_id
 
 
+@router.get("/gtm-os/admin/debug/crustdata-filters")
+def admin_crustdata_filters_debug(partner_tenant_id: int, request: Request, db: Session = Depends(get_db)):
+    """The EXACT payload search_crustdata() would send for this partner's current ICP, built but
+    never executed. FREE -- no provider call. Added 2026-10-08 live-debugging a case where the
+    planner's own failover hid which provider's payload was actually sent (Crustdata ran first,
+    failed over to Icypeas, and the response only ever surfaces the LAST attempted provider's
+    result) -- the same reason icp-preview exists for Icypeas, just for the second adapter.
+    """
+    _require_admin(request)
+    icp_param = db.query(Parameter).filter(Parameter.tenant_id == partner_tenant_id,
+                                           Parameter.key == PARTNER_ICP_PARAMETER_KEY).first()
+    if not icp_param or not icp_param.value:
+        raise HTTPException(status_code=400, detail="No ICP configured for this tenant yet.")
+
+    from app.gtm_os.plays.icp_filters import crustdata_filters_for_icp
+
+    filters = crustdata_filters_for_icp(icp_param.value, db=db, tenant_id=partner_tenant_id)
+    return {"tenant_id": partner_tenant_id, "filters": filters}
+
+
 @router.get("/gtm-os/admin/providers/catalog")
 def admin_search_provider_tools(request: Request, q: str, categories: str | None = None,
                                 limit: int = 10):

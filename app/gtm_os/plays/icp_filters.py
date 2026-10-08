@@ -715,6 +715,37 @@ def search_icypeas(db: Session, tenant_id: int, icp: dict, pages: int = 1) -> di
     return result
 
 
+def crustdata_filters_for_icp(icp: dict, db: Session | None = None, tenant_id: int | None = None) -> dict:
+    """The full rendered Crustdata filter payload for one ICP -- same role as
+    icypeas_filters_for_icp() above, extracted out of search_crustdata() 2026-10-08 so it can be
+    inspected (GET .../admin/debug/crustdata-filters) without spending anything, the same reason
+    icp-preview exists for Icypeas.
+
+    REAL FIX, 2026-10-07: the raw registry render sends the partner's own wording straight into
+    `basic_info.industries` -- exactly the "Professional Services" trap repeating for a new
+    provider. Resolve industry against Crustdata's own free autocomplete first; an unresolved
+    term is DROPPED from the structured filter (broadening the search) and/or sent as a keyword
+    fallback (see resolve_atom()), never sent literally into the exact-match enum.
+    """
+    from app.gtm_os.sourcing.atoms import INDUSTRY as _INDUSTRY
+    from app.gtm_os.sourcing.atoms import decompose_icp
+    from app.gtm_os.sourcing.registry import CRUSTDATA_V3_COMPANY_SEARCH as _CRUSTDATA
+    from app.gtm_os.sourcing.registry import coverage_for
+
+    icp_atoms = decompose_icp(icp)
+    coverage = coverage_for(_CRUSTDATA, icp_atoms)
+    conditions = [c for c in (coverage.filters.get("conditions") or [])
+                 if c.get("field") != "basic_info.industries"]
+    if db is not None:
+        from app.gtm_os.sourcing.resolution import resolve_atom
+
+        for atom in icp_atoms.by_key(_INDUSTRY):
+            resolved = resolve_atom(db, _CRUSTDATA, atom, tenant_id=tenant_id)
+            if resolved.resolved and resolved.filter_fragment.get("conditions"):
+                conditions.extend(resolved.filter_fragment["conditions"])
+    return {"op": "and", "conditions": conditions} if conditions else {}
+
+
 def _normalize_crustdata_row(co: dict) -> dict:
     """Crustdata's real field names (confirmed via its live schema, 2026-10-08) -> the same
     normalized row shape _process_icypeas_company/_create_icypeas_lead already read (url, name,
@@ -770,23 +801,7 @@ def search_crustdata(db: Session, tenant_id: int, icp: dict, pages: int = 1) -> 
     from app.gtm_os.sourcing.registry import coverage_for
 
     icp_atoms = decompose_icp(icp)
-    coverage = coverage_for(_CRUSTDATA, icp_atoms)
-    # REAL FIX, 2026-10-08: the raw registry render sends the partner's own wording straight
-    # into `basic_info.industries` -- exactly the "Professional Services" trap repeating for a
-    # new provider. Resolve industry against Crustdata's own free autocomplete first (same shape
-    # icypeas_filters_for_icp already uses for Icypeas); an unresolved term is DROPPED rather
-    # than sent literally, which broadens the search instead of guaranteeing it matches nothing.
-    conditions = [c for c in (coverage.filters.get("conditions") or [])
-                 if c.get("field") != "basic_info.industries"]
-    if db is not None:
-        from app.gtm_os.sourcing.atoms import INDUSTRY as _INDUSTRY
-        from app.gtm_os.sourcing.resolution import resolve_atom
-
-        for atom in icp_atoms.by_key(_INDUSTRY):
-            resolved = resolve_atom(db, _CRUSTDATA, atom, tenant_id=tenant_id)
-            if resolved.resolved and resolved.filter_fragment.get("conditions"):
-                conditions.extend(resolved.filter_fragment["conditions"])
-    crustdata_filters = {"op": "and", "conditions": conditions} if conditions else {}
+    crustdata_filters = crustdata_filters_for_icp(icp, db=db, tenant_id=tenant_id)
     fingerprint = hashlib.sha1(json.dumps(crustdata_filters, sort_keys=True).encode()).hexdigest()[:12]
 
     cursor = _cursor(db, tenant_id, provider="crustdata-v3")
@@ -850,8 +865,6 @@ def search_crustdata(db: Session, tenant_id: int, icp: dict, pages: int = 1) -> 
         payload = {"filters": crustdata_filters, "limit": quota.page_size,
                    "fields": ["basic_info", "headcount", "revenue", "locations", "funding", "taxonomy"],
                    **({"cursor": next_cursor} if next_cursor else {})}
-        result["_debug_payload_sent"] = payload  # TEMP, 2026-10-08: live-debugging an empty-result
-                                                  # mismatch vs an identical payload tested directly.
         try:
             response = execute_tool("crustdata_v3_company_search", payload)
         except DeeplineSpendBlocked as e:
