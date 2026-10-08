@@ -357,18 +357,24 @@ def test_search_crustdata_resolves_industry_then_creates_a_lead(db, monkeypatch)
     assert db.query(Batch).get(company.batch_id).tenant_id == PARTNER
 
 
-def test_search_crustdata_drops_an_unresolved_industry_term_rather_than_sending_it_raw(db, monkeypatch):
-    """The exact bug found live: a term the autocomplete can't match (e.g. 'life science')
-    must never be sent to the real search as a literal -- it should be dropped, broadening the
-    search instead of guaranteeing a zero-match filter."""
+def test_search_crustdata_sends_an_unresolved_industry_term_as_a_fuzzy_keyword_not_literal_enum(db, monkeypatch):
+    """UPDATED 2026-10-08 (explicit instruction, a pattern confirmed to work on other
+    platforms): a term the structured taxonomy doesn't have (confirmed by the resolver itself,
+    not just unchecked) is no longer dropped -- it's sent as a `(.)` fuzzy-text condition on the
+    SAME field instead of the exact `in` enum, which several providers genuinely do match
+    against. It must never be sent as a literal `in` value, which is what matched zero
+    companies for "Professional Services" in the first place."""
     import app.deepline_client as dc
 
     def fake_cli(tool, payload):
         if tool == "crustdata_v3_company_search_autocomplete":
             return {"toolResponse": {"raw": {"suggestions": []}}}  # confirmed real: no match
         if tool == "crustdata_v3_company_search":
-            fields = [c["field"] for c in payload["filters"]["conditions"]]
-            assert "basic_info.industries" not in fields
+            conditions = payload["filters"]["conditions"]
+            industry_conds = [c for c in conditions if c.get("field") == "basic_info.industries"]
+            assert len(industry_conds) == 1
+            assert industry_conds[0]["type"] == "(.)"
+            assert industry_conds[0]["value"] == "life science"
             return {"toolResponse": {"raw": {"companies": [], "next_cursor": None}}}
         raise AssertionError(f"unexpected tool: {tool}")
 

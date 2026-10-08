@@ -366,6 +366,19 @@ def _crustdata_company_type(atom: A.Atom) -> dict:
     return _crustdata_cond("basic_info.company_type", "=", atom.value)
 
 
+def _crustdata_keyword(atom: A.Atom) -> dict:
+    # Crustdata's `(.)` operator ("fuzzy text search", confirmed in its own schema) applied to
+    # basic_info.industries -- the same field the structured `in` filter above uses, just a
+    # substring match instead of an exact enum lookup. Used as the fallback for terms the real
+    # taxonomy doesn't have (see resolve_atom()'s METHOD_MIXED), 2026-10-08. Multiple terms are
+    # OR'd via a nested SearchConditionGroup, which Crustdata's own schema supports recursively.
+    terms = list(atom.value)
+    if not terms:
+        return {}
+    sub = [{"field": "basic_info.industries", "type": "(.)", "value": t} for t in terms]
+    return {"conditions": [sub[0] if len(sub) == 1 else {"op": "or", "conditions": sub}]}
+
+
 def _crustdata_funding_recency(atom: A.Atom) -> dict:
     # atom.value is (None, max_days) -- "a round within the last N days" becomes
     # "last_fundraise_date on or after (today - N days)". A real date comparison, not a guess:
@@ -467,6 +480,10 @@ CRUSTDATA_V3_COMPANY_SEARCH = ProviderEndpoint(
         A.COMPANY_TYPE: Capability(A.COMPANY_TYPE, SUPPORTED, FIXED_TAXONOMY,
                                    _crustdata_company_type,
                                    note="basic_info.company_type, exact match."),
+        "keyword": Capability("keyword", SUPPORTED, FREE_TEXT, _crustdata_keyword,
+                              note="Fuzzy substring match ((.) operator) on basic_info.industries "
+                                   "-- the fallback resolve_atom() uses for industry terms its "
+                                   "own resolver confirms aren't in the real taxonomy."),
         A.DEPARTMENT_HEADCOUNT: Capability(
             A.DEPARTMENT_HEADCOUNT, SUPPORTED, NUMERIC, _crustdata_department_headcount,
             note="roles.distribution.<function> -- per-function absolute headcount, full "

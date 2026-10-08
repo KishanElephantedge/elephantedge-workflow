@@ -239,6 +239,42 @@ def test_resolver_fetch_already_confirmed_terms_are_not_refetched(db):
     assert calls == []  # already confirmed -- the exact-match path returns before the resolver
 
 
+FAKE_ENDPOINT_WITH_RESOLVER_AND_KEYWORD = R.ProviderEndpoint(
+    provider="fake-mixed", endpoint="x", job="company_search",
+    capabilities={
+        A.INDUSTRY: R.Capability(
+            A.INDUSTRY, R.SUPPORTED, R.FIXED_TAXONOMY,
+            render=lambda atom: {"industry": {"include": list(atom.value)}},
+            resolver_fetch=lambda query, limit: {"medical device": ["Medical Device"]}.get(query.lower(), []),
+        ),
+        "keyword": R.Capability("keyword", R.SUPPORTED, R.FREE_TEXT,
+                                render=lambda atom: {"keyword": {"include": list(atom.value)}}),
+    },
+)
+
+
+def test_mixed_resolution_combines_real_taxonomy_values_with_a_keyword_fallback(db):
+    # One term the resolver confirms ("medical device"), one it confirms is absent ("life
+    # science") -- real-world instruction, 2026-10-08: send the confirmed one as a structured
+    # filter and the rejected one as free text, in the SAME call, rather than all-or-nothing.
+    atom = A.Atom(A.INDUSTRY, A.INCLUDE, ["medical device", "life science"],
+                 partner_term="medical device, life science")
+    resolved = RES.resolve_atom(db, FAKE_ENDPOINT_WITH_RESOLVER_AND_KEYWORD, atom,
+                                tenant_id=PARTNER, use_llm=False)
+    assert resolved.method == RES.METHOD_MIXED
+    assert resolved.filter_fragment["industry"] == {"include": ["Medical Device"]}
+    assert resolved.filter_fragment["keyword"] == {"include": ["life science"]}
+
+
+def test_mixed_resolution_never_fires_for_a_provider_with_no_resolver(db):
+    # Icypeas has no resolver at all -- "not checked" must stay on the existing all-or-nothing
+    # keyword path, never silently treated as "confirmed absent".
+    resolved = RES.resolve_atom(db, ICYPEAS, _industry_atom("Professional Services"),
+                                tenant_id=PARTNER, use_llm=False)
+    assert resolved.method == RES.METHOD_KEYWORD_FALLBACK
+    assert "industry" not in resolved.filter_fragment
+
+
 def test_crustdata_resolver_fetch_parses_the_real_suggestions_shape(monkeypatch):
     """Pins the exact live response shape confirmed 2026-10-08:
     {"suggestions": [{"value": "Medical Device"}]}, via Deepline's own execute_tool wrapper."""

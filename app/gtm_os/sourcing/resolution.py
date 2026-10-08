@@ -43,6 +43,7 @@ METHOD_VERBATIM = "verbatim"              # free-text/numeric filter: the value 
 METHOD_EXACT_TAXONOMY = "exact_taxonomy"  # the partner's word IS a real value
 METHOD_LLM_EXPANSION = "llm_expansion"    # mapped onto confirmed values by an LLM
 METHOD_KEYWORD_FALLBACK = "keyword_fallback"
+METHOD_MIXED = "mixed_taxonomy_and_keyword"
 METHOD_UNRESOLVED = "unresolved"
 
 SOURCE_OBSERVED = "observed_in_response"
@@ -147,6 +148,7 @@ def resolve_atom(db: Session, endpoint: R.ProviderEndpoint, atom: A.Atom,
     # confirmed, so a second search for the SAME wording never pays the LLM-expansion cost (or
     # worse, matches nothing) when the provider could have just said "that's not a real value"
     # for free up front.
+    resolver_rejected: set[str] = set()   # normalized terms the PROVIDER itself confirmed absent
     if cap.resolver_fetch is not None:
         for term in terms:
             if normalize(term) in by_norm:
@@ -160,6 +162,8 @@ def resolve_atom(db: Session, endpoint: R.ProviderEndpoint, atom: A.Atom,
             if suggestions:
                 record_observed_values(db, endpoint.provider, atom.key, suggestions,
                                        source=SOURCE_RESOLVER)
+            else:
+                resolver_rejected.add(normalize(term))
         confirmed = known_values(db, endpoint.provider, atom.key)
         by_norm = {v.normalized_value: v.value for v in confirmed}
         exact = [by_norm[normalize(t)] for t in terms if normalize(t) in by_norm]
@@ -170,18 +174,50 @@ def resolve_atom(db: Session, endpoint: R.ProviderEndpoint, atom: A.Atom,
                                      filter_fragment=cap.render(_with_value(atom, exact)),
                                      note="resolved via the provider's own free autocomplete"))
 
+    structured_values = list(exact)
+    structured_method = METHOD_EXACT_TAXONOMY if exact else None
     if confirmed and use_llm:
         expanded = _llm_expand(db, atom, terms, [v.value for v in confirmed], endpoint.provider)
         if expanded:
-            return _store(db, tenant_id, endpoint, atom,
-                          Resolution(atom=atom, method=METHOD_LLM_EXPANSION, values=expanded,
-                                     target_filter=_filter_name(cap.render(atom)),
-                                     filter_fragment=cap.render(_with_value(atom, expanded)),
-                                     note=f"mapped onto {len(confirmed)} confirmed values"))
+            structured_values, structured_method = expanded, METHOD_LLM_EXPANSION
 
-    # We cannot name a real value for this taxonomy yet. Free text is better than a filter that
-    # matches nothing -- but it is recorded as a fallback, not as a resolution.
+    # REAL-WORLD PATTERN, 2026-10-08 (explicit instruction, confirmed to work across other
+    # platforms): a term the structured taxonomy genuinely lacks is often still findable as a
+    # free-text/keyword match. Only terms the RESOLVER ITSELF rejected go here -- a stronger,
+    # provider-confirmed signal than inferring absence from what the LLM did or didn't map --
+    # never a term that simply was never checked (no resolver on this provider at all), which
+    # keeps using the pre-existing all-or-nothing keyword path further below unchanged.
     keyword = _keyword_capability(endpoint)
+    keyword_terms = [t for t in terms if normalize(t) in resolver_rejected]
+    keyword_fragment = keyword.render(_with_value(atom, keyword_terms)) if (keyword_terms and keyword) else {}
+
+    if structured_values and keyword_fragment:
+        structured_fragment = cap.render(_with_value(atom, structured_values))
+        return _store(db, tenant_id, endpoint, atom,
+                      Resolution(atom=atom, method=METHOD_MIXED, values=structured_values + keyword_terms,
+                                 target_filter=_filter_name(structured_fragment),
+                                 filter_fragment=_merge_fragments(structured_fragment, keyword_fragment),
+                                 note=f"{len(structured_values)} resolved to real taxonomy values, "
+                                      f"{len(keyword_terms)} sent as free text (the provider's own "
+                                      f"resolver confirmed these aren't in its taxonomy)"))
+
+    if structured_values:
+        return _store(db, tenant_id, endpoint, atom,
+                      Resolution(atom=atom, method=structured_method, values=structured_values,
+                                 target_filter=_filter_name(cap.render(atom)),
+                                 filter_fragment=cap.render(_with_value(atom, structured_values)),
+                                 note=(f"mapped onto {len(confirmed)} confirmed values"
+                                      if structured_method == METHOD_LLM_EXPANSION else None)))
+
+    if keyword_fragment:
+        return _store(db, tenant_id, endpoint, atom,
+                      Resolution(atom=atom, method=METHOD_KEYWORD_FALLBACK, values=keyword_terms,
+                                 target_filter=_filter_name(keyword_fragment), filter_fragment=keyword_fragment,
+                                 note="the provider's own resolver confirmed these aren't in its taxonomy"))
+
+    # We cannot name a real value for this taxonomy yet, and the resolver either doesn't exist
+    # here or hasn't been checked (no term reached resolver_rejected). Free text is better than
+    # a filter that matches nothing -- but it is recorded as a fallback, not as a resolution.
     if keyword is not None:
         return _keyword_resolution(db, endpoint, atom, keyword, tenant_id,
                                    note="no confirmed taxonomy value yet; the taxonomy is learned "
@@ -190,6 +226,21 @@ def resolve_atom(db: Session, endpoint: R.ProviderEndpoint, atom: A.Atom,
     return _store(db, tenant_id, endpoint, atom,
                   Resolution(atom=atom, method=METHOD_UNRESOLVED,
                              note="no confirmed taxonomy value and no free-text filter"))
+
+
+def _merge_fragments(a: dict, b: dict) -> dict:
+    """Combine two rendered fragments (a structured taxonomy condition and a keyword condition)
+    the same non-clobbering way registry.py's own _merge does, kept local to avoid reaching into
+    that module's private helper."""
+    merged = dict(a)
+    for key, value in b.items():
+        if key in merged and isinstance(merged[key], dict) and isinstance(value, dict):
+            merged[key] = {**merged[key], **value}
+        elif key in merged and isinstance(merged[key], list) and isinstance(value, list):
+            merged[key] = merged[key] + value
+        else:
+            merged[key] = value
+    return merged
 
 
 def _keyword_capability(endpoint: R.ProviderEndpoint) -> R.Capability | None:
