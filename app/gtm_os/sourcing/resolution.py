@@ -148,8 +148,8 @@ def resolve_atom(db: Session, endpoint: R.ProviderEndpoint, atom: A.Atom,
     # confirmed, so a second search for the SAME wording never pays the LLM-expansion cost (or
     # worse, matches nothing) when the provider could have just said "that's not a real value"
     # for free up front.
-    resolver_rejected: set[str] = set()   # normalized terms the PROVIDER itself confirmed absent
-    if cap.resolver_fetch is not None:
+    has_resolver = cap.resolver_fetch is not None
+    if has_resolver:
         for term in terms:
             if normalize(term) in by_norm:
                 continue
@@ -162,8 +162,6 @@ def resolve_atom(db: Session, endpoint: R.ProviderEndpoint, atom: A.Atom,
             if suggestions:
                 record_observed_values(db, endpoint.provider, atom.key, suggestions,
                                        source=SOURCE_RESOLVER)
-            else:
-                resolver_rejected.add(normalize(term))
         confirmed = known_values(db, endpoint.provider, atom.key)
         by_norm = {v.normalized_value: v.value for v in confirmed}
         exact = [by_norm[normalize(t)] for t in terms if normalize(t) in by_norm]
@@ -183,13 +181,19 @@ def resolve_atom(db: Session, endpoint: R.ProviderEndpoint, atom: A.Atom,
 
     # REAL-WORLD PATTERN, 2026-10-08 (explicit instruction, confirmed to work across other
     # platforms): a term the structured taxonomy genuinely lacks is often still findable as a
-    # free-text/keyword match. Only terms the RESOLVER ITSELF rejected go here -- a stronger,
-    # provider-confirmed signal than inferring absence from what the LLM did or didn't map --
-    # never a term that simply was never checked (no resolver on this provider at all), which
-    # keeps using the pre-existing all-or-nothing keyword path further below unchanged.
+    # free-text/keyword match. Eligible terms are anything WITHOUT an exact confirmed match once
+    # the resolver has run -- not just terms the resolver explicitly rejected. Found live: a term
+    # the resolver DID find something for ("diagnostics" -> "Medical and Diagnostic
+    # Laboratories") can still fall through when that one LLM-expansion call doesn't end up using
+    # it, and dropping it silently is the exact class of bug this whole mechanism exists to
+    # prevent. A redundant keyword condition alongside an already-resolved term is harmless (just
+    # a slightly wider net); covered by NEITHER branch is the real bug. Only runs when this
+    # provider actually has a resolver -- a provider with none keeps the pre-existing
+    # all-or-nothing keyword path further below, since "never checked" must not be treated as
+    # "confirmed absent".
     keyword = _keyword_capability(endpoint)
-    keyword_terms = [t for t in terms if normalize(t) in resolver_rejected]
-    keyword_fragment = keyword.render(_with_value(atom, keyword_terms)) if (keyword_terms and keyword) else {}
+    keyword_terms = [t for t in terms if normalize(t) not in by_norm] if (has_resolver and keyword) else []
+    keyword_fragment = keyword.render(_with_value(atom, keyword_terms)) if keyword_terms else {}
 
     if structured_values and keyword_fragment:
         structured_fragment = cap.render(_with_value(atom, structured_values))
@@ -198,8 +202,8 @@ def resolve_atom(db: Session, endpoint: R.ProviderEndpoint, atom: A.Atom,
                                  target_filter=_filter_name(structured_fragment),
                                  filter_fragment=_merge_fragments(structured_fragment, keyword_fragment),
                                  note=f"{len(structured_values)} resolved to real taxonomy values, "
-                                      f"{len(keyword_terms)} sent as free text (the provider's own "
-                                      f"resolver confirmed these aren't in its taxonomy)"))
+                                      f"{len(keyword_terms)} sent as free text (no exact taxonomy "
+                                      f"match after checking the provider's own resolver)"))
 
     if structured_values:
         return _store(db, tenant_id, endpoint, atom,
@@ -213,7 +217,7 @@ def resolve_atom(db: Session, endpoint: R.ProviderEndpoint, atom: A.Atom,
         return _store(db, tenant_id, endpoint, atom,
                       Resolution(atom=atom, method=METHOD_KEYWORD_FALLBACK, values=keyword_terms,
                                  target_filter=_filter_name(keyword_fragment), filter_fragment=keyword_fragment,
-                                 note="the provider's own resolver confirmed these aren't in its taxonomy"))
+                                 note="no exact taxonomy match after checking the provider's own resolver"))
 
     # We cannot name a real value for this taxonomy yet, and the resolver either doesn't exist
     # here or hasn't been checked (no term reached resolver_rejected). Free text is better than

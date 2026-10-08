@@ -333,8 +333,28 @@ def _crustdata_revenue(atom: A.Atom) -> dict:
     return {"conditions": conds}
 
 
+# A broad region name (not a real value in locations.country -- confirmed live 2026-10-08:
+# "Europe" returns ZERO autocomplete suggestions, while every country below returned itself
+# exactly) silently zeroes out a search, the same "Professional Services" trap in a new field.
+# This is NOT the free-text/keyword-fallback situation resolve_atom() already handles -- GEO is
+# its own value_space, verbatim by design for a provider whose real values genuinely ARE
+# whatever the partner wrote ("United States", "United Kingdom"). Only region NAMES need
+# expanding into the countries they mean; a real country name must pass through unchanged.
+CRUSTDATA_REGION_EXPANSIONS: dict[str, list[str]] = {
+    "europe": ["United Kingdom", "Germany", "France", "Netherlands", "Ireland", "Sweden",
+              "Switzerland", "Spain", "Italy", "Poland", "Belgium", "Denmark", "Norway",
+              "Finland", "Austria", "Portugal", "Czech Republic", "Romania"],
+}
+
+
 def _crustdata_geography(atom: A.Atom) -> dict:
-    return _crustdata_cond("locations.country", "in", list(atom.value))
+    countries: list[str] = []
+    for value in atom.value:
+        expansion = CRUSTDATA_REGION_EXPANSIONS.get(value.strip().lower())
+        countries.extend(expansion if expansion else [value])
+    # dict.fromkeys dedupes while preserving order -- harmless if a partner lists both "Europe"
+    # and "Germany", which would otherwise send "Germany" twice.
+    return _crustdata_cond("locations.country", "in", list(dict.fromkeys(countries)))
 
 
 def _crustdata_industry(atom: A.Atom) -> dict:

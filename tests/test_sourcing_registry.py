@@ -132,6 +132,27 @@ def test_no_atom_is_ever_silently_dropped():
 # coverage found that day, not just the department-headcount field that started the search.
 # -------------------------------------------------------------------------------------------
 
+def test_crustdata_expands_europe_into_real_countries_not_a_literal_value():
+    # Found live 2026-10-08 (Nora): "Europe" is not a real locations.country value in Crustdata
+    # (confirmed via its own autocomplete -- zero suggestions), so sending it literally silently
+    # zeroed out her entire search. Region names must expand; real country names must not.
+    coverage = R.coverage_for(R.CRUSTDATA_V3_COMPANY_SEARCH,
+                              A.decompose_icp({"geographies": ["United States", "United Kingdom", "Europe"]}))
+    countries = next(c for c in coverage.filters["conditions"]
+                     if c["field"] == "locations.country")["value"]
+    assert "Europe" not in countries
+    assert "United States" in countries and "United Kingdom" in countries
+    assert "Germany" in countries and "France" in countries
+
+
+def test_crustdata_geography_expansion_never_duplicates_an_explicitly_listed_country():
+    coverage = R.coverage_for(R.CRUSTDATA_V3_COMPANY_SEARCH,
+                              A.decompose_icp({"geographies": ["Germany", "Europe"]}))
+    countries = next(c for c in coverage.filters["conditions"]
+                     if c["field"] == "locations.country")["value"]
+    assert countries.count("Germany") == 1
+
+
 def test_crustdata_enforces_every_majji_must_have_including_department_headcount():
     coverage = R.coverage_for(R.CRUSTDATA_V3_COMPANY_SEARCH, A.decompose_icp(MAJJI))
     assert coverage.must_have_gap == []
