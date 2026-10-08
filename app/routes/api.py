@@ -6335,8 +6335,9 @@ def admin_crustdata_filters_debug(partner_tenant_id: int, request: Request, db: 
 
     from app.gtm_os.plays.icp_filters import crustdata_filters_for_icp
 
-    filters = crustdata_filters_for_icp(icp_param.value, db=db, tenant_id=partner_tenant_id)
-    return {"tenant_id": partner_tenant_id, "filters": filters}
+    filters, industry_fully_structured = crustdata_filters_for_icp(icp_param.value, db=db, tenant_id=partner_tenant_id)
+    return {"tenant_id": partner_tenant_id, "filters": filters,
+           "industry_verifiable": industry_fully_structured}
 
 
 @router.get("/gtm-os/admin/providers/catalog")

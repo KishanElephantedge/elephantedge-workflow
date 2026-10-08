@@ -407,6 +407,64 @@ def test_search_crustdata_stores_the_real_funding_date_not_just_filters_on_it(db
     assert "Last funding: Series C on 2026-06-01" in lead.evidence
 
 
+def test_crustdata_filters_for_icp_reports_whether_industry_is_safely_verifiable(db, monkeypatch):
+    """The flag that makes sample verification possible for Crustdata at all: industry is only
+    safe to judge rows against when it resolved to a REAL structured taxonomy value with no
+    keyword fallback mixed in -- a fuzzy keyword match was never a promised classification, same
+    discipline Icypeas' own verification already follows."""
+    import app.deepline_client as dc
+
+    monkeypatch.setattr(dc, "_call_deepline_cli", lambda tool, payload: {
+        "toolResponse": {"raw": {"suggestions": [{"value": "Medical Device"}]}}})
+    _, fully_structured = play.crustdata_filters_for_icp(
+        {**NORA_ICP, "industries": ["medical device"]}, db=db, tenant_id=PARTNER)
+    assert fully_structured is True
+
+    monkeypatch.setattr(dc, "_call_deepline_cli", lambda tool, payload: {
+        "toolResponse": {"raw": {"suggestions": []}}})
+    _, fully_structured = play.crustdata_filters_for_icp(
+        {**NORA_ICP, "industries": ["totally made up phrase"]}, db=db, tenant_id=PARTNER)
+    assert fully_structured is False
+
+    # No db session at all (a pure filter-inspection call) -- resolution never runs, so industry
+    # can never be claimed safe to verify.
+    _, fully_structured = play.crustdata_filters_for_icp({**NORA_ICP, "industries": ["medical device"]})
+    assert fully_structured is False
+
+
+def test_search_crustdata_catches_a_bad_batch_before_creating_any_leads(db, monkeypatch):
+    """THE real gap found live onboarding Jeff Ballard, 2026-10-08: search_crustdata() had no
+    sample-verification step at all (an explicit, acknowledged scope-cut when the adapter was
+    first built) -- his generic industry words fell to the fuzzy keyword fallback and matched
+    large Indian industrial conglomerates with nothing to do with his stated "B2B technology"
+    ICP, and nothing caught it. Here: employee_min/max is a structured filter that should always
+    be checkable regardless of industry resolution, so a batch that clearly violates it must stop
+    the run and create zero leads, the same discipline search_icypeas already has."""
+    import app.deepline_client as dc
+
+    def fake_cli(tool, payload):
+        if tool == "crustdata_v3_company_search_autocomplete":
+            return {"toolResponse": {"raw": {"suggestions": []}}}  # forces keyword fallback
+        if tool == "crustdata_v3_company_search":
+            # 6 companies, all wildly outside the stated 11-500 employee band -- a provider
+            # that returned 200 OK with rows that are simply wrong, same shape as the real bug.
+            bad = [_crustdata_company(i, employees=50_000) for i in range(1, 7)]
+            return {"toolResponse": {"raw": {"companies": bad, "next_cursor": None}}}
+        raise AssertionError(f"unexpected tool: {tool}")
+
+    monkeypatch.setattr(dc, "_call_deepline_cli", fake_cli)
+    icp = {**NORA_ICP, "industries": ["some made up phrase"]}  # guaranteed keyword fallback
+
+    with spend_scope(db, BILLING, "icp_filters", run_cap_usd=0.5):
+        result = play.search_crustdata(db, PARTNER, icp)
+
+    assert result.get("outcome") == "quality_fail"
+    assert "quality:" in (result.get("stopped") or "")
+    assert db.query(GtmLead).count() == 0
+    assert result["verification"]["checked"] >= 5
+    assert result["verification"]["match_rate"] == 0.0
+
+
 def test_search_crustdata_sends_an_unresolved_industry_term_as_a_fuzzy_keyword_not_literal_enum(db, monkeypatch):
     """UPDATED 2026-10-08 (explicit instruction, a pattern confirmed to work on other
     platforms, then corrected again by comparing against Crustdata's own dashboard query): a

@@ -736,8 +736,10 @@ def search_icypeas(db: Session, tenant_id: int, icp: dict, pages: int = 1) -> di
     return result
 
 
-def crustdata_filters_for_icp(icp: dict, db: Session | None = None, tenant_id: int | None = None) -> dict:
-    """The full rendered Crustdata filter payload for one ICP -- same role as
+def crustdata_filters_for_icp(icp: dict, db: Session | None = None, tenant_id: int | None = None
+                              ) -> tuple[dict, bool]:
+    """The full rendered Crustdata filter payload for one ICP, and whether industry resolved to a
+    PURELY structured taxonomy match (no keyword fallback involved at all) -- same role as
     icypeas_filters_for_icp() above, extracted out of search_crustdata() 2026-10-08 so it can be
     inspected (GET .../admin/debug/crustdata-filters) without spending anything, the same reason
     icp-preview exists for Icypeas.
@@ -747,6 +749,16 @@ def crustdata_filters_for_icp(icp: dict, db: Session | None = None, tenant_id: i
     provider. Resolve industry against Crustdata's own free autocomplete first; an unresolved
     term is DROPPED from the structured filter (broadening the search) and/or sent as a keyword
     fallback (see resolve_atom()), never sent literally into the exact-match enum.
+
+    The second return value exists for a SECOND real bug, found live 2026-10-08 onboarding Jeff
+    Ballard: his ICP's generic industry words ("AI", "cloud", "infrastructure") mostly failed to
+    resolve and fell to the fuzzy keyword fallback, which matched large Indian industrial
+    conglomerates (Adani, ACC cement) that are nothing like his stated "B2B technology" target --
+    and nothing caught it, because search_crustdata() had no sample-verification step at all. The
+    caller needs to know whether industry is safe to verify (purely structured) or must be
+    excluded from verification (any keyword fallback involved, same discipline Icypeas already
+    follows in verification.py's own _check_atom: a keyword match was never a promised
+    classification).
     """
     from app.gtm_os.sourcing.atoms import INDUSTRY as _INDUSTRY
     from app.gtm_os.sourcing.atoms import decompose_icp
@@ -757,14 +769,22 @@ def crustdata_filters_for_icp(icp: dict, db: Session | None = None, tenant_id: i
     coverage = coverage_for(_CRUSTDATA, icp_atoms)
     conditions = [c for c in (coverage.filters.get("conditions") or [])
                  if c.get("field") != "basic_info.industries"]
+    industry_fully_structured = True
     if db is not None:
-        from app.gtm_os.sourcing.resolution import resolve_atom
+        from app.gtm_os.sourcing.resolution import METHOD_KEYWORD_FALLBACK, METHOD_MIXED, resolve_atom
 
-        for atom in icp_atoms.by_key(_INDUSTRY):
+        industry_atoms = icp_atoms.by_key(_INDUSTRY)
+        if not industry_atoms:
+            industry_fully_structured = False
+        for atom in industry_atoms:
             resolved = resolve_atom(db, _CRUSTDATA, atom, tenant_id=tenant_id)
             if resolved.resolved and resolved.filter_fragment.get("conditions"):
                 conditions.extend(resolved.filter_fragment["conditions"])
-    return {"op": "and", "conditions": conditions} if conditions else {}
+            if resolved.method in (METHOD_KEYWORD_FALLBACK, METHOD_MIXED) or not resolved.resolved:
+                industry_fully_structured = False
+    else:
+        industry_fully_structured = False
+    return ({"op": "and", "conditions": conditions} if conditions else {}), industry_fully_structured
 
 
 def _normalize_crustdata_row(co: dict) -> dict:
@@ -825,13 +845,14 @@ def search_crustdata(db: Session, tenant_id: int, icp: dict, pages: int = 1) -> 
 
     from app.deepline_client import DeeplineError, DeeplineSpendBlocked, execute_tool
     from app.gtm_os.sourcing.atoms import DEPARTMENT_HEADCOUNT as A_DEPARTMENT_HEADCOUNT
+    from app.gtm_os.sourcing.atoms import HEADCOUNT as A_HEADCOUNT
+    from app.gtm_os.sourcing.atoms import REVENUE as A_REVENUE
     from app.gtm_os.sourcing.atoms import decompose_icp
     from app.gtm_os.sourcing.quota import plan as plan_quota
     from app.gtm_os.sourcing.registry import CRUSTDATA_V3_COMPANY_SEARCH as _CRUSTDATA
-    from app.gtm_os.sourcing.registry import coverage_for
 
     icp_atoms = decompose_icp(icp)
-    crustdata_filters = crustdata_filters_for_icp(icp, db=db, tenant_id=tenant_id)
+    crustdata_filters, industry_fully_structured = crustdata_filters_for_icp(icp, db=db, tenant_id=tenant_id)
     fingerprint = hashlib.sha1(json.dumps(crustdata_filters, sort_keys=True).encode()).hexdigest()[:12]
 
     cursor = _cursor(db, tenant_id, provider="crustdata-v3")
@@ -917,8 +938,36 @@ def search_crustdata(db: Session, tenant_id: int, icp: dict, pages: int = 1) -> 
         except OperationalError:
             db.rollback()
 
-        for raw_co in companies:
-            co = _normalize_crustdata_row(raw_co)
+        normalized = [_normalize_crustdata_row(raw_co) for raw_co in companies]
+
+        # SAMPLE VERIFICATION, 2026-10-08 -- the gap found live onboarding Jeff Ballard: this
+        # adapter had none at all (an explicit, acknowledged scope-cut when it was first built),
+        # and his generic industry words ("AI", "cloud", "infrastructure") fell to the fuzzy
+        # keyword fallback and matched large Indian industrial conglomerates with nothing to do
+        # with "B2B technology" -- nothing caught it, because nothing checked the actual rows.
+        # Same discipline as search_icypeas: headcount/revenue are always checkable; industry
+        # only when it resolved to a real structured taxonomy value for THIS run, never when any
+        # keyword fallback was involved (a fuzzy match was never a promised classification).
+        try:
+            from app.gtm_os.sourcing.outcomes import QUALITY_FAIL as _OUTCOME_QUALITY_FAIL
+            from app.gtm_os.sourcing.verification import verify_sample
+
+            checkable = [a for a in icp_atoms.must_haves()
+                        if a.key in (A_HEADCOUNT, A_REVENUE)
+                        or (a.key == "industry" and industry_fully_structured)]
+            verification = verify_sample(normalized, icp_atoms, checkable_atoms=checkable)
+            result["verification"] = verification.summary()
+            if not verification.passed():
+                result["stopped"] = (
+                    f"quality: only {verification.match_rate:.0%} of a {verification.checked}-row "
+                    f"sample matched the ICP ({verification.violations}). Stopping before buying "
+                    f"more of the same.")
+                result["outcome"] = _OUTCOME_QUALITY_FAIL
+                break
+        except Exception as e:  # noqa: BLE001 -- verification must never break a paid run
+            logger.warning("sample verification skipped: %s: %s", type(e).__name__, e)
+
+        for co in normalized:
             try:
                 outcome = _process_icypeas_company(
                     db, tenant_id, co, known_leads, pending,
