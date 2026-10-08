@@ -850,6 +850,8 @@ def search_crustdata(db: Session, tenant_id: int, icp: dict, pages: int = 1) -> 
         payload = {"filters": crustdata_filters, "limit": quota.page_size,
                    "fields": ["basic_info", "headcount", "revenue", "locations", "funding", "taxonomy"],
                    **({"cursor": next_cursor} if next_cursor else {})}
+        result["_debug_payload_sent"] = payload  # TEMP, 2026-10-08: live-debugging an empty-result
+                                                  # mismatch vs an identical payload tested directly.
         try:
             response = execute_tool("crustdata_v3_company_search", payload)
         except DeeplineSpendBlocked as e:
