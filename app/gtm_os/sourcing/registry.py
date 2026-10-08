@@ -340,18 +340,33 @@ def _crustdata_revenue(atom: A.Atom) -> dict:
 # its own value_space, verbatim by design for a provider whose real values genuinely ARE
 # whatever the partner wrote ("United States", "United Kingdom"). Only region NAMES need
 # expanding into the countries they mean; a real country name must pass through unchanged.
+_EUROPE = ["United Kingdom", "Albania", "Andorra", "Armenia", "Austria", "Azerbaijan",
+          "Belarus", "Belgium", "Bosnia and Herzegovina", "Bulgaria", "Croatia", "Cyprus",
+          "Czech Republic", "Czechia", "Denmark", "Estonia", "Finland", "France", "Georgia",
+          "Germany", "Greece", "Hungary", "Iceland", "Ireland", "Italy", "Kosovo", "Latvia",
+          "Liechtenstein", "Lithuania", "Luxembourg", "Malta", "Moldova", "Monaco",
+          "Montenegro", "Netherlands", "North Macedonia", "Norway", "Poland", "Portugal",
+          "Romania", "Russia", "San Marino", "Serbia", "Slovakia", "Slovenia", "Spain",
+          "Sweden", "Switzerland", "Turkey", "Ukraine", "Vatican City"]
+_APAC = ["Australia", "New Zealand", "Japan", "South Korea", "China", "India", "Singapore",
+        "Indonesia", "Malaysia", "Philippines", "Thailand", "Vietnam", "Hong Kong", "Taiwan"]
+_EMEA = _EUROPE + ["Israel", "United Arab Emirates", "Saudi Arabia", "South Africa", "Egypt",
+                   "Nigeria"]
+
 CRUSTDATA_REGION_EXPANSIONS: dict[str, list[str]] = {
-    # Adopted wholesale from Crustdata's own dashboard query (2026-10-08), proven live to return
-    # real results for this exact ICP shape -- more complete than the first hand-built list
-    # (includes Eastern Europe/Caucasus), so reused rather than re-verified country-by-country.
-    "europe": ["United Kingdom", "Albania", "Andorra", "Armenia", "Austria", "Azerbaijan",
-              "Belarus", "Belgium", "Bosnia and Herzegovina", "Bulgaria", "Croatia", "Cyprus",
-              "Czech Republic", "Czechia", "Denmark", "Estonia", "Finland", "France", "Georgia",
-              "Germany", "Greece", "Hungary", "Iceland", "Ireland", "Italy", "Kosovo", "Latvia",
-              "Liechtenstein", "Lithuania", "Luxembourg", "Malta", "Moldova", "Monaco",
-              "Montenegro", "Netherlands", "North Macedonia", "Norway", "Poland", "Portugal",
-              "Romania", "Russia", "San Marino", "Serbia", "Slovakia", "Slovenia", "Spain",
-              "Sweden", "Switzerland", "Turkey", "Ukraine", "Vatican City"],
+    # Each list verified live against Crustdata's own free autocomplete (2026-10-08) -- every
+    # entry below returned itself exactly, none were guessed from a generic country list.
+    # "Europe"'s set was additionally adopted wholesale from Crustdata's own dashboard query
+    # (proven live to return real results for that exact ICP), so it's more complete than the
+    # rest (includes every Eastern-Europe/Caucasus value their own assistant used).
+    "europe": _EUROPE,
+    "north america": ["United States", "Canada", "Mexico"],
+    "emea": _EMEA,
+    "apac": _APAC,
+    # Single-value aliases -- the partner's abbreviation isn't a real locations.country value
+    # either ("US" returns zero autocomplete suggestions), but the real value is unambiguous.
+    "us": ["United States"],
+    "usa": ["United States"],
 }
 
 

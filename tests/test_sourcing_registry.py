@@ -145,6 +145,20 @@ def test_crustdata_expands_europe_into_real_countries_not_a_literal_value():
     assert "Germany" in countries and "France" in countries
 
 
+def test_crustdata_expands_jeff_ballards_region_shorthand():
+    # Found live 2026-10-08 onboarding Jeff Ballard: "North America", "US", "EMEA", "APAC" ALL
+    # return zero real autocomplete suggestions, same trap as "Europe" in a different partner's
+    # wording -- confirmed this pattern recurs per partner, not a one-off fixed for Nora alone.
+    coverage = R.coverage_for(R.CRUSTDATA_V3_COMPANY_SEARCH,
+                              A.decompose_icp({"geographies": ["North America", "US", "Canada", "EMEA", "APAC"]}))
+    countries = next(c for c in coverage.filters["conditions"]
+                     if c["field"] == "locations.country")["value"]
+    for fake in ("North America", "US", "EMEA", "APAC"):
+        assert fake not in countries
+    for real in ("United States", "Canada", "Mexico", "Germany", "Japan", "India", "Israel", "South Africa"):
+        assert real in countries, f"{real} missing from expanded region set"
+
+
 def test_crustdata_geography_expansion_never_duplicates_an_explicitly_listed_country():
     coverage = R.coverage_for(R.CRUSTDATA_V3_COMPANY_SEARCH,
                               A.decompose_icp({"geographies": ["Germany", "Europe"]}))
