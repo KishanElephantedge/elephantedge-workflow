@@ -771,7 +771,21 @@ def search_crustdata(db: Session, tenant_id: int, icp: dict, pages: int = 1) -> 
 
     icp_atoms = decompose_icp(icp)
     coverage = coverage_for(_CRUSTDATA, icp_atoms)
-    conditions = coverage.filters.get("conditions") or []
+    # REAL FIX, 2026-10-08: the raw registry render sends the partner's own wording straight
+    # into `basic_info.industries` -- exactly the "Professional Services" trap repeating for a
+    # new provider. Resolve industry against Crustdata's own free autocomplete first (same shape
+    # icypeas_filters_for_icp already uses for Icypeas); an unresolved term is DROPPED rather
+    # than sent literally, which broadens the search instead of guaranteeing it matches nothing.
+    conditions = [c for c in (coverage.filters.get("conditions") or [])
+                 if c.get("field") != "basic_info.industries"]
+    if db is not None:
+        from app.gtm_os.sourcing.atoms import INDUSTRY as _INDUSTRY
+        from app.gtm_os.sourcing.resolution import resolve_atom
+
+        for atom in icp_atoms.by_key(_INDUSTRY):
+            resolved = resolve_atom(db, _CRUSTDATA, atom, tenant_id=tenant_id)
+            if resolved.resolved and resolved.filter_fragment.get("conditions"):
+                conditions.extend(resolved.filter_fragment["conditions"])
     crustdata_filters = {"op": "and", "conditions": conditions} if conditions else {}
     fingerprint = hashlib.sha1(json.dumps(crustdata_filters, sort_keys=True).encode()).hexdigest()[:12]
 

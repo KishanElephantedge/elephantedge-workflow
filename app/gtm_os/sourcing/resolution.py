@@ -23,12 +23,15 @@ answer only when the structured filter genuinely does not exist.
 from __future__ import annotations
 
 import json
+import logging
 import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
 from sqlalchemy.orm import Session
+
+logger = logging.getLogger(__name__)
 
 from app.gtm_os.sourcing import atoms as A
 from app.gtm_os.sourcing import registry as R
@@ -65,12 +68,14 @@ class Resolution:
         return self.method != METHOD_UNRESOLVED
 
 
-def record_observed_values(db: Session, provider: str, atom: str, values: list[str]) -> int:
-    """Learn a provider's real taxonomy from rows it actually returned.
-
-    This is the only reason we know Icypeas uses "Law Practice", "Facilities Services" and
-    "Insurance" -- its published list 404s. Every paid row teaches us something about the value
-    space, so the next resolution is better than the last. Cheap: no network, no LLM.
+def record_observed_values(db: Session, provider: str, atom: str, values: list[str],
+                           source: str = SOURCE_OBSERVED) -> int:
+    """Learn a provider's real taxonomy -- from rows it actually returned (SOURCE_OBSERVED,
+    the only reason we know Icypeas uses "Law Practice", "Facilities Settings" and "Insurance";
+    its published list 404s) or from its own free resolver endpoint (SOURCE_RESOLVER, see
+    resolve_atom() below). Either way, cheap: no LLM, and the resolver case is the only network
+    call, which is free. Every call teaches us something about the value space, so the next
+    resolution is better than the last.
     """
     learned = 0
     for raw in values:
@@ -84,7 +89,7 @@ def record_observed_values(db: Session, provider: str, atom: str, values: list[s
                        ProviderTaxonomyValue.normalized_value == key).first())
         if row is None:
             db.add(ProviderTaxonomyValue(provider=provider, atom=atom, value=value,
-                                         normalized_value=key, source=SOURCE_OBSERVED,
+                                         normalized_value=key, source=source,
                                          observed_count=1))
             learned += 1
         else:
@@ -133,6 +138,37 @@ def resolve_atom(db: Session, endpoint: R.ProviderEndpoint, atom: A.Atom,
                       Resolution(atom=atom, method=METHOD_EXACT_TAXONOMY, values=exact,
                                  target_filter=_filter_name(cap.render(atom)),
                                  filter_fragment=cap.render(_with_value(atom, exact))))
+
+    # Level 2, step 1 -- THIS MODULE'S OWN DOCSTRING described this as the first, cheapest,
+    # most authoritative step from day one, and it was never actually called for any provider
+    # until now (found 2026-10-08, onboarding Nora: Crustdata's industry filter came back
+    # empty, and tracing why showed `cap.resolver` was only ever metadata -- a name nobody
+    # dialed). Call the provider's own free resolver for whatever terms aren't already
+    # confirmed, so a second search for the SAME wording never pays the LLM-expansion cost (or
+    # worse, matches nothing) when the provider could have just said "that's not a real value"
+    # for free up front.
+    if cap.resolver_fetch is not None:
+        for term in terms:
+            if normalize(term) in by_norm:
+                continue
+            try:
+                suggestions = cap.resolver_fetch(term, 10)
+            except Exception as e:  # noqa: BLE001 -- the resolver is an optimization, never a dependency
+                logger.warning("resolver fetch skipped for %s/%s %r: %s: %s",
+                               endpoint.provider, atom.key, term, type(e).__name__, e)
+                continue
+            if suggestions:
+                record_observed_values(db, endpoint.provider, atom.key, suggestions,
+                                       source=SOURCE_RESOLVER)
+        confirmed = known_values(db, endpoint.provider, atom.key)
+        by_norm = {v.normalized_value: v.value for v in confirmed}
+        exact = [by_norm[normalize(t)] for t in terms if normalize(t) in by_norm]
+        if exact and len(exact) == len(terms):
+            return _store(db, tenant_id, endpoint, atom,
+                          Resolution(atom=atom, method=METHOD_EXACT_TAXONOMY, values=exact,
+                                     target_filter=_filter_name(cap.render(atom)),
+                                     filter_fragment=cap.render(_with_value(atom, exact)),
+                                     note="resolved via the provider's own free autocomplete"))
 
     if confirmed and use_llm:
         expanded = _llm_expand(db, atom, terms, [v.value for v in confirmed], endpoint.provider)

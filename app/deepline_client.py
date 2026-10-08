@@ -234,6 +234,13 @@ DEEPLINE_TOOL_COST_USD = {
     # Empty result pages are free per the provider's own pricing note, which is the real
     # upside case; this estimate is the conservative ceiling settled down afterwards.
     "crustdata_v3_company_search": lambda p: 0.002 * int(p.get("limit") or 20),
+    # Free (confirmed: billingSource "free" in Deepline's own catalog) -- still needs an entry
+    # here, same as icypeas_count_companies above, or a governed run refuses it outright with
+    # DeeplineSpendBlocked. Found by a local simulation BEFORE a second live run: the resolver's
+    # own exception handling silently swallowed that refusal and degraded straight to
+    # "unresolved", which would have reproduced the exact empty-search bug this adapter exists
+    # to fix, just hidden behind a caught exception instead of an obvious error.
+    "crustdata_v3_company_search_autocomplete": lambda p: 0.0,
 }
 
 

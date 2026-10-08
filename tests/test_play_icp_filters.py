@@ -29,10 +29,12 @@ def db(db_factory, monkeypatch):
     from app.gtm_os.intelligence.signal import GtmSignal
     from app.gtm_os.learning.message_draft import MessageDraft
     from app.gtm_os.opportunity.opportunity import Opportunity
+    from app.gtm_os.sourcing.models import IcpExclusion, IcpTermResolution, ProviderTaxonomyValue
     from app.gtm_os.strategy.strategy import GtmStrategy
 
     db = db_factory([Parameter, ProviderSpend, GtmLead, Batch, Company, Contact, CampaignPush, GtmSignal,
-                     ProblemHypothesis, DemandHypothesis, Opportunity, GtmStrategy, MessageDraft])
+                     ProblemHypothesis, DemandHypothesis, Opportunity, GtmStrategy, MessageDraft,
+                     ProviderTaxonomyValue, IcpTermResolution, IcpExclusion])
     config = copy.deepcopy(DEFAULT_GTM_OS_CONTROL_CONFIG)
     config["spend"] = {"daily_cap_usd": 1.0, "run_cap_usd": 0.5}
     set_control_config(db, BILLING, config)
@@ -281,6 +283,152 @@ def test_search_icypeas_creates_a_lead_with_the_free_jobo_decision_maker(db, mon
     contact = db.get(Contact, lead.contact_id)
     assert contact.linkedin_url == "https://www.linkedin.com/in/jane-doe"
     assert {r.tenant_id for r in db.query(ProviderSpend)} == {BILLING}
+
+
+# ------------------------------------------------------------------ search_crustdata (2026-10-08, 2nd adapter)
+
+def _crustdata_company(n, name=None, industry="Medical Device", employees=60,
+                       revenue_lo=10_000_000, revenue_hi=50_000_000):
+    """A realistic row in CRUSTDATA'S OWN field shape (basic_info/headcount/revenue/locations
+    nesting), confirmed live 2026-10-08 -- deliberately NOT the Icypeas row shape, so this test
+    exercises _normalize_crustdata_row's real translation rather than assuming it away."""
+    return {
+        "basic_info": {"name": name or f"Co{n}", "professional_network_url": f"https://www.linkedin.com/company/co{n}/",
+                       "industries": [industry], "website": f"https://co{n}.com"},
+        "headcount": {"total": employees},
+        "revenue": {"estimated": {"lower_bound_usd": revenue_lo, "upper_bound_usd": revenue_hi}},
+        "locations": {"country": "United States", "headquarters": "Ohio, United States"},
+    }
+
+
+NORA_ICP = {"employee_min": 11, "employee_max": 500, "industries": ["medical devices"],
+           "geographies": ["United States"], "revenue_min_usd": 10_000_000, "revenue_max_usd": 100_000_000}
+
+
+def test_search_crustdata_resolves_industry_then_creates_a_lead(db, monkeypatch):
+    """End-to-end simulation BEFORE any further live spend, per explicit instruction: resolve
+    industry via the mocked free autocomplete, search via the mocked paid endpoint, create a
+    company and lead via the SAME shared helpers search_icypeas uses.
+
+    The autocomplete mock returns "Medical Device" (singular, the REAL confirmed Crustdata
+    value) for the partner's "medical devices" (plural) -- the exact mismatch found live. That
+    requires the LLM-expansion step to bridge it, same as it would in production, so the LLM is
+    mocked here too rather than simplified away -- this test would otherwise pass for the wrong
+    reason."""
+    import app.deepline_client as dc
+    import app.llm_client as llm
+    import app.phases.decision_maker_reasoning as dmr
+    import app.phases.free_decision_maker as fdm
+
+    monkeypatch.setattr(llm, "generate_json", lambda *a, **k: {"values": ["Medical Device"]})
+    autocomplete_calls = []
+
+    def fake_cli(tool, payload):
+        if tool == "crustdata_v3_company_search_autocomplete":
+            autocomplete_calls.append(payload["query"])
+            return {"toolResponse": {"raw": {"suggestions": [{"value": "Medical Device"}]}}}
+        if tool == "crustdata_v3_company_search":
+            # The resolved condition must carry the REAL taxonomy value, never the partner's
+            # own raw wording -- assert on the actual payload sent, not just the final count.
+            conditions = payload["filters"]["conditions"]
+            industry_cond = next(c for c in conditions if c["field"] == "basic_info.industries")
+            assert industry_cond["value"] == ["Medical Device"]
+            return {"toolResponse": {"raw": {"companies": [_crustdata_company(1)], "next_cursor": None}}}
+        raise AssertionError(f"unexpected tool: {tool}")
+
+    monkeypatch.setattr(dc, "_call_deepline_cli", fake_cli)
+    monkeypatch.setattr(fdm, "_jobo_leadership_candidates", lambda db_, t, company: [_jobo_person()])
+    monkeypatch.setattr(dmr, "select_best_decision_makers",
+                        lambda db_, t, company, cands, n, offering_name=None: [
+                            {"name": "Jane Doe", "thread_role": "founder_ceo", "reasoning": "CEO"}])
+
+    with spend_scope(db, BILLING, "icp_filters", run_cap_usd=0.5):
+        result = play.search_crustdata(db, PARTNER, NORA_ICP)
+
+    assert autocomplete_calls == ["medical devices"]
+    assert result["outcomes"] == {"created": 1}
+    lead = db.query(GtmLead).one()
+    assert lead.state == "signal" and lead.person_name == "Jane Doe"
+    company = db.get(Company, lead.company_id)
+    assert company.name == "Co1"
+    assert company.source == "crustdata-v3:company_search"   # never mislabeled as icypeas
+    assert company.employee_count == 60
+    assert company.estimated_revenue_lower_usd == 10_000_000  # raw USD, unit multiplier stays 1x
+    assert db.query(Batch).get(company.batch_id).tenant_id == PARTNER
+
+
+def test_search_crustdata_drops_an_unresolved_industry_term_rather_than_sending_it_raw(db, monkeypatch):
+    """The exact bug found live: a term the autocomplete can't match (e.g. 'life science')
+    must never be sent to the real search as a literal -- it should be dropped, broadening the
+    search instead of guaranteeing a zero-match filter."""
+    import app.deepline_client as dc
+
+    def fake_cli(tool, payload):
+        if tool == "crustdata_v3_company_search_autocomplete":
+            return {"toolResponse": {"raw": {"suggestions": []}}}  # confirmed real: no match
+        if tool == "crustdata_v3_company_search":
+            fields = [c["field"] for c in payload["filters"]["conditions"]]
+            assert "basic_info.industries" not in fields
+            return {"toolResponse": {"raw": {"companies": [], "next_cursor": None}}}
+        raise AssertionError(f"unexpected tool: {tool}")
+
+    monkeypatch.setattr(dc, "_call_deepline_cli", fake_cli)
+    icp = {**NORA_ICP, "industries": ["life science"]}
+
+    with spend_scope(db, BILLING, "icp_filters", run_cap_usd=0.5):
+        result = play.search_crustdata(db, PARTNER, icp)
+
+    assert result["companies"] == 0
+    assert result["exhausted"] is True
+
+
+def test_search_crustdata_pagination_uses_next_cursor_not_a_token(db, monkeypatch):
+    # Crustdata's own pagination field is `next_cursor`, a different shape from Icypeas'
+    # `pagination.token` -- pinned so a future edit can't silently merge the two cursor shapes.
+    import app.deepline_client as dc
+
+    calls = []
+
+    def fake_cli(tool, payload):
+        if tool == "crustdata_v3_company_search_autocomplete":
+            return {"toolResponse": {"raw": {"suggestions": [{"value": "Medical Device"}]}}}
+        calls.append(payload)
+        if len(calls) == 1:
+            return {"toolResponse": {"raw": {"companies": [_crustdata_company(1)], "next_cursor": "abc123"}}}
+        return {"toolResponse": {"raw": {"companies": [_crustdata_company(2)], "next_cursor": None}}}
+
+    monkeypatch.setattr(dc, "_call_deepline_cli", fake_cli)
+    with spend_scope(db, BILLING, "icp_filters", run_cap_usd=0.5):
+        play.search_crustdata(db, PARTNER, NORA_ICP, pages=2)
+
+    assert calls[1]["cursor"] == "abc123"
+    cursor_param = db.query(Parameter).filter(
+        Parameter.tenant_id == PARTNER, Parameter.key == f"{play.CURSOR_KEY}:crustdata-v3").one()
+    assert cursor_param.value["next_cursor"] is None  # exhausted on page 2
+
+
+def test_search_crustdata_cursor_is_independent_of_icypeas_cursor(db, monkeypatch):
+    """The real clobbering risk this fixed: before _cursor() took a provider param, a second
+    adapter's resume state would have overwritten Icypeas' live one under the same key."""
+    import app.deepline_client as dc
+
+    monkeypatch.setattr(dc, "_call_deepline_cli", lambda tool, payload: {
+        "toolResponse": {"raw": {"leads": [], "pagination": {"token": "icypeas-token"}}}})
+    with spend_scope(db, BILLING, "icp_filters", run_cap_usd=0.5):
+        play.search_icypeas(db, PARTNER, ICP)
+
+    def fake_cli(tool, payload):
+        if tool == "crustdata_v3_company_search_autocomplete":
+            return {"toolResponse": {"raw": {"suggestions": []}}}
+        return {"toolResponse": {"raw": {"companies": [], "next_cursor": None}}}
+
+    monkeypatch.setattr(dc, "_call_deepline_cli", fake_cli)
+    with spend_scope(db, BILLING, "icp_filters", run_cap_usd=0.5):
+        play.search_crustdata(db, PARTNER, NORA_ICP)
+
+    icypeas_cursor = db.query(Parameter).filter(
+        Parameter.tenant_id == PARTNER, Parameter.key == play.CURSOR_KEY).one()
+    assert icypeas_cursor.value["token"] == "icypeas-token"  # untouched by the Crustdata run
 
 
 def test_search_icypeas_skips_a_company_when_both_free_and_paid_resolution_miss(db, monkeypatch):

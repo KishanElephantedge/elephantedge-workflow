@@ -54,9 +54,15 @@ class Capability:
     value_space: str | None = None
     # Renders {atom -> provider payload fragment}. None whenever state != SUPPORTED.
     render: Callable[[A.Atom], dict] | None = None
-    # Free endpoint that resolves partner wording into this filter's real values, if the provider
-    # has one. Prospeo does (/search-suggestions); Icypeas does not.
+    # Free endpoint NAME that resolves partner wording into this filter's real values, if the
+    # provider has one. Prospeo does (/search-suggestions); Icypeas does not. Metadata only --
+    # until `resolver_fetch` below, nothing in this codebase ever actually CALLED it.
     resolver: str | None = None
+    # The CALLABLE that does it: (query_term, limit) -> list of real values this provider's own
+    # free resolver suggests, or []. Added 2026-10-08 after finding `resolver` above had sat as
+    # a name nobody dialed since this file's very first version -- resolve_atom() calls this
+    # directly rather than re-deriving a provider's own input/output shape from a string.
+    resolver_fetch: Callable[[str, int], list[str]] | None = None
     note: str | None = None
     source: str | None = None
 
@@ -335,6 +341,27 @@ def _crustdata_industry(atom: A.Atom) -> dict:
     return _crustdata_cond("basic_info.industries", "in", list(atom.value))
 
 
+def _crustdata_resolver(field_name: str) -> Callable[[str, int], list[str]]:
+    """Builds a resolver_fetch for one Crustdata field. Lazily imports execute_tool so this
+    module stays side-effect-free to IMPORT (no network call happens just from building the
+    registry) -- the I/O only happens when resolution.py actually calls the returned function.
+    Verified live 2026-10-08: {"suggestions": [{"value": "..."}]}, confirmed free
+    (billingSource: free) in Deepline's own catalog."""
+
+    def fetch(query: str, limit: int = 10) -> list[str]:
+        from app.deepline_client import DeeplineError, DeeplineSpendBlocked, execute_tool
+
+        try:
+            response = execute_tool("crustdata_v3_company_search_autocomplete",
+                                    {"field": field_name, "query": query, "limit": limit})
+        except (DeeplineSpendBlocked, DeeplineError):
+            return []
+        raw = (response.get("toolResponse") or {}).get("raw") or {}
+        return [s.get("value") for s in (raw.get("suggestions") or []) if s.get("value")]
+
+    return fetch
+
+
 def _crustdata_company_type(atom: A.Atom) -> dict:
     return _crustdata_cond("basic_info.company_type", "=", atom.value)
 
@@ -427,11 +454,15 @@ CRUSTDATA_V3_COMPANY_SEARCH = ProviderEndpoint(
         A.INDUSTRY: Capability(
             A.INDUSTRY, SUPPORTED, FIXED_TAXONOMY, _crustdata_industry,
             resolver="crustdata_v3_company_search_autocomplete",
-            note="basic_info.industries via `in`. Provider's own guidance: get exact values free "
-                 "from the autocomplete tool first -- same 'resolve before filter' shape as "
-                 "Prospeo's /search-suggestions, confirmed by the provider's own guidance text "
-                 "('Filter values must be exact... Get them free from "
-                 "crustdata_v3_company_search_autocomplete before the first search').",
+            resolver_fetch=_crustdata_resolver("basic_info.industries"),
+            note="basic_info.industries via `in`. Verified LIVE 2026-10-08 (not just the "
+                 "provider's guidance text): the autocomplete tool does real fuzzy/substring "
+                 "matching against Crustdata's actual taxonomy, not the partner's own wording --"
+                 " 'medical devices' -> 'Medical Device', 'diagnostics' -> 'Medical and "
+                 "Diagnostic Laboratories', but broad category phrases like 'life science', "
+                 "'clinical', 'regulatory', 'lab technology' matched NOTHING. A partner's broad "
+                 "qualitative description and a provider's crisp taxonomy are genuinely "
+                 "different things -- resolving correctly does not guarantee a wide match.",
         ),
         A.COMPANY_TYPE: Capability(A.COMPANY_TYPE, SUPPORTED, FIXED_TAXONOMY,
                                    _crustdata_company_type,
