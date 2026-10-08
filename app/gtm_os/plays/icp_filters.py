@@ -137,11 +137,15 @@ def search_filters(icp: dict) -> dict:
     }
 
 
-def _cursor(db: Session, tenant_id: int) -> Parameter:
-    param = db.query(Parameter).filter(Parameter.tenant_id == tenant_id, Parameter.key == CURSOR_KEY).first()
+def _cursor(db: Session, tenant_id: int, provider: str = "icypeas") -> Parameter:
+    # Keyed per provider so a second adapter's pagination state can never clobber Icypeas'
+    # already-live one -- "icypeas" keeps the ORIGINAL key unsuffixed so production rows that
+    # predate multi-provider support are read unchanged; every other provider gets its own row.
+    key = CURSOR_KEY if provider == "icypeas" else f"{CURSOR_KEY}:{provider}"
+    param = db.query(Parameter).filter(Parameter.tenant_id == tenant_id, Parameter.key == key).first()
     if param is None:
-        param = Parameter(tenant_id=tenant_id, key=CURSOR_KEY, value={},
-                          description="Play F: next LinkedIn people-search page (reset when the ICP filters change)")
+        param = Parameter(tenant_id=tenant_id, key=key, value={},
+                          description=f"Play F: next {provider} company-search page (reset when the ICP filters change)")
         db.add(param)
         db.commit()
     return param
@@ -289,12 +293,22 @@ def _create_icypeas_lead(db: Session, tenant_id: int, key: str, company: Company
 
 
 def _process_icypeas_company(db: Session, tenant_id: int, co: dict, known_leads: set, pending: list,
-                             department_atoms: list | None = None) -> str | None:
+                             department_atoms: list | None = None,
+                             source_provider: str = "icypeas", source_endpoint: str = "find-companies"
+                             ) -> str | None:
     """One search result -> a rejected lead, a created lead, or a deferral into `pending` for
     the batched paid decision-maker resolver. Returns the outcome label to count, or None when
     deferred (its real outcome is only known once the batch resolves). Raises OperationalError
     up to the caller on a dropped connection -- deliberately NOT caught here, so the caller can
-    decide whether the page's progress (the cursor token) still gets saved regardless."""
+    decide whether the page's progress (the cursor token) still gets saved regardless.
+
+    Despite the name, this is PROVIDER-AGNOSTIC: it only reads a normalized row shape (url, name,
+    industry, numberOfEmployees, address, estimatedRevenuRange), which any adapter can produce by
+    translating its own provider's real field names into this shape at the call site -- see
+    search_crustdata() for the pattern. `source_provider`/`source_endpoint` default to Icypeas'
+    own values so every existing call site is unchanged; a new adapter passes its own, so a
+    company's recorded provenance (Company.source, the shared pool's source_provider/endpoint)
+    is never silently mislabeled as Icypeas just because this function was reused."""
     from app.phases.decision_maker_reasoning import select_best_decision_makers
     from app.phases.free_decision_maker import _jobo_leadership_candidates, _real_linkedin_url_from_jobo, _split_name
 
@@ -345,7 +359,7 @@ def _process_icypeas_company(db: Session, tenant_id: int, co: dict, known_leads:
         rev_unit = 1_000_000 if (revenue.get("estimatedMinRevenue") or {}).get("unit") == "MILLION" else 1
         company = Company(batch_id=_batch(db, tenant_id).id, name=name, domain=None, linkedin_url=url,
                           industry=co.get("industry"), employee_count=co.get("numberOfEmployees"),
-                          location=co.get("address"), source="icypeas:find_companies",
+                          location=co.get("address"), source=f"{source_provider}:{source_endpoint}",
                           estimated_revenue_lower_usd=int(rev_lo * rev_unit) if rev_lo is not None else None,
                           estimated_revenue_higher_usd=int(rev_hi * rev_unit) if rev_hi is not None else None)
         db.add(company)
@@ -365,7 +379,7 @@ def _process_icypeas_company(db: Session, tenant_id: int, co: dict, known_leads:
                 revenue_low_usd=company.estimated_revenue_lower_usd,
                 revenue_high_usd=company.estimated_revenue_higher_usd,
                 location=co.get("address"), country=None,
-                source_provider="icypeas", source_endpoint="find-companies", cost_usd=None,
+                source_provider=source_provider, source_endpoint=source_endpoint, cost_usd=None,
             )
         except Exception as e:  # noqa: BLE001 -- pool-building must never break a paid run
             logger.warning("pool recording skipped: %s: %s", type(e).__name__, e)
@@ -701,6 +715,197 @@ def search_icypeas(db: Session, tenant_id: int, icp: dict, pages: int = 1) -> di
     return result
 
 
+def _normalize_crustdata_row(co: dict) -> dict:
+    """Crustdata's real field names (confirmed via its live schema, 2026-10-08) -> the same
+    normalized row shape _process_icypeas_company/_create_icypeas_lead already read (url, name,
+    industry, numberOfEmployees, address, estimatedRevenuRange) -- so a second adapter needs a
+    translation function, not a second copy of the per-company logic."""
+    basic = co.get("basic_info") or {}
+    headcount = co.get("headcount") or {}
+    revenue = (co.get("revenue") or {}).get("estimated") or {}
+    locations = co.get("locations") or {}
+    industries = basic.get("industries") or []
+    rev_lo, rev_hi = revenue.get("lower_bound_usd"), revenue.get("upper_bound_usd")
+    return {
+        "url": basic.get("professional_network_url") or "",
+        "name": basic.get("name") or "",
+        "industry": industries[0] if industries else None,
+        "numberOfEmployees": headcount.get("total"),
+        "address": locations.get("headquarters") or locations.get("country"),
+        "website": basic.get("website"),
+        # unit "USD" (anything but Icypeas' own "MILLION" sentinel) -- Crustdata's bounds are
+        # already raw USD integers, so _process_icypeas_company's unit multiplier must stay 1x.
+        "estimatedRevenuRange": (
+            {"estimatedMinRevenue": {"amount": rev_lo, "unit": "USD"},
+             "estimatedMaxRevenue": {"amount": rev_hi, "unit": "USD"}}
+            if rev_lo is not None or rev_hi is not None else {}
+        ),
+    }
+
+
+def search_crustdata(db: Session, tenant_id: int, icp: dict, pages: int = 1) -> dict:
+    """The second real adapter, 2026-10-08. Registered so the planner's own ranking/failover
+    (built and tested since phase 6, but functionally idle beyond Icypeas until now) actually has
+    a second real candidate to route to -- the gap caught live: the registry could already
+    declare Crustdata SUPPORTED for department_headcount/funding_recency/technographics, and
+    still nothing could act on it, because declaring a capability and being able to call it are
+    different things (see registry.py's own header).
+
+    Mirrors search_icypeas()'s shape (quota, pool-first, per-company processing via the SAME
+    shared helpers, cursor-based resume) but deliberately THINNER: no free count pre-check
+    (Crustdata has none; its pricing note "empty result pages are free" is the closest
+    equivalent and not worth a separate round trip), no sample-verification gate, no extra
+    decision-maker path beyond what _process_icypeas_company already does generically. Add those
+    back if Crustdata volume ever justifies the extra calls -- this adapter earns its keep by
+    covering the three atoms it was built for, not by matching Icypeas feature-for-feature on
+    day one.
+    """
+    import hashlib
+
+    from app.deepline_client import DeeplineError, DeeplineSpendBlocked, execute_tool
+    from app.gtm_os.sourcing.atoms import DEPARTMENT_HEADCOUNT as A_DEPARTMENT_HEADCOUNT
+    from app.gtm_os.sourcing.atoms import decompose_icp
+    from app.gtm_os.sourcing.quota import plan as plan_quota
+    from app.gtm_os.sourcing.registry import CRUSTDATA_V3_COMPANY_SEARCH as _CRUSTDATA
+    from app.gtm_os.sourcing.registry import coverage_for
+
+    icp_atoms = decompose_icp(icp)
+    coverage = coverage_for(_CRUSTDATA, icp_atoms)
+    conditions = coverage.filters.get("conditions") or []
+    crustdata_filters = {"op": "and", "conditions": conditions} if conditions else {}
+    fingerprint = hashlib.sha1(json.dumps(crustdata_filters, sort_keys=True).encode()).hexdigest()[:12]
+
+    cursor = _cursor(db, tenant_id, provider="crustdata-v3")
+    state = dict(cursor.value or {})
+    next_cursor = state.get("next_cursor") if state.get("filters") == fingerprint else None
+
+    quota = plan_quota(db, tenant_id, PLAY, _CRUSTDATA.page_size_max or 1000)
+    if quota.satisfied:
+        return {"companies": 0, "created": 0, "outcomes": {}, "stopped": quota.reason,
+               "quota": {"target": quota.target, "delivered_today": quota.delivered_today,
+                         "remaining": 0, "page_size": 0}}
+
+    known_leads = {k for (k,) in db.query(GtmLead.lead_key).filter(GtmLead.tenant_id == tenant_id, GtmLead.play == PLAY)}
+    result = {"companies": 0, "created": 0, "outcomes": {}, "stopped": None}
+
+    def count(outcome):
+        result["outcomes"][outcome] = result["outcomes"].get(outcome, 0) + 1
+
+    pending: list = []
+
+    try:
+        from app.gtm_os.sourcing import pool as sourcing_pool
+
+        pool_matches = sourcing_pool.find_matches(db, tenant_id, PLAY, icp, limit=quota.remaining)
+        for match in pool_matches:
+            if not match.fresh:
+                continue
+            outcome = _process_icypeas_company(
+                db, tenant_id, sourcing_pool.to_search_row(match.row), known_leads, pending,
+                department_atoms=icp_atoms.by_key(A_DEPARTMENT_HEADCOUNT),
+                source_provider="crustdata-v3", source_endpoint="company_search")
+            sourcing_pool.mark_delivered(db, tenant_id, match.row.id, PLAY)
+            if outcome is not None:
+                count(f"pool:{outcome}")
+                if outcome == "created":
+                    result["created"] += 1
+    except OperationalError:
+        db.rollback()
+    except Exception as e:  # noqa: BLE001 -- the pool is an optimization, never a dependency
+        logger.warning("pool-first lookup skipped: %s: %s", type(e).__name__, e)
+
+    delivered_from_pool = result["created"]
+    if delivered_from_pool:
+        quota = plan_quota(db, tenant_id, PLAY, _CRUSTDATA.page_size_max or 1000)
+    result["quota"] = {"target": quota.target, "delivered_today": quota.delivered_today,
+                       "remaining": quota.remaining, "page_size": quota.page_size,
+                       "delivered_from_pool": delivered_from_pool}
+    if quota.satisfied:
+        result["stopped"] = result["stopped"] or f"daily target met using {delivered_from_pool} from the shared pool"
+        return result
+
+    for _ in range(pages):
+        payload = {"filters": crustdata_filters, "limit": quota.page_size,
+                   "fields": ["basic_info", "headcount", "revenue", "locations"],
+                   **({"cursor": next_cursor} if next_cursor else {})}
+        try:
+            response = execute_tool("crustdata_v3_company_search", payload)
+        except DeeplineSpendBlocked as e:
+            result["stopped"] = f"budget: {e}"
+            break
+        except DeeplineError as e:
+            result["stopped"] = f"search failed: {e}"
+            break
+        raw = (response.get("toolResponse") or {}).get("raw") or {}
+        companies = raw.get("companies") or []
+        next_cursor = raw.get("next_cursor")
+        result["companies"] += len(companies)
+
+        # Save progress the moment this (already-paid-for) page is in hand -- same reasoning as
+        # search_icypeas's own cursor-save: a crash in per-company processing below must never
+        # cause a re-buy of a page already received.
+        try:
+            cursor.value = {"filters": fingerprint, "next_cursor": next_cursor}
+            db.commit()
+        except OperationalError:
+            db.rollback()
+
+        for raw_co in companies:
+            co = _normalize_crustdata_row(raw_co)
+            try:
+                outcome = _process_icypeas_company(
+                    db, tenant_id, co, known_leads, pending,
+                    department_atoms=icp_atoms.by_key(A_DEPARTMENT_HEADCOUNT),
+                    source_provider="crustdata-v3", source_endpoint="company_search")
+            except OperationalError:
+                db.rollback()
+                outcome = "db_error_retry_later"
+            if outcome is not None:
+                count(outcome)
+                if outcome == "created":
+                    result["created"] += 1
+
+        if pending:
+            still_needed = max(0, quota.remaining - result["created"])
+            deferred = pending[still_needed:]
+            pending = pending[:still_needed]
+            if deferred:
+                result["outcomes"]["deferred_over_quota"] = \
+                    result["outcomes"].get("deferred_over_quota", 0) + len(deferred)
+
+        if pending:
+            try:
+                titles = icp.get("decision_maker_titles") or ["Owner", "Founder", "CEO"]
+                resolved = _resolve_decision_makers_batch(db, tenant_id, [c for _, c, _ in pending], titles)
+            except DeeplineSpendBlocked as e:
+                result["stopped"] = f"budget: {e}"
+                resolved = {}
+            for key, company, co2 in pending:
+                try:
+                    contact = resolved.get(company.id)
+                    if contact is None:
+                        count("no_decision_maker")
+                        continue
+                    _create_icypeas_lead(db, tenant_id, key, company, contact, contact.first_name, contact.last_name,
+                                        normalize_linkedin_url(contact.linkedin_url), co2)
+                    result["created"] += 1
+                    count("created")
+                except OperationalError:
+                    db.rollback()
+                    count("db_error_retry_later")
+            pending = []
+
+        if result["stopped"]:
+            break
+        if not companies or not next_cursor:
+            result["exhausted"] = True
+            break
+
+    cursor.value = {"filters": fingerprint, "next_cursor": next_cursor}
+    db.commit()
+    return result
+
+
 def search(db: Session, tenant_id: int, icp: dict, pages: int = 1) -> dict:
     """Fallback -- HarvestAPI's LinkedIn-bucket people search. Kept for when Icypeas is
     unavailable; search_icypeas() above is the default (2026-09-28), for the real reasons in
@@ -978,6 +1183,7 @@ def _register_sourcing_adapters() -> None:
     from app.gtm_os.sourcing.planner import register_adapter
 
     register_adapter("icypeas", lambda db, tenant_id, icp, **kw: search_icypeas(db, tenant_id, icp, **kw))
+    register_adapter("crustdata-v3", lambda db, tenant_id, icp, **kw: search_crustdata(db, tenant_id, icp, **kw))
 
 
 _register_sourcing_adapters()

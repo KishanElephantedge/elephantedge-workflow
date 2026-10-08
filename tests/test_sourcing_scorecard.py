@@ -208,13 +208,20 @@ def test_an_inconclusive_shape_history_is_neutral_not_penalized(db):
 
 def test_run_icp_filters_records_a_real_route_attempt(db, monkeypatch):
     """The gap this phase closed: the production entry point used to call search_icypeas()
-    directly, so route_attempts stayed empty forever and scorecards had nothing to read."""
+    directly, so route_attempts stayed empty forever and scorecards had nothing to read.
+
+    UPDATED 2026-10-08: Crustdata is now a real second registered adapter, and this test's mock
+    returns empty leads/companies for every call regardless of provider -- so Icypeas correctly
+    comes back EMPTY_VALIDATED and the planner correctly fails over to Crustdata, which also
+    comes back empty. Two real route attempts, not one, is the CORRECT outcome now; a test that
+    still expected exactly one would be asserting the single-provider world this phase was built
+    to leave behind."""
     import app.deepline_client as dc
     from app.gtm_os.plays import icp_filters as play
     from app.phases.partner_icp import PARTNER_ICP_PARAMETER_KEY
 
     monkeypatch.setattr(dc, "_call_deepline_cli", lambda tool, payload: {
-        "toolResponse": {"raw": {"leads": [], "pagination": {"token": None}}}})
+        "toolResponse": {"raw": {"leads": [], "companies": [], "pagination": {"token": None}}}})
     db.add(Parameter(tenant_id=PARTNER, key=PARTNER_ICP_PARAMETER_KEY, value=ICP))
     db.commit()
 
@@ -222,10 +229,11 @@ def test_run_icp_filters_records_a_real_route_attempt(db, monkeypatch):
 
     assert result["status"] == "completed"
     assert "routing" in result
-    assert result["routing"]["provider"] == "icypeas"
-    attempt = db.query(RouteAttempt).filter(RouteAttempt.tenant_id == PARTNER).one()
-    assert attempt.provider == "icypeas"
-    assert attempt.icp_fingerprint is not None
+    assert result["routing"]["provider"] in {"icypeas", "crustdata-v3"}
+    attempts = db.query(RouteAttempt).filter(RouteAttempt.tenant_id == PARTNER).all()
+    providers_attempted = {a.provider for a in attempts}
+    assert "icypeas" in providers_attempted
+    assert all(a.icp_fingerprint is not None for a in attempts)
 
 
 # ---- explanation: plain language, not an outcome-code dump ----
