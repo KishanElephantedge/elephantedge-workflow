@@ -196,14 +196,21 @@ def resolve_atom(db: Session, endpoint: R.ProviderEndpoint, atom: A.Atom,
     keyword_fragment = keyword.render(_with_value(atom, keyword_terms)) if keyword_terms else {}
 
     if structured_values and keyword_fragment:
+        # REAL BUG, found live 2026-10-08: a naive merge of the two fragments concatenates both
+        # into the SAME top-level AND group, requiring a company to match its real taxonomy
+        # value AND independently match a keyword tag -- far more restrictive than intended, and
+        # confirmed to zero out a real search (it correctly resolved "medical devices"/
+        # "diagnostics" to real values, and the query still matched nothing). These are
+        # ALTERNATIVE expressions of the SAME concept and must be OR'd, not ANDed.
         structured_fragment = cap.render(_with_value(atom, structured_values))
         return _store(db, tenant_id, endpoint, atom,
                       Resolution(atom=atom, method=METHOD_MIXED, values=structured_values + keyword_terms,
                                  target_filter=_filter_name(structured_fragment),
-                                 filter_fragment=_merge_fragments(structured_fragment, keyword_fragment),
+                                 filter_fragment=_or_combine_fragments(structured_fragment, keyword_fragment),
                                  note=f"{len(structured_values)} resolved to real taxonomy values, "
                                       f"{len(keyword_terms)} sent as free text (no exact taxonomy "
-                                      f"match after checking the provider's own resolver)"))
+                                      f"match after checking the provider's own resolver) -- "
+                                      f"combined as EITHER, not both"))
 
     if structured_values:
         return _store(db, tenant_id, endpoint, atom,
@@ -232,19 +239,27 @@ def resolve_atom(db: Session, endpoint: R.ProviderEndpoint, atom: A.Atom,
                              note="no confirmed taxonomy value and no free-text filter"))
 
 
-def _merge_fragments(a: dict, b: dict) -> dict:
-    """Combine two rendered fragments (a structured taxonomy condition and a keyword condition)
-    the same non-clobbering way registry.py's own _merge does, kept local to avoid reaching into
-    that module's private helper."""
-    merged = dict(a)
-    for key, value in b.items():
-        if key in merged and isinstance(merged[key], dict) and isinstance(value, dict):
-            merged[key] = {**merged[key], **value}
-        elif key in merged and isinstance(merged[key], list) and isinstance(value, list):
-            merged[key] = merged[key] + value
+def _or_combine_fragments(a: dict, b: dict) -> dict:
+    """Combine two rendered fragments for the SAME concept as ALTERNATIVES, not requirements.
+    Registry.py's own `_merge` (and the prior version of this function) concatenate list-shaped
+    values, which is correct for combining DIFFERENT concepts (headcount's conditions and
+    industry's conditions both have to hold -- that's a real AND). It is wrong here: a
+    structured taxonomy match and a keyword match are two ways of expressing the SAME "does this
+    company's industry fit" question, so satisfying either one must be enough.
+
+    Assumes both fragments share one key whose value is Crustdata's own `conditions`-list shape
+    -- the only provider with both a resolver and a keyword capability today, so the only one
+    this path runs against. A provider using this registry's dict-shaped filters (Icypeas'
+    {"industry": {"include": [...]}}, for example) would need its own OR expression; that
+    provider doesn't have a resolver_fetch yet, so this never fires for it."""
+    combined = {}
+    for key in set(a) | set(b):
+        va, vb = a.get(key), b.get(key)
+        if isinstance(va, list) and isinstance(vb, list):
+            combined[key] = [{"op": "or", "conditions": va + vb}]
         else:
-            merged[key] = value
-    return merged
+            combined[key] = vb if va is None else va
+    return combined
 
 
 def _keyword_capability(endpoint: R.ProviderEndpoint) -> R.Capability | None:

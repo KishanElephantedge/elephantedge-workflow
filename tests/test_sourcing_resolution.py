@@ -266,6 +266,54 @@ def test_mixed_resolution_combines_real_taxonomy_values_with_a_keyword_fallback(
     assert resolved.filter_fragment["keyword"] == {"include": ["life science"]}
 
 
+def test_mixed_resolution_ors_structured_and_keyword_never_ands_them(db):
+    """THE real bug, found live 2026-10-08 against Crustdata: a naive merge concatenated the
+    resolved taxonomy condition and the keyword fallback into the SAME top-level AND group,
+    requiring a company to match BOTH its real industry classification AND independently match
+    a keyword tag. It correctly resolved "medical devices"/"diagnostics" to real values and the
+    live query still matched zero companies, because of this. Uses Crustdata's REAL registry
+    entry (not a fake endpoint with separate dict keys, which doesn't exercise this) since the
+    bug is specific to a provider whose structured and keyword filters share one `conditions`
+    list -- combining them must produce ONE OR-group, never two ANDed conditions."""
+
+    def fake_resolver(query, limit):
+        return {"medical device": ["Medical Device"]}.get(query.lower(), [])
+
+    crustdata_with_resolver = R.CRUSTDATA_V3_COMPANY_SEARCH
+    # Capability is frozen -- build a throwaway endpoint reusing Crustdata's real render/keyword
+    # functions instead of mutating the shared registry object.
+    rigged = R.ProviderEndpoint(
+        provider="crustdata-v3", endpoint="x", job="company_search",
+        capabilities={
+            A.INDUSTRY: R.Capability(A.INDUSTRY, R.SUPPORTED, R.FIXED_TAXONOMY,
+                                     render=crustdata_with_resolver.capabilities[A.INDUSTRY].render,
+                                     resolver_fetch=fake_resolver),
+            "keyword": crustdata_with_resolver.capabilities["keyword"],
+        },
+    )
+    atom = A.Atom(A.INDUSTRY, A.INCLUDE, ["medical device", "life science"],
+                 partner_term="medical device, life science")
+    resolved = RES.resolve_atom(db, rigged, atom, tenant_id=PARTNER, use_llm=False)
+    assert resolved.method == RES.METHOD_MIXED
+
+    conditions = resolved.filter_fragment["conditions"]
+    assert len(conditions) == 1, "must be ONE combined OR-group, not two separate AND'd conditions"
+    group = conditions[0]
+    assert group["op"] == "or"
+
+    def flatten(conds):
+        for c in conds:
+            if "field" in c:
+                yield c
+            elif "conditions" in c:
+                yield from flatten(c["conditions"])
+
+    leaves = list(flatten(group["conditions"]))
+    assert {"basic_info.industries"} <= {c["field"] for c in leaves}
+    assert any(c["field"] in ("taxonomy.categories", "taxonomy.professional_network_specialities")
+              for c in leaves)
+
+
 def test_mixed_resolution_never_fires_for_a_provider_with_no_resolver(db):
     # Icypeas has no resolver at all -- "not checked" must stay on the existing all-or-nothing
     # keyword path, never silently treated as "confirmed absent".

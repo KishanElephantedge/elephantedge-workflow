@@ -328,10 +328,19 @@ def test_search_crustdata_resolves_industry_then_creates_a_lead(db, monkeypatch)
             autocomplete_calls.append(payload["query"])
             return {"toolResponse": {"raw": {"suggestions": [{"value": "Medical Device"}]}}}
         if tool == "crustdata_v3_company_search":
-            # The resolved condition must carry the REAL taxonomy value, never the partner's
-            # own raw wording -- assert on the actual payload sent, not just the final count.
-            conditions = payload["filters"]["conditions"]
-            industry_cond = next(c for c in conditions if c["field"] == "basic_info.industries")
+            # The resolved condition must carry the REAL taxonomy value, never the partner's own
+            # raw wording -- assert on the actual payload sent, not just the final count. May be
+            # nested inside an OR-group alongside a keyword fallback (the LLM resolved "medical
+            # devices" but didn't exact-match it, so both paths fire and are OR'd together).
+            def flatten(conds):
+                for c in conds:
+                    if "field" in c:
+                        yield c
+                    elif "conditions" in c:
+                        yield from flatten(c["conditions"])
+
+            leaves = list(flatten(payload["filters"]["conditions"]))
+            industry_cond = next(c for c in leaves if c["field"] == "basic_info.industries")
             assert industry_cond["value"] == ["Medical Device"]
             return {"toolResponse": {"raw": {"companies": [_crustdata_company(1)], "next_cursor": None}}}
         raise AssertionError(f"unexpected tool: {tool}")
