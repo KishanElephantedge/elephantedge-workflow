@@ -6178,13 +6178,20 @@ def parse_partner_icp(request: Request, body: dict = Body(...), db: Session = De
   "revenue_max_usd": number or null,
   "employee_min": number or null,
   "employee_max": number or null,
-  "sales_team_size_min": number or null,
-  "sales_team_size_max": number or null,
+  "department_headcount": {{"<department>": {{"min": number or null, "max": number or null}}}},
   "decision_maker_titles": [string],
+  "funding_stages": [string],
+  "funding_recency_max_days": number or null,
+  "leadership_change": {{"titles": [string], "max_age_days": number or null}} or null,
+  "technologies": {{"include": [string], "exclude": [string]}} or null,
   "notes": string or null
 }}
 
-"employee_min/max" is the whole company's headcount. "sales_team_size_min/max" is specifically the size of their sales/marketing department, only set this if the text distinguishes it from overall headcount. "decision_maker_titles" are the job titles to target (e.g. Owner, Founder, CEO) -- only include titles the text actually implies. "notes" is a short free-text summary of anything else meaningful (buying triggers, disqualifiers, tone) that doesn't fit the structured fields above.
+"employee_min/max" is the whole company's headcount. "department_headcount" is a map from department name (lowercase, e.g. "marketing", "sales", "engineering") to a min/max bound on headcount WITHIN that department specifically -- only set an entry if the text distinguishes that department's size from overall headcount, in EITHER direction (a floor like "at least 4 marketing people" or a ceiling like "no dedicated marketing hire" = max 0). "decision_maker_titles" are the job titles to target (e.g. Owner, Founder, CEO) -- only include titles the text actually implies.
+
+"funding_stages" is which funding/growth stages qualify (e.g. "Series B", "Series C", "PE-backed") -- only if the text states a stage requirement. "funding_recency_max_days" is set ONLY if the text requires a recent fundraising event (e.g. "raised a round in the last two quarters" -> 180) -- do not invent a number if the text doesn't give a timeframe. "leadership_change" is set ONLY if the text requires a RECENT change in a specific role (e.g. "a new CMO or VP Marketing joined in the past six months" -> {{"titles": ["CMO", "VP Marketing"], "max_age_days": 180}}) -- titles must be the specific roles named, not a generic "decision maker". "technologies" captures tools/platforms the target company must already use ("include", e.g. HubSpot, Salesforce) or must NOT be using ("exclude") -- only from tools the text actually names.
+
+"notes" is a short free-text summary of anything else meaningful (buying triggers, disqualifiers, tone, behavioral signals that have no structured field above, like "pipeline has stalled despite activity") that doesn't fit the structured fields.
 
 Text to extract from:
 \"\"\"
@@ -6193,7 +6200,26 @@ Text to extract from:
 
 Return ONLY the JSON object, no other text."""
 
-    parsed = generate_json(prompt, db, tenant_id, max_tokens=1000)
+    parsed = generate_json(prompt, db, tenant_id, max_tokens=1500)
+
+    department_headcount = {}
+    for dept, bounds in (parsed.get("department_headcount") or {}).items():
+        if isinstance(dept, str) and isinstance(bounds, dict):
+            lo, hi = bounds.get("min"), bounds.get("max")
+            if lo is not None or hi is not None:
+                department_headcount[dept.lower()] = {"min": lo, "max": hi}
+
+    leadership_change = parsed.get("leadership_change") or None
+    if leadership_change is not None:
+        lc_titles = [s for s in (leadership_change.get("titles") or []) if isinstance(s, str)]
+        lc_days = leadership_change.get("max_age_days")
+        leadership_change = {"titles": lc_titles, "max_age_days": lc_days} if lc_titles and lc_days else None
+
+    technologies = parsed.get("technologies") or None
+    if technologies is not None:
+        tech_include = [s for s in (technologies.get("include") or []) if isinstance(s, str)]
+        tech_exclude = [s for s in (technologies.get("exclude") or []) if isinstance(s, str)]
+        technologies = {"include": tech_include, "exclude": tech_exclude} if (tech_include or tech_exclude) else None
 
     return {
         "industries": [s for s in (parsed.get("industries") or []) if isinstance(s, str)],
@@ -6202,9 +6228,12 @@ Return ONLY the JSON object, no other text."""
         "revenue_max_usd": parsed.get("revenue_max_usd"),
         "employee_min": parsed.get("employee_min"),
         "employee_max": parsed.get("employee_max"),
-        "sales_team_size_min": parsed.get("sales_team_size_min"),
-        "sales_team_size_max": parsed.get("sales_team_size_max"),
+        "department_headcount": department_headcount,
         "decision_maker_titles": [s for s in (parsed.get("decision_maker_titles") or []) if isinstance(s, str)],
+        "funding_stages": [s for s in (parsed.get("funding_stages") or []) if isinstance(s, str)],
+        "funding_recency_max_days": parsed.get("funding_recency_max_days"),
+        "leadership_change": leadership_change,
+        "technologies": technologies,
         "notes": parsed.get("notes"),
     }
 

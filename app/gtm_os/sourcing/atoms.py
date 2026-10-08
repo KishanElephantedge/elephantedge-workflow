@@ -35,6 +35,18 @@ DEPARTMENT_HEADCOUNT = "department_headcount"
 DECISION_MAKER_TITLE = "decision_maker_title"
 COMPANY_TYPE = "company_type"
 
+# Added 2026-10-08, onboarding Nora (positioning/narrative consultancy for life-science tech).
+# Her ICP is the first one that qualifies on COMPANY STATE AT A POINT IN TIME, not just static
+# firmographics -- "just raised a round", "just hired a CMO" are events, true only for a window,
+# never a fact you can look up once and cache. Modeled as their own atom keys (not folded into
+# REVENUE/DECISION_MAKER_TITLE) because their value shape is fundamentally a recency window, and
+# collapsing that distinction is exactly how "marketing headcount" went unenforced before:
+# a different shape silently treated as an existing one.
+FUNDING_STAGE = "funding_stage"            # categorical: "Series B", "PE-backed", etc.
+FUNDING_RECENCY = "funding_recency"        # value = max days since the company's last round
+LEADERSHIP_CHANGE = "leadership_change"    # value = {"titles": [...], "max_age_days": N}
+TECHNOGRAPHICS = "technographics"          # value = tool/platform names the company runs
+
 RANGE = "range"
 INCLUDE = "include"
 EXCLUDE = "exclude"
@@ -129,6 +141,37 @@ def decompose_icp(icp: dict) -> IcpAtoms:
         # should_have: a route that cannot filter titles at search time is still viable, because
         # decision-maker resolution is a separate, later stage that targets these titles anyway.
         atoms.append(Atom(DECISION_MAKER_TITLE, INCLUDE, list(titles), necessity=SHOULD_HAVE))
+
+    funding_stages = icp.get("funding_stages") or []
+    if funding_stages:
+        atoms.append(Atom(FUNDING_STAGE, INCLUDE, list(funding_stages),
+                          partner_term=", ".join(funding_stages)))
+
+    # "Raised within the last N days" -- a should_have signal, not a must_have gate: a route that
+    # cannot check funding recency at search time is still viable (same reasoning as titles above),
+    # because a signal-detection pass can check it separately after the fact.
+    funding_recency_days = icp.get("funding_recency_max_days")
+    if funding_recency_days is not None:
+        atoms.append(Atom(FUNDING_RECENCY, RANGE, (None, funding_recency_days),
+                          necessity=SHOULD_HAVE))
+
+    leadership_change = icp.get("leadership_change") or {}
+    lc_titles = leadership_change.get("titles") or []
+    if lc_titles and leadership_change.get("max_age_days") is not None:
+        atoms.append(Atom(LEADERSHIP_CHANGE, RANGE,
+                          {"titles": list(lc_titles), "max_age_days": leadership_change["max_age_days"]},
+                          necessity=SHOULD_HAVE, partner_term=", ".join(lc_titles)))
+
+    technologies = icp.get("technologies") or {}
+    tech_include = technologies.get("include") or []
+    tech_exclude = technologies.get("exclude") or []
+    if tech_include:
+        atoms.append(Atom(TECHNOGRAPHICS, INCLUDE, list(tech_include),
+                          necessity=technologies.get("necessity", SHOULD_HAVE),
+                          partner_term=", ".join(tech_include)))
+    if tech_exclude:
+        atoms.append(Atom(TECHNOGRAPHICS, EXCLUDE, list(tech_exclude), necessity=SHOULD_HAVE,
+                          partner_term=", ".join(tech_exclude)))
 
     return IcpAtoms(atoms=atoms, unstructured_notes=icp.get("notes"))
 

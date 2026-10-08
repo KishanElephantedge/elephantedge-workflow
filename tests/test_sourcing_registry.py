@@ -124,3 +124,204 @@ def test_no_atom_is_ever_silently_dropped():
         classified = c.enforced + c.residual + c.unverified + c.unsupported
         assert len(classified) == len(icp.atoms), f"{endpoint.provider} lost an atom"
         assert {a.name for a in classified} == {a.name for a in icp.atoms}
+
+
+# -------------------------------------------------------------------------------------------
+# 2026-10-08 survey: a provider gets ONE registry entry for its WHOLE schema, not one entry per
+# capability we happened to be chasing. These pin the full Crustdata/Dropleads/PredictLeads
+# coverage found that day, not just the department-headcount field that started the search.
+# -------------------------------------------------------------------------------------------
+
+def test_crustdata_enforces_every_majji_must_have_including_department_headcount():
+    coverage = R.coverage_for(R.CRUSTDATA_V3_COMPANY_SEARCH, A.decompose_icp(MAJJI))
+    assert coverage.must_have_gap == []
+    enforced_names = {a.name for a in coverage.enforced}
+    assert enforced_names == {
+        "headcount", "revenue", "geography", "industry", "department_headcount(marketing)",
+    }
+
+
+def test_crustdata_department_headcount_renders_the_real_indexed_field():
+    icp = A.decompose_icp({"department_headcount": {"marketing": {"min": 0, "max": 0}}})
+    coverage = R.coverage_for(R.CRUSTDATA_V3_COMPANY_SEARCH, icp)
+    assert {"field": "roles.distribution.marketing", "type": "=>", "value": 0} in \
+        coverage.filters["conditions"]
+    assert {"field": "roles.distribution.marketing", "type": "=<", "value": 0} in \
+        coverage.filters["conditions"]
+
+
+def test_crustdata_conditions_from_different_atoms_accumulate_not_clobber():
+    # _merge's list-extend path: headcount and department_headcount each contribute conditions:
+    # [...] fragments, and both sets of conditions must survive in the merged filter.
+    icp = A.decompose_icp({"employee_min": 11, "employee_max": 50,
+                           "department_headcount": {"marketing": {"max": 0}}})
+    coverage = R.coverage_for(R.CRUSTDATA_V3_COMPANY_SEARCH, icp)
+    fields = {c["field"] for c in coverage.filters["conditions"]}
+    assert "headcount.total" in fields
+    assert "roles.distribution.marketing" in fields
+
+
+def test_dropleads_is_registered_but_not_in_the_company_search_waterfall():
+    # It's a person search, not a company search -- real, verified, and useful to compose.py's
+    # free department-presence check, but must never be ranked alongside real company-search
+    # endpoints by planner.rank().
+    assert R.DROPLEADS_SEARCH_PEOPLE.job != "company_search"
+    assert "dropleads" not in {e.provider for e in R.endpoints_for_job("company_search")}
+
+
+def test_dropleads_department_presence_is_a_probe_not_a_range_filter():
+    icp = A.decompose_icp({"department_headcount": {"marketing": {"max": 0}}})
+    coverage = R.coverage_for(R.DROPLEADS_SEARCH_PEOPLE, icp)
+    assert coverage.filters["departments"] == ["Marketing"]
+
+
+def test_predictleads_is_registered_honestly_as_thin_not_skipped():
+    # The real schema has exactly two filters. Confirmed ABSENT, not left UNVERIFIED, because the
+    # whole field list was read directly off the live schema -- there is nothing left to check.
+    icp = A.decompose_icp(MAJJI)
+    coverage = R.coverage_for(R.PREDICTLEADS_DISCOVER_COMPANIES, icp)
+    assert {a.name for a in coverage.enforced} == {"headcount", "geography"}
+    assert {a.name for a in coverage.unsupported} >= {"industry", "revenue",
+                                                       "department_headcount(marketing)"}
+    assert R.PREDICTLEADS_DISCOVER_COMPANIES.capability(A.INDUSTRY).state == R.ABSENT
+
+
+def test_predictleads_geography_takes_one_string_not_a_list():
+    coverage = R.coverage_for(R.PREDICTLEADS_DISCOVER_COMPANIES,
+                              A.decompose_icp({"geographies": ["United States", "Canada"]}))
+    assert coverage.filters["location"] == "United States"
+
+
+def test_predictleads_headcount_maps_onto_its_fixed_buckets():
+    coverage = R.coverage_for(R.PREDICTLEADS_DISCOVER_COMPANIES,
+                              A.decompose_icp({"employee_min": 11, "employee_max": 50}))
+    assert coverage.filters["sizes"] == ["11-50"]
+
+
+def test_peopledatalabs_stays_unverified_everywhere_rather_than_guessing_field_names():
+    # Deepline's own schema for this tool never disclosed PDL's real field vocabulary (just a
+    # generic query/sql envelope) -- so nothing here may be promoted to SUPPORTED without reading
+    # PDL's own docs first, the same rule that governs every other UNVERIFIED entry.
+    coverage = R.coverage_for(R.PEOPLEDATALABS_COMPANY_SEARCH, A.decompose_icp(MAJJI))
+    assert coverage.enforced == []
+    assert coverage.filters == {}
+
+
+def test_apollo_requires_its_own_credential_a_different_blocker_than_unverified():
+    # Verified 2026-10-08 against Deepline's own catalog: apollo_company_search is fully outside
+    # Deepline's managed credentials, unlike every other provider surveyed. This is a business
+    # decision (get an Apollo account), not a research task -- a distinct flag from UNVERIFIED.
+    assert R.APOLLO_ORGANIZATION_SEARCH.requires_own_credential is True
+    assert R.CRUSTDATA_V3_COMPANY_SEARCH.requires_own_credential is False
+    assert R.ICYPEAS_FIND_COMPANIES.requires_own_credential is False
+
+
+# -------------------------------------------------------------------------------------------
+# 2026-10-08, onboarding Nora (life-science positioning consultancy). Her ICP introduced four
+# genuinely new atom concepts -- funding stage, funding recency, leadership-change, and
+# technographics -- because her qualifying criteria are about company STATE AT A POINT IN TIME,
+# not static firmographics. These pin both the new decomposition and the real coverage found
+# researching them, including the one case where a tool's description promised something its
+# actual schema does not confirm.
+# -------------------------------------------------------------------------------------------
+
+NORA = {
+    "revenue_min_usd": 10_000_000, "revenue_max_usd": 100_000_000,
+    "industries": ["life-science technology"],
+    "geographies": ["United States", "United Kingdom"],
+    "department_headcount": {"marketing": {"min": 4}},
+    "funding_stages": ["Series B", "Series C"],
+    "funding_recency_max_days": 180,
+    "leadership_change": {"titles": ["CMO", "VP Marketing", "CRO"], "max_age_days": 180},
+    "technologies": {"include": ["HubSpot", "Salesforce"], "exclude": ["none"]},
+    "notes": "Buyers don't yet believe the problem can be solved.",
+}
+
+
+def test_nora_new_fields_all_decompose_into_atoms():
+    names = {a.name for a in A.decompose_icp(NORA).atoms}
+    assert "funding_stage" in names
+    assert "funding_recency" in names
+    assert "leadership_change" in names
+    assert "technographics" in names
+    # marketing >= 4 uses the SAME department_headcount atom Majji's marketing <= 0 uses --
+    # a minimum and a maximum are both just bounds on one generic range, no special-casing.
+    assert "department_headcount(marketing)" in names
+
+
+def test_funding_recency_defaults_to_an_upper_bound_only():
+    atom = A.decompose_icp({"funding_recency_max_days": 180}).by_key(A.FUNDING_RECENCY)[0]
+    assert atom.value == (None, 180)
+    assert atom.necessity == A.SHOULD_HAVE
+
+
+def test_technographics_include_and_exclude_are_separate_atoms():
+    atoms = A.decompose_icp(NORA).by_key(A.TECHNOGRAPHICS)
+    ops = {a.operator: list(a.value) for a in atoms}
+    assert ops[A.INCLUDE] == ["HubSpot", "Salesforce"]
+    assert ops[A.EXCLUDE] == ["none"]
+
+
+def test_forager_enforces_revenue_funding_stage_and_recency():
+    # NORA's worksheet qualifies by revenue, not headcount -- no employee_min/max is set, so no
+    # headcount atom exists to enforce; asserting it here would test a field Nora never stated.
+    coverage = R.coverage_for(R.FORAGER_PERSON_ROLE_SEARCH, A.decompose_icp(NORA))
+    enforced = {a.name for a in coverage.enforced}
+    assert enforced >= {"revenue", "funding_stage", "funding_recency"}
+
+
+def test_forager_headcount_renders_when_an_icp_actually_states_it():
+    coverage = R.coverage_for(R.FORAGER_PERSON_ROLE_SEARCH,
+                              A.decompose_icp({"employee_min": 50, "employee_max": 500}))
+    assert coverage.filters["organization_employees_start"] == 50
+    assert coverage.filters["organization_employees_end"] == 500
+
+
+def test_forager_funding_stage_maps_partner_wording_to_the_confirmed_enum():
+    coverage = R.coverage_for(R.FORAGER_PERSON_ROLE_SEARCH,
+                              A.decompose_icp({"funding_stages": ["Series B", "Series C"]}))
+    assert coverage.filters["funding_types"] == ["series_b", "series_c"]
+
+
+def test_forager_leadership_change_stays_unverified_despite_the_tool_description():
+    # The one real finding worth protecting: Forager's own description promises "time periods",
+    # but role_position_start_date has no _start/_end range pair in the actual jsonSchema, unlike
+    # every other date field on this endpoint. A description is not a schema, same rule as a UI
+    # screenshot not being an API contract.
+    cap = R.FORAGER_PERSON_ROLE_SEARCH.capability(A.LEADERSHIP_CHANGE)
+    assert cap.state == R.UNVERIFIED
+    assert cap.render is None
+    assert "no _start/_end range pair" in (cap.note or "") or "exact-match" in (cap.note or "")
+
+
+def test_forager_is_not_in_the_company_search_waterfall():
+    assert R.FORAGER_PERSON_ROLE_SEARCH.job != "company_search"
+    assert "forager" not in {e.provider for e in R.endpoints_for_job("company_search")}
+
+
+def test_crustdata_now_also_covers_fundings_recency_and_technographics():
+    # Fields that existed in Crustdata's schema all along (seen in the original survey) but had
+    # no atom to map onto until Nora's ICP needed one -- confirming the earlier correction stuck:
+    # register the WHOLE schema, use pieces of it as real atoms arrive, never re-survey per atom.
+    coverage = R.coverage_for(R.CRUSTDATA_V3_COMPANY_SEARCH, A.decompose_icp(NORA))
+    enforced = {a.name for a in coverage.enforced}
+    assert "funding_recency" in enforced
+    assert "technographics" in enforced
+    assert R.CRUSTDATA_V3_COMPANY_SEARCH.capability(A.FUNDING_STAGE).state == R.UNVERIFIED
+    assert R.CRUSTDATA_V3_COMPANY_SEARCH.capability(A.LEADERSHIP_CHANGE).state == R.ABSENT
+
+
+def test_predictleads_financing_discovery_confirms_recency_absent_not_inherited():
+    # The per-company predictleads endpoint (not registered here) takes a date filter; the bulk
+    # discovery endpoint does not, despite sharing a provider. One must never be assumed to carry
+    # the other's capability.
+    cap = R.PREDICTLEADS_DISCOVER_FINANCING_EVENTS.capability(A.FUNDING_RECENCY)
+    assert cap.state == R.ABSENT
+
+
+def test_no_atom_is_ever_silently_dropped_for_nora_either():
+    icp = A.decompose_icp(NORA)
+    for endpoint in R.endpoints_for_job("company_search"):
+        c = R.coverage_for(endpoint, icp)
+        classified = c.enforced + c.residual + c.unverified + c.unsupported
+        assert len(classified) == len(icp.atoms), f"{endpoint.provider} lost an atom"
