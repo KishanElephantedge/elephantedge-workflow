@@ -6397,6 +6397,37 @@ def admin_search_provider_tools(request: Request, q: str, categories: str | None
         raise HTTPException(status_code=502, detail=str(e))
 
 
+@router.post("/gtm-os/admin/debug/test-tool-call")
+def admin_test_tool_call(request: Request, body: dict = Body(...), db: Session = Depends(get_db)):
+    """One real, tightly-capped call to a priced tool -- the reusable mechanism for "verify
+    against a real reference before adapting a new provider" (HANDOVER.md rule 9), so that
+    discipline doesn't require writing one-off debug routes each time. Hard-capped at $0.10
+    regardless of what the caller passes, same reasoning as icp-filters-run's own $2 ceiling: a
+    verification call must never become the expensive mistake it exists to prevent.
+
+    Added 2026-10-09 to test crustdata_v3_person_search as a candidate replacement for
+    HarvestAPI's $0.07/page decision-maker search, after HarvestAPI reported no decision maker
+    at Atlan despite a real, named CRO (confirmed via public search) -- spend lands on
+    Elephant Edge's own ledger, never a partner's."""
+    _require_admin(request)
+    tool_id = body.get("tool_id")
+    payload = body.get("payload") or {}
+    if not tool_id:
+        raise HTTPException(status_code=400, detail="tool_id is required.")
+
+    from app.deepline_client import DeeplineError, DeeplineSpendBlocked, execute_tool
+    from app.spend_ledger import spend_scope
+
+    try:
+        with spend_scope(db, ELEPHANT_EDGE_TENANT_ID, f"debug_test_tool_call:{tool_id}", run_cap_usd=0.10):
+            response = execute_tool(tool_id, payload)
+    except DeeplineSpendBlocked as e:
+        raise HTTPException(status_code=400, detail=f"blocked: {e}")
+    except DeeplineError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    return response
+
+
 @router.get("/gtm-os/admin/providers/schema")
 def admin_describe_provider_tool(request: Request, tool_id: str):
     """One tool's real input schema -- filter names, types, enums. FREE, nothing is executed.

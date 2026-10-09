@@ -234,6 +234,12 @@ DEEPLINE_TOOL_COST_USD = {
     # Empty result pages are free per the provider's own pricing note, which is the real
     # upside case; this estimate is the conservative ceiling settled down afterwards.
     "crustdata_v3_company_search": lambda p: 0.002 * int(p.get("limit") or 20),
+    # VERIFIED 2026-10-09 via GET /gtm-os/admin/providers/schema (free, Deepline's own pricing
+    # block): $0.002/returned result, identical to company_search above -- same "empty pages are
+    # free" upside. Candidate replacement for HarvestAPI's $0.07/page decision-maker search
+    # (Jeff Ballard: HarvestAPI reported no decision maker at Atlan despite a real, named CRO --
+    # confirmed via public search -- a provider-coverage gap, not a targeting problem).
+    "crustdata_v3_person_search": lambda p: 0.002 * int(p.get("limit") or 10),
     # Free (confirmed: billingSource "free" in Deepline's own catalog) -- still needs an entry
     # here, same as icypeas_count_companies above, or a governed run refuses it outright with
     # DeeplineSpendBlocked. Found by a local simulation BEFORE a second live run: the resolver's
