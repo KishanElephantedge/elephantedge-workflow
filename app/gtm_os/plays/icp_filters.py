@@ -806,6 +806,11 @@ def _normalize_crustdata_row(co: dict) -> dict:
         "numberOfEmployees": headcount.get("total"),
         "address": locations.get("headquarters") or locations.get("country"),
         "website": basic.get("website"),
+        # Already returned whenever "basic_info" is in `fields` (confirmed live, no extra
+        # request needed) -- just never extracted until now. The one real signal that lets an
+        # industry fit be judged properly when the search fell to the keyword fallback (see
+        # verify_industry_fit_with_llm), instead of trusting a fuzzy word match alone.
+        "description": basic.get("description"),
         # unit "USD" (anything but Icypeas' own "MILLION" sentinel) -- Crustdata's bounds are
         # already raw USD integers, so _process_icypeas_company's unit multiplier must stay 1x.
         "estimatedRevenuRange": (
@@ -939,6 +944,34 @@ def search_crustdata(db: Session, tenant_id: int, icp: dict, pages: int = 1) -> 
             db.rollback()
 
         normalized = [_normalize_crustdata_row(raw_co) for raw_co in companies]
+
+        # LLM INDUSTRY-FIT JUDGMENT, 2026-10-09 -- the REAL root cause behind Jeff Ballard's
+        # bad matches, found after sample verification (below) alone proved insufficient: it
+        # can only check atoms it has a real value for, and industry-via-keyword-fallback has
+        # none to check, so two separate runs both put 7/7 large Indian industrial conglomerates
+        # through untouched. A big diversified conglomerate has far more self-description
+        # surface area to accidentally match ANY ONE of several generic single-word searches
+        # than a small, focused company does -- the keyword match itself is the weak signal, not
+        # something a post-hoc field check can catch. Judge against the company's own
+        # description instead, batched into one call for the whole page. Only runs when
+        # industry is a MUST_HAVE atom that fell to keyword matching -- a should-have or a
+        # cleanly structured match needs no judgment call.
+        from app.gtm_os.sourcing.atoms import INDUSTRY as A_INDUSTRY
+        from app.gtm_os.sourcing.atoms import MUST_HAVE as A_MUST_HAVE
+
+        industry_must_haves = [a for a in icp_atoms.by_key(A_INDUSTRY) if a.necessity == A_MUST_HAVE]
+        if normalized and not industry_fully_structured and industry_must_haves:
+            try:
+                from app.gtm_os.sourcing.verification import verify_industry_fit_with_llm
+
+                industry_terms = list(industry_must_haves[0].value)
+                verdicts = verify_industry_fit_with_llm(db, normalized, industry_terms, notes=icp.get("notes"))
+                rejected = sum(1 for fits in verdicts.values() if fits is False)
+                if rejected:
+                    normalized = [row for i, row in enumerate(normalized) if verdicts.get(i, True) is not False]
+                    result["outcomes"]["industry_mismatch_llm_rejected"] = rejected
+            except Exception as e:  # noqa: BLE001 -- a judgment outage must never block a real run
+                logger.warning("industry-fit LLM judgment skipped: %s: %s", type(e).__name__, e)
 
         # SAMPLE VERIFICATION, 2026-10-08 -- the gap found live onboarding Jeff Ballard: this
         # adapter had none at all (an explicit, acknowledged scope-cut when it was first built),

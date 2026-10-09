@@ -18,6 +18,7 @@ breaks it. Everything else is `unverifiable`, reported honestly rather than scor
 """
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -150,3 +151,52 @@ def verify_sample(rows: list[dict], icp_atoms: A.IcpAtoms, *,
 
     result.conclusive = result.checked >= min_sample
     return result
+
+
+def verify_industry_fit_with_llm(db, rows: list[dict], industry_terms: list[str],
+                                 notes: str | None = None) -> dict[int, bool]:
+    """When industry resolved via the KEYWORD fallback (no real taxonomy value to trust), a match
+    means a word appeared somewhere in the company's self-description -- not that the company
+    genuinely is that kind of business. Confirmed live 2026-10-08, Jeff Ballard: two separate
+    runs, 7/7 companies BOTH times were large Indian industrial conglomerates (Adani, Ambuja
+    Cement, Alkem Pharma) for a "B2B technology" ICP, because a conglomerate spanning a dozen
+    unrelated business lines has far more self-description surface area to accidentally match
+    ANY ONE of several generic single-word searches ("AI", "cloud", "data") than a small, focused
+    company does -- independent of whether it's actually the right kind of company. No amount of
+    checking the rows AFTER a keyword match catches this; the keyword match itself is the weak
+    signal. The one real signal a fuzzy match never uses: the company's own description, read
+    against what the partner actually described. One LLM call judges the whole page at once
+    (cheap, same per-page batching _llm_expand already uses in resolution.py).
+
+    Returns {row_index: True/False} only for rows it actually judged -- a transient failure
+    (exception, LLM budget exhaustion) returns {} rather than raising, so a judgment outage
+    degrades to "don't filter further" rather than blocking or wrongly rejecting a real page.
+
+    LLM call-budget is tracked against tenant_id=2 (Elephant Edge), same as _llm_expand in
+    resolution.py -- it's a shared, GLOBAL resource (the Gemini free-tier daily cap) regardless
+    of which partner's search triggered the call, not a per-partner spend decision.
+    """
+    from app.llm_client import generate_json
+
+    candidates = [{"index": i, "name": r.get("name") or "", "description": (r.get("description") or "")[:400]}
+                 for i, r in enumerate(rows) if r.get("name")]
+    if not candidates:
+        return {}
+
+    prompt = (
+        f"A B2B sales partner targets companies described as: {', '.join(industry_terms)}.\n"
+        + (f"Additional context from the partner: {notes}\n" if notes else "")
+        + "Below are candidate companies found by a KEYWORD search, which can produce false "
+          "positives -- e.g. a large diversified industrial conglomerate that happens to mention "
+          "one of the search words somewhere in a broad description, despite not actually being "
+          "that kind of company. For EACH company, judge from its name and description whether "
+          "it genuinely fits what the partner described, not just whether a word matched.\n\n"
+        f"Companies:\n{json.dumps(candidates)}\n\n"
+        'Return ONLY: {"fits": [indices of companies that genuinely fit]}'
+    )
+    try:
+        verdict = generate_json(prompt, db, 2, max_tokens=800)
+    except Exception:  # noqa: BLE001 -- a judgment outage must never block or corrupt a real run
+        return {}
+    fits = set(verdict.get("fits") or [])
+    return {c["index"]: (c["index"] in fits) for c in candidates}

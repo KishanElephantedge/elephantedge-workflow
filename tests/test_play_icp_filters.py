@@ -324,7 +324,17 @@ def test_search_crustdata_resolves_industry_then_creates_a_lead(db, monkeypatch)
     import app.phases.decision_maker_reasoning as dmr
     import app.phases.free_decision_maker as fdm
 
-    monkeypatch.setattr(llm, "generate_json", lambda *a, **k: {"values": ["Medical Device"]})
+    # Two DIFFERENT generate_json calls now happen for this ICP shape: resolution's own
+    # LLM-expansion (asks for "values"), and the industry-fit judgment this test also exercises
+    # since a MIXED resolution (a real structured match PLUS a redundant keyword clause, since
+    # "medical devices" itself never exact-matches the confirmed "Medical Device") still counts
+    # as "not fully structured" -- the keyword portion is still a weak signal worth judging.
+    def fake_llm(prompt, *a, **k):
+        if "fits" in prompt:
+            return {"fits": [0]}  # the one candidate genuinely fits
+        return {"values": ["Medical Device"]}
+
+    monkeypatch.setattr(llm, "generate_json", fake_llm)
     autocomplete_calls = []
 
     def fake_cli(tool, payload):
@@ -430,6 +440,59 @@ def test_crustdata_filters_for_icp_reports_whether_industry_is_safely_verifiable
     # can never be claimed safe to verify.
     _, fully_structured = play.crustdata_filters_for_icp({**NORA_ICP, "industries": ["medical device"]})
     assert fully_structured is False
+
+
+def test_search_crustdata_llm_rejects_a_conglomerate_but_keeps_a_real_match(db, monkeypatch):
+    """THE real root cause, found live 2026-10-09 (Jeff Ballard, two separate runs, both 7/7
+    large Indian industrial conglomerates for a "B2B technology" ICP): a fuzzy keyword match
+    only proves a word appeared somewhere in a company's self-description, not that it's
+    genuinely the right kind of company -- a big diversified conglomerate has far more
+    description surface area to accidentally match ANY ONE of several generic single-word
+    searches than a small, focused company does. Sample verification alone can't catch this
+    (industry-via-keyword has no real value to check against); only reading the actual
+    description can. This reproduces the exact shape: one real SaaS company, one conglomerate
+    whose broad description happens to mention "data" -- the LLM judge must keep the first and
+    reject the second, using their descriptions, not the keyword match that found them."""
+    import app.deepline_client as dc
+    import app.llm_client as llm
+    import app.phases.decision_maker_reasoning as dmr
+    import app.phases.free_decision_maker as fdm
+
+    def fake_llm(prompt, *a, **k):
+        if "fits" in prompt:
+            assert "Real SaaS Co" in prompt and "Conglomerate Corp" in prompt
+            return {"fits": [0]}  # only the real SaaS company genuinely fits
+        return {"values": []}
+
+    monkeypatch.setattr(llm, "generate_json", fake_llm)
+
+    def fake_cli(tool, payload):
+        if tool == "crustdata_v3_company_search_autocomplete":
+            return {"toolResponse": {"raw": {"suggestions": []}}}  # forces pure keyword fallback
+        if tool == "crustdata_v3_company_search":
+            good = _crustdata_company(1, name="Real SaaS Co")
+            good["basic_info"]["description"] = "A cloud-native B2B SaaS platform for enterprise data pipelines."
+            bad = _crustdata_company(2, name="Conglomerate Corp")
+            bad["basic_info"]["description"] = ("A diversified industrial group spanning cement, "
+                                                 "textiles, and financial services, with a growing "
+                                                 "data analytics division.")
+            return {"toolResponse": {"raw": {"companies": [good, bad], "next_cursor": None}}}
+        raise AssertionError(f"unexpected tool: {tool}")
+
+    monkeypatch.setattr(dc, "_call_deepline_cli", fake_cli)
+    monkeypatch.setattr(fdm, "_jobo_leadership_candidates", lambda db_, t, company: [_jobo_person()])
+    monkeypatch.setattr(dmr, "select_best_decision_makers",
+                        lambda db_, t, company, cands, n, offering_name=None: [
+                            {"name": "Jane Doe", "thread_role": "founder_ceo", "reasoning": "CEO"}])
+
+    icp = {**NORA_ICP, "industries": ["data"], "employee_min": None, "employee_max": None}
+    with spend_scope(db, BILLING, "icp_filters", run_cap_usd=0.5):
+        result = play.search_crustdata(db, PARTNER, icp)
+
+    assert result["outcomes"].get("industry_mismatch_llm_rejected") == 1
+    names = {c.name for c in db.query(Company).all()}
+    assert names == {"Real SaaS Co"}  # Conglomerate Corp was never even persisted
+    assert db.query(GtmLead).count() == 1
 
 
 def test_search_crustdata_catches_a_bad_batch_before_creating_any_leads(db, monkeypatch):
