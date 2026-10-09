@@ -491,8 +491,14 @@ def test_search_crustdata_llm_rejects_a_conglomerate_but_keeps_a_real_match(db, 
 
     assert result["outcomes"].get("industry_mismatch_llm_rejected") == 1
     names = {c.name for c in db.query(Company).all()}
-    assert names == {"Real SaaS Co"}  # Conglomerate Corp was never even persisted
-    assert db.query(GtmLead).count() == 1
+    assert names == {"Real SaaS Co"}  # Conglomerate Corp was never even persisted as a Company
+    # Two GtmLead rows now (2026-10-09 fix): the real match's lead, plus a REJECTED lead for the
+    # conglomerate so a future run's `known_leads` check skips re-fetching/re-judging it for free.
+    leads = db.query(GtmLead).all()
+    assert len(leads) == 2
+    rejected = [l for l in leads if l.state == play.STATE_REJECTED]
+    assert len(rejected) == 1
+    assert "industry mismatch" in rejected[0].qualifier_reason
 
 
 def test_search_crustdata_catches_a_bad_batch_before_creating_any_leads(db, monkeypatch):
@@ -662,7 +668,47 @@ def test_search_icypeas_skips_a_company_when_both_free_and_paid_resolution_miss(
         result = play.search_icypeas(db, PARTNER, ICP)
 
     assert result["outcomes"] == {"no_decision_maker": 1}
-    assert db.query(GtmLead).count() == 0
+    # 2026-10-09 fix: a miss now persists a REJECTED GtmLead (lead_key -> known_leads), so a
+    # later run doesn't pay again to re-discover the same "no decision maker found" result for
+    # this exact company.
+    leads = db.query(GtmLead).all()
+    assert len(leads) == 1
+    assert leads[0].state == play.STATE_REJECTED
+    assert "no decision maker" in leads[0].qualifier_reason
+
+
+def test_search_icypeas_never_repays_the_paid_decision_maker_batch_for_a_known_miss(db, monkeypatch):
+    """The actual dollar-saving half of the 2026-10-09 fix: once a company's "no decision maker
+    found" result is persisted, the SAME company surfacing again under a DIFFERENT filter set
+    (e.g. after a partner edits their ICP, which changes the search fingerprint and bypasses the
+    unrelated whole-filter-set exhaustion cooldown) must short-circuit via `known_leads` BEFORE
+    it is ever added to `pending` -- never reaching the paid $0.07/page HarvestAPI batch a second
+    time for the identical company. Proven here by asserting the paid resolver is not called on
+    the second run, even though the search itself runs again."""
+    import app.deepline_client as dc
+    import app.phases.free_decision_maker as fdm
+
+    search_leads_calls = []
+
+    monkeypatch.setattr(dc, "_call_deepline_cli", lambda tool, payload: {
+        "toolResponse": {"raw": {"leads": [_icypeas_company(1)], "pagination": {"token": None}}}})
+    monkeypatch.setattr(fdm, "_jobo_leadership_candidates", lambda db_, t, company: [_jobo_person(linkedin=False)])
+    monkeypatch.setattr(h, "search_leads", lambda page=1, **f: search_leads_calls.append(1) or [])
+
+    with spend_scope(db, BILLING, "icp_filters", run_cap_usd=0.5):
+        play.search_icypeas(db, PARTNER, ICP)
+    assert len(search_leads_calls) == 1  # the first run does pay to try
+
+    # A different filter set (the partner edited their ICP) -> a different search fingerprint,
+    # so the whole-filter-set exhaustion cooldown does NOT apply here; this is a genuinely new
+    # search that happens to surface the same company again.
+    edited_icp = {**ICP, "employee_max": 101}
+    with spend_scope(db, BILLING, "icp_filters", run_cap_usd=0.5):
+        result = play.search_icypeas(db, PARTNER, edited_icp)
+
+    assert result["outcomes"] == {"known": 1}  # short-circuited before decision-maker resolution
+    assert len(search_leads_calls) == 1  # still 1 -- the second run never paid again
+    assert db.query(GtmLead).count() == 1  # no duplicate rejection row either
 
 
 def test_search_icypeas_falls_back_to_the_paid_batched_resolver_when_jobo_misses(db, monkeypatch):

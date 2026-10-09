@@ -708,6 +708,19 @@ def search_icypeas(db: Session, tenant_id: int, icp: dict, pages: int = 1) -> di
                 try:
                     contact = resolved.get(company.id)
                     if contact is None:
+                        # Persist the miss, 2026-10-09: this used to just `continue`, with
+                        # nothing recorded -- the company's lead_key never entered
+                        # `known_leads`, so if it reappeared on a later page (any ICP edit
+                        # resets the cursor), the $0.07/page decision-maker batch paid to
+                        # re-discover the exact same "not found" result. A HarvestAPI miss can
+                        # still be a real person this provider's index doesn't have, not proof
+                        # nobody there holds that title -- so this is recorded as a provider
+                        # gap, not a company disqualification, and stays reviewable/correctable
+                        # the same way a wrong learned exclusion is (see exclusions.py).
+                        db.add(GtmLead(tenant_id=tenant_id, play=PLAY, lead_key=key, state=STATE_REJECTED,
+                                       qualifier_reason="no decision maker found for target titles via HarvestAPI "
+                                                        "(provider coverage gap, not a confirmed absence)"))
+                        db.commit()
                         count("no_decision_maker")
                         continue
                     _create_icypeas_lead(db, tenant_id, key, company, contact, contact.first_name, contact.last_name,
@@ -968,6 +981,23 @@ def search_crustdata(db: Session, tenant_id: int, icp: dict, pages: int = 1) -> 
                 verdicts = verify_industry_fit_with_llm(db, normalized, industry_terms, notes=icp.get("notes"))
                 rejected = sum(1 for fits in verdicts.values() if fits is False)
                 if rejected:
+                    # Persist each rejection, 2026-10-09: previously these rows were just
+                    # dropped from `normalized` with nothing recorded -- the exact same leak as
+                    # the no-decision-maker gap above. A company that reappears on a later page
+                    # (any ICP edit resets the cursor) paid again for the Crustdata row AND the
+                    # LLM call to re-reach the same "not a real fit" verdict. Recording it here
+                    # means `known_leads` skips it on the next run for free.
+                    for i, row in enumerate(normalized):
+                        if verdicts.get(i) is False:
+                            url = row.get("url") or ""
+                            if "linkedin.com/company/" in url:
+                                slug = url.rstrip("/").rsplit("/company/", 1)[-1].split("?")[0]
+                                db.add(GtmLead(tenant_id=tenant_id, play=PLAY, lead_key=f"company:{slug}",
+                                               state=STATE_REJECTED,
+                                               qualifier_reason=f"industry mismatch (LLM): {row.get('name')!r} "
+                                                                f"matched a search keyword but isn't genuinely "
+                                                                f"{', '.join(industry_terms[:3])}..."))
+                    db.commit()
                     normalized = [row for i, row in enumerate(normalized) if verdicts.get(i, True) is not False]
                     result["outcomes"]["industry_mismatch_llm_rejected"] = rejected
             except Exception as e:  # noqa: BLE001 -- a judgment outage must never block a real run
@@ -1033,6 +1063,14 @@ def search_crustdata(db: Session, tenant_id: int, icp: dict, pages: int = 1) -> 
                 try:
                     contact = resolved.get(company.id)
                     if contact is None:
+                        # Persist the miss, 2026-10-09 -- see search_icypeas's identical fix for
+                        # why: without this, a company that reappears on a later page (any ICP
+                        # edit resets the cursor) pays to re-discover the same "not found"
+                        # result. Recorded as a provider coverage gap, not a disqualification.
+                        db.add(GtmLead(tenant_id=tenant_id, play=PLAY, lead_key=key, state=STATE_REJECTED,
+                                       qualifier_reason="no decision maker found for target titles via HarvestAPI "
+                                                        "(provider coverage gap, not a confirmed absence)"))
+                        db.commit()
                         count("no_decision_maker")
                         continue
                     _create_icypeas_lead(db, tenant_id, key, company, contact, contact.first_name, contact.last_name,
