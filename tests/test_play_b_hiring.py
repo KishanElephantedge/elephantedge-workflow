@@ -6,6 +6,7 @@ from datetime import datetime
 
 import pytest
 
+import app.deepline_client as dc
 import app.llm_client as llm_client
 import app.phases.decision_maker as decision_maker
 from app.db.models import Batch, CampaignPush, Company, Contact, Parameter
@@ -21,6 +22,16 @@ from app.gtm_os.strategy.strategy import GtmStrategy
 from app.spend_ledger import ProviderSpend, reserve_spend, spend_scope, total_spend_today
 
 TENANT = 2
+
+
+@pytest.fixture(autouse=True)
+def _crustdata_tier_always_misses(monkeypatch):
+    """TIER 1 of the shared decision-maker resolver (crustdata_v3_person_search, added
+    2026-10-10) must never make a real subprocess/network call during a test -- the tests here
+    that mock harvestapi.search_leads predate it and exercise TIER 2 specifically, so tier 1 is
+    made to cleanly find nobody."""
+    monkeypatch.setattr(dc, "_call_deepline_cli", lambda tool, payload: {
+        "toolResponse": {"raw": {"profiles": []}}})
 
 
 @pytest.fixture

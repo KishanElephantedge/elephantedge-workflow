@@ -7,10 +7,21 @@ from either play alone.
 """
 import pytest
 
+import app.deepline_client as dc
 from app.db.models import Batch, CampaignPush, Company, Contact, Parameter, Tenant
 from app.gtm_os.sourcing.decision_maker import resolve_decision_makers_batch
 
 TENANT = 2
+
+
+@pytest.fixture(autouse=True)
+def _crustdata_tier_always_misses(monkeypatch):
+    """TIER 1 (crustdata_v3_person_search, added 2026-10-10) must never make a real subprocess/
+    network call during a test -- every test in this file predates it and exercises TIER 2
+    (HarvestAPI) behavior specifically, so tier 1 is made to cleanly find nobody, same as any
+    other provider call in this codebase's tests."""
+    monkeypatch.setattr(dc, "_call_deepline_cli", lambda tool, payload: {
+        "toolResponse": {"raw": {"profiles": []}}})
 
 
 @pytest.fixture
@@ -101,6 +112,89 @@ def test_offering_name_is_threaded_per_company_not_shared_across_the_batch(db, m
 
     assert seen_offering_names[acme.id] == "Sales OS"
     assert seen_offering_names[other.id] == "Playbook"
+
+
+def _crustdata_profile(name="Jim Smittkamp", title="Chief Revenue Officer", company="Acme",
+                       linkedin="https://www.linkedin.com/in/jim-smittkamp"):
+    return {
+        "basic_profile": {"name": name, "current_title": title},
+        "experience": {"employment_details": {"current": [{"company_name": company}]}},
+        "social_handles": {"professional_network_identifier": {"profile_url": linkedin}},
+    }
+
+
+def test_crustdata_person_search_tier_resolves_without_ever_calling_harvestapi(db, monkeypatch):
+    """TIER 1, 2026-10-10: when crustdata_v3_person_search finds a real candidate, the company
+    must never reach TIER 2 at all -- the whole point of trying the $0.002/result tier first is
+    that a resolved company doesn't pay HarvestAPI's $0.07/page on top of it."""
+    import app.deepline_client as local_dc
+    import app.harvestapi as h
+    import app.phases.decision_maker_reasoning as dmr
+
+    company = _company(db, "Acme")
+    harvest_calls = []
+    monkeypatch.setattr(h, "search_leads", lambda page=1, **f: harvest_calls.append(1) or [])
+    monkeypatch.setattr(local_dc, "_call_deepline_cli", lambda tool, payload: {
+        "toolResponse": {"raw": {"profiles": [_crustdata_profile()]}}})
+    monkeypatch.setattr(dmr, "select_best_decision_makers",
+                        lambda db_, t, c, cands, n, offering_name=None: [{"name": cands[0]["name"], "reasoning": "x"}])
+
+    out = resolve_decision_makers_batch(
+        db, TENANT, [company], ["Chief Revenue Officer"], default_thread_role="x", reasoning_label="test")
+
+    assert harvest_calls == []  # tier 2 never ran
+    contact = out[company.id]
+    assert contact is not None
+    assert contact.first_name == "Jim" and contact.last_name == "Smittkamp"
+    assert contact.linkedin_url == "https://www.linkedin.com/in/jim-smittkamp"
+    assert contact.title == "Chief Revenue Officer"
+
+
+def test_crustdata_person_search_tier_miss_falls_through_to_harvestapi(db, monkeypatch):
+    """A company tier 1 can't resolve must still reach tier 2 -- tier 1 is a cheaper FIRST try,
+    never a replacement that silently drops coverage HarvestAPI could still provide."""
+    import app.deepline_client as local_dc
+    import app.harvestapi as h
+    import app.phases.decision_maker_reasoning as dmr
+
+    company = _company(db, "Acme")
+    monkeypatch.setattr(local_dc, "_call_deepline_cli", lambda tool, payload: {
+        "toolResponse": {"raw": {"profiles": []}}})
+    monkeypatch.setattr(h, "search_leads", lambda page=1, **f: [_found_person()] if page == 1 else [])
+    monkeypatch.setattr(dmr, "select_best_decision_makers",
+                        lambda db_, t, c, cands, n, offering_name=None: [{"name": cands[0]["name"], "reasoning": "x"}])
+
+    out = resolve_decision_makers_batch(
+        db, TENANT, [company], ["CEO"], default_thread_role="x", reasoning_label="test")
+
+    contact = out[company.id]
+    assert contact is not None
+    assert contact.first_name == "Sam" and contact.last_name == "Lee"  # the HarvestAPI tier's pick
+
+
+def test_crustdata_person_search_tier_error_falls_through_to_harvestapi(db, monkeypatch):
+    """A tier 1 outage (budget block, provider error) must degrade to tier 2, not abort the
+    whole resolution -- the same resilience the existing HarvestAPI chunking already has."""
+    import app.deepline_client as local_dc
+    import app.harvestapi as h
+    import app.phases.decision_maker_reasoning as dmr
+
+    company = _company(db, "Acme")
+
+    def failing_cli(tool, payload):
+        if tool == "crustdata_v3_person_search":
+            raise local_dc.DeeplineError("simulated outage")
+        raise AssertionError(f"unexpected tool: {tool}")
+
+    monkeypatch.setattr(local_dc, "_call_deepline_cli", failing_cli)
+    monkeypatch.setattr(h, "search_leads", lambda page=1, **f: [_found_person()] if page == 1 else [])
+    monkeypatch.setattr(dmr, "select_best_decision_makers",
+                        lambda db_, t, c, cands, n, offering_name=None: [{"name": cands[0]["name"], "reasoning": "x"}])
+
+    out = resolve_decision_makers_batch(
+        db, TENANT, [company], ["CEO"], default_thread_role="x", reasoning_label="test")
+
+    assert out[company.id] is not None  # tier 2 still delivered despite tier 1's outage
 
 
 def test_no_offering_name_for_mapping_passes_none_not_a_crash(db, monkeypatch):
