@@ -142,9 +142,18 @@ def decompose_icp(icp: dict) -> IcpAtoms:
         # decision-maker resolution is a separate, later stage that targets these titles anyway.
         atoms.append(Atom(DECISION_MAKER_TITLE, INCLUDE, list(titles), necessity=SHOULD_HAVE))
 
+    # necessity is opt-in via a separate flag (funding_stages itself stays a flat list, the
+    # existing shape every current ICP already stores it as) -- default stays MUST_HAVE so
+    # existing partners who rely on it as a hard gate (e.g. Nora) see no behavior change.
+    # REAL BUG, found 2026-10-12 onboarding Angela Shori: her own words are explicit ("Funded
+    # or venture-backed is a plus, but bootstrapped companies can qualify") yet funding_stage
+    # had NO way to be anything but a hard gate -- the one atom type that couldn't express what
+    # its own partner actually said, directly contradicting the "never filter out, only flag"
+    # instruction her onboarding was built around.
     funding_stages = icp.get("funding_stages") or []
     if funding_stages:
         atoms.append(Atom(FUNDING_STAGE, INCLUDE, list(funding_stages),
+                          necessity=SHOULD_HAVE if icp.get("funding_stage_necessity") == "should_have" else MUST_HAVE,
                           partner_term=", ".join(funding_stages)))
 
     # "Raised within the last N days" -- a should_have signal, not a must_have gate: a route that

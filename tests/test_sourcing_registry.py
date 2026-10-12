@@ -312,6 +312,22 @@ def test_forager_headcount_renders_when_an_icp_actually_states_it():
     assert coverage.filters["organization_employees_end"] == 500
 
 
+def test_funding_stage_necessity_defaults_to_must_have_but_can_opt_into_should_have():
+    """REAL BUG, found 2026-10-12 onboarding Angela Shori: her own ICP document says "Funded or
+    venture-backed is a plus, but bootstrapped companies can qualify" -- funding_stage had no
+    way to be anything but a hard gate, the one atom type that couldn't express what its own
+    partner actually said. Default stays MUST_HAVE (existing partners like Nora rely on it as a
+    hard gate; no behavior change for them) -- should_have is opt-in via a separate flag so the
+    existing flat-list ICP shape every partner already stores funding_stages as is unchanged."""
+    default_atoms = A.decompose_icp({"funding_stages": ["Series B", "Series C"]})
+    funding = default_atoms.by_key(A.FUNDING_STAGE)[0]
+    assert funding.necessity == A.MUST_HAVE
+
+    soft_atoms = A.decompose_icp({"funding_stages": ["Seed", "Series A"], "funding_stage_necessity": "should_have"})
+    funding_soft = soft_atoms.by_key(A.FUNDING_STAGE)[0]
+    assert funding_soft.necessity == A.SHOULD_HAVE
+
+
 def test_forager_funding_stage_maps_partner_wording_to_the_confirmed_enum():
     coverage = R.coverage_for(R.FORAGER_PERSON_ROLE_SEARCH,
                               A.decompose_icp({"funding_stages": ["Series B", "Series C"]}))
