@@ -464,6 +464,36 @@ def test_crustdata_filters_for_icp_reports_whether_industry_is_safely_verifiable
     assert fully_structured is False
 
 
+def test_crustdata_filters_for_icp_excludes_already_known_company_names(db, monkeypatch):
+    """The actual fix the user asked for directly, 2026-10-12: "why are we fetching
+    already-created companies and industry-mismatches and wasting credits, can't we filter them
+    out directly at the tool level?" -- confirmed live that Crustdata's `not_in` operator
+    genuinely excludes a row server-side AND bills $0 for the resulting empty page. So a company
+    already on file (created OR LLM-rejected, both now leave a real Company row) must appear in
+    the rendered filter's exclude list, not just be skipped after being paid for again."""
+    import app.deepline_client as dc
+
+    batch = Batch(tenant_id=PARTNER, name="b")
+    db.add(batch)
+    db.commit()
+    known = Company(batch_id=batch.id, name="Already Seen Co", linkedin_url="https://www.linkedin.com/company/seen/")
+    db.add(known)
+    db.commit()
+    db.add(GtmLead(tenant_id=PARTNER, play="icp_filters", lead_key="company:seen", state=play.STATE_REJECTED,
+                   company_id=known.id, qualifier_reason="industry mismatch (LLM): test"))
+    db.commit()
+
+    monkeypatch.setattr(dc, "_call_deepline_cli", lambda tool, payload: {
+        "toolResponse": {"raw": {"suggestions": [{"value": "Medical Device"}]}}})
+    filters, _ = play.crustdata_filters_for_icp(
+        {**NORA_ICP, "industries": ["medical device"]}, db=db, tenant_id=PARTNER)
+
+    exclude_conditions = [c for c in filters["conditions"]
+                          if c.get("field") == "basic_info.name" and c.get("type") == "not_in"]
+    assert len(exclude_conditions) == 1
+    assert "Already Seen Co" in exclude_conditions[0]["value"]
+
+
 def test_search_crustdata_llm_rejects_a_conglomerate_but_keeps_a_real_match(db, monkeypatch):
     """THE real root cause, found live 2026-10-09 (Jeff Ballard, two separate runs, both 7/7
     large Indian industrial conglomerates for a "B2B technology" ICP): a fuzzy keyword match
@@ -513,7 +543,10 @@ def test_search_crustdata_llm_rejects_a_conglomerate_but_keeps_a_real_match(db, 
 
     assert result["outcomes"].get("industry_mismatch_llm_rejected") == 1
     names = {c.name for c in db.query(Company).all()}
-    assert names == {"Real SaaS Co"}  # Conglomerate Corp was never even persisted as a Company
+    # Conglomerate Corp now DOES get a minimal Company row too (2026-10-12 fix) -- so its real
+    # name is queryable for a future run's query-level `not_in` exclude (see
+    # _known_company_names), instead of being paid to be re-fetched just to be rejected again.
+    assert names == {"Real SaaS Co", "Conglomerate Corp"}
     # Two GtmLead rows now (2026-10-09 fix): the real match's lead, plus a REJECTED lead for the
     # conglomerate so a future run's `known_leads` check skips re-fetching/re-judging it for free.
     leads = db.query(GtmLead).all()

@@ -749,6 +749,35 @@ def search_icypeas(db: Session, tenant_id: int, icp: dict, pages: int = 1) -> di
     return result
 
 
+# Crustdata bills per RETURNED result, and a `not_in` exclude confirmed live (2026-10-12) to be
+# genuinely free when it filters a row out entirely ("provider_reported_zero_usage") -- so a
+# company we've already created OR already LLM-rejected costs nothing to skip at the QUERY
+# level, instead of being fetched again (paid) just to be recognized and discarded after the
+# fact. Capped, not unbounded: most-recent-first, since an old exclusion matters less once the
+# underlying market pool has had time to change, and an ever-growing filter payload is its own
+# cost on every call regardless of how many rows it actually blocks.
+MAX_EXCLUDED_NAMES = 200
+
+
+def _known_company_names(db: Session, tenant_id: int, limit: int = MAX_EXCLUDED_NAMES) -> list[str]:
+    """Every real company name already on file for this tenant via Play F -- both created and
+    LLM-rejected (both now leave a real Company row, see search_crustdata's rejection block) --
+    most recently touched first. Used to build a query-level `not_in` so Crustdata never returns
+    (and never bills for) a row we've already judged, instead of us paying to re-discover it."""
+    rows = (db.query(Company.name)
+           .join(GtmLead, GtmLead.company_id == Company.id)
+           .filter(GtmLead.tenant_id == tenant_id, GtmLead.play == PLAY, Company.name.isnot(None))
+           .order_by(GtmLead.created_at.desc()).limit(limit * 2).all())
+    seen, names = set(), []
+    for (name,) in rows:
+        if name not in seen:
+            seen.add(name)
+            names.append(name)
+        if len(names) >= limit:
+            break
+    return names
+
+
 def crustdata_filters_for_icp(icp: dict, db: Session | None = None, tenant_id: int | None = None
                               ) -> tuple[dict, bool]:
     """The full rendered Crustdata filter payload for one ICP, and whether industry resolved to a
@@ -797,6 +826,12 @@ def crustdata_filters_for_icp(icp: dict, db: Session | None = None, tenant_id: i
                 industry_fully_structured = False
     else:
         industry_fully_structured = False
+
+    if db is not None and tenant_id is not None:
+        excluded_names = _known_company_names(db, tenant_id)
+        if excluded_names:
+            conditions.append({"field": "basic_info.name", "type": "not_in", "value": excluded_names})
+
     return ({"op": "and", "conditions": conditions} if conditions else {}), industry_fully_structured
 
 
@@ -1019,8 +1054,21 @@ def search_crustdata(db: Session, tenant_id: int, icp: dict, pages: int = 1) -> 
                                 continue
                             known_leads.add(key)
                             try:
+                                # A minimal Company row, 2026-10-12: previously a rejected row
+                                # left no Company at all, so its real name existed nowhere a
+                                # future query could read it from. Now it does -- this is what
+                                # _known_company_names() below reads to build a query-level
+                                # `not_in` exclude, so a company we've already judged unfit is
+                                # never paid to be re-fetched at all, not just skipped after the
+                                # fact (see the user's explicit "filter them out at the tool
+                                # level, don't fetch and waste credits" instruction).
+                                company = Company(batch_id=_batch(db, tenant_id).id, name=row.get("name"),
+                                                  linkedin_url=url, industry=row.get("industry"),
+                                                  source="crustdata-v3:company_search")
+                                db.add(company)
+                                db.flush()
                                 db.add(GtmLead(tenant_id=tenant_id, play=PLAY, lead_key=key,
-                                               state=STATE_REJECTED,
+                                               state=STATE_REJECTED, company_id=company.id,
                                                qualifier_reason=f"industry mismatch (LLM): {row.get('name')!r} "
                                                                 f"matched a search keyword but isn't genuinely "
                                                                 f"{', '.join(industry_terms[:3])}..."))
