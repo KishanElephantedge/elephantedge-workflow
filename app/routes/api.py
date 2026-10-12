@@ -6659,6 +6659,35 @@ def put_partner_features(partner_tenant_id: int, request: Request, body: dict = 
     return get_partner_features(partner_tenant_id, request, db)
 
 
+@router.post("/gtm-os/partner/features/{feature_key}/request-access")
+def request_partner_feature_access(feature_key: str, request: Request, db: Session = Depends(get_db)):
+    """A partner-facing tab that isn't enabled for them yet is now clickable (2026-10-12,
+    explicit instruction, generalized for every partner, not built one-off) -- it opens a real
+    page with a heading/subheading and this button, instead of a silently non-interactive div.
+    This never auto-enables anything; it only notifies Elephant Edge the same way a partner ICP
+    change already does (see put_partner_icp's own notification), so a human decides, same
+    standing rule as every other "don't auto-act on a partner's behalf" case in this codebase."""
+    from app.gtm_os.features import registry as feature_registry
+
+    tenant_id = _resolve_tenant_id(request)
+    if tenant_id == ELEPHANT_EDGE_TENANT_ID:
+        raise HTTPException(status_code=400, detail="This route is for partner tenants only.")
+    tenant = db.get(Tenant, tenant_id)
+    if tenant is None:
+        raise HTTPException(status_code=404, detail="Tenant not found")
+
+    feature = feature_registry.get_feature(feature_key)
+    feature_label = feature.label if feature else feature_key
+
+    create_notification(
+        db, ELEPHANT_EDGE_TENANT_ID, type_="partner_feature_access_requested",
+        title=f"{tenant.name} requested access to {feature_label}",
+        message=f"Tenant {tenant_id} ({tenant.name}) asked for the {feature_label!r} tab to be turned on.",
+        severity="info",
+    )
+    return {"status": "requested", "feature_key": feature_key}
+
+
 @router.get("/gtm-os/partner/icp-preview")
 def preview_partner_icp_routing(request: Request, db: Session = Depends(get_db)):
     """What WOULD be searched for this partner, and what happens to each of their requirements.

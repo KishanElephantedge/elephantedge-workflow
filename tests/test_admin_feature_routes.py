@@ -10,7 +10,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from app.db.models import Credential, Parameter, Tenant
+from app.db.models import Credential, Notification, Parameter, Tenant
 from app.main import app
 
 ELEPHANT_EDGE, PARTNER = 2, 77
@@ -22,7 +22,7 @@ def db():
     engine = sa.create_engine("sqlite:///:memory:", poolclass=StaticPool,
                               connect_args={"check_same_thread": False})
     sa.orm.configure_mappers()
-    tables = [Tenant.__table__, Parameter.__table__, Credential.__table__]
+    tables = [Tenant.__table__, Parameter.__table__, Credential.__table__, Notification.__table__]
     Tenant.__table__.metadata.create_all(engine, tables=tables)
     session = sessionmaker(bind=engine)()
     session.add(Tenant(id=ELEPHANT_EDGE, name="Elephant Edge", slug="elephant-edge"))
@@ -133,3 +133,32 @@ def test_config_merges_so_a_partial_save_cannot_wipe_another_field(db):
 
 def test_configuring_an_unknown_tenant_is_404(db):
     assert _admin("get", "/gtm-os/admin/partners/9999/features").status_code == 404
+
+
+def test_partner_can_request_access_to_a_tab_they_dont_have(db, monkeypatch):
+    """A not-yet-enabled tab is now clickable for every partner (2026-10-12, explicit
+    instruction, generalized rather than built one-off) -- it opens a real page instead of a
+    silently non-interactive div, and this is what the button on it calls. Never auto-enables
+    anything: only notifies Elephant Edge, same standing rule as every other "don't auto-act on
+    a partner's behalf" case (e.g. put_partner_icp's own notification)."""
+    import app.routes.api as api_module
+
+    calls = []
+    monkeypatch.setattr(api_module, "create_notification",
+                        lambda db_, tenant_id, type_, title, message=None, severity="info": calls.append(
+                            {"tenant_id": tenant_id, "type_": type_, "title": title}))
+
+    res = client.post(f"/api/gtm-os/partner/features/email_campaigns/request-access",
+                      headers={"X-Tenant-Id": str(PARTNER)})
+    assert res.status_code == 200
+    assert res.json() == {"status": "requested", "feature_key": "email_campaigns"}
+    assert len(calls) == 1
+    assert calls[0]["tenant_id"] == ELEPHANT_EDGE
+    assert "New Partner" in calls[0]["title"]
+    assert "Email" in calls[0]["title"]  # the feature's real label, not the raw key
+
+
+def test_elephant_edge_itself_cannot_request_access_from_itself(db):
+    res = client.post("/api/gtm-os/partner/features/content/request-access",
+                      headers={"X-Tenant-Id": str(ELEPHANT_EDGE)})
+    assert res.status_code == 400
