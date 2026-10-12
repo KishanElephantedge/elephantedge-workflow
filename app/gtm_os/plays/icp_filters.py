@@ -810,12 +810,22 @@ def _normalize_crustdata_row(co: dict) -> dict:
     revenue = (co.get("revenue") or {}).get("estimated") or {}
     funding = co.get("funding") or {}
     locations = co.get("locations") or {}
-    industries = basic.get("industries") or []
+    taxonomy = co.get("taxonomy") or {}
+    # REAL BUG, found live 2026-10-12 (Sandy Yu's new Singapore companies, and -- on closer
+    # look -- every crustdata-sourced company for every partner since this adapter went live):
+    # `basic_info.industries` was never a real field in Crustdata's schema (confirmed live via
+    # a direct row fetch -- basic_info has no "industries" key at all), so this always silently
+    # returned None. The real industry classification lives under `taxonomy`, which `fields`
+    # already requests (for the LLM industry-fit judgment) but this function never read for
+    # display. professional_network_industry is the single best-match label Crustdata itself
+    # assigns; categories[0] is the fallback for a row missing that specific field.
+    categories = taxonomy.get("categories") or []
+    industry = taxonomy.get("professional_network_industry") or (categories[0] if categories else None)
     rev_lo, rev_hi = revenue.get("lower_bound_usd"), revenue.get("upper_bound_usd")
     return {
         "url": basic.get("professional_network_url") or "",
         "name": basic.get("name") or "",
-        "industry": industries[0] if industries else None,
+        "industry": industry,
         "numberOfEmployees": headcount.get("total"),
         "address": locations.get("headquarters") or locations.get("country"),
         "website": basic.get("website"),

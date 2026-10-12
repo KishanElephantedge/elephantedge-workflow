@@ -290,12 +290,16 @@ def test_search_icypeas_creates_a_lead_with_the_free_jobo_decision_maker(db, mon
 def _crustdata_company(n, name=None, industry="Medical Device", employees=60,
                        revenue_lo=10_000_000, revenue_hi=50_000_000,
                        last_funding_date=None, last_funding_round_type=None):
-    """A realistic row in CRUSTDATA'S OWN field shape (basic_info/headcount/revenue/locations
-    nesting), confirmed live 2026-10-08 -- deliberately NOT the Icypeas row shape, so this test
-    exercises _normalize_crustdata_row's real translation rather than assuming it away."""
+    """A realistic row in CRUSTDATA'S OWN field shape (basic_info/headcount/revenue/locations/
+    taxonomy nesting), confirmed live 2026-10-08 (and corrected 2026-10-12: `basic_info` has no
+    "industries" key at all in the real schema -- the real classification lives under
+    `taxonomy.professional_network_industry`/`taxonomy.categories`, confirmed via a direct live
+    row fetch) -- deliberately NOT the Icypeas row shape, so this test exercises
+    _normalize_crustdata_row's real translation rather than assuming it away."""
     row = {
         "basic_info": {"name": name or f"Co{n}", "professional_network_url": f"https://www.linkedin.com/company/co{n}/",
-                       "industries": [industry], "website": f"https://co{n}.com"},
+                       "website": f"https://co{n}.com"},
+        "taxonomy": {"professional_network_industry": industry, "categories": [industry]},
         "headcount": {"total": employees},
         "revenue": {"estimated": {"lower_bound_usd": revenue_lo, "upper_bound_usd": revenue_hi}},
         "locations": {"country": "United States", "headquarters": "Ohio, United States"},
@@ -307,6 +311,24 @@ def _crustdata_company(n, name=None, industry="Medical Device", employees=60,
 
 NORA_ICP = {"employee_min": 11, "employee_max": 500, "industries": ["medical devices"],
            "geographies": ["United States"], "revenue_min_usd": 10_000_000, "revenue_max_usd": 100_000_000}
+
+
+def test_normalize_crustdata_row_reads_industry_from_taxonomy_not_basic_info():
+    """REAL BUG, found live 2026-10-12 (Sandy Yu's new Singapore companies, and on closer check
+    every crustdata-sourced company since this adapter went live): `basic_info.industries` is
+    not a real field in Crustdata's schema at all -- confirmed via a direct live row fetch,
+    basic_info has no "industries" key -- so every company's stored `industry` was silently
+    None. The real classification lives under `taxonomy.professional_network_industry` (which
+    `fields` already requested for the LLM industry-fit judgment, just never read for this)."""
+    row = _crustdata_company(1, name="Anchanto", industry="E-Commerce")
+    normalized = play._normalize_crustdata_row(row)
+    assert normalized["industry"] == "E-Commerce"
+
+    # Falls back to the first taxonomy category when professional_network_industry is absent.
+    row_no_pni = _crustdata_company(2, name="Entomo")
+    row_no_pni["taxonomy"] = {"categories": ["HR Tech", "SaaS"]}
+    normalized2 = play._normalize_crustdata_row(row_no_pni)
+    assert normalized2["industry"] == "HR Tech"
 
 
 def test_search_crustdata_resolves_industry_then_creates_a_lead(db, monkeypatch):
