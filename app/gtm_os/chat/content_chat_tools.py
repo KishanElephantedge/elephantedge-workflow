@@ -69,6 +69,19 @@ the configured topics plainly (they're real, derived from this tenant's own posi
 yet evidenced as trending) rather than treating an empty trending list as "nothing to suggest."
 Skip this step ONLY when the user's own message already names a specific topic/angle -- go
 straight to job 2 in that case.
+
+When the user wants VARIETY rather than one fixed angle every time ("what are my options",
+"give me a few ideas"), three real, independent angles exist and are worth offering together
+rather than only ever defaulting to trend/competitor:
+   - Own voice -- generate_own_voice_topic: a natural continuation of a theme they already write
+     about, in their own real voice.
+   - Market/competitor -- generate_opportunity_for_topic (via list_trending_topics): reacting to
+     what's actually moving in the market or what a named competitor just published.
+   - Pipeline-grounded -- generate_pipeline_topic: a real pattern across their own matched ICP
+     accounts (e.g. "N of your M accounts are hiring for X right now").
+Each is independently real and evidence-gated -- call whichever fits the request, or more than
+one when the user wants a spread to choose from. Report an honest status (not_configured /
+insufficient_evidence) rather than silently skipping one that isn't ready yet.
 2. WRITE CONTENT -- once the user has picked from the menu (or their original message already
 named a specific topic/angle), write it. THREE separate paths exist, and
 using the wrong one is what causes dead ends -- most requests are path 3, not 1 or 2:
@@ -216,6 +229,36 @@ CONTENT_CHAT_TOOLS = [
             "topics. Creates real ContentOpportunity rows (origin='account_intelligence') the "
             "same way list_content_opportunities/review_content_opportunity/generate_platform_draft "
             "already handle -- no new review flow to learn."
+        ),
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "generate_own_voice_topic",
+        "description": (
+            "Generate a real content idea that's a natural continuation of a theme this partner "
+            "ALREADY writes about -- not a new topic, but another real angle on a theme that "
+            "shows up in their own recent real LinkedIn posts (their own phrases, branded "
+            "frameworks, recurring subjects). Automatically syncs their real recent posts first "
+            "(small real Apify cost) via their configured own_linkedin_profile_url -- fails "
+            "honestly with status='not_configured' if that isn't set yet, or "
+            "status='insufficient_evidence' if they have no posts on file to continue from. Use "
+            "this when the user asks for something 'in my own voice', 'what I already talk "
+            "about', or wants variety alongside trend/pipeline topics rather than always writing "
+            "about the external market."
+        ),
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "generate_pipeline_topic",
+        "description": (
+            "Generate a real content idea grounded in a pattern across THIS partner's own "
+            "already-matched ICP pipeline (e.g. 'N of your M matched accounts are hiring for "
+            "role X right now') -- never a single company's specifics, only a real aggregate, "
+            "anonymized count. Use this when the user asks for topics 'based on my accounts/"
+            "pipeline/companies' and the full account-intelligence pipeline "
+            "(generate_account_intelligence_topics) isn't the fit -- this is the lighter version "
+            "built for partner tenants sourcing a smaller pool. Fails honestly with "
+            "status='insufficient_evidence' if no role reaches a real multi-company pattern yet."
         ),
         "input_schema": {"type": "object", "properties": {}},
     },
@@ -399,6 +442,14 @@ def execute_content_chat_tool(name: str, tool_input: dict, db: Session, tenant_i
     if name == "generate_account_intelligence_topics":
         from app.gtm_os.content.account_intelligence_topics import generate_account_intelligence_topics
         return generate_account_intelligence_topics(db, tenant_id)
+
+    if name == "generate_own_voice_topic":
+        from app.gtm_os.content.authentic_voice import generate_authentic_voice_opportunity
+        return generate_authentic_voice_opportunity(db, tenant_id)
+
+    if name == "generate_pipeline_topic":
+        from app.gtm_os.content.partner_pipeline_topics import generate_pipeline_signal_opportunity
+        return generate_pipeline_signal_opportunity(db, tenant_id)
 
     if name == "run_fresh_sensing":
         from app.apify_client import GOOGLE_SEARCH_COST_PER_QUERY_NO_AI_OVERVIEW_USD

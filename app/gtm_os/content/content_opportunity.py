@@ -129,6 +129,7 @@ CONTENT_OPPORTUNITY_PROMPT = """You are helping {business_name} decide whether a
 content about one real, trending topic.
 
 {business_name}'s real positioning: {positioning}
+Real audience: {audience}
 
 Topic: {topic_name}
 Real trend state: {trend_state} -- {trend_explanation}
@@ -142,7 +143,8 @@ a reader would click), never the bare topic/keyword itself and never a generic c
 2. why_now -- 2-3 sentences on why this topic is worth writing about right now, grounded in the \
 specific real evidence above (cite what's actually happening, not a generic claim).
 3. suggested_angle -- 1-2 sentences on the specific angle {business_name} should take, consistent \
-with its real positioning above.
+with its real positioning above and actually relevant to the real audience above (not a generic \
+angle that could apply to anyone).
 
 Return JSON exactly:
 {{"headline": "<real, specific, compelling title>", "why_now": "<2-3 sentences>", \
@@ -191,6 +193,7 @@ def generate_content_opportunity(db: Session, tenant_id: int, content_topic_id: 
     )
     prompt = CONTENT_OPPORTUNITY_PROMPT.format(
         business_name=business_context["business_name"], positioning=business_context["positioning"],
+        audience=business_context.get("audience") or "not specified",
         topic_name=topic.canonical_name, trend_state=trend["state"], trend_explanation=trend["explanation"], evidence_block=evidence_block,
     )
 
@@ -291,6 +294,25 @@ def request_content_opportunity_changes(db: Session, tenant_id: int, content_opp
 
 VALID_PLATFORMS = {"blog", "linkedin", "linkedin_article", "twitter"}
 
+# A curated hook-formula menu for feed-native platforms (linkedin/twitter), synthesized from
+# published LinkedIn-copywriting craft (2026-10-09) -- each one is a real, named pattern, not an
+# invented rule, and the prompt always says to pick whichever fits the evidence, never force one.
+HOOK_FORMULA_MENU = """- Challenge hook: name a common belief, then say plainly that it's wrong ("Everyone says X. \
+That's backwards.").
+- Research/number hook: open with a specific, non-rounded number or stat, then explain what it \
+actually means ("3 of our last 5 clients had the same root cause.").
+- Story/cold-open hook: drop into a specific real moment (what the evidence actually shows), no \
+preamble, before stepping back to the point.
+- Unpopular-opinion hook: state a contrarian take plainly, then back it with the real evidence.
+- Confession/time-anchor hook: name when something changed for you or the business ("Six months \
+ago we stopped doing X.") and what that revealed.
+- Before/after hook: contrast what used to be true against what's true now, grounded in the real \
+evidence, closing on what that shift means going forward.
+- Question hook: open with the real question the evidence actually raises, not a generic one -- \
+questions pull more engagement than flat statements when the question is specific.
+- Permission-slip hook: speak directly to a reader stuck on this problem and name the one real \
+thing that should stop worrying them, grounded in the evidence."""
+
 # Real, distinct voice/length per platform -- never the same generic draft reused everywhere
 # (2026-08-28 explicit instruction). Grounded in how these platforms actually differ, not
 # invented style rules.
@@ -315,22 +337,39 @@ PLATFORM_BRIEF = {
     "linkedin": (
         "A LinkedIn post (120-200 words): short paragraphs or line breaks, no headers, "
         "conversational but substantive -- written to be read on a phone in a feed, not a formal "
-        "article. Pick whichever REAL, proven hook formula actually fits this topic's evidence "
-        "(never force one that doesn't fit): a Challenge hook (\"Everyone says X. That's wrong.\"), "
-        "a Research hook (\"I analyzed N things. The pattern was clear.\"), a Story opening (a "
-        "specific real moment), or an Unpopular-opinion hook (\"Unpopular opinion: ...\"). "
-        "Structure: sharp hook first line -> specific value in the body (grounded in the real "
-        "evidence, never generic) -> a clean, single call to action at the end -- never a listicle "
-        "of unrelated tips."
+        "article. The first line is read alone before a 'see more' truncation (roughly the first "
+        "200 characters) -- it has to work as a hook on its own, before the rest of the post is "
+        "even visible. Pick whichever REAL, proven hook formula actually fits this topic's "
+        "evidence (never force one that doesn't fit, and never use more than one):\n"
+        + HOOK_FORMULA_MENU +
+        "\nStructure: hook first line -> specific value in the body (grounded in the real "
+        "evidence, never generic) -> a single, soft call to action at the end (a real question or "
+        "an invitation to share a view, never \"DM me\" or a hard sell) -- never a listicle of "
+        "unrelated tips."
     ),
     "twitter": (
         "An X/Twitter thread (4-7 short posts, each under 280 characters, numbered): the first "
-        "post is the hook (same real formulas as the LinkedIn brief -- challenge, research, story, "
-        "or unpopular-opinion, whichever the evidence actually supports), each following post "
-        "makes one real point building on the evidence, the last post lands the angle without a "
-        "generic \"follow for more\" tack-on."
+        "post is the hook (same real formulas as the LinkedIn brief above, whichever the evidence "
+        "actually supports), each following post makes one real point building on the evidence, "
+        "the last post lands the angle without a generic \"follow for more\" tack-on."
     ),
 }
+
+# Shared craft rules -- how it's written, not what platform it's for. Applied to every draft
+# prompt below (DRAFT_PROMPT, DIRECT_DRAFT_PROMPT) regardless of platform, since these are about
+# sounding like a real person instead of an obviously AI-generated post, not platform mechanics.
+VOICE_RULES = """Writing voice -- follow these, they separate a post that reads as genuinely \
+written from one that reads as obviously AI-generated:
+- A specific number beats a vague adjective every time ("47% of deals" beats "a significant \
+share of deals") -- if the real evidence has a number, use it; never invent one that isn't there.
+- Avoid these words entirely, they read as AI filler: leverage, fundamentally, streamline, \
+harness, delve, unlock, foster, robust, holistic, synergy, paradigm, game-changer, elevate.
+- Always capitalize a real person's name, a company name, or a product name -- never lowercase \
+them even if the surrounding sentence is casual.
+- One sharp, well-supported insight beats three shallow ones. Do not pad the piece with extra \
+points just to fill the length target.
+- Write like a person who actually has this opinion, not a summary of what someone else said \
+about the topic."""
 
 # The Expedition Framework (2026-09-19, from the team's own Blog Architecture doc) -- the real
 # writing engine behind blog/linkedin_article drafts specifically. A thinking scaffold, never a
@@ -384,7 +423,12 @@ dash or en dash (-- or a long dash character) anywhere -- rewrite the sentence i
 period, or "and"/"but" always works).
 
 Write in {business_name}'s real voice: direct, no fluff, grounded in real evidence, consistent \
-with this positioning: {positioning}. Return JSON exactly:
+with this positioning: {positioning}. Real audience: {audience} -- write for them specifically, \
+not a generic reader.
+
+{voice_rules}
+
+Return JSON exactly:
 {{"draft_text": "<the full draft, formatted for this exact platform>"}}"""
 
 # Only blog/linkedin_article use the Expedition Framework's narrative arc -- linkedin/twitter
@@ -461,9 +505,10 @@ def generate_content_draft(db: Session, tenant_id: int, content_opportunity_id: 
         evidence_block = f"- {opportunity.why_now}"
     prompt = DRAFT_PROMPT.format(
         business_name=business_context["business_name"], positioning=business_context["positioning"],
+        audience=business_context.get("audience") or "not specified",
         platform_label={"blog": "blog post", "linkedin": "LinkedIn post", "linkedin_article": "LinkedIn Article", "twitter": "X/Twitter thread"}[platform],
         topic_name=opportunity.headline or topic.canonical_name, why_now=opportunity.why_now, suggested_angle=opportunity.suggested_angle,
-        evidence_block=evidence_block, platform_brief=PLATFORM_BRIEF[platform],
+        evidence_block=evidence_block, platform_brief=PLATFORM_BRIEF[platform], voice_rules=VOICE_RULES,
         expedition_guidance=("\n\n" + EXPEDITION_FRAMEWORK_GUIDANCE) if platform in _EXPEDITION_PLATFORMS else "",
     )
 
@@ -480,12 +525,41 @@ def generate_content_draft(db: Session, tenant_id: int, content_opportunity_id: 
     if not draft_text:
         return {"status": "discarded", "reason": "no draft_text returned"}
 
+    editor_review = None
+    # The Expedition Framework's own editorial discipline, applied automatically rather than
+    # left as dead code: only meaningful for the two platforms that actually use that narrative
+    # arc (blog/linkedin_article) -- a short feed post has no arc for this rubric to score. One
+    # revision pass max, same cost-bounding discipline as the rate-limit retry in llm_client.py --
+    # a draft that still needs work after one honest revision is a human review question, not
+    # something to loop on indefinitely.
+    if platform in _EXPEDITION_PLATFORMS:
+        rubric_result = review_draft_with_editor_rubric(db, tenant_id, opportunity.headline or topic.canonical_name, draft_text)
+        if rubric_result["status"] == "ok":
+            editor_review = rubric_result["review"]
+            if editor_review.get("verdict") == "needs_revision" and editor_review.get("real_issues"):
+                issues_block = "\n".join(f"- {issue}" for issue in editor_review["real_issues"])
+                revision_prompt = prompt + (
+                    f"\n\nA strong editor reviewed your first draft and flagged real problems -- "
+                    f"rewrite the piece addressing every one of these, not just acknowledging them:\n{issues_block}"
+                )
+                try:
+                    revised = generate_json(revision_prompt, db, tenant_id, max_tokens=max_tokens)
+                    revised_text = revised.get("draft_text") if isinstance(revised, dict) else None
+                    if revised_text:
+                        draft_text = revised_text
+                        editor_review["revised"] = True
+                except Exception:  # noqa: BLE001 -- the first draft is still good enough to return if the revision call fails
+                    pass
+
     drafts = dict(opportunity.drafts or {})
     drafts[platform] = draft_text
     opportunity.drafts = drafts
     opportunity.draft_generated_at = datetime.utcnow()
     db.commit()
-    return {"status": "ok", "platform": platform, "draft_text": draft_text}
+    result = {"status": "ok", "platform": platform, "draft_text": draft_text}
+    if editor_review is not None:
+        result["editor_review"] = editor_review
+    return result
 
 
 DIRECT_DRAFT_PROMPT = """Write a real, publishable {platform_label} for {business_name} on the \
@@ -509,7 +583,11 @@ markdown -- so write PLAIN TEXT ONLY: no #, ##, **, __, or - used as formatting,
 or en dash anywhere (rewrite the sentence instead).
 
 Write in {business_name}'s real voice: direct, no fluff, a genuine point of view -- not a \
-generic listicle unless the user specifically asked for one. Return JSON exactly:
+generic listicle unless the user specifically asked for one.
+
+{voice_rules}
+
+Return JSON exactly:
 {{"draft_text": "<the full draft, formatted for this exact platform>"}}"""
 
 
@@ -534,7 +612,7 @@ def generate_direct_draft(db: Session, tenant_id: int, user_request: str, platfo
         business_name=business_context["business_name"], positioning=business_context["positioning"],
         audience=business_context["audience"],
         platform_label={"blog": "blog post", "linkedin": "LinkedIn post", "linkedin_article": "LinkedIn Article", "twitter": "X/Twitter thread"}[platform],
-        user_request=user_request, platform_brief=PLATFORM_BRIEF[platform],
+        user_request=user_request, platform_brief=PLATFORM_BRIEF[platform], voice_rules=VOICE_RULES,
     )
     if platform in _EXPEDITION_PLATFORMS:
         prompt += "\n\n" + EXPEDITION_FRAMEWORK_GUIDANCE

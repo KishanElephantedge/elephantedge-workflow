@@ -7,9 +7,19 @@ natural continuation on one of those same themes.
 No external evidence is needed here BY DESIGN: the "why now" is simply "you already write about
 this, here is another real angle on the same theme, in your voice" -- not a trending-topic claim.
 Grounding discipline is the same as the rest of Content Intelligence in a different shape: the
-LLM only ever sees the partner's own real post excerpts (partner_recent_posts, a Parameter-backed
-list the partner/operator keeps current), never invents a theme or a framework name that doesn't
-appear in that real material.
+LLM only ever sees the partner's own real post excerpts, never invents a theme or a framework
+name that doesn't appear in that real material.
+
+REAL POSTS, FETCHED AUTOMATICALLY (fixed 2026-10-12, was originally designed around a
+partner_recent_posts Parameter that nothing ever populated -- hand-feeding it per partner on
+demand is not a real production path, see app/gtm_os/learning/own_linkedin_content.py's own
+module docstring for why that module exists). own_linkedin_profile_url is already a required
+config key for the content feature (app/gtm_os/features/registry.py) and
+own_linkedin_content.py already has a real, working Apify-backed sync against it
+(OwnLinkedinPost table, dedup'd by post_urn). So this module syncs that same real source
+on-demand, through the same Apify budget guard every other on-demand Apify call in this codebase
+goes through (see run_fresh_sensing in content_chat_tools.py for the identical pattern), rather
+than depending on a second, never-wired data source.
 
 Reuses the existing ContentTopic/ContentOpportunity tables and review lifecycle unchanged --
 origin="authentic_voice" is simply a fourth value alongside the ones content_opportunity.py's own
@@ -17,22 +27,42 @@ module docstring already documents."""
 
 from sqlalchemy.orm import Session
 
-from app.db.models import Parameter
+from app.apify_budget_guard import STATUS_ALLOWED, check_apify_budget
+from app.apify_client import LINKEDIN_POST_COST_PER_POST_USD
 from app.gtm_os.content.content_business_context import get_content_business_context
 from app.gtm_os.content.content_opportunity import ContentOpportunity
 from app.gtm_os.content.topic import ContentTopic
+from app.gtm_os.learning.own_linkedin_content import (
+    get_own_linkedin_profile_url, get_recent_own_posts, sync_own_linkedin_posts,
+)
 from app.llm_client import generate_json
 
-RECENT_POSTS_PARAMETER_KEY = "partner_recent_posts"
 AUTHENTIC_VOICE_TOPIC_NAME = "Recurring Themes"
+SYNC_POST_LIMIT = 10
 
 
-def get_partner_recent_posts(db: Session, tenant_id: int) -> list[dict]:
-    """Real recent post excerpts on file for this partner -- [{"date": "...", "text": "..."}].
-    Never invented; an empty list means nobody has captured any yet (real gap, not silently
-    filled with generic content)."""
-    param = db.query(Parameter).filter(Parameter.tenant_id == tenant_id, Parameter.key == RECENT_POSTS_PARAMETER_KEY).first()
-    return param.value if param and isinstance(param.value, list) else []
+def get_partner_recent_posts(db: Session, tenant_id: int, auto_sync: bool = True) -> list[dict]:
+    """Real recent post excerpts for this partner's own LinkedIn profile --
+    [{"date": "...", "text": "..."}], most recent first. Returns [] (never invented filler) if
+    no own_linkedin_profile_url is configured yet, or if the profile genuinely has no posts.
+
+    auto_sync=True (the default) triggers a real, budget-gated Apify refresh first, so a caller
+    never has to remember to sync separately -- set False only for a read-only check that must
+    never spend money (e.g. a status/diagnostic call)."""
+    profile_url = get_own_linkedin_profile_url(db, tenant_id)
+    if not profile_url:
+        return []
+
+    if auto_sync:
+        estimated_cost = SYNC_POST_LIMIT * LINKEDIN_POST_COST_PER_POST_USD
+        budget_result = check_apify_budget(db, tenant_id, estimated_cost, operation="authentic_voice_sync")
+        if budget_result["status"] == STATUS_ALLOWED:
+            sync_own_linkedin_posts(db, tenant_id, limit=SYNC_POST_LIMIT)
+        # A blocked/unavailable budget degrades to "use whatever's already on file" below --
+        # never raises, same fail-safe-not-fail-open discipline as every other Apify call site.
+
+    posts = get_recent_own_posts(db, tenant_id, limit=SYNC_POST_LIMIT)
+    return [{"date": p.posted_at.isoformat() if p.posted_at else "undated", "text": p.post_text or ""} for p in posts if p.post_text]
 
 
 def _get_or_create_authentic_voice_topic(db: Session, tenant_id: int) -> ContentTopic:
@@ -87,9 +117,12 @@ def generate_authentic_voice_opportunity(db: Session, tenant_id: int) -> dict:
     """Layer 1 (real gating) + Layer 2 (grounded synthesis), same shape as
     content_opportunity.generate_content_opportunity. Returns
     {"status": "insufficient_evidence" | "already_exists" | "llm_unavailable" | "ok", ...}."""
+    if not get_own_linkedin_profile_url(db, tenant_id):
+        return {"status": "not_configured", "reason": "no own_linkedin_profile_url set for this tenant yet (Settings) -- needed to find their real posts"}
+
     posts = get_partner_recent_posts(db, tenant_id)
     if not posts:
-        return {"status": "insufficient_evidence", "reason": "no partner_recent_posts on file for this tenant yet"}
+        return {"status": "insufficient_evidence", "reason": "synced this partner's real LinkedIn profile but found no posts yet -- nothing to continue a theme from"}
 
     business_context = get_content_business_context(db, tenant_id)
     if not business_context.get("business_name"):
