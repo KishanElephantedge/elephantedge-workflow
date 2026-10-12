@@ -1235,3 +1235,15 @@ def ensure_indexes():
             )
         """))
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_pool_deliveries_tenant ON pool_deliveries (tenant_id)"))
+
+        # content_opportunities.evidence_strength (2026-10-12, Content Intelligence cross-origin
+        # ranking -- see content_opportunity.py's get_suggested_content_opportunities()). Added
+        # by hand against the DSN render.md documents FIRST, then found live that this service's
+        # real DATABASE_URL does not point at that database after all -- the exact same class of
+        # mismatch the content_pillars table above already hit on 2026-09-21 ("the two rounds of
+        # manual CREATE TABLE this feature got were both run by hand against a database that
+        # turned out NOT to be the one this service's own DATABASE_URL actually points at").
+        # Added here, the one place guaranteed to run against the real database, so it's no
+        # longer a manual, easy-to-misapply step -- same fix, same reason, second time this
+        # exact mistake has been made.
+        conn.execute(text("ALTER TABLE content_opportunities ADD COLUMN IF NOT EXISTS evidence_strength INTEGER"))
