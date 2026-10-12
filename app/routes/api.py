@@ -4488,7 +4488,15 @@ def get_gtm_os_content_suggestions(request: Request, db: Session = Depends(get_d
     real suggestion for a brand-new tenant rather than showing an empty board)."""
     from app.gtm_os.content.content_opportunity import get_suggested_content_opportunities
 
-    return {"suggestions": get_suggested_content_opportunities(db, _resolve_tenant_id(request))}
+    # TEMPORARY diagnostic (2026-10-12): this route 500s in production but not in any local
+    # reproduction against the same database -- surfacing the real exception/traceback here,
+    # in the response body, since server logs aren't reachable from this session. Remove once
+    # the real cause is found and fixed.
+    try:
+        return {"suggestions": get_suggested_content_opportunities(db, _resolve_tenant_id(request))}
+    except Exception as e:  # noqa: BLE001 -- diagnostic only, removed once the real cause is found
+        import traceback
+        return {"_diagnostic_error": str(e), "_diagnostic_type": type(e).__name__, "_diagnostic_traceback": traceback.format_exc()}
 
 
 @router.get("/gtm-os/content-topics")
