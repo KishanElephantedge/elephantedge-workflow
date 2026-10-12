@@ -456,6 +456,44 @@ def test_search_crustdata_tags_hot_leads_without_rejecting_anyone(db, monkeypatc
     assert normal.hot_lead is None
 
 
+def test_search_crustdata_rejects_a_company_with_zero_firmographic_data_before_any_spend(db, monkeypatch):
+    """REAL GAP, found live 2026-10-12 (Angela Shori): 8 of 16 companies in one run had NO
+    headcount AND NO revenue data at all, so "missing data is never a violation" waved them
+    through unverified -- several later confirmed by real outside lookup to be large, mature,
+    well-funded companies (Bright Machines: Series C, $437M raised), not early-stage fits. A row
+    missing EVERY firmographic field is "we know nothing", not "a real match missing one data
+    point" -- must be rejected for free, before the paid decision-maker lookup ever runs, same
+    tier as the existing vendor/government name checks."""
+    import app.deepline_client as dc
+    import app.phases.free_decision_maker as fdm
+
+    decision_maker_calls = []
+
+    def fake_cli(tool, payload):
+        if tool == "crustdata_v3_company_search_autocomplete":
+            return {"toolResponse": {"raw": {"suggestions": [{"value": "Medical Device"}]}}}
+        if tool == "crustdata_v3_company_search":
+            blank = _crustdata_company(1, name="No Data Co", employees=None)
+            blank["headcount"] = {}  # no "total" key at all
+            blank["revenue"] = {"estimated": {}}  # no bounds at all
+            return {"toolResponse": {"raw": {"companies": [blank], "next_cursor": None}}}
+        raise AssertionError(f"unexpected tool: {tool}")
+
+    monkeypatch.setattr(dc, "_call_deepline_cli", fake_cli)
+    monkeypatch.setattr(fdm, "_jobo_leadership_candidates",
+                        lambda db_, t, company: decision_maker_calls.append(1) or [])
+
+    with spend_scope(db, BILLING, "icp_filters", run_cap_usd=0.5):
+        result = play.search_crustdata(db, PARTNER, NORA_ICP)
+
+    assert result["outcomes"] == {"no_firmographic_data": 1}
+    assert decision_maker_calls == []  # never even tried the free decision-maker lookup
+    assert db.query(Company).count() == 0  # no Company row created for an unverifiable row
+    lead = db.query(GtmLead).one()
+    assert lead.state == play.STATE_REJECTED
+    assert "no headcount or revenue data" in lead.qualifier_reason
+
+
 def test_search_crustdata_stores_the_real_funding_date_not_just_filters_on_it(db, monkeypatch):
     """REAL FIX, 2026-10-08: funding_recency was already a genuine, working search filter --
     confirmed live, it's why a company qualified at all for an ICP that sets it -- but the actual

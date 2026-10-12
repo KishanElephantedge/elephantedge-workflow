@@ -366,6 +366,26 @@ def _process_icypeas_company(db: Session, tenant_id: int, co: dict, known_leads:
             logger.warning("exclusion learning skipped: %s: %s", type(e).__name__, e)
         return "government_or_education"
 
+    # REAL GAP, found live 2026-10-12 (Angela Shori): "missing data is never a violation" was
+    # built to protect a row that's missing ONE field from a wrongful reject (BePresent's real
+    # headcount of 31 vs. its stale public "2-10 employees" page) -- it was never meant to wave
+    # through a company we know NOTHING about. 8 of 16 rows in one run (Bright Machines, Serve
+    # Robotics, Pixxel and others -- all later confirmed, by real outside lookup, to be mature,
+    # well-funded companies, not early-stage) had zero headcount AND zero revenue data, so they
+    # passed every must_have bound unverified and still cost a full decision-maker lookup each.
+    # A row with EVERY firmographic field empty is not "a real match missing one data point", it
+    # is "we don't know if this is a match at all" -- reject it for free, before any paid
+    # decision-maker spend, the same local-check tier vendor/government names already use.
+    revenue_range = co.get("estimatedRevenuRange") or {}
+    has_revenue = bool((revenue_range.get("estimatedMinRevenue") or {}).get("amount") is not None
+                       or (revenue_range.get("estimatedMaxRevenue") or {}).get("amount") is not None)
+    if co.get("numberOfEmployees") is None and not has_revenue:
+        db.add(GtmLead(tenant_id=tenant_id, play=PLAY, lead_key=key, state=STATE_REJECTED,
+                       qualifier_reason=f"no headcount or revenue data at all for {name!r} -- "
+                                        f"cannot verify fit, not worth a decision-maker lookup"))
+        db.commit()
+        return "no_firmographic_data"
+
     company = (db.query(Company).join(Batch, Company.batch_id == Batch.id)
                .filter(Batch.tenant_id == tenant_id, Company.linkedin_url == url).first())
     if company is not None and db.query(CampaignPush.id).join(Contact, CampaignPush.contact_id == Contact.id).filter(
