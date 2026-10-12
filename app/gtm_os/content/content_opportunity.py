@@ -30,7 +30,7 @@ this codebase (this table has no `published_at`/`published_by` field at all, del
 
 from datetime import datetime
 
-from sqlalchemy import Column, DateTime, ForeignKey, Integer, JSON, String, Text
+from sqlalchemy import Column, DateTime, ForeignKey, Integer, JSON, String, Text, nullslast
 from sqlalchemy.orm import Session
 
 from app.db.models import Base
@@ -311,7 +311,7 @@ def get_suggested_content_opportunities(db: Session, tenant_id: int, auto_genera
         db.query(ContentOpportunity, ContentTopic.canonical_name)
         .join(ContentTopic, ContentOpportunity.content_topic_id == ContentTopic.id)
         .filter(ContentOpportunity.tenant_id == tenant_id, ContentOpportunity.status == "candidate")
-        .order_by(ContentOpportunity.evidence_strength.desc().nullslast(), ContentOpportunity.created_at.desc())
+        .order_by(nullslast(ContentOpportunity.evidence_strength.desc()), ContentOpportunity.created_at.desc())
         .all()
     )
 
