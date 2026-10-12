@@ -37,7 +37,7 @@ import logging
 import re
 from datetime import datetime, timedelta
 
-from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session
 
 from app.db.models import Batch, CampaignPush, Company, Contact, Parameter
@@ -727,7 +727,7 @@ def search_icypeas(db: Session, tenant_id: int, icp: dict, pages: int = 1) -> di
                                         normalize_linkedin_url(contact.linkedin_url), co)
                     result["created"] += 1
                     count("created")
-                except OperationalError:
+                except (OperationalError, IntegrityError):
                     db.rollback()
                     count("db_error_retry_later")
             pending = []
@@ -987,21 +987,47 @@ def search_crustdata(db: Session, tenant_id: int, icp: dict, pages: int = 1) -> 
                     # (any ICP edit resets the cursor) paid again for the Crustdata row AND the
                     # LLM call to re-reach the same "not a real fit" verdict. Recording it here
                     # means `known_leads` skips it on the next run for free.
+                    #
+                    # REAL BUG, found live 2026-10-12 (Sandy Yu, Singapore): the SAME company can
+                    # appear on consecutive runs within the same request (e.g. a retry right
+                    # after a page already created its rejection rows) -- inserting the same
+                    # lead_key twice violates ux_gtm_leads_key, and because the whole block was
+                    # only wrapped in `except Exception: log and continue`, the session was never
+                    # rolled back, so the IntegrityError poisoned every later query in the SAME
+                    # request with PendingRollbackError, crashing the entire run with a 500 --
+                    # not just skipping this one learning write. Guard against `known_leads`
+                    # first (the cheap, normal-case fix), and roll back on any write failure so a
+                    # learning side-effect can never again take the whole run down with it.
                     for i, row in enumerate(normalized):
                         if verdicts.get(i) is False:
                             url = row.get("url") or ""
-                            if "linkedin.com/company/" in url:
-                                slug = url.rstrip("/").rsplit("/company/", 1)[-1].split("?")[0]
-                                db.add(GtmLead(tenant_id=tenant_id, play=PLAY, lead_key=f"company:{slug}",
+                            if "linkedin.com/company/" not in url:
+                                continue
+                            slug = url.rstrip("/").rsplit("/company/", 1)[-1].split("?")[0]
+                            key = f"company:{slug}"
+                            if key in known_leads:
+                                continue
+                            known_leads.add(key)
+                            try:
+                                db.add(GtmLead(tenant_id=tenant_id, play=PLAY, lead_key=key,
                                                state=STATE_REJECTED,
                                                qualifier_reason=f"industry mismatch (LLM): {row.get('name')!r} "
                                                                 f"matched a search keyword but isn't genuinely "
                                                                 f"{', '.join(industry_terms[:3])}..."))
-                    db.commit()
+                                db.commit()
+                            except (OperationalError, IntegrityError):
+                                db.rollback()
                     normalized = [row for i, row in enumerate(normalized) if verdicts.get(i, True) is not False]
                     result["outcomes"]["industry_mismatch_llm_rejected"] = rejected
             except Exception as e:  # noqa: BLE001 -- a judgment outage must never block a real run
                 logger.warning("industry-fit LLM judgment skipped: %s: %s", type(e).__name__, e)
+                # An uncaught DB error here (anything the inner except above didn't already
+                # handle) must not leave the session in a poisoned PendingRollbackError state --
+                # see this block's 2026-10-12 fix note for the exact failure this caused live.
+                try:
+                    db.rollback()
+                except Exception:  # noqa: BLE001 -- rollback itself must never raise past this point
+                    pass
 
         # SAMPLE VERIFICATION, 2026-10-08 -- the gap found live onboarding Jeff Ballard: this
         # adapter had none at all (an explicit, acknowledged scope-cut when it was first built),
@@ -1077,7 +1103,7 @@ def search_crustdata(db: Session, tenant_id: int, icp: dict, pages: int = 1) -> 
                                         normalize_linkedin_url(contact.linkedin_url), co2)
                     result["created"] += 1
                     count("created")
-                except OperationalError:
+                except (OperationalError, IntegrityError):
                     db.rollback()
                     count("db_error_retry_later")
             pending = []

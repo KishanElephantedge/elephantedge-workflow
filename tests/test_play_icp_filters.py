@@ -501,6 +501,58 @@ def test_search_crustdata_llm_rejects_a_conglomerate_but_keeps_a_real_match(db, 
     assert "industry mismatch" in rejected[0].qualifier_reason
 
 
+def test_search_crustdata_llm_rejection_is_idempotent_across_retries(db, monkeypatch):
+    """REAL BUG, found live 2026-10-12 (Sandy Yu, Singapore): the same conglomerate reappeared
+    on a retry (same ICP/fingerprint, same first page) and the LLM-rejection insert had no
+    `known_leads` guard -- the second INSERT hit ux_gtm_leads_key, and because that error was
+    only caught by a bare `except Exception: log and continue` with no db.rollback(), the
+    SQLAlchemy session was left in PendingRollbackError state for the rest of the request,
+    crashing the entire run with a 500 at the NEXT unrelated db.commit() (record_attempt's own,
+    in planner.py) -- not just silently skipping the duplicate learning write. Reproduces the
+    exact shape: the same rejected company fetched twice in a row must neither crash nor create
+    a second GtmLead row."""
+    import app.deepline_client as dc
+    import app.llm_client as llm
+    import app.phases.decision_maker_reasoning as dmr
+    import app.phases.free_decision_maker as fdm
+
+    def fake_llm(prompt, *a, **k):
+        if "fits" in prompt:
+            return {"fits": []}  # the conglomerate never fits, on either call
+        return {"values": []}
+
+    monkeypatch.setattr(llm, "generate_json", fake_llm)
+
+    def fake_cli(tool, payload):
+        if tool == "crustdata_v3_company_search_autocomplete":
+            return {"toolResponse": {"raw": {"suggestions": []}}}
+        if tool == "crustdata_v3_company_search":
+            bad = _crustdata_company(2, name="Conglomerate Corp")
+            bad["basic_info"]["description"] = "A diversified industrial group with a data analytics division."
+            return {"toolResponse": {"raw": {"companies": [bad], "next_cursor": None}}}
+        raise AssertionError(f"unexpected tool: {tool}")
+
+    monkeypatch.setattr(dc, "_call_deepline_cli", fake_cli)
+    monkeypatch.setattr(fdm, "_jobo_leadership_candidates", lambda db_, t, company: [_jobo_person()])
+    monkeypatch.setattr(dmr, "select_best_decision_makers",
+                        lambda db_, t, company, cands, n, offering_name=None: [])
+
+    icp = {**NORA_ICP, "industries": ["data"], "employee_min": None, "employee_max": None}
+
+    with spend_scope(db, BILLING, "icp_filters", run_cap_usd=0.5):
+        first = play.search_crustdata(db, PARTNER, icp)
+    assert first["outcomes"].get("industry_mismatch_llm_rejected") == 1
+
+    # Same ICP -> same fingerprint -> same first page from the mock. Must not crash and must
+    # not create a second GtmLead row for the same company.
+    with spend_scope(db, BILLING, "icp_filters", run_cap_usd=0.5):
+        second = play.search_crustdata(db, PARTNER, icp)
+    assert second.get("stopped") is None or "quality:" not in (second.get("stopped") or "")
+
+    leads = db.query(GtmLead).filter(GtmLead.lead_key == "company:co2").all()
+    assert len(leads) == 1
+
+
 def test_search_crustdata_catches_a_bad_batch_before_creating_any_leads(db, monkeypatch):
     """THE real gap found live onboarding Jeff Ballard, 2026-10-08: search_crustdata() had no
     sample-verification step at all (an explicit, acknowledged scope-cut when the adapter was
