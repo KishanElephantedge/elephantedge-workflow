@@ -1221,6 +1221,17 @@ def search_crustdata(db: Session, tenant_id: int, icp: dict, pages: int = 1) -> 
                     count("db_error_retry_later")
             pending = []
 
+        # REAL GAP, found live 2026-10-12 (Sandy Yu, Singapore): `quota.remaining` is captured
+        # ONCE before this loop starts and never rechecked per page, so a multi-page run (now
+        # the default -- see run_icp_filters's own fix note) kept paging and paying for
+        # decision-maker lookups even after the target was already hit on an earlier page. The
+        # per-page `still_needed`/`deferred` logic already stops OVER-CREATING past the target,
+        # but did nothing to stop OVER-FETCHING once it was already met. Explicit instruction:
+        # "continues until that hits the target or its the budget" -- not past either one.
+        if result["created"] >= quota.remaining:
+            result["stopped"] = result["stopped"] or \
+                f"daily target of {quota.target} reached this run ({result['created']} created)"
+            break
         if result["stopped"]:
             break
         if not companies or not next_cursor:
@@ -1450,13 +1461,21 @@ def qualify(db: Session, tenant_id: int, icp: dict, limit: int = 25) -> dict:
     return {"qualified": qualified, "rejected": rejected, "stopped": None}
 
 
-def run_icp_filters(db: Session, tenant_id: int, pages: int = 1, run_cap_usd: float | None = 0.25) -> dict:
+def run_icp_filters(db: Session, tenant_id: int, pages: int = 10, run_cap_usd: float | None = 0.25) -> dict:
     """Real bug fixed 2026-09-28, before this play's first production run: this used to spend
     with no control-plane check at all, unlike every other play -- Elephant Edge's own pause
     would stop the hiring and post_engagement plays but silently NOT this one, even though its
     spend is reserved against the SAME Elephant Edge ledger (BILLING_TENANT_ID). Checked against
     the billing tenant, not `tenant_id` (the partner) -- a partner tenant has no control-plane
-    config of its own, and pausing is Elephant Edge's own kill switch over its own spend."""
+    config of its own, and pausing is Elephant Edge's own kill switch over its own spend.
+
+    `pages` defaulted to 1 until 2026-10-12 (Sandy Yu, Singapore) -- a caller who didn't pass a
+    higher value got exactly one page's worth of candidates even when the target wasn't met and
+    plenty of budget remained, with no way to tell the difference from "the market is actually
+    this thin" without manually retrying. Explicit instruction: a run should keep paging on its
+    own "until that hits the target or its the budget" -- 10 is generous headroom for that; the
+    REAL backstops that actually end a run are quota.remaining (see search_crustdata's own
+    per-page check) and run_cap_usd, not this count."""
     from app.gtm_os.orchestration.control import ControlPlaneHalted, check_can_run
     from app.phases.partner_icp import get_partner_icp
     from app.spend_ledger import spend_scope

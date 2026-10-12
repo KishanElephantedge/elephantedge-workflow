@@ -6707,7 +6707,7 @@ def preview_partner_icp_routing(request: Request, db: Session = Depends(get_db))
 
 
 @router.post("/gtm-os/partner/icp-filters-run")
-def run_partner_icp_filters_route(request: Request, pages: int = 1, run_cap_usd: float = 0.25, db: Session = Depends(get_db)):
+def run_partner_icp_filters_route(request: Request, pages: int = 10, run_cap_usd: float = 0.25, db: Session = Depends(get_db)):
     """Runs Play F (ICP-filter LinkedIn people search -- no signal, filters built straight from
     the partner's own ICP config; app/gtm_os/plays/icp_filters.py) for the CALLING partner
     tenant right now. Synchronous, unlike POST .../partner/discover above -- this play calls
@@ -6717,7 +6717,11 @@ def run_partner_icp_filters_route(request: Request, pages: int = 1, run_cap_usd:
     run_cap_usd is capped at $2 here regardless of what's passed -- a query-param typo (e.g. an
     extra zero) must not turn into an accidental large spend; run_icp_filters() itself is what
     actually reserves each call against this cap plus Elephant Edge's own combined daily cap,
-    and is gated on Elephant Edge's control-plane pause state (see its own docstring for why)."""
+    and is gated on Elephant Edge's control-plane pause state (see its own docstring for why).
+
+    pages defaults to 10, not 1 (2026-10-12) -- see run_icp_filters's own note: a run should
+    keep paging on its own until the target is met or run_cap_usd is, not stop after one page
+    regardless of either. The $ cap above is what actually bounds a run, not this count."""
     tenant_id = _resolve_tenant_id(request)
     if tenant_id == ELEPHANT_EDGE_TENANT_ID:
         raise HTTPException(status_code=400, detail="This route is for partner tenants only -- Elephant Edge's own hiring/post-engagement plays run through the V2 scheduler, not this.")

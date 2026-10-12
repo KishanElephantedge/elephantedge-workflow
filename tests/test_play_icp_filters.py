@@ -494,6 +494,49 @@ def test_search_crustdata_rejects_a_company_with_zero_firmographic_data_before_a
     assert "no headcount or revenue data" in lead.qualifier_reason
 
 
+def test_search_crustdata_pages_until_target_met_then_stops(db, monkeypatch):
+    """REAL instruction, 2026-10-12 (Sandy Yu, Singapore): "it has to go to the next page...
+    and this continues until that hits the target or its the budget" -- not stop after one
+    page regardless of whether the target was met, and not keep paging past it either once it
+    is. Target set to 2; page 1 delivers 1, page 2 delivers the 2nd and must be the last page
+    fetched -- a 3rd page the mock would flag as unexpected must never be requested."""
+    import app.deepline_client as dc
+    import app.phases.decision_maker_reasoning as dmr
+    import app.phases.free_decision_maker as fdm
+
+    db.add(Parameter(tenant_id=PARTNER, key="daily_account_target", value=2))
+    db.commit()
+
+    pages_fetched = []
+
+    def fake_cli(tool, payload):
+        if tool == "crustdata_v3_company_search_autocomplete":
+            return {"toolResponse": {"raw": {"suggestions": [{"value": "Medical Device"}]}}}
+        if tool == "crustdata_v3_company_search":
+            n = len(pages_fetched) + 1
+            pages_fetched.append(n)
+            if n > 2:
+                raise AssertionError("fetched a 3rd page after the target was already met on page 2")
+            # Page 1: just UnderTarget Co. Page 2: OverTarget Co, cursor now exhausted.
+            company = _crustdata_company(n, name=f"Co{n}")
+            next_cursor = "page2" if n == 1 else None
+            return {"toolResponse": {"raw": {"companies": [company], "next_cursor": next_cursor}}}
+        raise AssertionError(f"unexpected tool: {tool}")
+
+    monkeypatch.setattr(dc, "_call_deepline_cli", fake_cli)
+    monkeypatch.setattr(fdm, "_jobo_leadership_candidates", lambda db_, t, company: [_jobo_person()])
+    monkeypatch.setattr(dmr, "select_best_decision_makers",
+                        lambda db_, t, company, cands, n, offering_name=None: [
+                            {"name": "Jane Doe", "thread_role": "founder_ceo", "reasoning": "CEO"}])
+
+    with spend_scope(db, BILLING, "icp_filters", run_cap_usd=0.5):
+        result = play.search_crustdata(db, PARTNER, NORA_ICP, pages=10)
+
+    assert pages_fetched == [1, 2]  # paged automatically to meet the target, then stopped
+    assert result["created"] == 2
+    assert "reached this run" in (result.get("stopped") or "")
+
+
 def test_search_crustdata_stores_the_real_funding_date_not_just_filters_on_it(db, monkeypatch):
     """REAL FIX, 2026-10-08: funding_recency was already a genuine, working search filter --
     confirmed live, it's why a company qualified at all for an ICP that sets it -- but the actual
