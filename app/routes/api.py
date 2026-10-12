@@ -4488,22 +4488,7 @@ def get_gtm_os_content_suggestions(request: Request, db: Session = Depends(get_d
     real suggestion for a brand-new tenant rather than showing an empty board)."""
     from app.gtm_os.content.content_opportunity import get_suggested_content_opportunities
 
-    # TEMPORARY diagnostic (2026-10-12): this route 500s in production but not in any local
-    # reproduction against the same database -- surfacing the real exception/traceback here,
-    # in the response body, since server logs aren't reachable from this session. Remove once
-    # the real cause is found and fixed.
-    from sqlalchemy import text
-    fingerprint = dict(db.execute(text(
-        "select current_database() as db, inet_server_addr()::text as addr, "
-        "(select count(*) from content_opportunities where tenant_id = :tid) as count, "
-        "(select column_name from information_schema.columns where table_name='content_opportunities' and column_name='evidence_strength') as has_col"
-    ), {"tid": _resolve_tenant_id(request)}).mappings().first())
-
-    try:
-        return {"_diagnostic_fingerprint": fingerprint, "suggestions": get_suggested_content_opportunities(db, _resolve_tenant_id(request))}
-    except Exception as e:  # noqa: BLE001 -- diagnostic only, removed once the real cause is found
-        import traceback
-        return {"_diagnostic_fingerprint": fingerprint, "_diagnostic_error": str(e), "_diagnostic_type": type(e).__name__, "_diagnostic_traceback": traceback.format_exc()}
+    return {"suggestions": get_suggested_content_opportunities(db, _resolve_tenant_id(request))}
 
 
 @router.get("/gtm-os/content-topics")
@@ -6381,9 +6366,66 @@ def delete_companies_admin(request: Request, body: dict = Body(...), db: Session
     deleted_names = [c.name for c in db.query(Company).filter(Company.id.in_(company_ids)).all()]
     from app.gtm_os.plays.lead import GtmLead as _GtmLead
 
-    db.query(_GtmLead).filter(_GtmLead.company_id.in_(company_ids)).delete(synchronize_session=False)
-    db.query(Contact).filter(Contact.company_id.in_(company_ids)).delete(synchronize_session=False)
-    db.query(Company).filter(Company.id.in_(company_ids)).delete(synchronize_session=False)
+    # REAL BUG, found live 2026-10-12 (Angela Shori, deleting Supabase): this route only ever
+    # cleaned up GtmLead and Contact, so any company that made it past the Qualifier -- which
+    # writes a real Opportunity/DemandHypothesis/ProblemHypothesis chain via _write_opportunity,
+    # the same path every qualified lead in this codebase goes through -- hit a raw
+    # ForeignKeyViolation on demand_hypotheses and crashed with a 500 instead of deleting.
+    # Enumerated from the real production schema (information_schema, 2026-10-12), in dependency
+    # order (leaves first): a company with a full qualified history touches 20+ tables through
+    # contacts/opportunities/signals, not just the two this route originally handled. Raw SQL
+    # deliberately, same reasoning as scripts/merge_duplicate_companies.py's own _REFERENCING
+    # list: a reference missing from this ordering raises loudly instead of being silently
+    # cascaded away by the ORM, so a schema change surfaces as an error here, not lost data.
+    from sqlalchemy import text as _sql_text
+
+    ids = list(company_ids)
+    db.query(_GtmLead).filter(_GtmLead.company_id.in_(ids)).delete(synchronize_session=False)
+    ordered_deletes = [
+        "DELETE FROM message_send_attempts WHERE message_draft_id IN "
+        "(SELECT id FROM message_drafts WHERE contact_id IN (SELECT id FROM contacts WHERE company_id IN :ids) "
+        "OR opportunity_id IN (SELECT id FROM opportunities WHERE company_id IN :ids))",
+        "DELETE FROM sales_outcomes WHERE contact_id IN (SELECT id FROM contacts WHERE company_id IN :ids) "
+        "OR opportunity_id IN (SELECT id FROM opportunities WHERE company_id IN :ids) "
+        "OR gtm_signal_id IN (SELECT id FROM gtm_signals WHERE company_id IN :ids) "
+        "OR interpreted_signal_id IN (SELECT id FROM interpreted_signals WHERE company_id IN :ids)",
+        "DELETE FROM demand_hypothesis_evidence WHERE demand_hypothesis_id IN "
+        "(SELECT id FROM demand_hypotheses WHERE company_id IN :ids) "
+        "OR interpreted_signal_id IN (SELECT id FROM interpreted_signals WHERE company_id IN :ids)",
+        "DELETE FROM problem_hypothesis_evidence WHERE problem_hypothesis_id IN "
+        "(SELECT id FROM problem_hypotheses WHERE company_id IN :ids) "
+        "OR interpreted_signal_id IN (SELECT id FROM interpreted_signals WHERE company_id IN :ids)",
+        "DELETE FROM content_topic_evidence WHERE gtm_signal_id IN (SELECT id FROM gtm_signals WHERE company_id IN :ids)",
+        "DELETE FROM topic_candidates WHERE gtm_signal_id IN (SELECT id FROM gtm_signals WHERE company_id IN :ids)",
+        "DELETE FROM calendar_bookings WHERE outcome_company_id IN :ids "
+        "OR outcome_opportunity_id IN (SELECT id FROM opportunities WHERE company_id IN :ids)",
+        "DELETE FROM campaign_events WHERE contact_id IN (SELECT id FROM contacts WHERE company_id IN :ids)",
+        "DELETE FROM campaign_pushes WHERE contact_id IN (SELECT id FROM contacts WHERE company_id IN :ids)",
+        "DELETE FROM enrichments WHERE contact_id IN (SELECT id FROM contacts WHERE company_id IN :ids)",
+        "DELETE FROM personalized_messages WHERE contact_id IN (SELECT id FROM contacts WHERE company_id IN :ids)",
+        "DELETE FROM proposals WHERE company_id IN :ids OR contact_id IN (SELECT id FROM contacts WHERE company_id IN :ids)",
+        "DELETE FROM partner_company_recommendations WHERE company_id IN :ids",
+        "DELETE FROM scores WHERE company_id IN :ids",
+        "DELETE FROM signals WHERE company_id IN :ids",  # V1's own table, distinct from gtm_signals
+        "DELETE FROM icp_matches WHERE company_id IN :ids",
+        "DELETE FROM investigation_objectives WHERE target_company_id IN :ids",
+        "DELETE FROM message_drafts WHERE contact_id IN (SELECT id FROM contacts WHERE company_id IN :ids) "
+        "OR opportunity_id IN (SELECT id FROM opportunities WHERE company_id IN :ids)",
+        "DELETE FROM gtm_strategies WHERE opportunity_id IN (SELECT id FROM opportunities WHERE company_id IN :ids)",
+        "DELETE FROM opportunities WHERE company_id IN :ids",
+        "DELETE FROM demand_hypotheses WHERE company_id IN :ids",
+        "DELETE FROM problem_hypotheses WHERE company_id IN :ids",
+        "DELETE FROM interpreted_signals WHERE company_id IN :ids "
+        "OR contact_id IN (SELECT id FROM contacts WHERE company_id IN :ids)",
+        "DELETE FROM gtm_signals WHERE company_id IN :ids "
+        "OR contact_id IN (SELECT id FROM contacts WHERE company_id IN :ids)",
+        "DELETE FROM contacts WHERE company_id IN :ids",
+        "DELETE FROM companies WHERE id IN :ids",
+    ]
+    from sqlalchemy import bindparam as _bindparam
+
+    for stmt in ordered_deletes:
+        db.execute(_sql_text(stmt).bindparams(_bindparam("ids", expanding=True)), {"ids": ids})
     db.commit()
     return {"deleted_count": len(company_ids), "deleted_names": deleted_names}
 
