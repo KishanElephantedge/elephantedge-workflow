@@ -4492,11 +4492,18 @@ def get_gtm_os_content_suggestions(request: Request, db: Session = Depends(get_d
     # reproduction against the same database -- surfacing the real exception/traceback here,
     # in the response body, since server logs aren't reachable from this session. Remove once
     # the real cause is found and fixed.
+    from sqlalchemy import text
+    fingerprint = dict(db.execute(text(
+        "select current_database() as db, inet_server_addr()::text as addr, "
+        "(select count(*) from content_opportunities where tenant_id = :tid) as count, "
+        "(select column_name from information_schema.columns where table_name='content_opportunities' and column_name='evidence_strength') as has_col"
+    ), {"tid": _resolve_tenant_id(request)}).mappings().first())
+
     try:
-        return {"suggestions": get_suggested_content_opportunities(db, _resolve_tenant_id(request))}
+        return {"_diagnostic_fingerprint": fingerprint, "suggestions": get_suggested_content_opportunities(db, _resolve_tenant_id(request))}
     except Exception as e:  # noqa: BLE001 -- diagnostic only, removed once the real cause is found
         import traceback
-        return {"_diagnostic_error": str(e), "_diagnostic_type": type(e).__name__, "_diagnostic_traceback": traceback.format_exc()}
+        return {"_diagnostic_fingerprint": fingerprint, "_diagnostic_error": str(e), "_diagnostic_type": type(e).__name__, "_diagnostic_traceback": traceback.format_exc()}
 
 
 @router.get("/gtm-os/content-topics")
