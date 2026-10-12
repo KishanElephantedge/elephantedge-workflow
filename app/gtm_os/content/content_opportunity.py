@@ -265,21 +265,46 @@ def get_suggested_content_opportunities(db: Session, tenant_id: int, auto_genera
     competing stars.
 
     auto_generate=True (the default) also tries, BEFORE collecting opportunities, to generate a
-    first account_intelligence/pipeline_signal suggestion if none exists yet for this tenant --
-    both are genuinely free of Apify/paid-search cost (pure DB aggregate + one LLM call each,
-    already-gated by their own real MIN_COMPANIES_FOR_A_PATTERN checks), so a brand-new tenant
-    with zero trend/competitor evidence yet still sees a real, evidence-backed suggestion instead
-    of an empty board. Each generator's own 'already_exists' check makes this safe to call on
-    every page load -- only the FIRST call for a tenant ever reaches the LLM. Pass False for a
-    pure read (e.g. a cost-conscious caller that already knows generation ran recently)."""
+    first account_intelligence/pipeline_signal suggestion if NEITHER ORIGIN HAS EVER PRODUCED ONE
+    for this tenant -- both are genuinely free of Apify/paid-search cost (pure DB aggregate + one
+    LLM call each, already-gated by their own real MIN_COMPANIES_FOR_A_PATTERN checks), so a
+    brand-new tenant with zero trend/competitor evidence yet still sees a real, evidence-backed
+    suggestion instead of an empty board.
+
+    REAL BUG FOUND AND FIXED (2026-10-12): the gate used to be each generator's own internal
+    'already_exists' check, which only catches an EXACT ContentTopic.canonical_name string match
+    -- an LLM asked the same question twice will phrase a topic_name differently almost every
+    time, so that check almost never actually fired. Confirmed live: three consecutive calls for
+    the same tenant produced 4, then 7, then 9 suggestions, each one a fresh real LLM call and a
+    near-duplicate topic, not a cache hit -- calling this on every page load would have spent
+    real money and piled up near-duplicates forever. The gate below checks ANY existing
+    ContentOpportunity row for that origin (any status, not just 'candidate') before ever
+    calling the generator, so generation genuinely only happens once per tenant per origin, ever
+    -- a partner who wants a fresh one after reviewing the first can still ask the chat directly
+    (generate_own_voice_topic/generate_pipeline_topic's own chat-tool path has no such gate,
+    since that's an explicit human ask, not an automatic page-load side effect).
+
+    Pass auto_generate=False for a pure read (e.g. a cost-conscious caller that already knows
+    generation ran before)."""
     if auto_generate:
         from app.gtm_os.content.account_intelligence_topics import generate_account_intelligence_topics
         from app.gtm_os.content.partner_pipeline_topics import generate_pipeline_signal_opportunity
 
-        for generate in (generate_account_intelligence_topics, generate_pipeline_signal_opportunity):
+        existing_origins = {
+            row[0] for row in db.query(ContentOpportunity.origin)
+            .filter(ContentOpportunity.tenant_id == tenant_id, ContentOpportunity.origin.in_(["account_intelligence", "pipeline_signal"]))
+            .distinct()
+            .all()
+        }
+        if "account_intelligence" not in existing_origins:
             try:
-                generate(db, tenant_id)
+                generate_account_intelligence_topics(db, tenant_id)
             except Exception:  # noqa: BLE001 -- a failed opportunistic generation must never break the read
+                db.rollback()
+        if "pipeline_signal" not in existing_origins:
+            try:
+                generate_pipeline_signal_opportunity(db, tenant_id)
+            except Exception:  # noqa: BLE001
                 db.rollback()
 
     rows = (
