@@ -25,13 +25,56 @@ confirmed live: the exact same Codeable job posting (same linkedin_id/url) was s
 across overlapping search calls before this guard existed."""
 
 import hashlib
+import re
 from datetime import datetime
 from urllib.parse import quote
 
+import httpx
 from sqlalchemy.orm import Session
 
 from app.apify_client import _get_api_key as _get_apify_api_key
 from app.apify_client import ApifyError, search_google_ai_overview, search_google_organic_results, search_linkedin_jobs, search_linkedin_posts
+from app.google_cse_client import GoogleCseError, search_google_custom
+
+
+def _search_google_with_fallback(db: Session, tenant_id: int, query: str, num: int = 10) -> list[dict]:
+    """Google Custom Search first (cheaper, see google_cse_client.py's own docstring), Apify's
+    Google-search actor as the fallback -- added 2026-10-12 after a real gap found live: the
+    straight swap this replaced had NO fallback, so a tenant that already had this working via
+    Apify would see it go to zero results the moment Google CSE hit any real blocker (confirmed
+    live: billing not yet active on the new Cloud project, a 403 on every single call). Same
+    "whichever is primary, the other is the fallback, so an outage on either side degrades to a
+    working path instead of failing" discipline as llm_client.py's own Gemini/Claude fallback --
+    not a new pattern, this codebase's own established one, just applied to this provider pair.
+
+    The fallback is real Apify spend, so it goes through check_apify_budget itself here --
+    sweep.py's wrappers stopped pre-checking Apify budget for these two sources when Google CSE
+    became primary (see _run_web_search_trends's own docstring), and without a check HERE
+    instead, this fallback would reintroduce exactly the "a call site added later, nobody
+    wrapped it" unguarded-spend bug apify_budget_guard.py's own docstring warns about. A blocked
+    or unavailable budget degrades to an empty result for this one query, never raises -- same
+    per-query error isolation as every other caller in this file."""
+    try:
+        return [
+            {"url": r["url"], "title": r["title"], "description": r["description"]}
+            for r in search_google_custom(db, tenant_id, query, num=num)
+        ]
+    except GoogleCseError:
+        pass
+
+    from app.apify_client import GOOGLE_SEARCH_COST_PER_QUERY_NO_AI_OVERVIEW_USD
+    from app.apify_budget_guard import STATUS_ALLOWED, check_apify_budget
+
+    budget_result = check_apify_budget(db, tenant_id, GOOGLE_SEARCH_COST_PER_QUERY_NO_AI_OVERVIEW_USD, operation="web_search_fallback")
+    if budget_result["status"] != STATUS_ALLOWED:
+        return []
+
+    try:
+        api_key = _get_apify_api_key(db, tenant_id)
+        results = search_google_organic_results(api_key, query, max_pages=1)
+    except ApifyError:
+        return []
+    return [{"url": r.get("url"), "title": r.get("title"), "description": r.get("description")} for r in results]
 from app.deepline_client import execute_tool
 from app.gtm_os.intelligence.signal import GtmSignal
 from app.phases.discovery import EMPLOYEE_COUNT_MIN, REVENUE_MIN_USD
@@ -117,6 +160,43 @@ def _parse_dt(value) -> datetime | None:
         return datetime.fromisoformat(str(value).replace("Z", "+00:00")).replace(tzinfo=None)
     except ValueError:
         return None
+
+
+# Real publish-date patterns, checked in order -- covers the metadata shapes real news/blog
+# pages actually use. Best-effort and genuinely free (plain HTTP via httpx, no Apify, no API
+# key) -- this fixes a real gap in sense_web_search_trends/sense_competitor_content below:
+# Apify's Google-search actor returns no publish date at all (confirmed live, see that
+# function's own docstring), so trend_intelligence.py's emerging/accelerating/declining
+# classification could previously only use OUR discovery date, never the article's real one.
+_PUBLISHED_DATE_PATTERNS = [
+    r'property=["\']article:published_time["\']\s+content=["\']([^"\']+)',
+    r'content=["\']([^"\']+)["\']\s+property=["\']article:published_time["\']',
+    r'"datePublished"\s*:\s*"([^"]+)"',
+    r'<time[^>]+datetime=["\']([^"\']+)["\']',
+]
+
+
+def _fetch_published_date(url: str) -> datetime | None:
+    """Best-effort real publish date for one search result page -- never raises, never blocks
+    sensing on a slow/broken/paywalled page (returns None, same 'missing is honest, never
+    invented' discipline as _parse_dt above). Only ever called for a genuinely NEW result (after
+    the already_sensed dedup check), so steady-state sweeps fetch very few pages per run, not
+    every result every time."""
+    try:
+        response = httpx.get(url, timeout=5, follow_redirects=True,
+                              headers={"User-Agent": "Mozilla/5.0 (compatible; ElephantEdgeResearchBot/1.0)"})
+        if response.status_code != 200:
+            return None
+        html = response.text[:50_000]  # publish-date metadata is always near the top of <head>
+        for pattern in _PUBLISHED_DATE_PATTERNS:
+            match = re.search(pattern, html, re.IGNORECASE)
+            if match:
+                parsed = _parse_dt(match.group(1))
+                if parsed:
+                    return parsed
+    except Exception:  # noqa: BLE001 -- a broken/slow page must never block the sensing call it's inside
+        pass
+    return None
 
 
 def sense_linkedin_jobs(
@@ -1188,39 +1268,39 @@ def sense_website_visitors(db: Session, tenant_id: int, limit: int = 50) -> list
 def sense_web_search_trends(db: Session, tenant_id: int, limit: int = 20) -> list[GtmSignal]:
     """Content Intelligence -- the "trend" leg (targeting the real ~60% of the content mix,
     2026-08-28 explicit instruction). No Reddit/X/Perplexity API integration exists in this
-    codebase (confirmed by direct search) -- a real, already-working Google Search integration
-    (search_google_organic_results, the same Apify actor free_decision_maker.py/
-    reverse_discovery.py already use) stands in for those platforms until real API keys for them
-    exist. Same shared GtmSignal architecture as every other adapter in this file -- feeds
-    directly into the EXISTING, unmodified topic_linking.py -> candidate_extraction.py ->
-    promotion.py -> trend_intelligence.py pipeline (that pipeline is already source-agnostic, see
+    codebase (confirmed by direct search); sense_google_news_rss() above is the genuinely free
+    supplement for the news angle specifically. This function covers plain Google Search, moved
+    2026-10-12 off Apify's Google-search actor onto a direct Google Custom Search API call
+    (google_cse_client.search_google_custom) -- same real provider, cheaper path to it (Apify was
+    charging a markup to run an actor that itself just calls Google). Same shared GtmSignal
+    architecture as every other adapter in this file -- feeds directly into the EXISTING,
+    unmodified topic_linking.py -> candidate_extraction.py -> promotion.py ->
+    trend_intelligence.py pipeline (that pipeline is already source-agnostic, see
     topic_linking.py's own module docstring, so it needed zero changes for this).
 
     ONE real query per enabled topic (get_enabled_content_topics, the same config HN/RSS sensing
-    already reads) -- real cost $0.0055/query (GOOGLE_SEARCH_COST_PER_QUERY_NO_AI_OVERVIEW_USD).
-    `limit` bounds the number of topics processed per call, same "no runaway cost as config grows"
-    discipline as every budget-bounded sensing function in this codebase.
+    already reads). Free for the first 100 Google CSE queries/day across the whole shared account
+    (see google_cse_client.py's own docstring for why that's tracked centrally, fails closed, not
+    assumed unlimited) -- `limit` still bounds the number of topics processed per call, same
+    "no runaway cost/quota burn as config grows" discipline as every bounded sensing function in
+    this codebase.
 
     DEDUPLICATION: scoped by (tenant_id, source, source_ref) together, source_ref is the result's
     own URL -- same reasoning as sense_hackernews_stories()'s own docstring: a real article/page
     can legitimately be relevant to more than one of this tenant's topics, but the SAME topic
     searching the SAME query and getting the SAME URL again should never re-create a signal.
 
-    NO observed_at: this actor's organicResults items carry no reliable publish-date field (only
-    url/title/description, confirmed live) -- left null rather than inventing one, same
-    discipline as every other source's own time parser in this file."""
+    observed_at is now filled via _fetch_published_date() below (added 2026-10-12) -- Google's
+    search results themselves still carry no reliable publish-date field, same as when this used
+    Apify, so a best-effort page-scrape remains the real source for that, not the search API."""
     topics = get_enabled_content_topics(db, tenant_id)[:limit]
     if not topics:
         return []
 
-    api_key = _get_apify_api_key(db, tenant_id)
     signals = []
     for topic in topics:
         query = topic["name"]
-        try:
-            results = search_google_organic_results(api_key, query, max_pages=1)
-        except ApifyError:
-            continue  # this topic's query failed -- picked up again next sweep, other topics unaffected
+        results = _search_google_with_fallback(db, tenant_id, query, num=10)
 
         for result in results:
             url = result.get("url")
@@ -1240,7 +1320,7 @@ def sense_web_search_trends(db: Session, tenant_id: int, limit: int = 20) -> lis
                 source="web_search_trend",
                 source_ref=source_ref,
                 signal_type="search_result",
-                observed_at=None,
+                observed_at=_fetch_published_date(url),
                 raw_evidence=result,
                 extracted_info={
                     "title": result.get("title"),
@@ -1265,23 +1345,23 @@ def sense_competitor_content(db: Session, tenant_id: int, limit: int = 30) -> li
     mentioning them. Competitor list is app/gtm_os/content/competitors.py's own config (separate
     from topics.py, same reasoning feeds.py's own separation documents).
 
-    `limit` bounds the total number of real (topic, competitor) query pairs made per call --
-    real cost $0.0055/query, and the full cross product (topics x competitors) can legitimately
-    exceed a sensible per-run budget as either list grows. Iterates topic-major (topic 1 against
-    every competitor, then topic 2, ...) -- if capped, later topics simply aren't covered this
-    run and are picked up on a subsequent one; this does NOT guarantee even coverage across
+    `limit` bounds the total number of real (topic, competitor) query pairs made per call -- same
+    shared Google CSE daily quota as sense_web_search_trends() above (moved off Apify the same
+    way, 2026-10-12), and the full cross product (topics x competitors) can legitimately exceed a
+    sensible per-run share of that quota as either list grows. Iterates topic-major (topic 1
+    against every competitor, then topic 2, ...) -- if capped, later topics simply aren't covered
+    this run and are picked up on a subsequent one; this does NOT guarantee even coverage across
     topics when capped, which is an accepted tradeoff, not a silent gap (documented here rather
     than hidden).
 
-    Every other property (dedup by (tenant_id, source, source_ref), extracted_info shape, no
-    invented observed_at, per-query error isolation) is identical to sense_web_search_trends()
-    above -- see that function's own docstring."""
+    Every other property (dedup by (tenant_id, source, source_ref), extracted_info shape, real
+    observed_at via _fetch_published_date(), per-query error isolation) is identical to
+    sense_web_search_trends() above -- see that function's own docstring."""
     topics = get_enabled_content_topics(db, tenant_id)
     competitors = get_enabled_content_competitors(db, tenant_id)
     if not topics or not competitors:
         return []
 
-    api_key = _get_apify_api_key(db, tenant_id)
     signals = []
     queries_made = 0
     for topic in topics:
@@ -1291,10 +1371,7 @@ def sense_competitor_content(db: Session, tenant_id: int, limit: int = 30) -> li
             queries_made += 1
 
             query = f"site:{competitor['domain']} {topic['name']}"
-            try:
-                results = search_google_organic_results(api_key, query, max_pages=1)
-            except ApifyError:
-                continue
+            results = _search_google_with_fallback(db, tenant_id, query, num=10)
 
             for result in results:
                 url = result.get("url")
@@ -1314,7 +1391,7 @@ def sense_competitor_content(db: Session, tenant_id: int, limit: int = 30) -> li
                     source="competitor_content",
                     source_ref=source_ref,
                     signal_type="search_result",
-                    observed_at=None,
+                    observed_at=_fetch_published_date(url),
                     company_name_raw=competitor["name"],
                     raw_evidence=result,
                     extracted_info={
@@ -1329,6 +1406,149 @@ def sense_competitor_content(db: Session, tenant_id: int, limit: int = 30) -> li
                 )
                 db.add(signal)
                 signals.append(signal)
+
+    db.commit()
+    return signals
+
+
+def sense_competitor_linkedin_posts(db: Session, tenant_id: int, limit_per_competitor: int = 5) -> list[GtmSignal]:
+    """Content Intelligence -- a second real competitor-content channel (2026-10-12), alongside
+    sense_competitor_content()'s Google site: search above. A competitor's own LinkedIn posts
+    (announcements, takes, case studies) often never rank well enough for a site: search to
+    catch them, even though they're exactly the real-time material a content strategist would
+    actually be watching for. Only runs for a competitor that has a real linkedin_url configured
+    (competitors.py) -- absent is a real, valid state, never guessed at.
+
+    Deliberately tagged source="competitor_content" (the SAME value sense_competitor_content()
+    already uses), not a new source name -- this feeds the exact same, already-built
+    topic_linking/trend_intelligence/content_opportunity pipeline for free (origin-tagging in
+    content_opportunity.py already keys off this source value to mark an opportunity
+    origin='competitor'), rather than inventing a parallel pipeline for what is the same real
+    kind of evidence from a second real channel. Dedup is still per (tenant, source, source_ref)
+    with source_ref the post's own URN/URL, so this can never collide with a Google-search-
+    produced competitor_content row for the same competitor.
+
+    Uses the same real Apify LinkedIn-post actor as sense_linkedin_posts()/
+    own_linkedin_content.py's sync_own_linkedin_posts() -- same real per-post cost
+    (LINKEDIN_POST_COST_PER_POST_USD), same actor, just pointed at a competitor's company page
+    instead of the partner's own profile."""
+    competitors = [c for c in get_enabled_content_competitors(db, tenant_id) if c.get("linkedin_url")]
+    if not competitors:
+        return []
+
+    api_key = _get_apify_api_key(db, tenant_id)
+    signals = []
+    for competitor in competitors:
+        try:
+            posts = search_linkedin_posts(api_key, [competitor["linkedin_url"]], limit_per_source=limit_per_competitor)
+        except ApifyError:
+            continue  # this competitor's fetch failed -- picked up again next sweep, others unaffected
+
+        for post in posts:
+            source_ref = str(post.get("urn") or post.get("postUrl") or post.get("url") or "")
+            if not source_ref:
+                continue
+            already_sensed = (
+                db.query(GtmSignal)
+                .filter(GtmSignal.tenant_id == tenant_id, GtmSignal.source == "competitor_content", GtmSignal.source_ref == source_ref)
+                .first()
+            )
+            if already_sensed:
+                continue
+
+            text = post.get("text") or ""
+            signal = GtmSignal(
+                tenant_id=tenant_id,
+                source="competitor_content",
+                source_ref=source_ref,
+                signal_type="linkedin_post",
+                observed_at=_parse_dt(post.get("postedAtISO") or post.get("postedAt")),
+                company_name_raw=competitor["name"],
+                raw_evidence=post,
+                extracted_info={
+                    "title": text[:80] + ("..." if len(text) > 80 else ""),
+                    "summary": text,
+                    "url": post.get("url") or source_ref,
+                    "competitor_name": competitor["name"],
+                    "competitor_domain": competitor["domain"],
+                },
+                dedup_key=_dedup_key("competitor_content", source_ref),
+            )
+            db.add(signal)
+            signals.append(signal)
+
+    db.commit()
+    return signals
+
+
+def sense_google_news_rss(db: Session, tenant_id: int, limit_per_topic: int = 10) -> list[GtmSignal]:
+    """Content Intelligence trend leg, free alternative/supplement to sense_web_search_trends()
+    (2026-10-12). Google News publishes a real, public, unauthenticated RSS search endpoint
+    (news.google.com/rss/search) -- no API key, no Apify call, genuinely free, using the exact
+    same feedparser-based fetch_feed_entries() this file already relies on for sense_rss_articles.
+    One real bonus over the paid Google-search-via-Apify path: Google News RSS items carry a real
+    `pubDate`, so observed_at here is an ACTUAL publish date, not the best-effort page-scrape
+    _fetch_published_date() the paid path needed to add after the fact (see that function's own
+    docstring for why it exists at all).
+
+    Deliberately tagged source="web_search_trend" -- the SAME value sense_web_search_trends()
+    already uses, same "reuse the existing pipeline for free" reasoning as
+    sense_competitor_linkedin_posts()'s own docstring: this feeds the exact same, already-built
+    topic_linking/trend_intelligence/content_opportunity pipeline (origin-tagging in
+    content_opportunity.py only ever checks for "competitor_content" to decide origin='competitor',
+    so 'trend' is the correct bucket here too) rather than inventing a parallel one. Cadence is
+    tracked separately via _content_channel_cadence_due's Parameter marker under its own
+    "google_news_rss" key (see sweep.py), decoupled from the PAID web_search_trend channel's
+    weekly cost-driven cadence -- this one costs nothing, so it can run on its own, tighter
+    schedule without that reasoning applying to it.
+
+    ONE real query per enabled topic, same bound as sense_web_search_trends -- not about cost
+    here (it's free), but about not hammering Google News with an unbounded number of queries
+    per tenant per run."""
+    topics = get_enabled_content_topics(db, tenant_id)
+    if not topics:
+        return []
+
+    signals = []
+    for topic in topics:
+        query = topic["name"]
+        feed_url = f"https://news.google.com/rss/search?q={quote(query)}&hl=en-US&gl=US&ceid=US:en"
+        try:
+            entries = fetch_feed_entries(feed_url)
+        except Exception:  # noqa: BLE001 -- one topic's feed failure must never block the others
+            continue
+
+        for entry in entries[:limit_per_topic]:
+            url = entry.get("link")
+            if not url:
+                continue
+            source_ref = url
+            already_sensed = (
+                db.query(GtmSignal)
+                .filter(GtmSignal.tenant_id == tenant_id, GtmSignal.source == "web_search_trend", GtmSignal.source_ref == source_ref)
+                .first()
+            )
+            if already_sensed:
+                continue
+
+            signal = GtmSignal(
+                tenant_id=tenant_id,
+                source="web_search_trend",
+                source_ref=source_ref,
+                signal_type="search_result",
+                observed_at=_parse_feed_time(entry),
+                raw_evidence=entry,
+                extracted_info={
+                    "title": entry.get("title"),
+                    "summary": entry.get("summary"),
+                    "url": url,
+                    "matched_keyword": query,
+                    "channel": "google_news_rss",
+                },
+                dedup_key=_dedup_key("web_search_trend", source_ref),
+            )
+            db.add(signal)
+            signals.append(signal)
 
     db.commit()
     return signals

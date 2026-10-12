@@ -22,7 +22,7 @@ from sqlalchemy.orm import Session
 
 from app.db.models import Batch, Company
 from app.gtm_os.content.content_business_context import get_content_business_context
-from app.gtm_os.content.content_opportunity import ContentOpportunity
+from app.gtm_os.content.content_opportunity import REAL_ACCOUNT_COUNT_WEIGHT, ContentOpportunity
 from app.gtm_os.content.topic import ContentTopic
 from app.llm_client import generate_json
 
@@ -153,6 +153,11 @@ def generate_pipeline_signal_opportunity(db: Session, tenant_id: int) -> dict:
         tenant_id=tenant_id, content_topic_id=topic.id, origin="pipeline_signal", trend_state="stable",
         headline=response["headline"], why_now=response["why_now"], suggested_angle=response["suggested_angle"],
         cited_urls=[], status="candidate",
+        # Strongest single-role pattern behind this opportunity -- same REAL_ACCOUNT_COUNT_WEIGHT
+        # as content_opportunity.py's own account-bridge weighting, same reasoning:
+        # "N real matched accounts show this pattern right now" is comparable evidence strength
+        # to "N real target accounts are already circling this trend topic".
+        evidence_strength=max(data["company_count"] for data in patterns["by_role"].values()) * REAL_ACCOUNT_COUNT_WEIGHT,
     )
     db.add(opportunity)
     db.commit()

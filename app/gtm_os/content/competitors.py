@@ -19,6 +19,20 @@ from app.db.models import Parameter
 
 COMPETITORS_PARAMETER_KEY = "content_intelligence_competitors"
 
+# Matches content_business_context.py's own constant -- duplicated rather than imported, same
+# reasoning (content/ -> routes/ import direction stays one-way; this module has no reason to
+# import that one either, so it's just restated here).
+ELEPHANT_EDGE_TENANT_ID = 2
+
+# REAL BUG, FOUND AND FIXED 2026-10-12: get_content_competitors() used to fall back to this list
+# for ANY tenant with no override, not just Elephant Edge -- confirmed live, only 2 of the then-
+# enabled partner tenants had ever actually overridden it, so every other partner's
+# "competitor-reactive" content track was silently searching Elephant Edge's own 9 competitors'
+# sites (Aexus, Skaled, Chief Outsiders, ...), never a competitor relevant to that partner's own
+# business. This list is now gated to tenant_id == ELEPHANT_EDGE_TENANT_ID specifically, same
+# "never fabricate for a business we don't know anything about" discipline
+# content_business_context.py already applies to business_name/positioning/audience -- any other
+# tenant with no override now gets a real empty list, not someone else's competitors.
 DEFAULT_COMPETITORS: list[dict] = [
     {"name": "Aexus", "domain": "aexus.com", "enabled": True},
     {"name": "Activated Scale", "domain": "activatedscale.com", "enabled": True},
@@ -67,13 +81,26 @@ def _validate_competitors(competitors: list[dict]) -> None:
         if not isinstance(enabled, bool):
             raise CompetitorConfigError(f"competitor {domain!r} has a malformed 'enabled' value -- must be true/false")
 
+        # Optional -- a competitor's own LinkedIn company page, used by
+        # sense_competitor_linkedin_posts (sensing.py) as a second real competitor-content
+        # channel alongside the site: Google search above (a competitor's LinkedIn posts often
+        # aren't indexed well enough for that search to catch). Absent is a real, valid state
+        # (that channel simply has nothing to do for this competitor), never defaulted/guessed.
+        linkedin_url = competitor.get("linkedin_url")
+        if linkedin_url is not None and (not isinstance(linkedin_url, str) or not linkedin_url.strip()):
+            raise CompetitorConfigError(f"competitor {domain!r} has a malformed 'linkedin_url' value -- must be a non-empty string or omitted")
+
 
 def _normalize_competitor(competitor: dict) -> dict:
-    return {
+    normalized = {
         "name": competitor["name"].strip(),
         "domain": competitor["domain"].strip().lower(),
         "enabled": competitor.get("enabled", True),
     }
+    linkedin_url = competitor.get("linkedin_url")
+    if linkedin_url:
+        normalized["linkedin_url"] = linkedin_url.strip()
+    return normalized
 
 
 def get_content_competitors(db: Session, tenant_id: int) -> list[dict]:
@@ -85,7 +112,9 @@ def get_content_competitors(db: Session, tenant_id: int) -> list[dict]:
     )
     if param and isinstance(param.value, list) and param.value:
         return param.value
-    return DEFAULT_COMPETITORS
+    if tenant_id == ELEPHANT_EDGE_TENANT_ID:
+        return DEFAULT_COMPETITORS
+    return []
 
 
 def get_enabled_content_competitors(db: Session, tenant_id: int) -> list[dict]:

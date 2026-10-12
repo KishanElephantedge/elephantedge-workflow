@@ -110,7 +110,15 @@ Be direct and decisive, like an operator making a real call, not a mentor listin
 invent evidence, a URL, a statistic, a dollar figure, or an engagement number not returned by a
 tool -- a vague-but-true point beats a specific-but-invented one. A finished draft must be ready
 to publish as-is: no meta-commentary about why it works, no bracketed placeholders, no explaining
-your reasoning inside the post itself."""
+your reasoning inside the post itself.
+
+ALWAYS PASTE THE ACTUAL DRAFT, NEVER JUST DESCRIBE IT: once a drafting tool
+(generate_platform_draft/draft_post_from_meetings/draft_from_own_expertise/generate_pillar_draft/
+generate_cluster_draft) returns draft_text, your reply must contain that exact text, verbatim,
+immediately -- not a summary of what it says or why it works. A reply like "here's your post,
+ready to publish" with no actual post text is useless to someone who needs to copy-paste it; it
+forces them to ask again for words you already have. One short line of framing before or after
+the pasted text is fine, but the real text itself must always be there on the first reply."""
 
 
 CONTENT_CHAT_TOOLS = [
@@ -264,7 +272,7 @@ CONTENT_CHAT_TOOLS = [
     },
     {
         "name": "run_fresh_sensing",
-        "description": "Trigger a real, on-demand check for new trending/competitor content evidence right now (real cost, real Apify/Google Search calls) -- use when explicitly asked to look for fresh topics rather than relying on the daily automatic sweep.",
+        "description": "Trigger a real, on-demand check for new trending/competitor content evidence right now -- Google News RSS (free) plus a direct Google Custom Search call for trend/competitor topics (shared free-tier quota, degrades to fewer results rather than failing once exhausted for the day). Use when explicitly asked to look for fresh topics rather than relying on the weekly automatic sweep.",
         "input_schema": {"type": "object", "properties": {}},
     },
     {
@@ -452,28 +460,28 @@ def execute_content_chat_tool(name: str, tool_input: dict, db: Session, tenant_i
         return generate_pipeline_signal_opportunity(db, tenant_id)
 
     if name == "run_fresh_sensing":
-        from app.apify_client import GOOGLE_SEARCH_COST_PER_QUERY_NO_AI_OVERVIEW_USD
-        from app.apify_budget_guard import STATUS_ALLOWED, check_apify_budget
         from app.gtm_os.content.content_opportunity import run_content_opportunity_generation_sweep
         from app.gtm_os.content.promotion import run_candidate_promotion_sweep
         from app.gtm_os.content.topic_linking import run_content_topic_linking_sweep
         from app.gtm_os.content.trend_intelligence import run_trend_intelligence_sweep
-        from app.gtm_os.intelligence.sensing import sense_competitor_content, sense_web_search_trends
+        from app.gtm_os.intelligence.sensing import sense_competitor_content, sense_google_news_rss, sense_web_search_trends
 
-        trend_limit, competitor_limit = 20, 30
-        estimated_cost = (trend_limit + competitor_limit) * GOOGLE_SEARCH_COST_PER_QUERY_NO_AI_OVERVIEW_USD
-        budget_result = check_apify_budget(db, tenant_id, estimated_cost)
-        if budget_result["status"] != STATUS_ALLOWED:
-            return {"status": "budget_blocked", "reason": budget_result["reason"]}
+        # All three channels here are now either genuinely free (Google News RSS) or covered by
+        # the shared Google Custom Search daily quota, which fails closed INSIDE
+        # google_cse_client.py itself (per-query, not pre-checked here) -- 2026-10-12, moved off
+        # the old Apify-cost pre-check this tool used to need before calling
+        # sense_web_search_trends/sense_competitor_content.
+        news_signals = sense_google_news_rss(db, tenant_id)
+        trend_signals = sense_web_search_trends(db, tenant_id, limit=20)
+        competitor_signals = sense_competitor_content(db, tenant_id, limit=30)
 
-        trend_signals = sense_web_search_trends(db, tenant_id, limit=trend_limit)
-        competitor_signals = sense_competitor_content(db, tenant_id, limit=competitor_limit)
         linking = run_content_topic_linking_sweep(db, tenant_id)
         run_candidate_promotion_sweep(db, tenant_id)
         run_trend_intelligence_sweep(db, tenant_id)
         opportunities = run_content_opportunity_generation_sweep(db, tenant_id)
         return {
             "status": "ok",
+            "new_google_news_signals": len(news_signals),
             "new_trend_signals": len(trend_signals),
             "new_competitor_signals": len(competitor_signals),
             "topic_linking": linking,

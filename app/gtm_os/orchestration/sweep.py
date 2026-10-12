@@ -123,6 +123,7 @@ from sqlalchemy.orm import Session
 from app.db.models import Base, Parameter
 from app.gtm_os.content.candidate_extraction import run_candidate_extraction_sweep
 from app.gtm_os.content.candidate_normalization import run_candidate_normalization_sweep
+from app.gtm_os.content.competitors import get_enabled_content_competitors
 from app.gtm_os.content.content_opportunity import run_content_opportunity_generation_sweep
 from app.gtm_os.content.promotion import run_candidate_promotion_sweep
 from app.gtm_os.content.topic_linking import run_content_topic_linking_sweep
@@ -140,6 +141,8 @@ from app.gtm_os.intelligence.signal import GtmSignal
 from app.gtm_os.intelligence.problem_detection import run_problem_hypothesis_sweep
 from app.gtm_os.intelligence.sensing import (
     sense_competitor_content,
+    sense_competitor_linkedin_posts,
+    sense_google_news_rss,
     sense_hackernews_stories,
     sense_linkedin_jobs,
     sense_linkedin_post_search,
@@ -423,6 +426,7 @@ CONTENT_INTELLIGENCE_STAGES: list[tuple[str, callable]] = [
     ("candidate_promotion", lambda db, tenant_id: run_candidate_promotion_sweep(db, tenant_id)),
     ("trend_intelligence", lambda db, tenant_id: run_trend_intelligence_sweep(db, tenant_id)),
     ("content_opportunity_generation", lambda db, tenant_id: run_content_opportunity_generation_sweep(db, tenant_id)),
+    ("own_linkedin_sync", lambda db, tenant_id: _run_own_linkedin_sync(db, tenant_id)),
 ]
 
 # Account/Strategy/Sales branch (Batch 6 Part L) -- runs AFTER problem_detection/demand_detection
@@ -552,7 +556,51 @@ def _source_cadence_due(db: Session, tenant_id: int, source: str, cadence_days: 
 
 
 CONTENT_SENSING_CADENCE_DAYS = 7
-CONTENT_CADENCE_SOURCES = ("web_search_trend", "competitor_content")
+CONTENT_CADENCE_SOURCES = ("web_search_trend", "competitor_content", "competitor_linkedin_content")
+
+# Google News RSS is genuinely free (no Apify, no API key), unlike the other three channels
+# above, which all exist specifically to bound real PAID cost -- so it gets its own, tighter,
+# cost-unrelated cadence rather than inheriting CONTENT_SENSING_CADENCE_DAYS's cost-driven 7.
+GOOGLE_NEWS_RSS_CADENCE_DAYS = 1
+
+
+def _content_channel_cadence_due(db: Session, tenant_id: int, channel_key: str, cadence_days: int) -> tuple[bool, str]:
+    """Same cadence discipline as _source_cadence_due above, but backed by a small Parameter
+    marker instead of GtmSignal.source -- needed for a channel that either deliberately reuses an
+    existing GtmSignal.source value (competitor_linkedin_content tags its rows
+    "competitor_content", same as the Google-search channel, by design -- see
+    sense_competitor_linkedin_posts's own docstring for why) or writes no GtmSignal at all
+    (own_linkedin_sync, which writes OwnLinkedinPost instead). _source_cadence_due's
+    GtmSignal.source lookup would never see a distinct value to key off in either case."""
+    from app.db.models import Parameter
+
+    key = f"content_channel_last_run:{channel_key}"
+    param = db.query(Parameter).filter(Parameter.tenant_id == tenant_id, Parameter.key == key).first()
+    if param is None or not param.value:
+        return True, "never run"
+    try:
+        last_run = datetime.fromisoformat(param.value)
+    except (TypeError, ValueError):
+        return True, "unparseable marker, treating as never run"
+    elapsed_days = (datetime.utcnow() - last_run).total_seconds() / 86400.0
+    if elapsed_days < cadence_days:
+        return False, f"last run {elapsed_days:.1f}d ago, cadence is {cadence_days}d"
+    return True, f"last run {elapsed_days:.1f}d ago"
+
+
+def _mark_content_channel_run(db: Session, tenant_id: int, channel_key: str) -> None:
+    """Written only AFTER a real run actually happened -- never on a config-missing/budget-
+    blocked skip, so those don't falsely look like a completed run on the next cadence check."""
+    from app.db.models import Parameter
+
+    key = f"content_channel_last_run:{channel_key}"
+    param = db.query(Parameter).filter(Parameter.tenant_id == tenant_id, Parameter.key == key).first()
+    now_iso = datetime.utcnow().isoformat()
+    if param:
+        param.value = now_iso
+    else:
+        db.add(Parameter(tenant_id=tenant_id, key=key, value=now_iso, description=f"Last run marker for content channel {channel_key!r}"))
+    db.commit()
 
 
 def _get_salesrobot_config(db: Session, tenant_id: int) -> tuple[str, list[str]] | None:
@@ -787,42 +835,109 @@ def _run_website_visitors(db: Session, tenant_id: int):
 
 
 def _run_web_search_trends(db: Session, tenant_id: int):
-    """Content Intelligence trend leg (2026-08-28) -- real paid Apify calls (Google Search), so,
-    same as _run_linkedin_jobs, this checks apify_budget_guard itself before calling. No
-    MissingSourceConfiguration needed -- sense_web_search_trends() already senses nothing if zero
-    enabled content topics are configured, a valid state, not a misconfiguration."""
-    from app.apify_client import GOOGLE_SEARCH_COST_PER_QUERY_NO_AI_OVERVIEW_USD
-    from app.apify_budget_guard import STATUS_ALLOWED, check_apify_budget
-
+    """Content Intelligence trend leg (2026-08-28). Moved off Apify onto a direct Google Custom
+    Search API call 2026-10-12 (see sense_web_search_trends()/google_cse_client.py's own
+    docstrings) -- no apify_budget_guard check here any more; the real quota/cost gate now lives
+    inside google_cse_client.py itself (shared daily counter, fails closed), the same "the
+    caller doesn't need to remember to guard this" reasoning apify_budget_guard's own docstring
+    gives for living at the call layer rather than every site. No MissingSourceConfiguration
+    needed -- sense_web_search_trends() already senses nothing if zero enabled content topics are
+    configured, a valid state, not a misconfiguration."""
     due, cadence_reason = _source_cadence_due(db, tenant_id, "web_search_trend", CONTENT_SENSING_CADENCE_DAYS)
     if not due:
         raise SourceNotDue(cadence_reason)
 
-    limit = 20
-    budget_result = check_apify_budget(db, tenant_id, limit * GOOGLE_SEARCH_COST_PER_QUERY_NO_AI_OVERVIEW_USD)
-    if budget_result["status"] != STATUS_ALLOWED:
-        raise SourceBudgetBlocked(budget_result["reason"])
-
-    return sense_web_search_trends(db, tenant_id, limit=limit)
+    return sense_web_search_trends(db, tenant_id, limit=20)
 
 
 def _run_competitor_content(db: Session, tenant_id: int):
-    """Content Intelligence competitor leg (2026-08-28) -- same real-paid-call budget check as
+    """Content Intelligence competitor leg (2026-08-28) -- same Google-CSE move as
     _run_web_search_trends above. No MissingSourceConfiguration needed -- sense_competitor_content()
     already senses nothing if zero enabled topics or zero enabled competitors are configured."""
-    from app.apify_client import GOOGLE_SEARCH_COST_PER_QUERY_NO_AI_OVERVIEW_USD
-    from app.apify_budget_guard import STATUS_ALLOWED, check_apify_budget
-
     due, cadence_reason = _source_cadence_due(db, tenant_id, "competitor_content", CONTENT_SENSING_CADENCE_DAYS)
     if not due:
         raise SourceNotDue(cadence_reason)
 
-    limit = 30
-    budget_result = check_apify_budget(db, tenant_id, limit * GOOGLE_SEARCH_COST_PER_QUERY_NO_AI_OVERVIEW_USD)
+    return sense_competitor_content(db, tenant_id, limit=30)
+
+
+def _run_google_news_rss(db: Session, tenant_id: int):
+    """Content Intelligence trend leg, free channel (2026-10-12) -- no Apify call, no API key,
+    so NO budget check here at all (unlike _run_web_search_trends/_run_competitor_content,
+    which exist specifically to gate real paid spend). Cadence still applies (own
+    GOOGLE_NEWS_RSS_CADENCE_DAYS, tighter than the paid channels' cost-driven weekly one) so this
+    doesn't hammer Google News on every single sweep tick for no reason, even though it's free."""
+    due, cadence_reason = _content_channel_cadence_due(db, tenant_id, "google_news_rss", GOOGLE_NEWS_RSS_CADENCE_DAYS)
+    if not due:
+        raise SourceNotDue(cadence_reason)
+
+    signals = sense_google_news_rss(db, tenant_id)
+    _mark_content_channel_run(db, tenant_id, "google_news_rss")
+    return signals
+
+
+def _run_competitor_linkedin_content(db: Session, tenant_id: int):
+    """Content Intelligence -- competitor LinkedIn channel (2026-10-12), a second real
+    competitor-content source alongside _run_competitor_content's Google site: search. Real paid
+    Apify call (the same LinkedIn-post actor own_linkedin_content.py's sync already uses), so
+    budget-gated the same way. Cadence tracked via _content_channel_cadence_due (a Parameter
+    marker), not _source_cadence_due, because this channel deliberately writes its GtmSignal rows
+    with source="competitor_content" -- same value the Google-search channel already uses, by
+    design, so both feed the one real content-opportunity pipeline (see
+    sense_competitor_linkedin_posts's own docstring)."""
+    from app.apify_client import LINKEDIN_POST_COST_PER_POST_USD
+    from app.apify_budget_guard import STATUS_ALLOWED, check_apify_budget
+
+    due, cadence_reason = _content_channel_cadence_due(db, tenant_id, "competitor_linkedin_content", CONTENT_SENSING_CADENCE_DAYS)
+    if not due:
+        raise SourceNotDue(cadence_reason)
+
+    linkedin_competitors = [c for c in get_enabled_content_competitors(db, tenant_id) if c.get("linkedin_url")]
+    if not linkedin_competitors:
+        raise MissingSourceConfiguration("no enabled competitor has a linkedin_url configured yet")
+
+    limit_per_competitor = 5
+    estimated_cost = len(linkedin_competitors) * limit_per_competitor * LINKEDIN_POST_COST_PER_POST_USD
+    budget_result = check_apify_budget(db, tenant_id, estimated_cost)
     if budget_result["status"] != STATUS_ALLOWED:
         raise SourceBudgetBlocked(budget_result["reason"])
 
-    return sense_competitor_content(db, tenant_id, limit=limit)
+    signals = sense_competitor_linkedin_posts(db, tenant_id, limit_per_competitor=limit_per_competitor)
+    _mark_content_channel_run(db, tenant_id, "competitor_linkedin_content")
+    return signals
+
+
+def _run_own_linkedin_sync(db: Session, tenant_id: int) -> dict:
+    """Content Intelligence -- own-voice source feed (2026-10-12). Keeps authentic_voice.py's
+    real evidence (OwnLinkedinPost) fresh on its own weekly cadence, instead of only ever
+    syncing the moment someone happens to ask for an own-voice draft (generate_own_voice_topic's
+    own on-demand sync still exists as a fallback/forcer, this is just the automatic version).
+    Lives in CONTENT_INTELLIGENCE_STAGES rather than SWEEPABLE_SOURCES because it writes
+    OwnLinkedinPost directly, not a GtmSignal -- it was never meant to feed topic_linking, same
+    "don't force a different data shape into a contract built for GtmSignal rows" reasoning this
+    module's own docstrings apply elsewhere. Returns a plain status dict (CONTENT_INTELLIGENCE_
+    STAGES' own contract), not a list -- _run_stage_with_retry auto-fills 'status': 'succeeded'
+    when a dict comes back without one."""
+    from app.apify_client import LINKEDIN_POST_COST_PER_POST_USD
+    from app.apify_budget_guard import STATUS_ALLOWED, check_apify_budget
+    from app.gtm_os.learning.own_linkedin_content import get_own_linkedin_profile_url, sync_own_linkedin_posts
+
+    if not get_own_linkedin_profile_url(db, tenant_id):
+        return {"status": "skipped", "reason": "no own_linkedin_profile_url configured for this tenant yet"}
+
+    due, cadence_reason = _content_channel_cadence_due(db, tenant_id, "own_linkedin_sync", CONTENT_SENSING_CADENCE_DAYS)
+    if not due:
+        return {"status": "skipped", "reason": f"not due: {cadence_reason}"}
+
+    sync_limit = 10
+    estimated_cost = sync_limit * LINKEDIN_POST_COST_PER_POST_USD
+    budget_result = check_apify_budget(db, tenant_id, estimated_cost)
+    if budget_result["status"] != STATUS_ALLOWED:
+        return {"status": "skipped", "reason": f"budget: {budget_result['reason']}"}
+
+    result = sync_own_linkedin_posts(db, tenant_id, limit=sync_limit)
+    _mark_content_channel_run(db, tenant_id, "own_linkedin_sync")
+    return result
 
 
 # Source registration -- (name, runner(db, tenant_id) -> list[GtmSignal]). A future source
@@ -848,7 +963,9 @@ SWEEPABLE_SOURCES: list[tuple[str, callable]] = [
     ("linkedin_post_search", _run_linkedin_post_search),
     ("website_visitor", _run_website_visitors),
     ("web_search_trend", _run_web_search_trends),
+    ("google_news_rss", _run_google_news_rss),
     ("competitor_content", _run_competitor_content),
+    ("competitor_linkedin_content", _run_competitor_linkedin_content),
 ]
 
 
@@ -898,7 +1015,19 @@ def _dry_run_source_status(db: Session, tenant_id: int, name: str) -> dict:
         return {"status": "would_run"}
     # The weekly content channels are skipped by cadence in a real run -- this preview has to say
     # so, or dry_run reports "would_run" for sources that will not actually run (2026-08-31).
-    if name in CONTENT_CADENCE_SOURCES:
+    # competitor_linkedin_content uses the Parameter-marker cadence check, not the GtmSignal-
+    # source one, for the same reason its real runner does (see _run_competitor_linkedin_content's
+    # own docstring: it deliberately writes GtmSignal.source="competitor_content", so
+    # _source_cadence_due would never find a matching row to key off).
+    if name == "competitor_linkedin_content":
+        due, reason = _content_channel_cadence_due(db, tenant_id, "competitor_linkedin_content", CONTENT_SENSING_CADENCE_DAYS)
+        if not due:
+            return {"status": "would_skip", "reason": f"not due: {reason}"}
+    elif name == "google_news_rss":
+        due, reason = _content_channel_cadence_due(db, tenant_id, "google_news_rss", GOOGLE_NEWS_RSS_CADENCE_DAYS)
+        if not due:
+            return {"status": "would_skip", "reason": f"not due: {reason}"}
+    elif name in CONTENT_CADENCE_SOURCES:
         due, reason = _source_cadence_due(db, tenant_id, name, CONTENT_SENSING_CADENCE_DAYS)
         if not due:
             return {"status": "would_skip", "reason": f"not due: {reason}"}

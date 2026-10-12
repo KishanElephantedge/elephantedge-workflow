@@ -41,6 +41,20 @@ from app.gtm_os.content.trend_intelligence import evaluate_topic_trend
 from app.gtm_os.intelligence.signal import GtmSignal
 from app.llm_client import generate_json
 
+# Shared evidence_strength weights, reused by every origin module that computes one (this file,
+# account_intelligence_topics.py, partner_pipeline_topics.py, authentic_voice.py) -- ONE set of
+# weights so a trend-origin opportunity and a pipeline-signal-origin opportunity land on a real,
+# comparable scale, same relative priority already reasoned through in content_chat_tools.py's
+# own "HOW TO PRIORITIZE" system-prompt guidance (account-level evidence outweighs raw mention
+# counts) -- restated here as real numbers instead of only ever living in prose the LLM reads.
+OBSERVATION_COUNT_WEIGHT = 1
+INDEPENDENT_ENTITY_WEIGHT = 2
+REAL_ACCOUNT_COUNT_WEIGHT = 5
+# authentic_voice has no comparable external evidence count at all (its "why now" is "you already
+# write about this", not a market/account signal) -- a flat, deliberately low baseline so it's
+# still a real, visible suggestion, never ranked above something with genuine outside evidence.
+AUTHENTIC_VOICE_BASELINE_STRENGTH = 1
+
 VALID_STATUSES = {"candidate", "approved", "rejected", "changes_requested"}
 # Topics without enough real, recent, independent evidence (insufficient_evidence) or ones
 # actively losing relevance (declining) never get an opportunity generated -- see module
@@ -73,6 +87,16 @@ class ContentOpportunity(Base):
     why_now = Column(Text, nullable=False)
     suggested_angle = Column(Text, nullable=False)
     cited_urls = Column(JSON, nullable=False)  # real evidence URLs the LLM actually cited -- verified, never invented
+
+    # Added 2026-10-12, nullable (no backfill for existing rows -- see migration note below).
+    # A real, comparable "how strong is the evidence behind this one" number, computed the SAME
+    # way regardless of which of the 5 origins produced it (trend/competitor/account_intelligence/
+    # pipeline_signal/authentic_voice) -- see compute_evidence_strength() below for the real
+    # formula per origin. Exists so a partner-facing "suggested topics" view can rank opportunities
+    # from fundamentally different evidence shapes (web search hits vs. matched-account counts vs.
+    # "you already write about this") on ONE comparable scale, instead of only ever being able to
+    # show trend/competitor topics (the only origin with a pre-existing per-topic trend_state).
+    evidence_strength = Column(Integer, nullable=True)
 
     status = Column(String, nullable=False, default="candidate")
     reviewed_at = Column(DateTime, nullable=True)
@@ -219,11 +243,67 @@ def generate_content_opportunity(db: Session, tenant_id: int, content_topic_id: 
         why_now=response["why_now"],
         suggested_angle=response["suggested_angle"],
         cited_urls=cited,
+        evidence_strength=(
+            trend["recent_observation_count"] * OBSERVATION_COUNT_WEIGHT
+            + trend["recent_independent_entity_count"] * INDEPENDENT_ENTITY_WEIGHT
+        ),
     )
     db.add(opportunity)
     db.commit()
     db.refresh(opportunity)
     return {"status": "ok", "content_opportunity_id": opportunity.id, "origin": origin}
+
+
+def get_suggested_content_opportunities(db: Session, tenant_id: int, auto_generate: bool = True) -> list[dict]:
+    """The one, real, cross-origin "what should I post next" view (2026-10-12) -- merges every
+    still-open (status='candidate') ContentOpportunity regardless of which of the 5 origins
+    produced it (trend/competitor/account_intelligence/pipeline_signal/authentic_voice), ranked
+    by the one shared evidence_strength scale those origins now all populate (see this module's
+    own OBSERVATION_COUNT_WEIGHT/REAL_ACCOUNT_COUNT_WEIGHT/AUTHENTIC_VOICE_BASELINE_STRENGTH).
+    The single highest-scoring row is flagged recommended=True; everything else recommended=False
+    -- never more than one, so the UI has one unambiguous "post this next" answer, not several
+    competing stars.
+
+    auto_generate=True (the default) also tries, BEFORE collecting opportunities, to generate a
+    first account_intelligence/pipeline_signal suggestion if none exists yet for this tenant --
+    both are genuinely free of Apify/paid-search cost (pure DB aggregate + one LLM call each,
+    already-gated by their own real MIN_COMPANIES_FOR_A_PATTERN checks), so a brand-new tenant
+    with zero trend/competitor evidence yet still sees a real, evidence-backed suggestion instead
+    of an empty board. Each generator's own 'already_exists' check makes this safe to call on
+    every page load -- only the FIRST call for a tenant ever reaches the LLM. Pass False for a
+    pure read (e.g. a cost-conscious caller that already knows generation ran recently)."""
+    if auto_generate:
+        from app.gtm_os.content.account_intelligence_topics import generate_account_intelligence_topics
+        from app.gtm_os.content.partner_pipeline_topics import generate_pipeline_signal_opportunity
+
+        for generate in (generate_account_intelligence_topics, generate_pipeline_signal_opportunity):
+            try:
+                generate(db, tenant_id)
+            except Exception:  # noqa: BLE001 -- a failed opportunistic generation must never break the read
+                db.rollback()
+
+    rows = (
+        db.query(ContentOpportunity, ContentTopic.canonical_name)
+        .join(ContentTopic, ContentOpportunity.content_topic_id == ContentTopic.id)
+        .filter(ContentOpportunity.tenant_id == tenant_id, ContentOpportunity.status == "candidate")
+        .order_by(ContentOpportunity.evidence_strength.desc().nullslast(), ContentOpportunity.created_at.desc())
+        .all()
+    )
+
+    suggestions = []
+    for opportunity, topic_name in rows:
+        suggestions.append({
+            "content_opportunity_id": opportunity.id,
+            "origin": opportunity.origin,
+            "headline": opportunity.headline or topic_name,
+            "why_now": opportunity.why_now,
+            "suggested_angle": opportunity.suggested_angle,
+            "evidence_strength": opportunity.evidence_strength or 0,
+            "recommended": False,
+        })
+    if suggestions:
+        suggestions[0]["recommended"] = True
+    return suggestions
 
 
 def run_content_opportunity_generation_sweep(db: Session, tenant_id: int, limit: int = 50) -> dict:

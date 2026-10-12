@@ -26,7 +26,7 @@ from sqlalchemy.orm import Session
 
 from app.db.models import Batch, Company
 from app.gtm_os.content.content_business_context import get_content_business_context
-from app.gtm_os.content.content_opportunity import ContentOpportunity
+from app.gtm_os.content.content_opportunity import REAL_ACCOUNT_COUNT_WEIGHT, ContentOpportunity
 from app.gtm_os.content.topic import ContentTopic
 from app.gtm_os.intelligence.demand_hypothesis import DemandHypothesis
 from app.gtm_os.intelligence.problem_hypothesis import ProblemHypothesis
@@ -195,6 +195,11 @@ def generate_account_intelligence_topics(db: Session, tenant_id: int) -> dict:
             tenant_id=tenant_id, content_topic_id=topic.id, origin="account_intelligence",
             trend_state="account_pattern",  # not a trend-intelligence state -- this origin has no trend curve
             why_now=item["why_now"], suggested_angle=item["suggested_angle"], cited_urls=[],
+            # Real company_count behind the SPECIFIC function pattern this topic was grounded in
+            # -- same REAL_ACCOUNT_COUNT_WEIGHT as content_opportunity.py's own account-bridge
+            # weighting, so "N real accounts show this pattern" lands on the same comparable
+            # scale as a trend topic's own account-bridge count.
+            evidence_strength=patterns[function]["company_count"] * REAL_ACCOUNT_COUNT_WEIGHT,
         )
         db.add(opportunity)
         db.commit()

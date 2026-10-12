@@ -4476,6 +4476,21 @@ def get_gtm_os_market_intelligence(request: Request, db: Session = Depends(get_d
     return get_market_intelligence_overview(db, _resolve_tenant_id(request))
 
 
+@router.get("/gtm-os/content-suggestions")
+def get_gtm_os_content_suggestions(request: Request, db: Session = Depends(get_db)):
+    """Partner-facing "what should I post next" view (2026-10-12) -- the cross-origin
+    counterpart to /gtm-os/market-intelligence above, which only ever shows trend/competitor
+    ContentTopic rows. This merges every still-open suggestion from all 5 origins (trend,
+    competitor, account_intelligence, pipeline_signal, authentic_voice), ranked on one real,
+    comparable evidence_strength scale, with the single strongest one flagged recommended=True.
+    See get_suggested_content_opportunities()'s own docstring for the auto-generation behavior
+    (account_intelligence/pipeline_signal are free of Apify cost, so this tries to seed a first
+    real suggestion for a brand-new tenant rather than showing an empty board)."""
+    from app.gtm_os.content.content_opportunity import get_suggested_content_opportunities
+
+    return {"suggestions": get_suggested_content_opportunities(db, _resolve_tenant_id(request))}
+
+
 @router.get("/gtm-os/content-topics")
 def get_gtm_os_content_topics(request: Request, db: Session = Depends(get_db)):
     """Content Intelligence topic configuration (topics.py, Step 16A) -- no override saved yet

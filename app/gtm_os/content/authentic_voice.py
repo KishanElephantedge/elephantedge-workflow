@@ -30,7 +30,7 @@ from sqlalchemy.orm import Session
 from app.apify_budget_guard import STATUS_ALLOWED, check_apify_budget
 from app.apify_client import LINKEDIN_POST_COST_PER_POST_USD
 from app.gtm_os.content.content_business_context import get_content_business_context
-from app.gtm_os.content.content_opportunity import ContentOpportunity
+from app.gtm_os.content.content_opportunity import AUTHENTIC_VOICE_BASELINE_STRENGTH, ContentOpportunity
 from app.gtm_os.content.topic import ContentTopic
 from app.gtm_os.learning.own_linkedin_content import (
     get_own_linkedin_profile_url, get_recent_own_posts, sync_own_linkedin_posts,
@@ -158,6 +158,7 @@ def generate_authentic_voice_opportunity(db: Session, tenant_id: int) -> dict:
         tenant_id=tenant_id, content_topic_id=topic.id, origin="authentic_voice", trend_state="stable",
         headline=response["headline"], why_now=response["why_now"], suggested_angle=response["suggested_angle"],
         cited_urls=[], status="candidate",
+        evidence_strength=AUTHENTIC_VOICE_BASELINE_STRENGTH,
     )
     db.add(opportunity)
     db.commit()
