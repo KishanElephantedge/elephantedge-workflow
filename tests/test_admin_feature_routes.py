@@ -135,6 +135,25 @@ def test_configuring_an_unknown_tenant_is_404(db):
     assert _admin("get", "/gtm-os/admin/partners/9999/features").status_code == 404
 
 
+def test_partner_can_read_their_own_feature_readiness(db):
+    """REAL GAP, found live 2026-10-12 (Paul Foreman): "content" was enabled for him but not
+    ready (no own_linkedin_profile_url set), and the frontend had no way to tell enabled from
+    enabled-and-ready apart from rendering the real page and letting it show broken/empty."""
+    _admin("put", f"/gtm-os/admin/partners/{PARTNER}/features", json={
+        "enabled_features": ["accounts", "content"],
+    })
+    res = client.get("/api/gtm-os/partner/features/readiness", headers={"X-Tenant-Id": str(PARTNER)})
+    assert res.status_code == 200
+    body = res.json()
+    # "accounts" requires a real partner_icp to be READY by this same check -- genuinely not set
+    # here, same as it genuinely wasn't for Paul Foreman (his accounts came from a direct import,
+    # bypassing the ICP-driven pipeline entirely; see the frontend's own accounts-is-different
+    # carve-out for why this is correct and NOT gated on in the sidebar the same way).
+    assert body["accounts"] == {"enabled": True, "ready": False}
+    assert body["content"] == {"enabled": True, "ready": False}  # missing own_linkedin_profile_url
+    assert body["email_campaigns"] == {"enabled": False, "ready": False}
+
+
 def test_partner_can_request_access_to_a_tab_they_dont_have(db, monkeypatch):
     """A not-yet-enabled tab is now clickable for every partner (2026-10-12, explicit
     instruction, generalized rather than built one-off) -- it opens a real page instead of a

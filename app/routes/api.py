@@ -6659,6 +6659,22 @@ def put_partner_features(partner_tenant_id: int, request: Request, body: dict = 
     return get_partner_features(partner_tenant_id, request, db)
 
 
+@router.get("/gtm-os/partner/features/readiness")
+def get_partner_feature_readiness(request: Request, db: Session = Depends(get_db)):
+    """A partner's own session asking "which of my tabs actually work right now" -- real gap
+    found live 2026-10-12 (Paul Foreman): a feature can be in enabledFeatures but still missing
+    real config (his content tab had no own_linkedin_profile_url set), and the frontend had no
+    way to tell "enabled" from "enabled AND ready" apart from rendering the real page and
+    letting it show broken/empty. Deliberately a thin read -- only key/enabled/ready, none of
+    get_partner_features' config/missing_config/missing_credentials detail, since that's
+    internal admin-screen detail a partner's own session has no reason to see."""
+    from app.gtm_os.features import config as fc
+
+    tenant_id = _resolve_tenant_id(request)
+    statuses = fc.all_statuses(db, tenant_id)
+    return {s.key: {"enabled": s.enabled, "ready": s.ready} for s in statuses}
+
+
 @router.post("/gtm-os/partner/features/{feature_key}/request-access")
 def request_partner_feature_access(feature_key: str, request: Request, db: Session = Depends(get_db)):
     """A partner-facing tab that isn't enabled for them yet is now clickable (2026-10-12,
