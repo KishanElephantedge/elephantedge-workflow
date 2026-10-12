@@ -200,3 +200,56 @@ def verify_industry_fit_with_llm(db, rows: list[dict], industry_terms: list[str]
         return {}
     fits = set(verdict.get("fits") or [])
     return {c["index"]: (c["index"] in fits) for c in candidates}
+
+
+def detect_readiness_signals_with_llm(db, rows: list[dict], readiness_signals: list[str],
+                                      notes: str | None = None) -> dict[int, list[str]]:
+    """ADDITIVE ONLY -- never a rejection gate, the same discipline as app/phases/hot_leads.py's
+    existing hot-lead tagging ("a company that already made it through the pipeline keeps its
+    spot regardless; this only ever adds a marker on top"). Built 2026-10-12 onboarding Angela
+    Shori: her real ICP states explicit "Need" signals (e.g. "actively hiring a first sales or
+    marketing leader", "board or fundraising pressure") that are the real reason a company is a
+    good fit, but most of them have no structured field any provider exposes -- the only honest
+    way to check them is to read what the company's own real description actually says, grounded
+    exactly like verify_industry_fit_with_llm is, never invented from nothing.
+
+    Generalized (not partner-specific) so this is reusable the moment a FUTURE partner's ICP
+    names its own signals: `readiness_signals` is just free text from that partner's own ICP,
+    the same way `industry_terms` already is for the sibling function above.
+
+    Returns {row_index: [matched signal strings]} -- an empty list for a row where nothing
+    grounded, which is a real, honest result (not evidence of absence, just nothing to report),
+    and {} entirely on any outage, so a judgment failure can never block or corrupt a real run."""
+    from app.llm_client import generate_json
+
+    if not readiness_signals:
+        return {}
+    candidates = [{"index": i, "name": r.get("name") or "", "description": (r.get("description") or "")[:500]}
+                 for i, r in enumerate(rows) if r.get("name")]
+    if not candidates:
+        return {}
+
+    prompt = (
+        "A B2B sales partner is looking for companies showing any of these real signals that "
+        "they're ready for help right now:\n"
+        + "\n".join(f"- {s}" for s in readiness_signals) + "\n"
+        + (f"\nAdditional context from the partner: {notes}\n" if notes else "")
+        + "\nFor EACH company below, using ONLY its name and real description -- never guess or "
+          "invent something the text doesn't support -- list which of the signals above (if any) "
+          "the description genuinely shows real, concrete evidence for. Most companies will show "
+          "none; that's a normal, honest result, not a failure to find something. A company "
+          "showing zero signals is STILL a real, useful account -- this is additive tagging, not "
+          "a pass/fail filter.\n\n"
+        f"Companies:\n{json.dumps(candidates)}\n\n"
+        'Return ONLY: {"signals": {"<index>": ["<matched signal text, verbatim from the list above>", ...]}}'
+    )
+    try:
+        verdict = generate_json(prompt, db, 2, max_tokens=1200)
+    except Exception:  # noqa: BLE001 -- a judgment outage must never block or corrupt a real run
+        return {}
+    raw_signals = verdict.get("signals") or {}
+    out: dict[int, list[str]] = {}
+    for c in candidates:
+        matched = raw_signals.get(str(c["index"])) or raw_signals.get(c["index"]) or []
+        out[c["index"]] = [s for s in matched if isinstance(s, str) and s in readiness_signals]
+    return out

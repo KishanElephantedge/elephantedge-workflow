@@ -313,7 +313,9 @@ def _create_icypeas_lead(db: Session, tenant_id: int, key: str, company: Company
 
 def _process_icypeas_company(db: Session, tenant_id: int, co: dict, known_leads: set, pending: list,
                              department_atoms: list | None = None,
-                             source_provider: str = "icypeas", source_endpoint: str = "find-companies"
+                             source_provider: str = "icypeas", source_endpoint: str = "find-companies",
+                             readiness_signals: list[str] | None = None,
+                             funding_recency_max_days: int | None = None,
                              ) -> str | None:
     """One search result -> a rejected lead, a created lead, or a deferral into `pending` for
     the batched paid decision-maker resolver. Returns the outcome label to count, or None when
@@ -376,13 +378,29 @@ def _process_icypeas_company(db: Session, tenant_id: int, co: dict, known_leads:
         rev_lo = (revenue.get("estimatedMinRevenue") or {}).get("amount")
         rev_hi = (revenue.get("estimatedMaxRevenue") or {}).get("amount")
         rev_unit = 1_000_000 if (revenue.get("estimatedMinRevenue") or {}).get("unit") == "MILLION" else 1
+        last_funding_date = _parse_date(co.get("last_funding_date"))
+
+        # ADDITIVE hot-lead tagging, 2026-10-12 (Angela Shori onboarding) -- same discipline as
+        # app/phases/hot_leads.py's existing Apify-path logic: never a new qualification gate,
+        # only a marker layered on top. A company this run already decided to create keeps its
+        # spot regardless of whether any readiness signal fired; this just flags which ones did,
+        # so a partner's dashboard can prioritize without anything being silently dropped.
+        hot_reasons = list(readiness_signals or [])
+        if funding_recency_max_days is not None and last_funding_date is not None:
+            age_days = (datetime.utcnow() - last_funding_date).days
+            if 0 <= age_days <= funding_recency_max_days:
+                hot_reasons.append(f"Raised funding {last_funding_date.date().isoformat()} "
+                                   f"({age_days}d ago)")
+
         company = Company(batch_id=_batch(db, tenant_id).id, name=name, domain=None, linkedin_url=url,
                           industry=co.get("industry"), employee_count=co.get("numberOfEmployees"),
                           location=co.get("address"), source=f"{source_provider}:{source_endpoint}",
                           estimated_revenue_lower_usd=int(rev_lo * rev_unit) if rev_lo is not None else None,
                           estimated_revenue_higher_usd=int(rev_hi * rev_unit) if rev_hi is not None else None,
-                          last_funding_date=_parse_date(co.get("last_funding_date")),
-                          last_funding_round_type=co.get("last_funding_round_type"))
+                          last_funding_date=last_funding_date,
+                          last_funding_round_type=co.get("last_funding_round_type"),
+                          hot_lead=bool(hot_reasons) or None,
+                          hot_lead_reasoning="; ".join(hot_reasons) if hot_reasons else None)
         db.add(company)
         db.commit()
 
@@ -1114,12 +1132,29 @@ def search_crustdata(db: Session, tenant_id: int, icp: dict, pages: int = 1) -> 
         except Exception as e:  # noqa: BLE001 -- verification must never break a paid run
             logger.warning("sample verification skipped: %s: %s", type(e).__name__, e)
 
-        for co in normalized:
+        # READINESS SIGNALS, 2026-10-12 (Angela Shori onboarding) -- additive-only, never a
+        # rejection gate (see _process_icypeas_company's own note). Only runs when the partner's
+        # ICP actually names signals to look for; silently does nothing otherwise, same as the
+        # industry-fit judgment only running when industry fell to the keyword fallback.
+        readiness_by_index: dict[int, list[str]] = {}
+        readiness_signals = [s for s in (icp.get("readiness_signals") or []) if isinstance(s, str)]
+        if normalized and readiness_signals:
+            try:
+                from app.gtm_os.sourcing.verification import detect_readiness_signals_with_llm
+
+                readiness_by_index = detect_readiness_signals_with_llm(
+                    db, normalized, readiness_signals, notes=icp.get("notes"))
+            except Exception as e:  # noqa: BLE001 -- a judgment outage must never block a real run
+                logger.warning("readiness-signal detection skipped: %s: %s", type(e).__name__, e)
+
+        for idx, co in enumerate(normalized):
             try:
                 outcome = _process_icypeas_company(
                     db, tenant_id, co, known_leads, pending,
                     department_atoms=icp_atoms.by_key(A_DEPARTMENT_HEADCOUNT),
-                    source_provider="crustdata-v3", source_endpoint="company_search")
+                    source_provider="crustdata-v3", source_endpoint="company_search",
+                    readiness_signals=readiness_by_index.get(idx),
+                    funding_recency_max_days=icp.get("funding_recency_max_days"))
             except OperationalError:
                 db.rollback()
                 outcome = "db_error_retry_later"

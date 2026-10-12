@@ -402,6 +402,60 @@ def test_search_crustdata_resolves_industry_then_creates_a_lead(db, monkeypatch)
     assert db.query(Batch).get(company.batch_id).tenant_id == PARTNER
 
 
+def test_search_crustdata_tags_hot_leads_without_rejecting_anyone(db, monkeypatch):
+    """REAL instruction, 2026-10-12 (Angela Shori onboarding): "after fetching based on ICP we
+    should not filter out any instead we check for the signals and update the signals column so
+    that which has the signals become hot leads and others normal and both should be useful."
+    Reuses app/phases/hot_leads.py's existing "additive only, never a new qualification gate"
+    discipline. Two companies here: one shows a real readiness signal (grounded in its actual
+    description) plus recent funding, the other shows neither -- BOTH must still be created as
+    real leads, and only the first gets hot_lead=True."""
+    import app.deepline_client as dc
+    import app.llm_client as llm
+    import app.phases.decision_maker_reasoning as dmr
+    import app.phases.free_decision_maker as fdm
+
+    def fake_llm(prompt, *a, **k):
+        if '"signals"' in prompt:
+            return {"signals": {"0": ["actively hiring a first sales leader"]}}  # only company 0
+        if '"fits"' in prompt:
+            return {"fits": [0, 1]}  # both genuinely fit -- not what this test exercises
+        return {"values": ["Medical Device"]}
+
+    monkeypatch.setattr(llm, "generate_json", fake_llm)
+
+    def fake_cli(tool, payload):
+        if tool == "crustdata_v3_company_search_autocomplete":
+            return {"toolResponse": {"raw": {"suggestions": [{"value": "Medical Device"}]}}}
+        if tool == "crustdata_v3_company_search":
+            hot = _crustdata_company(1, name="Hot Co",
+                                     last_funding_date="2026-09-20", last_funding_round_type="Series A")
+            hot["basic_info"]["description"] = "Just posted an opening for our first VP of Sales."
+            normal = _crustdata_company(2, name="Normal Co")
+            return {"toolResponse": {"raw": {"companies": [hot, normal], "next_cursor": None}}}
+        raise AssertionError(f"unexpected tool: {tool}")
+
+    monkeypatch.setattr(dc, "_call_deepline_cli", fake_cli)
+    monkeypatch.setattr(fdm, "_jobo_leadership_candidates", lambda db_, t, company: [_jobo_person()])
+    monkeypatch.setattr(dmr, "select_best_decision_makers",
+                        lambda db_, t, company, cands, n, offering_name=None: [
+                            {"name": "Jane Doe", "thread_role": "founder_ceo", "reasoning": "CEO"}])
+
+    icp = {**NORA_ICP, "readiness_signals": ["actively hiring a first sales leader"],
+          "funding_recency_max_days": 180}
+    with spend_scope(db, BILLING, "icp_filters", run_cap_usd=0.5):
+        result = play.search_crustdata(db, PARTNER, icp)
+
+    # BOTH companies created -- nothing rejected for lacking a readiness signal.
+    assert result["outcomes"] == {"created": 2}
+    hot = db.query(Company).filter(Company.name == "Hot Co").one()
+    normal = db.query(Company).filter(Company.name == "Normal Co").one()
+    assert hot.hot_lead is True
+    assert "actively hiring a first sales leader" in hot.hot_lead_reasoning
+    assert "Raised funding" in hot.hot_lead_reasoning
+    assert normal.hot_lead is None
+
+
 def test_search_crustdata_stores_the_real_funding_date_not_just_filters_on_it(db, monkeypatch):
     """REAL FIX, 2026-10-08: funding_recency was already a genuine, working search filter --
     confirmed live, it's why a company qualified at all for an ICP that sets it -- but the actual

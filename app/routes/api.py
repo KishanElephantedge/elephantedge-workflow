@@ -6775,9 +6775,10 @@ def get_partner_accounts(
                 # signal, not just stored and never shown.
                 "signal": (
                     f"Hiring: {c.hiring_signal_role.replace('_', ' ')}" if c.hiring_signal_role
-                    else ("Hot lead" if c.hot_lead else
-                          (f"Raised funding {c.last_funding_date.date().isoformat()}"
-                           if c.last_funding_date else None))
+                    else (c.hot_lead_reasoning if c.hot_lead and c.hot_lead_reasoning
+                          else ("Hot lead" if c.hot_lead else
+                               (f"Raised funding {c.last_funding_date.date().isoformat()}"
+                                if c.last_funding_date else None)))
                 ),
                 "source_label": objective["objective_label"],
                 "contact_count": contact_counts.get(c.id, 0),
