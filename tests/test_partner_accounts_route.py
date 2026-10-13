@@ -100,3 +100,33 @@ def test_a_qualified_company_with_a_non_rejected_gtmlead_still_shows():
     assert resp.status_code == 200
     names = [a["name"] for a in resp.json()["accounts"]]
     assert "Hillhouse Investment" in names
+
+
+def test_admin_can_manually_reject_a_company_with_no_industry_label():
+    """2026-10-13, Nora Volger: Galaxy and Skydio had no stored industry label at all (Crustdata
+    never returned one), so reconcile_industry_fit's LLM backfill has nothing to judge against --
+    but Nora herself said in Slack review that neither is a life-science fit. A human verdict
+    needs a way in that doesn't require an industry label."""
+    from app.db.session import get_db as _get_db_dep
+    db = next(app.dependency_overrides[_get_db_dep]())
+
+    batch = _batch(db)
+    co = _company(db, batch, "Galaxy", None)
+
+    resp = client.post(f"/api/gtm-os/admin/accounts/{co.id}/reject", headers={"X-Tenant-Id": "2"},
+                       json={"tenant_id": TENANT, "reason": "crypto/digital assets, not life-science (Nora, Slack)"})
+    assert resp.status_code == 200
+    assert resp.json()["rejected"] is True
+
+    lead = db.query(GtmLead).filter(GtmLead.company_id == co.id).one()
+    assert lead.state == STATE_REJECTED
+
+    # idempotent -- rejecting again doesn't create a second row
+    resp2 = client.post(f"/api/gtm-os/admin/accounts/{co.id}/reject", headers={"X-Tenant-Id": "2"},
+                        json={"tenant_id": TENANT})
+    assert resp2.json()["already_rejected"] is True
+    assert db.query(GtmLead).filter(GtmLead.company_id == co.id).count() == 1
+
+    # and it's now hidden from the tenant's own dashboard
+    listing = client.get("/api/gtm-os/partner/accounts", headers={"X-Tenant-Id": str(TENANT)})
+    assert "Galaxy" not in [a["name"] for a in listing.json()["accounts"]]

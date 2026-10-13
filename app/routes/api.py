@@ -6430,6 +6430,41 @@ def delete_companies_admin(request: Request, body: dict = Body(...), db: Session
     return {"deleted_count": len(company_ids), "deleted_names": deleted_names}
 
 
+@router.post("/gtm-os/admin/accounts/{company_id}/reject")
+def admin_reject_company(company_id: int, request: Request, body: dict = Body(...), db: Session = Depends(get_db)):
+    """Hide one company from its tenant's dashboard without deleting it -- for when a human
+    (partner feedback, admin review) has already judged it a mismatch and no LLM re-judgment is
+    needed or possible (e.g. no stored industry label at all, like Nora Volger's Galaxy/Skydio,
+    2026-10-13: Crustdata never returned an industry for either and reconcile_industry_fit has
+    nothing to judge against, but Nora herself said in Slack review that Galaxy -- crypto/digital
+    assets -- and Skydio -- a drone manufacturer -- aren't her life-science ICP). Same
+    STATE_REJECTED record a live run or the LLM backfill would write, so get_partner_accounts
+    already excludes it; reusable for any future manual correction, not specific to one tenant.
+    Body: {"reason": str, "tenant_id": int} -- tenant_id required since a company_id alone
+    doesn't say which tenant's GtmLead to attribute the rejection to.
+    """
+    _require_admin(request)
+    tenant_id = body.get("tenant_id")
+    reason = body.get("reason") or "manually reviewed: not a fit"
+    if not tenant_id:
+        raise HTTPException(status_code=400, detail="tenant_id is required")
+    company = db.get(Company, company_id)
+    if company is None:
+        raise HTTPException(status_code=404, detail="company not found")
+
+    from app.gtm_os.plays.icp_filters import PLAY
+    from app.gtm_os.plays.lead import GtmLead, STATE_REJECTED
+
+    existing = db.query(GtmLead).filter(GtmLead.company_id == company_id, GtmLead.tenant_id == tenant_id,
+                                        GtmLead.state == STATE_REJECTED).first()
+    if existing:
+        return {"company_id": company_id, "already_rejected": True}
+    db.add(GtmLead(tenant_id=tenant_id, play=PLAY, lead_key=f"manual-reject:{company_id}",
+                   state=STATE_REJECTED, company_id=company_id, qualifier_reason=reason))
+    db.commit()
+    return {"company_id": company_id, "rejected": True, "reason": reason}
+
+
 @router.get("/gtm-os/admin/debug/crustdata-filters")
 def admin_crustdata_filters_debug(partner_tenant_id: int, request: Request, db: Session = Depends(get_db)):
     """The EXACT payload search_crustdata() would send for this partner's current ICP, built but
