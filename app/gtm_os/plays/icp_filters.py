@@ -797,6 +797,76 @@ def search_icypeas(db: Session, tenant_id: int, icp: dict, pages: int = 1) -> di
 MAX_EXCLUDED_NAMES = 200
 
 
+def reconcile_industry_fit(db: Session, tenant_id: int, icp: dict) -> dict:
+    """Re-judge every already-accepted company for this tenant against its industry MUST_HAVE,
+    for the companies that have NO existing GtmLead row at all (so already-rejected/already-
+    reviewed ones are never re-judged or double-billed for an LLM call).
+
+    REAL BUG, found live 2026-10-13 (Sandy Yu's dashboard still showing "FCS Solutions /
+    Hospitality", "Epsilon Telecommunications" alongside real B2B SaaS matches, even after
+    get_partner_accounts started hiding STATE_REJECTED rows): those companies were never marked
+    rejected in the first place. verify_industry_fit_with_llm (verification.py) FAILS OPEN by
+    design on a judgment outage -- any row with no verdict entry defaults to kept, documented as
+    "a judgment outage must never block a real run" -- so when that LLM batch call failed or
+    returned partial verdicts for a page, every company on it silently passed the industry gate
+    uncaught, including ones whose own Crustdata-assigned industry (Hospitality,
+    Telecommunications, Investment Management) obviously isn't the ICP's "B2B SaaS / enterprise
+    software / software". The gate failing open is the right call-time default (an LLM blip
+    should never block a run); this is the backstop that catches what slipped through, run
+    separately, for free, with no risk to a live fetch.
+
+    Crustdata's own `industry` label (already stored on Company, no description field exists on
+    old rows to re-check against) is exactly the signal a human would judge from by eye -- the
+    same two columns (name, industry) the user manually marked wrong/plausible from. Reuses
+    verify_industry_fit_with_llm by packing that label into the `description` slot it already
+    reads, rather than duplicating its prompt/parsing.
+    """
+    from app.gtm_os.sourcing.atoms import INDUSTRY as A_INDUSTRY
+    from app.gtm_os.sourcing.atoms import MUST_HAVE as A_MUST_HAVE
+    from app.gtm_os.sourcing.atoms import decompose_icp
+    from app.gtm_os.sourcing.verification import verify_industry_fit_with_llm
+
+    icp_atoms = decompose_icp(icp)
+    industry_must_haves = [a for a in icp_atoms.by_key(A_INDUSTRY) if a.necessity == A_MUST_HAVE]
+    if not industry_must_haves:
+        return {"checked": 0, "rejected": 0, "skipped_no_industry_label": 0}
+
+    industry_terms = list(industry_must_haves[0].value)
+    # Only skip companies ALREADY marked rejected -- a company with some OTHER kind of GtmLead
+    # row (qualified, contact_found, ...) is exactly the "still showing on the dashboard" case
+    # this backfill exists to catch, so it must stay a candidate.
+    already_rejected = {cid for (cid,) in db.query(GtmLead.company_id)
+                        .filter(GtmLead.tenant_id == tenant_id, GtmLead.play == PLAY,
+                                GtmLead.state == STATE_REJECTED, GtmLead.company_id.isnot(None))}
+    query = db.query(Company).join(Batch).filter(Batch.tenant_id == tenant_id)
+    if already_rejected:
+        query = query.filter(Company.id.notin_(already_rejected))
+    candidates = query.all()
+    # Can't judge fairly with no industry label at all -- leave those alone rather than guess.
+    judgeable = [c for c in candidates if c.industry]
+    skipped = len(candidates) - len(judgeable)
+    if not judgeable:
+        return {"checked": 0, "rejected": 0, "skipped_no_industry_label": skipped}
+
+    rows = [{"name": c.name, "description": f"Industry classification: {c.industry}"} for c in judgeable]
+    verdicts = verify_industry_fit_with_llm(db, rows, industry_terms, notes=icp.get("notes"))
+    rejected = 0
+    for i, company in enumerate(judgeable):
+        if verdicts.get(i) is False:
+            key = f"reconcile:{company.id}"
+            try:
+                db.add(GtmLead(tenant_id=tenant_id, play=PLAY, lead_key=key,
+                               state=STATE_REJECTED, company_id=company.id,
+                               qualifier_reason=f"industry mismatch (LLM, reconciled): "
+                                                f"{company.name!r} is {company.industry!r}, not "
+                                                f"{', '.join(industry_terms[:3])}..."))
+                db.commit()
+                rejected += 1
+            except (OperationalError, IntegrityError):
+                db.rollback()
+    return {"checked": len(judgeable), "rejected": rejected, "skipped_no_industry_label": skipped}
+
+
 def _known_company_names(db: Session, tenant_id: int, limit: int = MAX_EXCLUDED_NAMES) -> list[str]:
     """Every real company name already on file for this tenant via Play F -- both created and
     LLM-rejected (both now leave a real Company row, see search_crustdata's rejection block) --

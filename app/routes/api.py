@@ -6451,6 +6451,26 @@ def admin_crustdata_filters_debug(partner_tenant_id: int, request: Request, db: 
            "industry_verifiable": industry_fully_structured}
 
 
+@router.post("/gtm-os/admin/backfill-industry-fit")
+def admin_backfill_industry_fit(partner_tenant_id: int, request: Request, db: Session = Depends(get_db)):
+    """Re-judges every already-accepted company for a partner against their industry MUST_HAVE,
+    for companies with no existing rejection record (see icp_filters.reconcile_industry_fit's own
+    docstring for the real bug this catches: the live LLM gate fails open on a judgment outage, so
+    a page can slip through uncaught). FREE -- one LLM call, no provider spend. Genuine mismatches
+    get the same STATE_REJECTED record a live run would have written, which get_partner_accounts
+    already excludes -- the row stays in the DB, it just stops showing on the partner's dashboard.
+    """
+    _require_admin(request)
+    icp_param = db.query(Parameter).filter(Parameter.tenant_id == partner_tenant_id,
+                                           Parameter.key == PARTNER_ICP_PARAMETER_KEY).first()
+    if not icp_param or not icp_param.value:
+        raise HTTPException(status_code=400, detail="No ICP configured for this tenant yet.")
+
+    from app.gtm_os.plays.icp_filters import reconcile_industry_fit
+
+    return {"tenant_id": partner_tenant_id, **reconcile_industry_fit(db, partner_tenant_id, icp_param.value)}
+
+
 @router.get("/gtm-os/admin/providers/catalog")
 def admin_search_provider_tools(request: Request, q: str, categories: str | None = None,
                                 limit: int = 10):

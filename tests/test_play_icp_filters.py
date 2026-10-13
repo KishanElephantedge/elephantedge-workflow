@@ -1201,3 +1201,72 @@ def test_resolve_decision_makers_batch_keeps_earlier_pages_when_a_later_page_is_
 
     assert resolved[company.id] is not None
     assert resolved[company.id].first_name == "Sam"
+
+
+def test_reconcile_industry_fit_rejects_a_slipped_through_mismatch(db, monkeypatch):
+    """REAL BUG, found live 2026-10-13 (Sandy Yu's dashboard still showing "FCS Solutions /
+    Hospitality" and "Epsilon Telecommunications" after get_partner_accounts started hiding
+    STATE_REJECTED rows): those companies were never rejected in the first place --
+    verify_industry_fit_with_llm fails open on a judgment outage, so a whole page can slip
+    through with no rejection record when the LLM call misses a verdict. This backfill re-judges
+    already-accepted companies using the same free LLM check, grounded on Crustdata's own
+    industry label (the one real signal still on an old row, no description was ever stored)."""
+    import app.llm_client as llm
+
+    batch = Batch(tenant_id=PARTNER, name="b", source="play_icp_filters", status="in_progress")
+    db.add(batch)
+    db.commit()
+
+    mismatch = Company(batch_id=batch.id, name="FCS Solutions", industry="Hospitality", source="crustdata-v3:company_search")
+    fits = Company(batch_id=batch.id, name="LinkSure Network", industry="Mobile Computing Software Products",
+                   source="crustdata-v3:company_search")
+    no_label = Company(batch_id=batch.id, name="Mystery Co", industry=None, source="crustdata-v3:company_search")
+    db.add_all([mismatch, fits, no_label])
+    db.commit()
+
+    def fake_llm(prompt, *a, **k):
+        assert "Hospitality" in prompt and "Mobile Computing Software Products" in prompt
+        return {"fits": [1]}  # only the second candidate (index order: mismatch=0, fits=1)
+
+    monkeypatch.setattr(llm, "generate_json", fake_llm)
+
+    icp = {**NORA_ICP, "industries": ["B2B SaaS", "software"]}
+    result = play.reconcile_industry_fit(db, PARTNER, icp)
+
+    assert result == {"checked": 2, "rejected": 1, "skipped_no_industry_label": 1}
+    rejected_lead = db.query(GtmLead).filter(GtmLead.company_id == mismatch.id).one()
+    assert rejected_lead.state == "rejected"
+    assert db.query(GtmLead).filter(GtmLead.company_id == fits.id).count() == 0
+    assert db.query(GtmLead).filter(GtmLead.company_id == no_label.id).count() == 0
+    # the row itself is untouched -- only a rejection record was added
+    assert db.query(Company).filter(Company.id == mismatch.id).one().name == "FCS Solutions"
+
+
+def test_reconcile_industry_fit_never_re_judges_an_already_rejected_company(db, monkeypatch):
+    """A company already marked STATE_REJECTED (by a live run or an earlier backfill) must never
+    be re-sent to the LLM -- that would be a repeat call for a question already answered."""
+    import app.llm_client as llm
+    from app.gtm_os.plays.lead import STATE_REJECTED
+
+    batch = Batch(tenant_id=PARTNER, name="b", source="play_icp_filters", status="in_progress")
+    db.add(batch)
+    db.commit()
+    co = Company(batch_id=batch.id, name="Already Rejected Co", industry="Hospitality",
+                 source="crustdata-v3:company_search")
+    db.add(co)
+    db.commit()
+    db.add(GtmLead(tenant_id=PARTNER, play="icp_filters", lead_key="x", state=STATE_REJECTED, company_id=co.id))
+    db.commit()
+
+    calls = {"n": 0}
+
+    def fake_llm(prompt, *a, **k):
+        calls["n"] += 1
+        return {"fits": []}
+
+    monkeypatch.setattr(llm, "generate_json", fake_llm)
+
+    result = play.reconcile_industry_fit(db, PARTNER, {**NORA_ICP, "industries": ["software"]})
+
+    assert calls["n"] == 0
+    assert result == {"checked": 0, "rejected": 0, "skipped_no_industry_label": 0}
