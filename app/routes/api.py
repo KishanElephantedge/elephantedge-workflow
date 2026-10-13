@@ -6839,8 +6839,20 @@ def get_partner_accounts(
     period_days: int = 0, period_date_from: str = "", period_date_to: str = "", db: Session = Depends(get_db),
 ):
     from app.gtm_os.intelligence.signal import GtmSignal
+    from app.gtm_os.plays.lead import GtmLead, STATE_REJECTED
 
     tenant_id = _resolve_tenant_id(request)
+
+    # A company the ICP-filter play persisted as STATE_REJECTED (wrong industry, vendor/agency
+    # name, size, etc.) is kept in the DB on purpose -- so it's never re-paid-for on a later run
+    # -- but was never meant to be shown to the partner (2026-10-13, Sandy Yu's dashboard showing
+    # "FCS Solutions / Hospitality / wrong" etc. alongside real matches). Exclude by EXISTS, not a
+    # join, since one Company can carry more than one GtmLead row across rejection passes.
+    rejected_company_ids = (
+        db.query(GtmLead.company_id)
+        .filter(GtmLead.tenant_id == tenant_id, GtmLead.state == STATE_REJECTED,
+                GtmLead.company_id.isnot(None))
+    )
 
     # Same "fetched -- any time / today / 7d / 30d / custom" filter the pre-merge PartnerAccounts
     # page already had (2026-09-16, explicit instruction: "for the partners let for them also be
@@ -6862,7 +6874,7 @@ def get_partner_accounts(
         companies = (
             db.query(Company)
             .join(Batch)
-            .filter(Batch.tenant_id == tenant_id)
+            .filter(Batch.tenant_id == tenant_id, Company.id.notin_(rejected_company_ids))
             .order_by(Company.created_at.desc())
             .all()
         )
@@ -6951,7 +6963,11 @@ def get_partner_accounts(
     # tab is selected, or "All (28)" / "Firmographic (8)" / "Engagement (20)" would drift
     # depending on which one a partner happened to click first. Cheap COUNT queries, not derived
     # from `rows` above (which may already be filtered down to one source_filter).
-    firmographic_count = db.query(func.count(Company.id)).join(Batch).filter(Batch.tenant_id == tenant_id).scalar() or 0
+    firmographic_count = (
+        db.query(func.count(Company.id)).join(Batch)
+        .filter(Batch.tenant_id == tenant_id, Company.id.notin_(rejected_company_ids))
+        .scalar() or 0
+    )
     engagement_count = (
         db.query(func.count(GtmSignal.id))
         .filter(GtmSignal.tenant_id == tenant_id, GtmSignal.source == "linkedin_engagement")
@@ -6966,7 +6982,8 @@ def get_partner_accounts(
     if period_start is not None:
         period_company_ids = [
             row[0] for row in db.query(Company.id).join(Batch, Company.batch_id == Batch.id)
-            .filter(Batch.tenant_id == tenant_id, Company.created_at >= period_start, Company.created_at <= period_end).all()
+            .filter(Batch.tenant_id == tenant_id, Company.id.notin_(rejected_company_ids),
+                    Company.created_at >= period_start, Company.created_at <= period_end).all()
         ]
         decision_makers_fetched = (
             db.query(func.count(Contact.id))
