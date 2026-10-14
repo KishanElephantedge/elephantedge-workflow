@@ -6631,6 +6631,17 @@ def admin_reject_company(company_id: int, request: Request, body: dict = Body(..
     return {"company_id": company_id, "rejected": True, "reason": reason}
 
 
+@router.get("/gtm-os/admin/content/competitors")
+def admin_get_content_competitors(partner_tenant_id: int, request: Request, db: Session = Depends(get_db)):
+    """What get_content_competitors() actually returns for a tenant right now -- free, read-only,
+    for sanity-checking the self-discovery derivation (or a stored override) without guessing
+    from the sensing wrapper's aggregate counts alone."""
+    _require_admin(request)
+    from app.gtm_os.content.competitors import get_content_competitors
+
+    return {"tenant_id": partner_tenant_id, "competitors": get_content_competitors(db, partner_tenant_id)}
+
+
 @router.get("/gtm-os/admin/accounts/rejected")
 def admin_list_rejected_accounts(partner_tenant_id: int, request: Request, db: Session = Depends(get_db)):
     """Every STATE_REJECTED company for a tenant, with why -- for sanity-checking a reconcile
