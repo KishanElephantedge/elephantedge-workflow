@@ -6772,6 +6772,30 @@ def admin_run_fresh_content_sensing(partner_tenant_id: int, request: Request, db
     }
 
 
+@router.post("/gtm-os/admin/content/relink-existing-signals")
+def admin_relink_existing_content_signals(partner_tenant_id: int, request: Request, db: Session = Depends(get_db)):
+    """Re-runs topic_linking/promotion/trend/opportunity-generation against SIGNALS ALREADY IN
+    THE DB -- no new sensing, no Apify/CSE call, completely free. For after editing a tenant's
+    topic aliases (PUT /gtm-os/content-topics): match_topic() is a literal case-insensitive
+    substring match against each topic's name + aliases (topics.py's own documented, deliberate
+    choice over semantic matching) -- real evidence can sit unmatched for weeks if the topic's
+    own name is too jargon-y to appear verbatim in real article text, and aliases are exactly
+    the documented fix for that, but adding them does nothing until the existing backlog of
+    already-fetched signals gets re-evaluated against the new alias list.
+    """
+    _require_admin(request)
+    from app.gtm_os.content.content_opportunity import run_content_opportunity_generation_sweep
+    from app.gtm_os.content.promotion import run_candidate_promotion_sweep
+    from app.gtm_os.content.topic_linking import run_content_topic_linking_sweep
+    from app.gtm_os.content.trend_intelligence import run_trend_intelligence_sweep
+
+    linking = run_content_topic_linking_sweep(db, partner_tenant_id)
+    run_candidate_promotion_sweep(db, partner_tenant_id)
+    run_trend_intelligence_sweep(db, partner_tenant_id)
+    opportunities = run_content_opportunity_generation_sweep(db, partner_tenant_id)
+    return {"tenant_id": partner_tenant_id, "topic_linking": linking, "opportunity_generation": opportunities}
+
+
 @router.post("/gtm-os/admin/content/sync-own-voice")
 def admin_sync_own_voice_content(partner_tenant_id: int, request: Request, db: Session = Depends(get_db)):
     """Turns on the "authentic_voice" content origin for a partner -- syncs their own recent
