@@ -130,3 +130,38 @@ def test_admin_can_manually_reject_a_company_with_no_industry_label():
     # and it's now hidden from the tenant's own dashboard
     listing = client.get("/api/gtm-os/partner/accounts", headers={"X-Tenant-Id": str(TENANT)})
     assert "Galaxy" not in [a["name"] for a in listing.json()["accounts"]]
+
+
+def test_admin_can_manually_import_known_companies_into_a_partner_tenant():
+    """2026-10-14, Nora Volger: 7 companies hand-verified from a provider's own export (Crustdata
+    Atlas), real data already in hand -- no reason to pay to re-discover them. Admin-only, plain
+    insert, no provider spend."""
+    resp = client.post("/api/gtm-os/admin/accounts/import", headers={"X-Tenant-Id": "2"}, json={
+        "tenant_id": TENANT,
+        "companies": [
+            {"name": "PatientIQ", "industry": "Hospitals and Health Care", "location": "United States",
+             "estimated_revenue_lower_usd": 10000000, "estimated_revenue_higher_usd": 20000000,
+             "last_funding_round_type": "series_c", "last_funding_date": "2026-09-03"},
+            {"name": "Healthxchange", "industry": "Pharmaceutical Manufacturing", "location": "United Kingdom",
+             "estimated_revenue_lower_usd": 20000000, "estimated_revenue_higher_usd": 50000000,
+             "last_funding_round_type": "private_equity", "last_funding_date": "2026-09-01"},
+        ],
+    })
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["imported"] == 2
+
+    listing = client.get("/api/gtm-os/partner/accounts", headers={"X-Tenant-Id": str(TENANT)})
+    names = [a["name"] for a in listing.json()["accounts"]]
+    assert "PatientIQ" in names
+    assert "Healthxchange" in names
+
+
+def test_admin_import_accounts_requires_tenant_id_and_nonempty_companies():
+    resp = client.post("/api/gtm-os/admin/accounts/import", headers={"X-Tenant-Id": "2"},
+                       json={"companies": [{"name": "Foo"}]})
+    assert resp.status_code == 400
+
+    resp2 = client.post("/api/gtm-os/admin/accounts/import", headers={"X-Tenant-Id": "2"},
+                        json={"tenant_id": TENANT, "companies": []})
+    assert resp2.status_code == 400

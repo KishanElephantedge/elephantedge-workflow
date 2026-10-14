@@ -6430,6 +6430,65 @@ def delete_companies_admin(request: Request, body: dict = Body(...), db: Session
     return {"deleted_count": len(company_ids), "deleted_names": deleted_names}
 
 
+class AdminCompanyImport(BaseModel):
+    name: str
+    domain: str | None = None
+    industry: str | None = None
+    employee_count: int | None = None
+    location: str | None = None
+    estimated_revenue_lower_usd: int | None = None
+    estimated_revenue_higher_usd: int | None = None
+    last_funding_round_type: str | None = None
+    last_funding_date: str | None = None  # ISO date string, e.g. "2026-09-03"
+    linkedin_url: str | None = None
+
+
+@router.post("/gtm-os/admin/accounts/import")
+def admin_import_accounts(request: Request, body: dict = Body(...), db: Session = Depends(get_db)):
+    """Manually add real, already-known companies to a partner's dashboard -- for a verified
+    shortlist (e.g. hand-picked from a provider's own UI/export) where there's no reason to pay
+    to re-discover data already in hand. No provider spend; a plain insert.
+
+    Body: {"tenant_id": int, "companies": [AdminCompanyImport, ...]}. Creates a dedicated
+    "Manual import" batch per tenant+day (same per-day-batch convention icp_filters.py's
+    _batch() uses) so these rows are visibly distinct from an ICP-filter-sourced batch, not
+    mixed into one that implies they came from a paid search.
+    """
+    _require_admin(request)
+    tenant_id = body.get("tenant_id")
+    if not tenant_id:
+        raise HTTPException(status_code=400, detail="tenant_id is required")
+    companies = [AdminCompanyImport(**c) for c in (body.get("companies") or [])]
+    if not companies:
+        raise HTTPException(status_code=400, detail="companies is required and must be non-empty")
+
+    batch_name = f"Manual import -- {datetime.utcnow().date().isoformat()}"
+    batch = db.query(Batch).filter(Batch.tenant_id == tenant_id, Batch.name == batch_name).first()
+    if batch is None:
+        batch = Batch(tenant_id=tenant_id, name=batch_name, source="admin_manual_import", status="in_progress")
+        db.add(batch)
+        db.commit()
+
+    created = []
+    for c in companies:
+        company = Company(
+            batch_id=batch.id, name=c.name, domain=c.domain, industry=c.industry,
+            employee_count=c.employee_count, location=c.location,
+            estimated_revenue_lower_usd=c.estimated_revenue_lower_usd,
+            estimated_revenue_higher_usd=c.estimated_revenue_higher_usd,
+            last_funding_round_type=c.last_funding_round_type,
+            last_funding_date=datetime.fromisoformat(c.last_funding_date) if c.last_funding_date else None,
+            linkedin_url=c.linkedin_url, source="admin_manual_import",
+        )
+        db.add(company)
+        created.append(company)
+    db.commit()
+    for c in created:
+        db.refresh(c)
+    return {"tenant_id": tenant_id, "imported": len(created),
+           "companies": [{"id": c.id, "name": c.name} for c in created]}
+
+
 @router.post("/gtm-os/admin/accounts/{company_id}/reject")
 def admin_reject_company(company_id: int, request: Request, body: dict = Body(...), db: Session = Depends(get_db)):
     """Hide one company from its tenant's dashboard without deleting it -- for when a human
