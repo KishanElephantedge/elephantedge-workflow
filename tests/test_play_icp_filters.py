@@ -1270,3 +1270,55 @@ def test_reconcile_industry_fit_never_re_judges_an_already_rejected_company(db, 
 
     assert calls["n"] == 0
     assert result == {"checked": 0, "rejected": 0, "skipped_no_industry_label": 0}
+
+
+def test_reconcile_firmographic_fit_rejects_a_company_over_the_current_revenue_cap(db):
+    """REAL BUG, found live 2026-10-14 (Nora Volger, Verily Health): she said "I focus under
+    $100M" and revenue_max_usd was set on her ICP as a result -- but a company already in her
+    account list from before that change ($500M-1000M revenue) was never re-checked. Purely
+    deterministic -- no LLM call, just a number comparison."""
+    batch = Batch(tenant_id=PARTNER, name="b", source="play_icp_filters", status="in_progress")
+    db.add(batch)
+    db.commit()
+
+    too_big = Company(batch_id=batch.id, name="Verily Health", estimated_revenue_lower_usd=500_000_000,
+                      estimated_revenue_higher_usd=1_000_000_000, source="crustdata-v3:company_search")
+    fits = Company(batch_id=batch.id, name="Trinity Biotech", estimated_revenue_lower_usd=10_000_000,
+                   estimated_revenue_higher_usd=20_000_000, source="crustdata-v3:company_search")
+    unknown = Company(batch_id=batch.id, name="Mystery Co", source="crustdata-v3:company_search")
+    db.add_all([too_big, fits, unknown])
+    db.commit()
+
+    icp = {**NORA_ICP, "revenue_min_usd": 10_000_000, "revenue_max_usd": 100_000_000}
+    result = play.reconcile_firmographic_fit(db, PARTNER, icp)
+
+    assert result == {"checked": 1, "rejected": 1}
+    rejected_lead = db.query(GtmLead).filter(GtmLead.company_id == too_big.id).one()
+    assert rejected_lead.state == "rejected"
+    assert "exceeds ICP cap" in rejected_lead.qualifier_reason
+    assert db.query(GtmLead).filter(GtmLead.company_id == fits.id).count() == 0
+    assert db.query(GtmLead).filter(GtmLead.company_id == unknown.id).count() == 0
+    # the row itself is untouched -- only a rejection record was added
+    assert db.query(Company).filter(Company.id == too_big.id).one().name == "Verily Health"
+
+
+def test_reconcile_firmographic_fit_never_re_checks_an_already_rejected_company(db):
+    """A company already marked rejected (by a live run, the industry reconciler, or an earlier
+    firmographic reconcile pass) must never be re-evaluated or double-counted."""
+    from app.gtm_os.plays.lead import STATE_REJECTED
+
+    batch = Batch(tenant_id=PARTNER, name="b", source="play_icp_filters", status="in_progress")
+    db.add(batch)
+    db.commit()
+    co = Company(batch_id=batch.id, name="Already Rejected Co", estimated_revenue_lower_usd=500_000_000,
+                estimated_revenue_higher_usd=1_000_000_000, source="crustdata-v3:company_search")
+    db.add(co)
+    db.commit()
+    db.add(GtmLead(tenant_id=PARTNER, play="icp_filters", lead_key="x", state=STATE_REJECTED, company_id=co.id))
+    db.commit()
+
+    icp = {**NORA_ICP, "revenue_max_usd": 100_000_000}
+    result = play.reconcile_firmographic_fit(db, PARTNER, icp)
+
+    assert result == {"checked": 0, "rejected": 0}
+    assert db.query(GtmLead).filter(GtmLead.company_id == co.id).count() == 1

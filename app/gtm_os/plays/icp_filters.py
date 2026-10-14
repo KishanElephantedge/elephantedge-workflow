@@ -867,6 +867,66 @@ def reconcile_industry_fit(db: Session, tenant_id: int, icp: dict) -> dict:
     return {"checked": len(judgeable), "rejected": rejected, "skipped_no_industry_label": skipped}
 
 
+def reconcile_firmographic_fit(db: Session, tenant_id: int, icp: dict) -> dict:
+    """Catch already-accepted companies that violate the CURRENT revenue/headcount bounds on
+    the ICP, even though they were fine when fetched -- same shape as reconcile_industry_fit,
+    but deterministic (a number comparison, no LLM call needed).
+
+    REAL BUG, found live 2026-10-14 (Nora Volger): she said "I focus under $100M" and
+    revenue_max_usd was set to 100000000 on her ICP as a result -- but Verily Health
+    ($500M-1000M revenue) was already sitting in her account list from BEFORE that change and
+    nothing ever re-checked it against the new cap. The industry-fit reconciler doesn't catch
+    this at all; it only judges industry. Same root cause as the industry case, different field.
+
+    Only a KNOWN violation rejects -- missing revenue/headcount data is never treated as a
+    violation (the company might still be a real fit; we just don't know), matching the
+    "missing data is never a violation" rule used everywhere else fetch-time firmographic
+    checks run. A company's revenue is stored as a [lower, upper] range: it only violates the
+    ICP's max if even its OWN lower bound exceeds it, and only violates the min if even its OWN
+    upper bound falls short -- the narrowest reading that still counts as "definitely outside."
+    """
+    revenue_min = icp.get("revenue_min_usd")
+    revenue_max = icp.get("revenue_max_usd")
+    employee_min = icp.get("employee_min")
+    employee_max = icp.get("employee_max")
+    if not any([revenue_min, revenue_max, employee_min, employee_max]):
+        return {"checked": 0, "rejected": 0}
+
+    already_rejected = {cid for (cid,) in db.query(GtmLead.company_id)
+                        .filter(GtmLead.tenant_id == tenant_id, GtmLead.play == PLAY,
+                                GtmLead.state == STATE_REJECTED, GtmLead.company_id.isnot(None))}
+    query = db.query(Company).join(Batch).filter(Batch.tenant_id == tenant_id)
+    if already_rejected:
+        query = query.filter(Company.id.notin_(already_rejected))
+    candidates = query.all()
+
+    checked, rejected = 0, 0
+    for company in candidates:
+        reason = None
+        if revenue_max and company.estimated_revenue_lower_usd and company.estimated_revenue_lower_usd > revenue_max:
+            reason = (f"revenue ${company.estimated_revenue_lower_usd:,}-"
+                     f"${(company.estimated_revenue_higher_usd or 0):,} exceeds ICP cap of ${revenue_max:,}")
+        elif revenue_min and company.estimated_revenue_higher_usd and company.estimated_revenue_higher_usd < revenue_min:
+            reason = (f"revenue ${(company.estimated_revenue_lower_usd or 0):,}-"
+                     f"${company.estimated_revenue_higher_usd:,} is below ICP floor of ${revenue_min:,}")
+        elif employee_max and company.employee_count and company.employee_count > employee_max:
+            reason = f"{company.employee_count} employees exceeds ICP cap of {employee_max}"
+        elif employee_min and company.employee_count and company.employee_count < employee_min:
+            reason = f"{company.employee_count} employees is below ICP floor of {employee_min}"
+        if reason is None:
+            continue
+        checked += 1
+        key = f"reconcile-firmographic:{company.id}"
+        try:
+            db.add(GtmLead(tenant_id=tenant_id, play=PLAY, lead_key=key, state=STATE_REJECTED,
+                           company_id=company.id, qualifier_reason=f"firmographic mismatch (reconciled): {reason}"))
+            db.commit()
+            rejected += 1
+        except (OperationalError, IntegrityError):
+            db.rollback()
+    return {"checked": checked, "rejected": rejected}
+
+
 def _known_company_names(db: Session, tenant_id: int, limit: int = MAX_EXCLUDED_NAMES) -> list[str]:
     """Every real company name already on file for this tenant via Play F -- both created and
     LLM-rejected (both now leave a real Company row, see search_crustdata's rejection block) --

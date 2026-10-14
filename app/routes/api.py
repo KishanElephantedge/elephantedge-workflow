@@ -6636,6 +6636,25 @@ def admin_backfill_industry_fit(partner_tenant_id: int, request: Request, db: Se
     return {"tenant_id": partner_tenant_id, **reconcile_industry_fit(db, partner_tenant_id, icp_param.value)}
 
 
+@router.post("/gtm-os/admin/backfill-firmographic-fit")
+def admin_backfill_firmographic_fit(partner_tenant_id: int, request: Request, db: Session = Depends(get_db)):
+    """Re-checks every already-accepted company for a partner against the CURRENT revenue/
+    headcount bounds on their ICP -- catches a company that was fine when fetched but violates
+    the ICP after it changed (see icp_filters.reconcile_firmographic_fit's own docstring: Nora
+    Volger's Verily Health, 2026-10-14). Deterministic, free, no LLM call. Same STATE_REJECTED
+    record a live run would write; the row stays in the DB, it just stops showing.
+    """
+    _require_admin(request)
+    icp_param = db.query(Parameter).filter(Parameter.tenant_id == partner_tenant_id,
+                                           Parameter.key == PARTNER_ICP_PARAMETER_KEY).first()
+    if not icp_param or not icp_param.value:
+        raise HTTPException(status_code=400, detail="No ICP configured for this tenant yet.")
+
+    from app.gtm_os.plays.icp_filters import reconcile_firmographic_fit
+
+    return {"tenant_id": partner_tenant_id, **reconcile_firmographic_fit(db, partner_tenant_id, icp_param.value)}
+
+
 @router.get("/gtm-os/admin/providers/catalog")
 def admin_search_provider_tools(request: Request, q: str, categories: str | None = None,
                                 limit: int = 10):
