@@ -41,28 +41,38 @@ AUTHENTIC_VOICE_TOPIC_NAME = "Recurring Themes"
 SYNC_POST_LIMIT = 10
 
 
-def get_partner_recent_posts(db: Session, tenant_id: int, auto_sync: bool = True) -> list[dict]:
+def get_partner_recent_posts(db: Session, tenant_id: int, auto_sync: bool = True) -> tuple[list[dict], str | None]:
     """Real recent post excerpts for this partner's own LinkedIn profile --
-    [{"date": "...", "text": "..."}], most recent first. Returns [] (never invented filler) if
-    no own_linkedin_profile_url is configured yet, or if the profile genuinely has no posts.
+    [{"date": "...", "text": "..."}], most recent first, plus a real sync error if one happened
+    (never silently swallowed -- see the caller's own comment on why this was a real bug).
+    Returns ([], None) if no own_linkedin_profile_url is configured yet, or if the profile
+    genuinely has no posts and the sync itself succeeded.
 
     auto_sync=True (the default) triggers a real, budget-gated Apify refresh first, so a caller
     never has to remember to sync separately -- set False only for a read-only check that must
     never spend money (e.g. a status/diagnostic call)."""
     profile_url = get_own_linkedin_profile_url(db, tenant_id)
     if not profile_url:
-        return []
+        return [], None
 
+    sync_error = None
     if auto_sync:
         estimated_cost = SYNC_POST_LIMIT * LINKEDIN_POST_COST_PER_POST_USD
         budget_result = check_apify_budget(db, tenant_id, estimated_cost, operation="authentic_voice_sync")
         if budget_result["status"] == STATUS_ALLOWED:
-            sync_own_linkedin_posts(db, tenant_id, limit=SYNC_POST_LIMIT)
+            sync_result = sync_own_linkedin_posts(db, tenant_id, limit=SYNC_POST_LIMIT)
+            # REAL BUG, found live 2026-10-14: this return value used to be discarded entirely --
+            # a genuine Apify failure (bad actor response, malformed profile URL, rate limit)
+            # fell straight through to reading whatever's already in the DB (nothing, on a first
+            # sync), producing the misleading "found no posts yet" message for every partner
+            # tried (Majji, Nora, Angela all hit this), masking the real reason.
+            if sync_result.get("status") == "apify_error":
+                sync_error = sync_result.get("error")
         # A blocked/unavailable budget degrades to "use whatever's already on file" below --
         # never raises, same fail-safe-not-fail-open discipline as every other Apify call site.
 
     posts = get_recent_own_posts(db, tenant_id, limit=SYNC_POST_LIMIT)
-    return [{"date": p.posted_at.isoformat() if p.posted_at else "undated", "text": p.post_text or ""} for p in posts if p.post_text]
+    return [{"date": p.posted_at.isoformat() if p.posted_at else "undated", "text": p.post_text or ""} for p in posts if p.post_text], sync_error
 
 
 def _get_or_create_authentic_voice_topic(db: Session, tenant_id: int) -> ContentTopic:
@@ -120,7 +130,9 @@ def generate_authentic_voice_opportunity(db: Session, tenant_id: int) -> dict:
     if not get_own_linkedin_profile_url(db, tenant_id):
         return {"status": "not_configured", "reason": "no own_linkedin_profile_url set for this tenant yet (Settings) -- needed to find their real posts"}
 
-    posts = get_partner_recent_posts(db, tenant_id)
+    posts, sync_error = get_partner_recent_posts(db, tenant_id)
+    if sync_error:
+        return {"status": "apify_error", "reason": f"the LinkedIn post sync itself failed: {sync_error}"}
     if not posts:
         return {"status": "insufficient_evidence", "reason": "synced this partner's real LinkedIn profile but found no posts yet -- nothing to continue a theme from"}
 
