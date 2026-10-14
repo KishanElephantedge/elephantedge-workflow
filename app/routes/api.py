@@ -6512,6 +6512,20 @@ def admin_search_meeting_notes(q: str, request: Request, db: Session = Depends(g
     ]}
 
 
+@router.get("/gtm-os/admin/meeting-notes/{note_id}/raw")
+def admin_get_meeting_note_raw(note_id: int, request: Request, db: Session = Depends(get_db)):
+    """The full raw Granola note payload (attendees/people, calendar metadata, etc.) -- the
+    search route above only returns the AI summary, which doesn't include attendee emails.
+    Added alongside it for the same real need (2026-10-14)."""
+    _require_admin(request)
+    from app.gtm_os.meetings.meeting_notes import MeetingNote
+
+    note = db.get(MeetingNote, note_id)
+    if note is None:
+        raise HTTPException(status_code=404, detail="note not found")
+    return {"id": note.id, "title": note.title, "raw_payload": note.raw_payload}
+
+
 @router.post("/gtm-os/admin/accounts/{company_id}/reject")
 def admin_reject_company(company_id: int, request: Request, body: dict = Body(...), db: Session = Depends(get_db)):
     """Hide one company from its tenant's dashboard without deleting it -- for when a human
