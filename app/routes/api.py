@@ -6526,6 +6526,40 @@ def admin_get_meeting_note_raw(note_id: int, request: Request, db: Session = Dep
     return {"id": note.id, "title": note.title, "raw_payload": note.raw_payload}
 
 
+class AdminCompanyUpdate(BaseModel):
+    domain: str | None = None
+    industry: str | None = None
+    employee_count: int | None = None
+    location: str | None = None
+    estimated_revenue_lower_usd: int | None = None
+    estimated_revenue_higher_usd: int | None = None
+    last_funding_round_type: str | None = None
+    last_funding_date: str | None = None
+    linkedin_url: str | None = None
+
+
+@router.patch("/gtm-os/admin/accounts/{company_id}")
+def admin_update_company(company_id: int, request: Request, body: AdminCompanyUpdate = Body(...),
+                         db: Session = Depends(get_db)):
+    """Fill in or correct a field on an already-imported company -- for completing a manually
+    added row (e.g. its LinkedIn URL) without re-importing it. PARTIAL update: only fields
+    actually supplied are changed. No tenant_id needed -- a company_id already belongs to one
+    tenant via its batch, same lookup admin_reject_company's sibling routes don't need either."""
+    _require_admin(request)
+    company = db.get(Company, company_id)
+    if company is None:
+        raise HTTPException(status_code=404, detail="company not found")
+
+    updates = body.model_dump(exclude_unset=True)
+    if "last_funding_date" in updates:
+        updates["last_funding_date"] = (datetime.fromisoformat(updates["last_funding_date"])
+                                        if updates["last_funding_date"] else None)
+    for key, value in updates.items():
+        setattr(company, key, value)
+    db.commit()
+    return {"id": company.id, "name": company.name, **{k: getattr(company, k) for k in updates}}
+
+
 @router.post("/gtm-os/admin/accounts/{company_id}/reject")
 def admin_reject_company(company_id: int, request: Request, body: dict = Body(...), db: Session = Depends(get_db)):
     """Hide one company from its tenant's dashboard without deleting it -- for when a human

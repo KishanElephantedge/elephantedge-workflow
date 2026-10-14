@@ -165,3 +165,24 @@ def test_admin_import_accounts_requires_tenant_id_and_nonempty_companies():
     resp2 = client.post("/api/gtm-os/admin/accounts/import", headers={"X-Tenant-Id": "2"},
                         json={"tenant_id": TENANT, "companies": []})
     assert resp2.status_code == 400
+
+
+def test_admin_can_patch_a_company_to_fill_in_a_missing_field():
+    """2026-10-14, Nora Volger: the 7 manually imported companies were missing their LinkedIn
+    URL (not in the import payload at the time) -- needed a way to fill it in without
+    re-importing the whole row."""
+    from app.db.session import get_db as _get_db_dep
+    db = next(app.dependency_overrides[_get_db_dep]())
+
+    batch = _batch(db)
+    co = _company(db, batch, "PatientIQ", "Hospitals and Health Care")
+
+    resp = client.patch(f"/api/gtm-os/admin/accounts/{co.id}", headers={"X-Tenant-Id": "2"},
+                        json={"linkedin_url": "https://www.linkedin.com/company/patientiq"})
+    assert resp.status_code == 200
+    assert resp.json()["linkedin_url"] == "https://www.linkedin.com/company/patientiq"
+
+    refreshed = db.query(Company).filter(Company.id == co.id).one()
+    assert refreshed.linkedin_url == "https://www.linkedin.com/company/patientiq"
+    # a field not supplied is left untouched
+    assert refreshed.industry == "Hospitals and Health Care"
