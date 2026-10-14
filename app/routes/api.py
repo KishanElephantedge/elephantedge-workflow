@@ -6631,6 +6631,20 @@ def admin_reject_company(company_id: int, request: Request, body: dict = Body(..
     return {"company_id": company_id, "rejected": True, "reason": reason}
 
 
+@router.get("/gtm-os/admin/content/cse-quota")
+def admin_get_cse_quota(request: Request, db: Session = Depends(get_db)):
+    """Today's real Google Custom Search free-quota usage (100/day, shared across every tenant --
+    see google_cse_client.py's own docstring) -- free, read-only, for diagnosing why trend/
+    competitor sensing returned zero without guessing."""
+    _require_admin(request)
+    from app.google_cse_client import DAILY_COUNT_PARAMETER_KEY, FREE_DAILY_QUOTA
+
+    param = db.query(Parameter).filter(Parameter.tenant_id == ELEPHANT_EDGE_TENANT_ID,
+                                       Parameter.key == DAILY_COUNT_PARAMETER_KEY).first()
+    value = param.value if param and isinstance(param.value, dict) else {}
+    return {"date": value.get("date"), "count": value.get("count", 0), "free_daily_quota": FREE_DAILY_QUOTA}
+
+
 @router.get("/gtm-os/admin/content/competitors")
 def admin_get_content_competitors(partner_tenant_id: int, request: Request, db: Session = Depends(get_db)):
     """What get_content_competitors() actually returns for a tenant right now -- free, read-only,

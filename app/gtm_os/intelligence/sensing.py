@@ -36,6 +36,12 @@ from app.apify_client import _get_api_key as _get_apify_api_key
 from app.apify_client import ApifyError, search_google_ai_overview, search_google_organic_results, search_linkedin_jobs, search_linkedin_posts
 from app.google_cse_client import GoogleCseError, search_google_custom
 
+# Same real billing tenant as everywhere else partner Apify/CSE spend gets reserved against --
+# see authentic_voice.py's own ELEPHANT_EDGE_TENANT_ID comment for the exact bug this avoids
+# (check_apify_budget called with a PARTNER's own tenant_id silently blocks forever, since a
+# partner tenant has no control_config row of its own).
+ELEPHANT_EDGE_TENANT_ID = 2
+
 
 def _search_google_with_fallback(db: Session, tenant_id: int, query: str, num: int = 10) -> list[dict]:
     """Google Custom Search first (cheaper, see google_cse_client.py's own docstring), Apify's
@@ -65,7 +71,7 @@ def _search_google_with_fallback(db: Session, tenant_id: int, query: str, num: i
     from app.apify_client import GOOGLE_SEARCH_COST_PER_QUERY_NO_AI_OVERVIEW_USD
     from app.apify_budget_guard import STATUS_ALLOWED, check_apify_budget
 
-    budget_result = check_apify_budget(db, tenant_id, GOOGLE_SEARCH_COST_PER_QUERY_NO_AI_OVERVIEW_USD, operation="web_search_fallback")
+    budget_result = check_apify_budget(db, ELEPHANT_EDGE_TENANT_ID, GOOGLE_SEARCH_COST_PER_QUERY_NO_AI_OVERVIEW_USD, operation="web_search_fallback")
     if budget_result["status"] != STATUS_ALLOWED:
         return []
 
