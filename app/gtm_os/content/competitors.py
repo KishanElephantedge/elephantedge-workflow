@@ -180,10 +180,20 @@ def derive_competitors_from_content_business_context(db: Session, tenant_id: int
 
     from app.gtm_os.intelligence.sensing import _search_google_with_fallback
     from app.llm_client import generate_json
+    from app.phases.partner_icp import get_partner_icp
 
     business_name = business_context["business_name"]
-    query = f'"{business_name}" competitors alternatives'
-    results = _search_google_with_fallback(db, tenant_id, query, num=10)
+    results = _search_google_with_fallback(db, tenant_id, f'"{business_name}" competitors alternatives', num=10)
+    # REAL GAP, found live 2026-10-15 (Nora/Majji/Angela, all solo fractional consultants): a
+    # name-based search returns nothing for a small, not-widely-written-about business -- nobody
+    # publishes "X vs Y alternatives" content about a solo consultant. Fall back to searching by
+    # the partner's own stated industry (partner_icp's real `industries` list, never invented --
+    # same real-data-only discipline as the name search) to find real peer firms instead.
+    if not results:
+        icp = get_partner_icp(db, tenant_id) or {}
+        industries = icp.get("industries") or []
+        if industries:
+            results = _search_google_with_fallback(db, tenant_id, f"best {industries[0]} consulting firms advisors", num=10)
     if not results:
         return []
 

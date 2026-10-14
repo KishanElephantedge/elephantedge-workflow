@@ -81,3 +81,36 @@ def test_no_business_context_returns_an_honest_empty_list_not_elephant_edges_own
 
 def test_elephant_edge_itself_still_gets_its_own_default_list(db):
     assert comp.get_content_competitors(db, comp.ELEPHANT_EDGE_TENANT_ID) == comp.DEFAULT_COMPETITORS
+
+
+def test_derive_competitors_falls_back_to_industry_search_when_name_search_finds_nothing(db, monkeypatch):
+    """REAL GAP, found live 2026-10-15: a name-based search ("X competitors alternatives")
+    returns nothing for a small, solo fractional consultant -- nobody publishes comparison
+    content about them. Falls back to searching by the partner's own real stated industry
+    instead, never an invented one."""
+    import app.gtm_os.intelligence.sensing as sensing
+
+    db.add(Parameter(tenant_id=TENANT, key="partner_icp", value={"industries": ["life-science technology"]}))
+    db.commit()
+
+    queries_seen = []
+
+    def fake_search(db_, tenant_id, query, num=10):
+        queries_seen.append(query)
+        if "Uptake GTM" in query:
+            return []  # name search finds nothing
+        return REAL_RESULTS  # industry search finds real peers
+
+    monkeypatch.setattr(sensing, "_search_google_with_fallback", fake_search)
+    monkeypatch.setattr(llm_client, "generate_json", lambda *a, **k: {"competitors": [
+        {"name": "RealRival", "domain": "realrival.com"},
+    ]})
+
+    business_context = {"business_name": "Uptake GTM", "positioning": "x", "audience": "y"}
+
+    derived = comp.derive_competitors_from_content_business_context(db, TENANT, business_context)
+
+    assert len(queries_seen) == 2
+    assert "Uptake GTM" in queries_seen[0]
+    assert "life-science technology" in queries_seen[1]
+    assert derived == [{"name": "RealRival", "domain": "realrival.com", "enabled": True}]
