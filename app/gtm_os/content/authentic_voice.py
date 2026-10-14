@@ -28,6 +28,22 @@ module docstring already documents."""
 from sqlalchemy.orm import Session
 
 from app.apify_budget_guard import STATUS_ALLOWED, check_apify_budget
+
+# REAL BUG, found live 2026-10-14 (Nora Volger -- confirmed via a direct manual Apify run with
+# the SAME profile URL and SAME API key returning real posts, then a raw curl against the exact
+# endpoint/payload our own code sends ALSO returning real posts -- so neither the actor, the
+# input shape, nor the API key was ever the problem). check_apify_budget(db, tenant_id, ...) was
+# called with the PARTNER's own tenant_id -- but a partner tenant has no control_config row of
+# its own, so get_control_config() returns the default (apify.daily_budget_usd/monthly_budget_usd
+# both None), which check_apify_budget correctly reads as "no budget configured" and BLOCKS.
+# Every other partner-spend path in this codebase (partner_daily_run.py's discovery and
+# engagement mining) already checks against ELEPHANT_EDGE_TENANT_ID specifically, since that's
+# the real billing tenant -- partner tenants were never meant to carry their own Apify budget
+# config. This was the one on-demand Apify call site that still checked the wrong tenant, so it
+# silently blocked every single call and degraded to "found no posts yet" -- indistinguishable
+# from a partner who genuinely hasn't posted, exactly the failure mode this module's own
+# docstring already warned a judgment outage must never be confused with.
+ELEPHANT_EDGE_TENANT_ID = 2
 from app.apify_client import LINKEDIN_POST_COST_PER_POST_USD
 from app.gtm_os.content.content_business_context import get_content_business_context
 from app.gtm_os.content.content_opportunity import AUTHENTIC_VOICE_BASELINE_STRENGTH, ContentOpportunity
@@ -58,7 +74,7 @@ def get_partner_recent_posts(db: Session, tenant_id: int, auto_sync: bool = True
     sync_error = None
     if auto_sync:
         estimated_cost = SYNC_POST_LIMIT * LINKEDIN_POST_COST_PER_POST_USD
-        budget_result = check_apify_budget(db, tenant_id, estimated_cost, operation="authentic_voice_sync")
+        budget_result = check_apify_budget(db, ELEPHANT_EDGE_TENANT_ID, estimated_cost, operation="authentic_voice_sync")
         if budget_result["status"] == STATUS_ALLOWED:
             sync_result = sync_own_linkedin_posts(db, tenant_id, limit=SYNC_POST_LIMIT)
             # REAL BUG, found live 2026-10-14: this return value used to be discarded entirely --

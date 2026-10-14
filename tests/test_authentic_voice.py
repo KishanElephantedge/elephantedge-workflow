@@ -57,3 +57,26 @@ def test_a_clean_sync_with_genuinely_zero_posts_still_reports_insufficient_evide
     result = av.generate_authentic_voice_opportunity(db, TENANT)
 
     assert result["status"] == "insufficient_evidence"
+
+
+def test_budget_is_checked_against_the_billing_tenant_not_the_partners_own(db, monkeypatch):
+    """REAL BUG, found live 2026-10-14 (Nora Volger): check_apify_budget was called with the
+    PARTNER's own tenant_id -- a partner tenant has no control_config row of its own, so the
+    default (apify budget both None) made every single call silently BLOCKED, degrading to
+    "found no posts yet" even though she had real posts (confirmed via a direct manual Apify run
+    and a raw curl against our exact payload, both returning real data). Every other partner-spend
+    path in this codebase already checks ELEPHANT_EDGE_TENANT_ID specifically."""
+    _set_profile_url(db)
+    seen_tenant_ids = []
+
+    def fake_check_budget(db_, tenant_id, cost, operation=None):
+        seen_tenant_ids.append(tenant_id)
+        return {"status": av.STATUS_ALLOWED}
+
+    monkeypatch.setattr(av, "check_apify_budget", fake_check_budget)
+    monkeypatch.setattr(av, "sync_own_linkedin_posts", lambda *a, **k: {"status": "ok", "new_posts": 0, "error": None})
+
+    av.get_partner_recent_posts(db, TENANT)
+
+    assert seen_tenant_ids == [av.ELEPHANT_EDGE_TENANT_ID]
+    assert av.ELEPHANT_EDGE_TENANT_ID != TENANT
