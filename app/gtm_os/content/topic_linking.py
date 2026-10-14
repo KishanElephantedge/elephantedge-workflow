@@ -142,37 +142,52 @@ def run_content_topic_linking_sweep(
             .all()
         }
 
+        # REAL FIX, found live 2026-10-15 (Nora Volger, Competitor Activity showing zero topics
+        # despite 40 real competitor_content signals already fetched): sense_web_search_trends/
+        # sense_competitor_content/sense_google_news_rss all search Google FOR one specific
+        # configured topic (the topic's own name IS the query) and already record that in
+        # extracted_info.matched_keyword -- real provenance already on the signal, not derived.
+        # Relying only on match_topic()'s literal substring-in-title/summary scan threw that
+        # provenance away: a competitor's page can rank for "site:example.com Commercial
+        # Narrative Development" without the phrase appearing anywhere in its own title/summary,
+        # so a signal Google itself judged relevant to that exact query was still being counted
+        # as unmatched. A search result returned FOR a topic's own query is evidence for that
+        # topic by construction -- no text-scanning needed to re-derive what's already known.
+        matched_keyword = ((signal.extracted_info or {}).get("matched_keyword") or "").strip().lower()
+
         signal_matched_any = False
-        if text:
-            for configured_topic in configured_topics:
-                if not match_topic(text, [configured_topic]):
-                    continue
-                signal_matched_any = True
-                result["matches_found"] += 1
+        for configured_topic in configured_topics:
+            topic_name_lower = configured_topic["name"].strip().lower()
+            via_provenance = matched_keyword == topic_name_lower
+            via_text = bool(text) and match_topic(text, [configured_topic])
+            if not via_provenance and not via_text:
+                continue
+            signal_matched_any = True
+            result["matches_found"] += 1
 
-                content_topic = content_topic_by_config_name[configured_topic["name"].strip().lower()]
+            content_topic = content_topic_by_config_name[topic_name_lower]
 
-                if content_topic.id in already_linked_topic_ids:
-                    result["already_linked"] += 1
-                    continue
+            if content_topic.id in already_linked_topic_ids:
+                result["already_linked"] += 1
+                continue
 
-                term = _matched_term(text, configured_topic)
-                evidence = ContentTopicEvidence(
-                    tenant_id=tenant_id,
-                    content_topic_id=content_topic.id,
-                    gtm_signal_id=signal.id,
-                    matched_term=term,
-                    match_method="deterministic_alias_match",
-                )
-                db.add(evidence)
-                already_linked_topic_ids.add(content_topic.id)
-                result["evidence_created"] += 1
+            term = configured_topic["name"] if via_provenance and not via_text else _matched_term(text, configured_topic)
+            evidence = ContentTopicEvidence(
+                tenant_id=tenant_id,
+                content_topic_id=content_topic.id,
+                gtm_signal_id=signal.id,
+                matched_term=term,
+                match_method="search_provenance" if via_provenance and not via_text else "deterministic_alias_match",
+            )
+            db.add(evidence)
+            already_linked_topic_ids.add(content_topic.id)
+            result["evidence_created"] += 1
 
-                if signal.observed_at is not None:
-                    if content_topic.first_seen_at is None or signal.observed_at < content_topic.first_seen_at:
-                        content_topic.first_seen_at = signal.observed_at
-                    if content_topic.last_seen_at is None or signal.observed_at > content_topic.last_seen_at:
-                        content_topic.last_seen_at = signal.observed_at
+            if signal.observed_at is not None:
+                if content_topic.first_seen_at is None or signal.observed_at < content_topic.first_seen_at:
+                    content_topic.first_seen_at = signal.observed_at
+                if content_topic.last_seen_at is None or signal.observed_at > content_topic.last_seen_at:
+                    content_topic.last_seen_at = signal.observed_at
 
         if not signal_matched_any:
             result["unmatched_signals"] += 1
