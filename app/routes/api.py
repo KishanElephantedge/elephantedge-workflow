@@ -6713,6 +6713,52 @@ def admin_backfill_firmographic_fit(partner_tenant_id: int, request: Request, db
     return {"tenant_id": partner_tenant_id, **reconcile_firmographic_fit(db, partner_tenant_id, icp_param.value)}
 
 
+@router.post("/gtm-os/admin/content/run-fresh-sensing")
+def admin_run_fresh_content_sensing(partner_tenant_id: int, request: Request, db: Session = Depends(get_db)):
+    """Turns on the "trend" and "competitor" content origins for a partner -- the same real
+    pipeline the chat assistant's run_fresh_sensing tool already runs, exposed directly so it
+    doesn't need a chat round-trip. Genuinely free/near-free: Google News RSS is free, Google
+    Custom Search runs against the shared daily quota and fails closed per-query if exhausted
+    (see content_chat_tools.py's own comment, 2026-10-12 -- this moved OFF an Apify-cost
+    pre-check it used to need). No Apify call anywhere in this sequence.
+
+    A partner with no configured competitors (content_intelligence_competitors Parameter) will
+    simply get 0 competitor signals -- never fabricated, see competitors.py's own docstring on
+    why that list defaults empty for every tenant but Elephant Edge.
+    """
+    _require_admin(request)
+    from app.gtm_os.content.content_opportunity import run_content_opportunity_generation_sweep
+    from app.gtm_os.content.promotion import run_candidate_promotion_sweep
+    from app.gtm_os.content.topic_linking import run_content_topic_linking_sweep
+    from app.gtm_os.content.trend_intelligence import run_trend_intelligence_sweep
+    from app.gtm_os.intelligence.sensing import sense_competitor_content, sense_google_news_rss, sense_web_search_trends
+
+    news_signals = sense_google_news_rss(db, partner_tenant_id)
+    trend_signals = sense_web_search_trends(db, partner_tenant_id, limit=20)
+    competitor_signals = sense_competitor_content(db, partner_tenant_id, limit=30)
+    linking = run_content_topic_linking_sweep(db, partner_tenant_id)
+    run_candidate_promotion_sweep(db, partner_tenant_id)
+    run_trend_intelligence_sweep(db, partner_tenant_id)
+    opportunities = run_content_opportunity_generation_sweep(db, partner_tenant_id)
+    return {
+        "tenant_id": partner_tenant_id, "new_google_news_signals": len(news_signals),
+        "new_trend_signals": len(trend_signals), "new_competitor_signals": len(competitor_signals),
+        "topic_linking": linking, "opportunity_generation": opportunities,
+    }
+
+
+@router.post("/gtm-os/admin/content/sync-own-voice")
+def admin_sync_own_voice_content(partner_tenant_id: int, request: Request, db: Session = Depends(get_db)):
+    """Turns on the "authentic_voice" content origin for a partner -- syncs their own recent
+    LinkedIn posts (Apify, $0.002/post -- the only content origin that genuinely needs Apify)
+    and proposes a topic continuation grounded in them. Requires own_linkedin_profile_url
+    already configured on the content feature (app/gtm_os/features/registry.py)."""
+    _require_admin(request)
+    from app.gtm_os.content.authentic_voice import generate_authentic_voice_opportunity
+
+    return {"tenant_id": partner_tenant_id, **generate_authentic_voice_opportunity(db, partner_tenant_id)}
+
+
 @router.get("/gtm-os/admin/providers/catalog")
 def admin_search_provider_tools(request: Request, q: str, categories: str | None = None,
                                 limit: int = 10):
