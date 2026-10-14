@@ -104,6 +104,16 @@ def _normalize_competitor(competitor: dict) -> dict:
 
 
 def get_content_competitors(db: Session, tenant_id: int) -> list[dict]:
+    """REAL FIX (2026-10-14): a partner tenant used to just get [] forever -- the competitor
+    angle was the one content origin in this platform with no self-discovery at all, unlike
+    topics.py's own derive_topics_from_content_business_context (the exact architectural gap a
+    partner-side question surfaced live: "why should competitors be something a human has to
+    type in, shouldn't the system find its own competitors from the partner's own context?").
+    Now: no override -> derive from the partner's own real content_business_context (same
+    "compute fresh from live config, cache once a human/LLM derivation has run" pattern topics.py
+    already uses), SAVED so this never re-runs (re-deriving is a real Google CSE query + LLM
+    call, not free). A tenant with no business_context configured yet still gets a real empty
+    list -- never Elephant Edge's own competitors, never an invented one."""
     param = (
         db.query(Parameter)
         .filter(Parameter.tenant_id == tenant_id)
@@ -114,7 +124,105 @@ def get_content_competitors(db: Session, tenant_id: int) -> list[dict]:
         return param.value
     if tenant_id == ELEPHANT_EDGE_TENANT_ID:
         return DEFAULT_COMPETITORS
-    return []
+
+    from app.gtm_os.content.content_business_context import get_content_business_context
+
+    business_context = get_content_business_context(db, tenant_id)
+    if not business_context.get("business_name"):
+        return []
+
+    derived = derive_competitors_from_content_business_context(db, tenant_id, business_context)
+    if derived:
+        set_content_competitors(db, tenant_id, derived)
+    return derived
+
+
+COMPETITOR_EXTRACTION_PROMPT = """A business has described its own real positioning and audience \
+below. Below that is a REAL, LIVE set of Google search results for companies that compete with or \
+offer a similar service to this business -- not invented, actually returned by a real search.
+
+Business name: {business_name}
+Real positioning (their own words): {positioning}
+Real audience (their own words): {audience}
+
+Real search results:
+{results_block}
+
+Your job: from ONLY the real companies that actually appear in the search results above, identify \
+which ones are genuine competitors or close alternatives to this business -- a real company \
+offering a similar service to a similar audience, not a generic article, directory, or unrelated \
+result.
+
+CRITICAL RULES:
+- Only name a company that is ACTUALLY PRESENT in the search results above, by its real name and \
+real domain as shown in the result URL. Never invent a company, name, or domain not present above.
+- Skip results that are articles, directories, listicles, or not actually a competing company's \
+own site.
+- If genuinely none of the results are a real competitor, return an empty list -- never pad with \
+an invented one.
+
+Return strict JSON: {{"competitors": [{{"name": "<real company name>", "domain": "<real domain from \
+the result URL>"}}, ...]}}, at most 8."""
+
+
+def derive_competitors_from_content_business_context(db: Session, tenant_id: int, business_context: dict) -> list[dict]:
+    """One real, grounded search + LLM extraction -- only reached when nothing is cached yet (see
+    get_content_competitors() above, which saves the result so this never re-runs for the same
+    tenant). Unlike topics.py's derivation, this can't ground purely in the partner's own
+    positioning text -- a positioning paragraph essentially never names real competitor
+    companies, so an LLM asked to extract from text alone would have to invent names, which this
+    codebase's own standing discipline (see this module's own file docstring, topics.py's
+    derive_default_topics) explicitly forbids. Instead: one real Google search for competitors/
+    alternatives to this business, then the LLM may only name a company that's ACTUALLY PRESENT
+    in those real results -- grounded in real search evidence, same discipline
+    sense_competitor_content/sense_web_search_trends already apply to signals."""
+    from urllib.parse import urlparse
+
+    from app.gtm_os.intelligence.sensing import _search_google_with_fallback
+    from app.llm_client import generate_json
+
+    business_name = business_context["business_name"]
+    query = f'"{business_name}" competitors alternatives'
+    results = _search_google_with_fallback(db, tenant_id, query, num=10)
+    if not results:
+        return []
+
+    results_block = "\n".join(
+        f"- {r.get('title', '')} ({r.get('url', '')}): {r.get('description', '')}" for r in results
+    )
+
+    try:
+        result = generate_json(
+            COMPETITOR_EXTRACTION_PROMPT.format(
+                business_name=business_name,
+                positioning=business_context.get("positioning") or "(not stated)",
+                audience=business_context.get("audience") or "(not stated)",
+                results_block=results_block,
+            ),
+            db, tenant_id, max_tokens=500,
+        )
+    except Exception:
+        return []
+
+    real_domains = {urlparse(r["url"]).netloc.lower().removeprefix("www.") for r in results if r.get("url")}
+
+    competitors = []
+    seen_domains: set[str] = set()
+    for c in (result.get("competitors") or []):
+        if not isinstance(c, dict):
+            continue
+        name, domain = c.get("name"), c.get("domain")
+        if not name or not domain:
+            continue
+        domain = domain.strip().lower().removeprefix("www.")
+        # Grounding check: only keep a competitor whose domain actually appeared in the real
+        # search results above -- an LLM drifting off-prompt and naming something not in the
+        # evidence is caught here, not trusted.
+        if domain not in real_domains or domain in seen_domains:
+            continue
+        seen_domains.add(domain)
+        competitors.append({"name": name.strip(), "domain": domain, "enabled": True})
+    return competitors
 
 
 def get_enabled_content_competitors(db: Session, tenant_id: int) -> list[dict]:
