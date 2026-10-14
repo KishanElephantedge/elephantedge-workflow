@@ -6595,6 +6595,28 @@ def admin_reject_company(company_id: int, request: Request, body: dict = Body(..
     return {"company_id": company_id, "rejected": True, "reason": reason}
 
 
+@router.get("/gtm-os/admin/accounts/rejected")
+def admin_list_rejected_accounts(partner_tenant_id: int, request: Request, db: Session = Depends(get_db)):
+    """Every STATE_REJECTED company for a tenant, with why -- for sanity-checking a reconcile
+    pass (industry-fit, firmographic-fit, or a manual reject) before trusting it, instead of
+    just trusting the count. The row stays in the DB either way; this just makes the reason
+    for each one visible."""
+    _require_admin(request)
+    from app.gtm_os.plays.lead import GtmLead, STATE_REJECTED
+
+    rows = (db.query(GtmLead, Company)
+           .join(Company, GtmLead.company_id == Company.id)
+           .filter(GtmLead.tenant_id == partner_tenant_id, GtmLead.state == STATE_REJECTED)
+           .order_by(GtmLead.created_at.desc()).all())
+    return {"tenant_id": partner_tenant_id, "count": len(rows), "rejected": [
+        {"company_id": c.id, "name": c.name, "industry": c.industry,
+         "estimated_revenue_lower_usd": c.estimated_revenue_lower_usd,
+         "estimated_revenue_higher_usd": c.estimated_revenue_higher_usd,
+         "employee_count": c.employee_count, "reason": lead.qualifier_reason}
+        for lead, c in rows
+    ]}
+
+
 @router.get("/gtm-os/admin/debug/crustdata-filters")
 def admin_crustdata_filters_debug(partner_tenant_id: int, request: Request, db: Session = Depends(get_db)):
     """The EXACT payload search_crustdata() would send for this partner's current ICP, built but
