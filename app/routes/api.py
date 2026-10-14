@@ -6489,6 +6489,29 @@ def admin_import_accounts(request: Request, body: dict = Body(...), db: Session 
            "companies": [{"id": c.id, "name": c.name} for c in created]}
 
 
+@router.get("/gtm-os/admin/meeting-notes/search")
+def admin_search_meeting_notes(q: str, request: Request, db: Session = Depends(get_db)):
+    """Free-text search across synced Granola meeting notes (title/owner_name/summary/
+    transcript) -- for finding a real contact's email or context from a past call, instead of
+    guessing. Added 2026-10-14 looking for Erin Felton's and Allison Snow's real emails before
+    creating their logins; no existing route exposed MeetingNote at all. Reusable for any future
+    lookup, not specific to this case."""
+    _require_admin(request)
+    from app.gtm_os.meetings.meeting_notes import MeetingNote
+
+    like = f"%{q.strip()}%"
+    rows = (db.query(MeetingNote)
+           .filter(or_(MeetingNote.title.ilike(like), MeetingNote.owner_name.ilike(like),
+                       MeetingNote.summary.ilike(like), MeetingNote.transcript_text.ilike(like)))
+           .order_by(MeetingNote.note_created_at.desc()).limit(10).all())
+    return {"query": q, "count": len(rows), "notes": [
+        {"id": r.id, "title": r.title, "owner_name": r.owner_name, "owner_email": r.owner_email,
+         "note_created_at": r.note_created_at.isoformat() if r.note_created_at else None,
+         "summary": (r.summary or "")[:1500]}
+        for r in rows
+    ]}
+
+
 @router.post("/gtm-os/admin/accounts/{company_id}/reject")
 def admin_reject_company(company_id: int, request: Request, body: dict = Body(...), db: Session = Depends(get_db)):
     """Hide one company from its tenant's dashboard without deleting it -- for when a human
