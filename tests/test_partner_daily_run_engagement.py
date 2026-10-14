@@ -61,6 +61,7 @@ def test_a_complete_engagement_config_validates_cleanly():
         "enabled": False, "schedule_hour_utc": 9, "daily_target": None, "source": None, "pages": 2,
         "engagement_mining_enabled": True, "engagement_posts_per_day": 5, "engagement_commenters_per_post": 3,
         "last_run_date": None, "engagement_last_run_date": None,
+        "content_intelligence_enabled": False, "content_schedule_hour_utc": None, "content_last_run_date": None,
     })
 
 

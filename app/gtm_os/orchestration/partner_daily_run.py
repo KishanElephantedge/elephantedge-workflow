@@ -22,6 +22,12 @@ CONFIG. One Parameter per tenant (PARTNER_DAILY_RUN_PARAMETER_KEY), shape:
         "engagement_commenters_per_post": int, # minimum commenters harvested PER post (a floor,
                                                 # not a shared pool -- see ENGAGEMENT MINING)
         "last_run_date": "YYYY-MM-DD", # UTC date of the last real trigger, prevents double-firing
+        "content_intelligence_enabled": bool, # THIRD objective, own schedule -- see CONTENT
+                                               # INTELLIGENCE below
+        "content_schedule_hour_utc": int,     # 0-23, own hour -- deliberately NOT shared with
+                                               # firmographic's, since a partner may want content
+                                               # automated before (or without) account discovery
+        "content_last_run_date": "YYYY-MM-DD",
     }
 
 ENGAGEMENT MINING, 2026-09-22 real correction. This started as a side effect of piggybacking on
@@ -56,7 +62,21 @@ SCHEDULING MODEL. main.py's scheduler ticks this module's check function once an
 day, since each tenant picks its own hour) -- see _scheduled_partner_daily_tick there. This module
 itself just answers "is tenant X due right now" and, if so, fires the SAME async background
 mechanism the manual POST /gtm-os/partner/discover route already uses, so a daily run behaves
-identically to a manually-triggered one (same verification, same real ICP enforcement)."""
+identically to a manually-triggered one (same verification, same real ICP enforcement).
+
+CONTENT INTELLIGENCE, 2026-10-14 real instruction after the admin-route version
+(POST /gtm-os/admin/content/run-fresh-sensing, POST .../sync-own-voice) was built and proven live
+-- trend/competitor sensing genuinely pulling real signals, authentic-voice genuinely syncing real
+posts, for Majji/Nora/Angela: "does that work, does it add topics, or still do I have to run it" --
+the honest answer at the time was "still manual, nothing schedules it." This wires the exact same
+sequence (run_partner_content_intelligence_now below calls the identical functions the admin
+routes call, not a second copy) into this daily tick, gated on its OWN enabled flag + hour,
+independent of firmographic/engagement -- a tenant with `content` in enabled_features but no
+account-discovery config configured yet (true for all three of Majji/Nora/Angela as of this
+writing: `enabled: false` on every one of them) must still be able to turn content automation on
+by itself. Also gated on the tenant actually having `content` in enabled_features at tick time
+(not just at config-save time), same defensive re-check every admin content route already does --
+a feature later disabled must stop firing, not keep running on a stale config."""
 
 from datetime import datetime, timezone
 
@@ -86,6 +106,11 @@ DEFAULT_CONFIG = {
     # configured engagement mining), so it needs its own "already ran today" marker rather than
     # silently piggybacking on firmographic's.
     "engagement_last_run_date": None,
+    # THIRD objective, own schedule, independent of firmographic/engagement -- see CONTENT
+    # INTELLIGENCE above.
+    "content_intelligence_enabled": False,
+    "content_schedule_hour_utc": None,
+    "content_last_run_date": None,
 }
 
 
@@ -149,6 +174,19 @@ def _validate_config(config: dict) -> None:
     # otherwise "enable engagement mining" would silently do nothing (no hour to check it at).
     if config.get("engagement_mining_enabled") and hour is None:
         raise DailyRunConfigError("engagement_mining_enabled=true requires schedule_hour_utc to be set (both objectives share one daily trigger time)")
+
+    if not isinstance(config.get("content_intelligence_enabled"), bool):
+        raise DailyRunConfigError("content_intelligence_enabled must be true/false")
+
+    content_hour = config.get("content_schedule_hour_utc")
+    if content_hour is not None and (not isinstance(content_hour, int) or isinstance(content_hour, bool) or not (0 <= content_hour <= 23)):
+        raise DailyRunConfigError("content_schedule_hour_utc must be an integer 0-23, or null")
+
+    # Deliberately its OWN hour, not reusing schedule_hour_utc -- see this module's own
+    # CONTENT INTELLIGENCE docstring section for why (a partner may want content automated
+    # before/without account discovery ever being configured).
+    if config.get("content_intelligence_enabled") and content_hour is None:
+        raise DailyRunConfigError("content_intelligence_enabled=true requires content_schedule_hour_utc to be set")
 
 
 def set_daily_run_config(db: Session, tenant_id: int, updates: dict) -> dict:
@@ -310,18 +348,72 @@ def run_partner_engagement_mining_now(tenant_id: int, posts_per_day: int, commen
         db.close()
 
 
+def run_partner_content_intelligence_now(tenant_id: int) -> None:
+    """THE CONTENT-INTELLIGENCE RUNNER -- calls the identical functions
+    POST /gtm-os/admin/content/run-fresh-sensing and .../sync-own-voice already call and proved
+    live (not a second copy of the logic), own db session, same "never share a session across
+    threads" discipline as the other two runners. Re-checks `content` is actually in
+    enabled_features at run time (not just trusted from config-save time) -- see this module's
+    own CONTENT INTELLIGENCE docstring section.
+
+    Each step is its own try/except: a failure in authentic-voice sync (e.g. a real Apify error)
+    must never stop trend/competitor sensing from running, and vice versa -- same per-stage
+    isolation as CONTENT_INTELLIGENCE_STAGES in sweep.py."""
+    import logging
+
+    from app.db.session import SessionLocal
+
+    logger = logging.getLogger(__name__)
+    db = SessionLocal()
+    try:
+        from app.gtm_os.features import config as feature_config
+
+        if "content" not in feature_config.enabled_features(db, tenant_id):
+            logger.info("partner content intelligence: 'content' no longer enabled for tenant_id=%s, skipping", tenant_id)
+            return
+
+        from app.gtm_os.content.authentic_voice import generate_authentic_voice_opportunity
+        from app.gtm_os.content.content_opportunity import run_content_opportunity_generation_sweep
+        from app.gtm_os.content.promotion import run_candidate_promotion_sweep
+        from app.gtm_os.content.topic_linking import run_content_topic_linking_sweep
+        from app.gtm_os.content.trend_intelligence import run_trend_intelligence_sweep
+        from app.gtm_os.intelligence.sensing import sense_competitor_content, sense_google_news_rss, sense_web_search_trends
+
+        try:
+            sense_google_news_rss(db, tenant_id)
+            sense_web_search_trends(db, tenant_id, limit=20)
+            sense_competitor_content(db, tenant_id, limit=30)
+            run_content_topic_linking_sweep(db, tenant_id)
+            run_candidate_promotion_sweep(db, tenant_id)
+            run_trend_intelligence_sweep(db, tenant_id)
+            run_content_opportunity_generation_sweep(db, tenant_id)
+        except Exception:  # noqa: BLE001 -- the voice sync below must still get a chance to run
+            logger.exception("partner content intelligence: sensing/opportunity stages failed for tenant_id=%s", tenant_id)
+
+        try:
+            generate_authentic_voice_opportunity(db, tenant_id)
+        except Exception:  # noqa: BLE001
+            logger.exception("partner content intelligence: authentic-voice sync failed for tenant_id=%s", tenant_id)
+    except Exception:  # noqa: BLE001 -- one objective's failure must never look like a crash with nothing recorded
+        logger.exception("partner content intelligence failed for tenant_id=%s", tenant_id)
+    finally:
+        db.close()
+
+
 def run_partner_daily_tick_for_tenant(db: Session, tenant_id: int, now: datetime | None = None) -> dict:
     """Checked once an hour, per partner tenant, by the scheduler (main.py). Fires the real
     discovery run(s) (each in its own background thread, same as the manual route -- this
     function itself must return quickly, never block the hourly tick on a multi-minute run)
     exactly once per UTC day, at the tenant's own configured hour.
 
-    TWO INDEPENDENT OBJECTIVES, one shared trigger hour, 2026-09-22 -- firmographic discovery
-    and engagement mining are gated and tracked separately (own enabled flag, own
-    last_run_date), since a tenant could have one configured without the other, but both check
-    the SAME schedule_hour_utc so a partner who wants "both, once a day" gets exactly that. Real
-    correction after engagement mining was found firing every hour with no target: "it should
-    run daily and with a target set."
+    THREE INDEPENDENT OBJECTIVES as of 2026-10-14 (was two). Firmographic discovery and
+    engagement mining are gated and tracked separately (own enabled flag, own last_run_date) but
+    both check the SAME schedule_hour_utc, 2026-09-22, so a partner who wants "both, once a day"
+    gets exactly that. Content intelligence is the THIRD, with its OWN independent
+    content_schedule_hour_utc -- deliberately not gated behind schedule_hour_utc at all, since a
+    tenant can have `content` enabled with no account-discovery config set yet (true for all
+    three of Majji/Nora/Angela as of this writing). Real correction after engagement mining was
+    found firing every hour with no target: "it should run daily and with a target set."
 
     KNOWN LIMITATION, not silently hidden: a discovery run can occasionally hang (confirmed live
     2026-09-16, root cause not yet found) with no watchdog to kill it. A hung run from one day
@@ -331,15 +423,32 @@ def run_partner_daily_tick_for_tenant(db: Session, tenant_id: int, now: datetime
     import threading
 
     config = get_daily_run_config(db, tenant_id)
-    if not config["enabled"] and not config["engagement_mining_enabled"]:
+    if not config["enabled"] and not config["engagement_mining_enabled"] and not config["content_intelligence_enabled"]:
         return {"status": "skipped", "reason": "daily run disabled for this tenant"}
 
     now = now or datetime.now(timezone.utc)
-    if now.hour != config["schedule_hour_utc"]:
-        return {"status": "skipped", "reason": f"not this tenant's scheduled hour ({config['schedule_hour_utc']} UTC)"}
-
     today_str = now.strftime("%Y-%m-%d")
-    result: dict = {"firmographic": None, "engagement": None}
+    result: dict = {"firmographic": None, "engagement": None, "content": None}
+
+    # Firmographic + engagement share schedule_hour_utc -- only check it if either is actually
+    # on, so a content-only tenant (schedule_hour_utc never set) doesn't get blocked by a
+    # None != now.hour comparison below.
+    firmographic_or_engagement_due = now.hour == config["schedule_hour_utc"]
+
+    if config["content_intelligence_enabled"] and now.hour == config["content_schedule_hour_utc"] and config.get("content_last_run_date") != today_str:
+        set_daily_run_config(db, tenant_id, {"content_last_run_date": today_str})
+        thread = threading.Thread(target=run_partner_content_intelligence_now, args=(tenant_id,), daemon=True)
+        thread.start()
+        result["content"] = {"status": "started"}
+    elif config["content_intelligence_enabled"] and config.get("content_last_run_date") == today_str:
+        result["content"] = {"status": "skipped", "reason": "already ran today"}
+    elif config["content_intelligence_enabled"]:
+        result["content"] = {"status": "skipped", "reason": f"not this tenant's scheduled content hour ({config['content_schedule_hour_utc']} UTC)"}
+
+    if not firmographic_or_engagement_due:
+        if result["content"] is None:
+            return {"status": "skipped", "reason": f"not this tenant's scheduled hour ({config['schedule_hour_utc']} UTC)"}
+        return {"status": "started" if "started" in result["content"].get("status", "") else "skipped", **result}
 
     if config["enabled"] and config.get("last_run_date") != today_str:
         title_search = get_daily_run_title_search(db, tenant_id)
@@ -381,6 +490,7 @@ def run_partner_daily_tick_for_tenant(db: Session, tenant_id: int, now: datetime
     elif config["engagement_mining_enabled"]:
         result["engagement"] = {"status": "skipped", "reason": "already ran today"}
 
-    if result["firmographic"] is None and result["engagement"] is None:
+    if result["firmographic"] is None and result["engagement"] is None and result["content"] is None:
         return {"status": "skipped", "reason": "neither objective is enabled for this tenant"}
-    return {"status": "started" if "started" in (result["firmographic"] or {}).get("status", "") or "started" in (result["engagement"] or {}).get("status", "") else "skipped", **result}
+    any_started = any("started" in (result[k] or {}).get("status", "") for k in ("firmographic", "engagement", "content"))
+    return {"status": "started" if any_started else "skipped", **result}
