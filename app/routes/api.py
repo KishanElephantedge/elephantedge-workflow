@@ -6560,6 +6560,42 @@ def admin_update_company(company_id: int, request: Request, body: AdminCompanyUp
     return {"id": company.id, "name": company.name, **{k: getattr(company, k) for k in updates}}
 
 
+class AdminContactImport(BaseModel):
+    first_name: str
+    last_name: str | None = None
+    title: str | None = None
+    linkedin_url: str | None = None
+    email: str | None = None
+
+
+@router.post("/gtm-os/admin/accounts/{company_id}/contacts")
+def admin_add_contact(company_id: int, request: Request, body: AdminContactImport = Body(...),
+                      db: Session = Depends(get_db)):
+    """Manually add a real, human-verified decision-maker to ANY tenant's company -- the only
+    existing contact-import route (/companies/{id}/contacts/import) is hardcoded to Elephant
+    Edge's own tenant only, so a partner's manually-imported company (e.g. Nora Volger's 7
+    companies) had no way to get a contact attached at all. Deliberately keeps MULTIPLE real
+    contacts per company rather than picking one "best" person -- explicit instruction
+    (2026-10-14): "we can keep multiple roles... if they want they can reach out to multiple
+    people or anyone they can choose", matching the platform's standing additive-not-filtering
+    philosophy for signals/leads elsewhere."""
+    _require_admin(request)
+    company = db.get(Company, company_id)
+    if company is None:
+        raise HTTPException(status_code=404, detail="company not found")
+
+    contact = Contact(company_id=company_id, first_name=body.first_name, last_name=body.last_name,
+                      title=body.title, linkedin_url=body.linkedin_url, email=body.email,
+                      email_source="manual" if body.email else None,
+                      matched_title_reasoning="Manually added, not found via Decision Maker search")
+    db.add(contact)
+    company.decision_maker_searched_at = datetime.utcnow()
+    db.commit()
+    db.refresh(contact)
+    return {"id": contact.id, "company_id": company_id, "first_name": contact.first_name,
+           "last_name": contact.last_name, "title": contact.title}
+
+
 @router.post("/gtm-os/admin/accounts/{company_id}/reject")
 def admin_reject_company(company_id: int, request: Request, body: dict = Body(...), db: Session = Depends(get_db)):
     """Hide one company from its tenant's dashboard without deleting it -- for when a human

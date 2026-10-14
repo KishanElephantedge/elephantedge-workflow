@@ -186,3 +186,27 @@ def test_admin_can_patch_a_company_to_fill_in_a_missing_field():
     assert refreshed.linkedin_url == "https://www.linkedin.com/company/patientiq"
     # a field not supplied is left untouched
     assert refreshed.industry == "Hospitals and Health Care"
+
+
+def test_admin_can_add_multiple_contacts_to_a_partner_company():
+    """2026-10-14, Nora Volger: the only existing contact-import route is hardcoded to Elephant
+    Edge's own tenant, so a manually imported partner company had no way to attach a real
+    decision-maker. Explicit instruction: keep MULTIPLE real contacts, not just one "best" pick."""
+    from app.db.session import get_db as _get_db_dep
+    db = next(app.dependency_overrides[_get_db_dep]())
+
+    batch = _batch(db)
+    co = _company(db, batch, "Semble", "Hospitals and Health Care")
+
+    resp1 = client.post(f"/api/gtm-os/admin/accounts/{co.id}/contacts", headers={"X-Tenant-Id": "2"},
+                        json={"first_name": "Tim", "last_name": "Knowles", "title": "Chief Revenue Officer",
+                             "linkedin_url": "https://www.linkedin.com/in/timknowles"})
+    assert resp1.status_code == 200
+
+    resp2 = client.post(f"/api/gtm-os/admin/accounts/{co.id}/contacts", headers={"X-Tenant-Id": "2"},
+                        json={"first_name": "Mikael", "last_name": "Landau", "title": "Co-Founder & CPO"})
+    assert resp2.status_code == 200
+
+    contacts = db.query(Contact).filter(Contact.company_id == co.id).all()
+    assert len(contacts) == 2
+    assert {c.first_name for c in contacts} == {"Tim", "Mikael"}
