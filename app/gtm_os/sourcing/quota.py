@@ -30,7 +30,7 @@ from datetime import datetime, time
 
 from sqlalchemy.orm import Session
 
-from app.gtm_os.plays.lead import GtmLead
+from app.gtm_os.plays.lead import STATE_REJECTED, GtmLead
 
 # Used only when a partner has no explicit target configured. Small on purpose: over-delivering
 # costs money, under-delivering costs a day, and the second is the cheaper mistake to correct.
@@ -80,12 +80,21 @@ def delivered_today(db: Session, tenant_id: int, play: str, now: datetime | None
 
     Counts GtmLead rows rather than companies fetched: a company we fetched but rejected was not
     delivered to the partner, and must not count against their target.
+
+    REAL BUG, found live 2026-10-15: the query below counted EVERY GtmLead row regardless of
+    state, contradicting the sentence above it. A free, after-the-fact reconciliation pass
+    (reconcile_industry_fit/reconcile_firmographic_fit in icp_filters.py, run to clean up
+    wrong-fit companies a crashed discovery run had left live on a partner's dashboard) writes
+    STATE_REJECTED GtmLead rows under this same play name -- cleaning up 25 bad companies for
+    Erin Felton made this function report "25 delivered today" and blocked a same-day real run
+    at $0 spent, with nothing actually delivered. Excluding STATE_REJECTED is what the docstring
+    always promised; this just makes the code do it.
     """
     now = now or datetime.utcnow()
     start = datetime.combine(now.date(), time.min)
     return (db.query(GtmLead)
             .filter(GtmLead.tenant_id == tenant_id, GtmLead.play == play,
-                    GtmLead.created_at >= start)
+                    GtmLead.created_at >= start, GtmLead.state != STATE_REJECTED)
             .count())
 
 

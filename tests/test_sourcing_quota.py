@@ -73,6 +73,20 @@ def test_one_partners_deliveries_do_not_count_against_another(db):
     assert Q.delivered_today(db, PARTNER_B, PLAY) == 0
 
 
+def test_rejected_leads_do_not_count_against_todays_target(db):
+    """REAL BUG, found live 2026-10-15: a free reconciliation pass (icp_filters.py's
+    reconcile_industry_fit/reconcile_firmographic_fit) writes STATE_REJECTED GtmLead rows under
+    this same play name to clean up wrong-fit companies a crashed discovery run left on a
+    partner's dashboard. Rejecting 25 bad companies for Erin Felton made delivered_today() report
+    25 and blocked a same-day real run at $0 spent -- this function's own docstring already
+    promised rejected companies "must not count against their target"; the query just didn't."""
+    _deliver(db, PARTNER_A, 3)
+    db.add(GtmLead(tenant_id=PARTNER_A, play=PLAY, lead_key="company:rejected-1", state="rejected"))
+    db.add(GtmLead(tenant_id=PARTNER_A, play=PLAY, lead_key="company:rejected-2", state="rejected"))
+    db.commit()
+    assert Q.delivered_today(db, PARTNER_A, PLAY) == 3
+
+
 def test_when_the_target_is_met_the_run_buys_nothing(db):
     """The cheapest outcome in the system: a run that costs $0."""
     feature_config.set_config(db, PARTNER_A, "accounts", {"daily_account_target": 5})
