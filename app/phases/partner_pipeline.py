@@ -219,20 +219,39 @@ def enforce_icp_on_companies(db: Session, tenant_id: int, companies: list, icp: 
     # Company rows themselves stayed in the batch regardless, with no field anywhere to mark one
     # rejected. A partner's dashboard (GET /companies) reads Company rows directly by
     # tenant_id/batch_id with no other filter, so every "dropped" company kept showing up in their
-    # real Accounts view as if it had passed. Deleting the actual rejected Company objects
-    # (tracked directly, not re-matched by name) is what makes "dropped" actually mean dropped.
+    # real Accounts view as if it had passed.
     #
-    # Second real bug fix (2026-09-16): deleting here without recording WHY meant the next
-    # discovery run had no memory of it -- Utron/Burro/Vertech, all already proven below
-    # Amdrodd's revenue floor, kept reappearing across repeated Apify runs the same way Docker/
-    # Cytek/FormFactor did on the Jobo side before that got fixed. Same fix, applied here too:
-    # record the domain as rejected before deleting, so _existing_domains() (discovery.py)
-    # excludes it from every future run, not just this one.
+    # Second real bug fix (2026-09-16): recording nothing about WHY meant the next discovery run
+    # had no memory of it -- Utron/Burro/Vertech, all already proven below Amdrodd's revenue
+    # floor, kept reappearing across repeated Apify runs the same way Docker/Cytek/FormFactor did
+    # on the Jobo side before that got fixed. Record the domain as rejected so
+    # _existing_domains() (discovery.py) excludes it from every future run for this tenant.
+    #
+    # Third real bug fix (2026-10-15, found live running Allison Snow's and Erin Felton's first
+    # real discovery batches -- both crashed, zero companies delivered to either partner): this
+    # used to hard-delete the rejected Company row outright. That throws a bare
+    # ForeignKeyViolation and kills the WHOLE batch the instant a rejected company already has a
+    # GtmSignal pointing at it (created moments earlier by this same discovery pass) -- there is
+    # no cascade on gtm_signals.company_id. Worse even when it doesn't crash: deleting discards
+    # the revenue/HQ/headcount data just paid for, so the exact same company gets re-discovered
+    # and re-enriched from scratch for the next partner whose ICP it might actually fit.
+    #
+    # Fixed by reusing the GtmLead STATE_REJECTED pattern the V2 ICP-reconcile backfill already
+    # proved correct (routes/api.py's get_partner_accounts excludes STATE_REJECTED company_ids by
+    # EXISTS subquery, 2026-10-13) instead of inventing a second mechanism: the Company row is
+    # kept -- no delete, no FK violation, no discarded enrichment -- and a GtmLead row marks it
+    # rejected for THIS tenant's ICP so it's hidden from their Accounts view and never re-billed
+    # for them specifically.
+    from app.gtm_os.plays.lead import GtmLead, STATE_REJECTED
     from app.phases.discovery import add_rejected_domain
 
     for c in dropped_companies:
         add_rejected_domain(db, tenant_id, c.domain)
-        db.delete(c)
+        reason = next((r for name, r in dropped if name == c.name), "ICP mismatch")
+        db.add(GtmLead(
+            tenant_id=tenant_id, play="apify_discovery", lead_key=f"company:{c.id}",
+            state=STATE_REJECTED, company_id=c.id, qualifier_reason=reason,
+        ))
     if dropped_companies:
         db.commit()
 

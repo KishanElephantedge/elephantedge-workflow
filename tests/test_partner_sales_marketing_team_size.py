@@ -14,6 +14,10 @@ import pytest
 
 from app.db.models import Batch, Company, Contact, Parameter, Score, Signal
 from app.gtm_os.icp.icp_matching import estimated_sales_and_marketing_team_size_range
+from app.gtm_os.intelligence.signal import GtmSignal
+from app.gtm_os.learning.message_draft import MessageDraft
+from app.gtm_os.opportunity.opportunity import Opportunity
+from app.gtm_os.plays.lead import GtmLead
 from app.phases.partner_pipeline import enforce_icp_on_companies
 
 TENANT = 15  # majji
@@ -22,9 +26,12 @@ TENANT = 15  # majji
 @pytest.fixture
 def db(db_factory):
     # Parameter: the drop path calls add_rejected_domain(), a Parameter-backed exclusion list.
-    # Signal/Score/Contact: Company's cascade="all, delete-orphan" relationships -- db.delete(c)
-    # touches all three regardless of whether any row exists.
-    return db_factory([Company, Batch, Parameter, Signal, Score, Contact])
+    # GtmLead (+ its FK targets GtmSignal/Opportunity/MessageDraft): the drop path marks a
+    # rejected company STATE_REJECTED here instead of deleting it (2026-10-15 fix -- deleting
+    # threw a ForeignKeyViolation whenever a GtmSignal already referenced the company, and
+    # discarded paid-for enrichment on every rejection).
+    return db_factory([Company, Batch, Parameter, Signal, Score, Contact, GtmSignal, Opportunity,
+                       MessageDraft, GtmLead])
 
 
 def _company(db, batch, **kw):
@@ -108,7 +115,11 @@ def test_measured_team_size_outside_band_is_dropped_and_removed(db):
     assert result["kept"] == []
     assert len(result["dropped"]) == 1
     assert "outside configured 2-3" in result["dropped"][0][1]
-    assert db.query(Company).filter(Company.id == c.id).first() is None, "a known violation must be deleted, matching the revenue check's own discipline"
+    # A known violation is kept in the DB (not deleted -- see the module's 2026-10-15 fix note)
+    # and marked rejected via GtmLead so it's hidden from this tenant's view but never re-bought.
+    assert db.query(Company).filter(Company.id == c.id).first() is not None
+    lead = db.query(GtmLead).filter(GtmLead.company_id == c.id).first()
+    assert lead is not None and lead.state == "rejected"
 
 
 def test_measured_team_size_inside_band_is_kept(db):
