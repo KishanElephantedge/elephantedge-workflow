@@ -126,18 +126,14 @@ EMAIL_CAMPAIGNS = Feature(
 )
 
 
-INTERNAL_TASKS = Feature(
-    key="internal_tasks",
-    label="Internal Tasks",
-    description="A simple tracker for what Elephant Edge owes this partner and what the partner "
-                "owes us, each with a deadline. Toggling this on only controls whether the tab "
-                "appears in OUR admin view of this partner's workspace -- it is never shown to "
-                "the partner themselves, enforced at the route layer regardless of this flag.",
-    note="No per-tenant configuration required; rows are added directly in the admin view.",
-)
-
-
-FEATURES: tuple[Feature, ...] = (ACCOUNTS, CONTENT, CRM, WEBINARS, EMAIL_CAMPAIGNS, INTERNAL_TASKS)
+# "internal_tasks" is deliberately NOT a Feature entry here. This registry gates what a PARTNER
+# can see/request (tenants.enabled_features -> their own nav, readiness, RequestAccess) -- the
+# internal tasks tab never goes through any of that (synefi's PartnerApp.jsx's isTabReady()
+# short-circuits it straight to the real page, 2026-10-16, explicit instruction: "this is not
+# their partner task to show that thing so remove that"), and it's reachable by an admin for
+# EVERY partner, not an opt-in per tenant. Registering it here would just be a second, unused
+# on/off switch nobody reads.
+FEATURES: tuple[Feature, ...] = (ACCOUNTS, CONTENT, CRM, WEBINARS, EMAIL_CAMPAIGNS)
 
 
 def get_feature(key: str) -> Feature | None:
