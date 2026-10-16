@@ -126,7 +126,18 @@ EMAIL_CAMPAIGNS = Feature(
 )
 
 
-FEATURES: tuple[Feature, ...] = (ACCOUNTS, CONTENT, CRM, WEBINARS, EMAIL_CAMPAIGNS)
+INTERNAL_TASKS = Feature(
+    key="internal_tasks",
+    label="Internal Tasks",
+    description="A simple tracker for what Elephant Edge owes this partner and what the partner "
+                "owes us, each with a deadline. Toggling this on only controls whether the tab "
+                "appears in OUR admin view of this partner's workspace -- it is never shown to "
+                "the partner themselves, enforced at the route layer regardless of this flag.",
+    note="No per-tenant configuration required; rows are added directly in the admin view.",
+)
+
+
+FEATURES: tuple[Feature, ...] = (ACCOUNTS, CONTENT, CRM, WEBINARS, EMAIL_CAMPAIGNS, INTERNAL_TASKS)
 
 
 def get_feature(key: str) -> Feature | None:

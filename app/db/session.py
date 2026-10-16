@@ -1247,3 +1247,21 @@ def ensure_indexes():
         # longer a manual, easy-to-misapply step -- same fix, same reason, second time this
         # exact mistake has been made.
         conn.execute(text("ALTER TABLE content_opportunities ADD COLUMN IF NOT EXISTS evidence_strength INTEGER"))
+
+        # partner_tasks (2026-10-16) -- internal-only task tracker per partner engagement, see
+        # app/db/models.py's PartnerTask for why this is never exposed through a partner-facing
+        # route.
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS partner_tasks (
+                id SERIAL PRIMARY KEY,
+                tenant_id INTEGER NOT NULL,
+                title VARCHAR NOT NULL,
+                owner VARCHAR NOT NULL,
+                deadline DATE,
+                status VARCHAR NOT NULL DEFAULT 'open',
+                created_by VARCHAR,
+                created_at TIMESTAMP DEFAULT now(),
+                completed_at TIMESTAMP
+            )
+        """))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_partner_tasks_tenant ON partner_tasks (tenant_id)"))

@@ -929,3 +929,32 @@ class EfficiencyActivityEvent(Base):
     source_run_id = Column(Integer, ForeignKey("autonomous_runs.id"), nullable=True)
     event_metadata = Column("metadata", JSON, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
+
+
+OWNER_US = "us"
+OWNER_PARTNER = "partner"
+TASK_STATUS_OPEN = "open"
+TASK_STATUS_DONE = "done"
+
+
+class PartnerTask(Base):
+    """A simple internal task tracker per partner engagement (e.g. "what do we owe Sandy,
+    what does Sandy owe us"), built 2026-10-16 per Majji's request. Deliberately NEVER exposed
+    through a partner-facing route: a partner must never see work being tracked about them.
+    Enforced at the route layer by requiring the gateway's x-internal-user header (see
+    app/routes/api.py's _require_internal_viewer), not by frontend hiding alone -- the gateway
+    sets that header server-side from the logged-in user's real role, the same trust pattern
+    x-tenant-id already uses, so a partner's own login can never reach these routes even
+    against their own tenant_id.
+    """
+    __tablename__ = "partner_tasks"
+
+    id = Column(Integer, primary_key=True)
+    tenant_id = Column(Integer, nullable=False)  # the partner this task is about
+    title = Column(String, nullable=False)
+    owner = Column(String, nullable=False)  # OWNER_US | OWNER_PARTNER -- who is on the hook
+    deadline = Column(Date, nullable=True)
+    status = Column(String, nullable=False, default=TASK_STATUS_OPEN)  # TASK_STATUS_*
+    created_by = Column(String, nullable=True)  # the internal user's email
+    created_at = Column(DateTime, default=datetime.utcnow)
+    completed_at = Column(DateTime, nullable=True)

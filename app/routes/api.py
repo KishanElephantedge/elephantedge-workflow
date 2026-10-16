@@ -6334,6 +6334,115 @@ def _require_admin(request: Request) -> int:
     return tenant_id
 
 
+def _require_internal_viewer(request: Request) -> int:
+    """For routes scoped to a PARTNER's own tenant_id (unlike _require_admin above, which only
+    ever allows Elephant Edge's own tenant) that must still never be reachable by that partner's
+    own login -- e.g. an internal task tracker about them. X-Tenant-Id alone can't express this:
+    it's identical whether the caller is the partner or an internal admin viewing them through
+    /v2/partner-view. x-internal-user is the gateway's own answer to that -- set server-side from
+    the logged-in user's real role (see gateway/app/main.py's proxy()), the same trust pattern
+    x-tenant-id already uses, and stripped from any incoming request before that header is set,
+    so a caller cannot forge it by just adding the header themselves."""
+    if request.headers.get("x-internal-user", "").lower() != "true":
+        raise HTTPException(status_code=404, detail="Not found")
+    return _resolve_tenant_id(request)
+
+
+class PartnerTaskCreate(BaseModel):
+    title: str
+    owner: str  # "us" | "partner"
+    deadline: str | None = None  # ISO date, e.g. "2026-11-01"
+    created_by: str | None = None
+
+
+class PartnerTaskUpdate(BaseModel):
+    title: str | None = None
+    owner: str | None = None
+    deadline: str | None = None
+    status: str | None = None  # "open" | "done"
+
+
+@router.get("/gtm-os/internal/tasks")
+def list_partner_tasks(request: Request, db: Session = Depends(get_db)):
+    """What we owe this partner and what they owe us, each with a deadline -- see PartnerTask's
+    own docstring for why this route is never reachable by the partner's own login."""
+    tenant_id = _require_internal_viewer(request)
+    from app.db.models import PartnerTask
+
+    tasks = (db.query(PartnerTask).filter(PartnerTask.tenant_id == tenant_id)
+             .order_by(PartnerTask.status.asc(), PartnerTask.deadline.asc().nulls_last(), PartnerTask.created_at.desc())
+             .all())
+    return [{
+        "id": t.id, "title": t.title, "owner": t.owner, "status": t.status,
+        "deadline": t.deadline.isoformat() if t.deadline else None,
+        "created_by": t.created_by, "created_at": t.created_at.isoformat() if t.created_at else None,
+        "completed_at": t.completed_at.isoformat() if t.completed_at else None,
+    } for t in tasks]
+
+
+@router.post("/gtm-os/internal/tasks")
+def create_partner_task(request: Request, payload: PartnerTaskCreate, db: Session = Depends(get_db)):
+    tenant_id = _require_internal_viewer(request)
+    from app.db.models import OWNER_PARTNER, OWNER_US, PartnerTask
+
+    if payload.owner not in (OWNER_US, OWNER_PARTNER):
+        raise HTTPException(status_code=400, detail=f"owner must be {OWNER_US!r} or {OWNER_PARTNER!r}")
+    try:
+        deadline = datetime.fromisoformat(payload.deadline).date() if payload.deadline else None
+    except ValueError:
+        raise HTTPException(status_code=400, detail="deadline must be an ISO date, e.g. 2026-11-01")
+
+    task = PartnerTask(tenant_id=tenant_id, title=payload.title.strip(), owner=payload.owner,
+                       deadline=deadline, created_by=payload.created_by)
+    db.add(task)
+    db.commit()
+    db.refresh(task)
+    return {"id": task.id}
+
+
+@router.patch("/gtm-os/internal/tasks/{task_id}")
+def update_partner_task(task_id: int, request: Request, payload: PartnerTaskUpdate, db: Session = Depends(get_db)):
+    tenant_id = _require_internal_viewer(request)
+    from app.db.models import OWNER_PARTNER, OWNER_US, TASK_STATUS_DONE, TASK_STATUS_OPEN, PartnerTask
+
+    task = db.query(PartnerTask).filter(PartnerTask.id == task_id, PartnerTask.tenant_id == tenant_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="task not found")
+
+    if payload.title is not None:
+        task.title = payload.title.strip()
+    if payload.owner is not None:
+        if payload.owner not in (OWNER_US, OWNER_PARTNER):
+            raise HTTPException(status_code=400, detail=f"owner must be {OWNER_US!r} or {OWNER_PARTNER!r}")
+        task.owner = payload.owner
+    if payload.deadline is not None:
+        try:
+            task.deadline = datetime.fromisoformat(payload.deadline).date() if payload.deadline else None
+        except ValueError:
+            raise HTTPException(status_code=400, detail="deadline must be an ISO date, e.g. 2026-11-01")
+    if payload.status is not None:
+        if payload.status not in (TASK_STATUS_OPEN, TASK_STATUS_DONE):
+            raise HTTPException(status_code=400, detail=f"status must be {TASK_STATUS_OPEN!r} or {TASK_STATUS_DONE!r}")
+        task.status = payload.status
+        task.completed_at = datetime.utcnow() if payload.status == TASK_STATUS_DONE else None
+
+    db.commit()
+    return {"id": task.id}
+
+
+@router.delete("/gtm-os/internal/tasks/{task_id}")
+def delete_partner_task(task_id: int, request: Request, db: Session = Depends(get_db)):
+    tenant_id = _require_internal_viewer(request)
+    from app.db.models import PartnerTask
+
+    task = db.query(PartnerTask).filter(PartnerTask.id == task_id, PartnerTask.tenant_id == tenant_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="task not found")
+    db.delete(task)
+    db.commit()
+    return {"deleted": True}
+
+
 @router.delete("/gtm-os/admin/companies")
 def delete_companies_admin(request: Request, body: dict = Body(...), db: Session = Depends(get_db)):
     """Delete specific companies (and their Contact/GtmLead rows) from ANY tenant, by exact ID --
