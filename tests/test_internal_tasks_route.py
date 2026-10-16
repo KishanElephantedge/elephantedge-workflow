@@ -94,16 +94,12 @@ def test_an_invalid_status_is_rejected():
     assert resp.status_code == 400
 
 
-def test_a_task_can_move_through_all_three_statuses():
+def test_a_task_can_be_marked_done_and_reopened():
+    """Only two real stored states (2026-10-16, second same-day redesign: "in progress i dont
+    think so we need") -- Upcoming vs Pending (overdue) is computed client-side from the
+    deadline, not a status anyone sets by hand."""
     task_id = client.post("/api/gtm-os/internal/tasks", headers=ADMIN_HEADERS,
                           json={"title": "Sandy sends her logo files", "owner": "partner"}).json()["id"]
-
-    resp = client.patch(f"/api/gtm-os/internal/tasks/{task_id}", headers=ADMIN_HEADERS,
-                        json={"status": "in_progress"})
-    assert resp.status_code == 200
-    tasks = client.get("/api/gtm-os/internal/tasks", headers=ADMIN_HEADERS).json()
-    assert tasks[0]["status"] == "in_progress"
-    assert tasks[0]["completed_at"] is None
 
     client.patch(f"/api/gtm-os/internal/tasks/{task_id}", headers=ADMIN_HEADERS, json={"status": "completed"})
     tasks = client.get("/api/gtm-os/internal/tasks", headers=ADMIN_HEADERS).json()
@@ -115,6 +111,14 @@ def test_a_task_can_move_through_all_three_statuses():
     tasks = client.get("/api/gtm-os/internal/tasks", headers=ADMIN_HEADERS).json()
     assert tasks[0]["status"] == "pending"
     assert tasks[0]["completed_at"] is None
+
+
+def test_in_progress_is_no_longer_a_valid_status():
+    task_id = client.post("/api/gtm-os/internal/tasks", headers=ADMIN_HEADERS,
+                          json={"title": "x", "owner": "us"}).json()["id"]
+    resp = client.patch(f"/api/gtm-os/internal/tasks/{task_id}", headers=ADMIN_HEADERS,
+                        json={"status": "in_progress"})
+    assert resp.status_code == 400
 
 
 def test_notes_can_be_added_and_cleared():

@@ -1266,9 +1266,12 @@ def ensure_indexes():
             )
         """))
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_partner_tasks_tenant ON partner_tasks (tenant_id)"))
-        # Redesign landed before this table was ever deployed (2026-10-16): open/done -> three
-        # states (pending/in_progress/completed), plus notes. IF NOT EXISTS/idempotent so this
-        # is a no-op on a fresh install and a real upgrade on one that already ran the old DDL.
+        # Redesign landed before this table was ever deployed (2026-10-16): open/done -> pending/
+        # completed (a brief "in_progress" third state came and went same day -- "Upcoming" vs
+        # "Pending" turned out to be a function of deadline vs today, not a state anyone sets by
+        # hand, so it's computed in the frontend instead), plus notes. IF NOT EXISTS/idempotent
+        # so this is a no-op on a fresh install and a real upgrade on one that already ran the
+        # old DDL.
         conn.execute(text("ALTER TABLE partner_tasks ADD COLUMN IF NOT EXISTS notes TEXT"))
-        conn.execute(text("UPDATE partner_tasks SET status = 'pending' WHERE status = 'open'"))
+        conn.execute(text("UPDATE partner_tasks SET status = 'pending' WHERE status IN ('open', 'in_progress')"))
         conn.execute(text("UPDATE partner_tasks SET status = 'completed' WHERE status = 'done'"))

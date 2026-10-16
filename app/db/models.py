@@ -933,15 +933,15 @@ class EfficiencyActivityEvent(Base):
 
 OWNER_US = "us"
 OWNER_PARTNER = "partner"
-# Three states, not two -- the minimum every real task tool (Asana, Trello, Linear, ClickUp)
-# converges on, because "open" collapses "haven't started" and "actively working on it" into
-# one bucket that answers neither "what's stalled" nor "what's actually moving." Renamed from
-# the original open/done pair (2026-10-16, explicit redesign instruction) before this table was
-# ever deployed, so no migration/back-compat concern.
+# Back to two stored states (2026-10-16, second same-day redesign instruction: "in progress i
+# dont think so we need"). What looked like a need for a third state was really a need for
+# "Upcoming" vs "Pending" -- and that's a function of deadline vs today, not a fact anyone sets
+# by hand, so it's computed in the frontend from deadline + status rather than stored here.
+# completed is the only state a person actually sets ("Mark as done"); everything else a task
+# is, is pending.
 TASK_STATUS_PENDING = "pending"
-TASK_STATUS_IN_PROGRESS = "in_progress"
 TASK_STATUS_COMPLETED = "completed"
-TASK_STATUSES = (TASK_STATUS_PENDING, TASK_STATUS_IN_PROGRESS, TASK_STATUS_COMPLETED)
+TASK_STATUSES = (TASK_STATUS_PENDING, TASK_STATUS_COMPLETED)
 
 
 class PartnerTask(Base):
