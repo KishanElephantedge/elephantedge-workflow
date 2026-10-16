@@ -62,7 +62,8 @@ def test_a_partner_login_cannot_create_a_task_either():
 def test_an_internal_admin_can_create_and_list_a_task():
     resp = client.post("/api/gtm-os/internal/tasks", headers=ADMIN_HEADERS,
                        json={"title": "Send Sandy the Q4 deck", "owner": "us",
-                             "deadline": "2026-11-01", "created_by": "majji@elephantedge.ai"})
+                             "deadline": "2026-11-01", "notes": "Wait for Majji's sign-off first",
+                             "created_by": "majji@elephantedge.ai"})
     assert resp.status_code == 200
     task_id = resp.json()["id"]
 
@@ -74,7 +75,8 @@ def test_an_internal_admin_can_create_and_list_a_task():
     assert tasks[0]["title"] == "Send Sandy the Q4 deck"
     assert tasks[0]["owner"] == "us"
     assert tasks[0]["deadline"] == "2026-11-01"
-    assert tasks[0]["status"] == "open"
+    assert tasks[0]["notes"] == "Wait for Majji's sign-off first"
+    assert tasks[0]["status"] == "pending"
     assert tasks[0]["created_by"] == "majji@elephantedge.ai"
 
 
@@ -84,17 +86,47 @@ def test_an_invalid_owner_is_rejected():
     assert resp.status_code == 400
 
 
-def test_marking_a_task_done_sets_completed_at():
+def test_an_invalid_status_is_rejected():
+    task_id = client.post("/api/gtm-os/internal/tasks", headers=ADMIN_HEADERS,
+                          json={"title": "x", "owner": "us"}).json()["id"]
+    resp = client.patch(f"/api/gtm-os/internal/tasks/{task_id}", headers=ADMIN_HEADERS,
+                        json={"status": "done"})  # the old two-state value, no longer valid
+    assert resp.status_code == 400
+
+
+def test_a_task_can_move_through_all_three_statuses():
     task_id = client.post("/api/gtm-os/internal/tasks", headers=ADMIN_HEADERS,
                           json={"title": "Sandy sends her logo files", "owner": "partner"}).json()["id"]
 
     resp = client.patch(f"/api/gtm-os/internal/tasks/{task_id}", headers=ADMIN_HEADERS,
-                        json={"status": "done"})
+                        json={"status": "in_progress"})
     assert resp.status_code == 200
-
     tasks = client.get("/api/gtm-os/internal/tasks", headers=ADMIN_HEADERS).json()
-    assert tasks[0]["status"] == "done"
+    assert tasks[0]["status"] == "in_progress"
+    assert tasks[0]["completed_at"] is None
+
+    client.patch(f"/api/gtm-os/internal/tasks/{task_id}", headers=ADMIN_HEADERS, json={"status": "completed"})
+    tasks = client.get("/api/gtm-os/internal/tasks", headers=ADMIN_HEADERS).json()
+    assert tasks[0]["status"] == "completed"
     assert tasks[0]["completed_at"] is not None
+
+    # Reopening clears completed_at again -- a task un-done is genuinely not done.
+    client.patch(f"/api/gtm-os/internal/tasks/{task_id}", headers=ADMIN_HEADERS, json={"status": "pending"})
+    tasks = client.get("/api/gtm-os/internal/tasks", headers=ADMIN_HEADERS).json()
+    assert tasks[0]["status"] == "pending"
+    assert tasks[0]["completed_at"] is None
+
+
+def test_notes_can_be_added_and_cleared():
+    task_id = client.post("/api/gtm-os/internal/tasks", headers=ADMIN_HEADERS,
+                          json={"title": "x", "owner": "us"}).json()["id"]
+    assert client.get("/api/gtm-os/internal/tasks", headers=ADMIN_HEADERS).json()[0]["notes"] is None
+
+    client.patch(f"/api/gtm-os/internal/tasks/{task_id}", headers=ADMIN_HEADERS, json={"notes": "waiting on legal"})
+    assert client.get("/api/gtm-os/internal/tasks", headers=ADMIN_HEADERS).json()[0]["notes"] == "waiting on legal"
+
+    client.patch(f"/api/gtm-os/internal/tasks/{task_id}", headers=ADMIN_HEADERS, json={"notes": ""})
+    assert client.get("/api/gtm-os/internal/tasks", headers=ADMIN_HEADERS).json()[0]["notes"] is None
 
 
 def test_a_tenants_tasks_never_leak_into_another_tenants_list():

@@ -933,8 +933,15 @@ class EfficiencyActivityEvent(Base):
 
 OWNER_US = "us"
 OWNER_PARTNER = "partner"
-TASK_STATUS_OPEN = "open"
-TASK_STATUS_DONE = "done"
+# Three states, not two -- the minimum every real task tool (Asana, Trello, Linear, ClickUp)
+# converges on, because "open" collapses "haven't started" and "actively working on it" into
+# one bucket that answers neither "what's stalled" nor "what's actually moving." Renamed from
+# the original open/done pair (2026-10-16, explicit redesign instruction) before this table was
+# ever deployed, so no migration/back-compat concern.
+TASK_STATUS_PENDING = "pending"
+TASK_STATUS_IN_PROGRESS = "in_progress"
+TASK_STATUS_COMPLETED = "completed"
+TASK_STATUSES = (TASK_STATUS_PENDING, TASK_STATUS_IN_PROGRESS, TASK_STATUS_COMPLETED)
 
 
 class PartnerTask(Base):
@@ -954,7 +961,8 @@ class PartnerTask(Base):
     title = Column(String, nullable=False)
     owner = Column(String, nullable=False)  # OWNER_US | OWNER_PARTNER -- who is on the hook
     deadline = Column(Date, nullable=True)
-    status = Column(String, nullable=False, default=TASK_STATUS_OPEN)  # TASK_STATUS_*
+    status = Column(String, nullable=False, default=TASK_STATUS_PENDING)  # TASK_STATUS_*
+    notes = Column(Text, nullable=True)  # free-text detail, shown collapsed under the title
     created_by = Column(String, nullable=True)  # the internal user's email
     created_at = Column(DateTime, default=datetime.utcnow)
     completed_at = Column(DateTime, nullable=True)

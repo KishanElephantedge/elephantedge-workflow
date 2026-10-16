@@ -6352,6 +6352,7 @@ class PartnerTaskCreate(BaseModel):
     title: str
     owner: str  # "us" | "partner"
     deadline: str | None = None  # ISO date, e.g. "2026-11-01"
+    notes: str | None = None
     created_by: str | None = None
 
 
@@ -6359,7 +6360,18 @@ class PartnerTaskUpdate(BaseModel):
     title: str | None = None
     owner: str | None = None
     deadline: str | None = None
-    status: str | None = None  # "open" | "done"
+    notes: str | None = None
+    status: str | None = None  # TASK_STATUSES
+
+
+def _serialize_task(t) -> dict:
+    return {
+        "id": t.id, "title": t.title, "owner": t.owner, "status": t.status,
+        "deadline": t.deadline.isoformat() if t.deadline else None,
+        "notes": t.notes,
+        "created_by": t.created_by, "created_at": t.created_at.isoformat() if t.created_at else None,
+        "completed_at": t.completed_at.isoformat() if t.completed_at else None,
+    }
 
 
 @router.get("/gtm-os/internal/tasks")
@@ -6372,12 +6384,7 @@ def list_partner_tasks(request: Request, db: Session = Depends(get_db)):
     tasks = (db.query(PartnerTask).filter(PartnerTask.tenant_id == tenant_id)
              .order_by(PartnerTask.status.asc(), PartnerTask.deadline.asc().nulls_last(), PartnerTask.created_at.desc())
              .all())
-    return [{
-        "id": t.id, "title": t.title, "owner": t.owner, "status": t.status,
-        "deadline": t.deadline.isoformat() if t.deadline else None,
-        "created_by": t.created_by, "created_at": t.created_at.isoformat() if t.created_at else None,
-        "completed_at": t.completed_at.isoformat() if t.completed_at else None,
-    } for t in tasks]
+    return [_serialize_task(t) for t in tasks]
 
 
 @router.post("/gtm-os/internal/tasks")
@@ -6393,17 +6400,18 @@ def create_partner_task(request: Request, payload: PartnerTaskCreate, db: Sessio
         raise HTTPException(status_code=400, detail="deadline must be an ISO date, e.g. 2026-11-01")
 
     task = PartnerTask(tenant_id=tenant_id, title=payload.title.strip(), owner=payload.owner,
-                       deadline=deadline, created_by=payload.created_by)
+                       deadline=deadline, notes=(payload.notes or "").strip() or None,
+                       created_by=payload.created_by)
     db.add(task)
     db.commit()
     db.refresh(task)
-    return {"id": task.id}
+    return _serialize_task(task)
 
 
 @router.patch("/gtm-os/internal/tasks/{task_id}")
 def update_partner_task(task_id: int, request: Request, payload: PartnerTaskUpdate, db: Session = Depends(get_db)):
     tenant_id = _require_internal_viewer(request)
-    from app.db.models import OWNER_PARTNER, OWNER_US, TASK_STATUS_DONE, TASK_STATUS_OPEN, PartnerTask
+    from app.db.models import OWNER_PARTNER, OWNER_US, TASK_STATUS_COMPLETED, TASK_STATUSES, PartnerTask
 
     task = db.query(PartnerTask).filter(PartnerTask.id == task_id, PartnerTask.tenant_id == tenant_id).first()
     if not task:
@@ -6420,14 +6428,16 @@ def update_partner_task(task_id: int, request: Request, payload: PartnerTaskUpda
             task.deadline = datetime.fromisoformat(payload.deadline).date() if payload.deadline else None
         except ValueError:
             raise HTTPException(status_code=400, detail="deadline must be an ISO date, e.g. 2026-11-01")
+    if payload.notes is not None:
+        task.notes = payload.notes.strip() or None
     if payload.status is not None:
-        if payload.status not in (TASK_STATUS_OPEN, TASK_STATUS_DONE):
-            raise HTTPException(status_code=400, detail=f"status must be {TASK_STATUS_OPEN!r} or {TASK_STATUS_DONE!r}")
+        if payload.status not in TASK_STATUSES:
+            raise HTTPException(status_code=400, detail=f"status must be one of {TASK_STATUSES!r}")
         task.status = payload.status
-        task.completed_at = datetime.utcnow() if payload.status == TASK_STATUS_DONE else None
+        task.completed_at = datetime.utcnow() if payload.status == TASK_STATUS_COMPLETED else None
 
     db.commit()
-    return {"id": task.id}
+    return _serialize_task(task)
 
 
 @router.delete("/gtm-os/internal/tasks/{task_id}")
