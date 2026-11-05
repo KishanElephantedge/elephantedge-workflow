@@ -6,6 +6,7 @@ psycopg[binary]
 pydantic-settings
 python-dotenv
 httpx
+python-multipart
 APScheduler
 redis
 dnspython
