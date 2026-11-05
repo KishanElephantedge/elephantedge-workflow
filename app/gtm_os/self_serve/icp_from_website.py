@@ -227,6 +227,18 @@ size (not the customer industries you're inferring -- that still comes from the 
 positioning).
 """
 
+EMPLOYEE_SIZE_SEARCH_PROMPT = """Search the web for the real, current employee headcount of the
+company at this website: {url}
+
+Look on their LinkedIn company page, Crunchbase, news coverage, or any other reliable current
+source. A very early-stage startup genuinely may have no public employee count anywhere -- if
+you can't find one, say so honestly rather than guessing a number.
+
+Return JSON exactly:
+{{"found": true|false,
+  "employee_min": <int|null>, "employee_max": <int|null>,
+  "source_note": "<where you found this, e.g. 'LinkedIn: 11-50 employees', or why you couldn't>"}}"""
+
 
 def infer_icp_from_website(db: Session, tenant_id: int, url: str) -> dict:
     """The full pipeline: fetch -> (free LinkedIn lookup, if the page links to one) -> infer.
@@ -284,6 +296,27 @@ def infer_icp_from_website(db: Session, tenant_id: int, url: str) -> dict:
     # companies (see company_profile_check.py's own profile_rejection_reason comment).
     if linkedin_profile and linkedin_profile.get("size_band") and result.get("employee_min") is None:
         result["employee_min"], result["employee_max"] = linkedin_profile["size_band"]
+
+    # LAST RESORT: a real web search (not a direct LinkedIn scrape, which is blocked -- see
+    # call_gemini's own docstring), the same mechanism behind the user's own manual Google AI
+    # Mode test. Only runs when every earlier signal (website text, LinkedIn scrape) came back
+    # with nothing -- it costs real money (~$0.035/request, Google's grounding fee, separate
+    # from normal token cost) and a genuinely early-stage company with no public headcount
+    # anywhere should still come back null rather than loop forever trying to find one.
+    if result.get("employee_min") is None:
+        try:
+            from app.gemini_client import GeminiError, call_gemini_json
+
+            search_prompt = EMPLOYEE_SIZE_SEARCH_PROMPT.format(url=url)
+            search_result = call_gemini_json(search_prompt, db, tenant_id, max_tokens=500, use_search=True)
+            if search_result.get("found") and search_result.get("employee_min") is not None:
+                result["employee_min"] = search_result["employee_min"]
+                result["employee_max"] = search_result.get("employee_max")
+                result["employee_size_source"] = search_result.get("source_note")
+        except GeminiError as e:
+            logger.info("self-serve employee-size web search skipped for %s: %s", url, e)
+        except Exception as e:  # noqa: BLE001 -- a bonus lookup must never break the main result
+            logger.warning("self-serve employee-size web search failed for %s: %s", url, e)
 
     result["source_url"] = url
     result["page_text_chars"] = len(page_text)

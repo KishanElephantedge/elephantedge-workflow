@@ -98,10 +98,28 @@ def _get_api_key(db: Session, tenant_id: int) -> str:
     raise GeminiError("gemini_api_key credential is not set for this tenant")
 
 
-def call_gemini(prompt: str, db: Session, tenant_id: int, max_tokens: int = 2000, model: str = DEFAULT_MODEL) -> str:
+# "Grounding with Google Search" (use_search=True below) is a SEPARATELY billed Gemini API
+# feature, not covered by the per-token cost_usd this module already logs -- Google's own
+# published rate is $35 per 1000 grounded requests ($0.035/request) beyond a small free daily
+# allowance. Logged here so a caller's own spend tracking (if any) can account for it; not
+# enforced as a budget cap anywhere in this client, same as the rest of this file's cost
+# logging is observational, not gating.
+GROUNDING_COST_PER_REQUEST_USD = 0.035
+
+
+def call_gemini(prompt: str, db: Session, tenant_id: int, max_tokens: int = 2000, model: str = DEFAULT_MODEL,
+                use_search: bool = False) -> str:
     """Single-turn call, returns the text of Gemini's response. Raises GeminiError on any
     non-2xx response, missing credential, or malformed output -- app/llm_client.py catches
-    this and falls back to Claude."""
+    this and falls back to Claude.
+
+    use_search=True enables Gemini's native "Grounding with Google Search" tool -- the model
+    issues real web searches and grounds its answer in live results, the same mechanism behind
+    Google Search's own "AI Mode". Added 2026-11-05 for the self-serve ICP's employee-count
+    lookup: a direct unauthenticated LinkedIn page fetch (company_profile_check.py) is blocked
+    by LinkedIn's own anti-bot measures (confirmed live, even for Stripe's page, from this
+    backend's own production IP) -- a real web search is a different request path LinkedIn
+    doesn't block the same way, and is what the user's own manual Google AI Mode test used."""
     if model in THINKING_MODELS:
         max_tokens = max(max_tokens, THINKING_MIN_MAX_TOKENS)
     api_key = _get_api_key(db, tenant_id)
@@ -112,6 +130,8 @@ def call_gemini(prompt: str, db: Session, tenant_id: int, max_tokens: int = 2000
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {"maxOutputTokens": max_tokens},
     }
+    if use_search:
+        payload["tools"] = [{"google_search": {}}]
     response = httpx.post(url, params=params, headers=headers, json=payload, timeout=60)
     # 503/500 are Gemini being transiently overloaded, not a quota wall or a bad request. Without a
     # retry a single blip fails the calling stage outright -- and with Anthropic out of credit there
@@ -133,9 +153,11 @@ def call_gemini(prompt: str, db: Session, tenant_id: int, max_tokens: int = 2000
     input_tokens = usage.get("promptTokenCount", 0)
     output_tokens = usage.get("candidatesTokenCount", 0)
     cost_usd = (input_tokens / 1_000_000 * INPUT_COST_PER_MTOK_USD) + (output_tokens / 1_000_000 * OUTPUT_COST_PER_MTOK_USD)
+    if use_search:
+        cost_usd += GROUNDING_COST_PER_REQUEST_USD
     logger.warning(
-        "gemini_client call: model=%s input_tokens=%d output_tokens=%d cost_usd=%.5f",
-        model, input_tokens, output_tokens, cost_usd,
+        "gemini_client call: model=%s input_tokens=%d output_tokens=%d cost_usd=%.5f use_search=%s",
+        model, input_tokens, output_tokens, cost_usd, use_search,
     )
 
     candidates = data.get("candidates", [])
@@ -148,11 +170,17 @@ def call_gemini(prompt: str, db: Session, tenant_id: int, max_tokens: int = 2000
     return text
 
 
-def call_gemini_json(prompt: str, db: Session, tenant_id: int, max_tokens: int = 2000, model: str = DEFAULT_MODEL) -> dict:
+def call_gemini_json(prompt: str, db: Session, tenant_id: int, max_tokens: int = 2000, model: str = DEFAULT_MODEL,
+                     use_search: bool = False) -> dict:
     """Same as call_gemini, but parses the response as JSON. Gemini tends to return clean
     JSON without markdown fences (confirmed in testing), but this strips them defensively
-    anyway, matching claude_client.call_claude_json's behavior."""
-    text = call_gemini(prompt, db, tenant_id, max_tokens=max_tokens, model=model)
+    anyway, matching claude_client.call_claude_json's behavior.
+
+    use_search=True: see call_gemini's own docstring. Note grounded responses are LESS reliable
+    about returning clean JSON (the model sometimes narrates its search before answering), so a
+    caller using this should expect occasional GeminiError here and treat it as "couldn't
+    determine," not retry blindly."""
+    text = call_gemini(prompt, db, tenant_id, max_tokens=max_tokens, model=model, use_search=use_search)
     cleaned = text.strip()
     if cleaned.startswith("```"):
         # Close on the NEXT fence, not the end of the string, and decode with raw_decode so any
