@@ -255,6 +255,7 @@ DEEPLINE_TOOL_COST_USD = {
     # given call used. Self-serve's single-page JS-rendering fallback (icp_from_website.py) is the
     # only caller today.
     "firecrawl_batch_scrape": lambda p: 0.01 * len(p.get("urls") or [1]),
+    "firecrawl_get_batch_scrape_status": lambda p: 0.0,  # free (Deepline's own pricing block) -- a poll, not a new scrape
 }
 
 
