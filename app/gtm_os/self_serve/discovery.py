@@ -108,19 +108,23 @@ def search_companies_only(db: Session, icp: dict, limit: int = DEFAULT_RESULT_LI
     if not provider_order:
         provider_order = ["crustdata-v3", "icypeas"]
 
+    # Over-fetch a bit beyond `limit` so the LLM industry-fit pass below (which rejects real
+    # mismatches) still leaves close to `limit` good rows rather than under-delivering.
+    fetch_size = max(limit * 3, 15)
+
     with spend_scope(db, BILLING_TENANT_ID, f"self_serve:company_search", run_cap_usd=run_cap_usd) as scope:
         for provider in provider_order:
             try:
                 if provider == "icypeas":
                     filters = icypeas_filters_for_icp(icp, db=db, tenant_id=BILLING_TENANT_ID)
                     response = execute_tool("icypeas_find_companies",
-                                            {"query": filters, "pagination": {"size": max(limit * 2, 10)}})
+                                            {"query": filters, "pagination": {"size": fetch_size}})
                     raw = (response.get("toolResponse") or {}).get("raw") or {}
                     rows = raw.get("leads") or []
                 else:
                     filters, _structured = crustdata_filters_for_icp(icp, db=db, tenant_id=BILLING_TENANT_ID)
                     response = execute_tool("crustdata_v3_company_search",
-                                            {"filters": filters, "limit": max(limit * 2, 10),
+                                            {"filters": filters, "limit": fetch_size,
                                              "fields": ["basic_info", "headcount", "revenue", "locations",
                                                        "funding", "taxonomy"]})
                     raw = (response.get("toolResponse") or {}).get("raw") or {}
@@ -133,7 +137,7 @@ def search_companies_only(db: Session, icp: dict, limit: int = DEFAULT_RESULT_LI
                 result["stopped"] = f"{provider}: search failed ({e})"
                 continue
 
-            companies = []
+            candidates = []
             for co in rows:
                 name = co.get("name") or ""
                 industry = co.get("industry")
@@ -148,16 +152,37 @@ def search_companies_only(db: Session, icp: dict, limit: int = DEFAULT_RESULT_LI
                     continue
                 if _looks_like_a_vendor(name) or _looks_like_government_or_education(name, industry):
                     continue
-                companies.append({
+                candidates.append({
                     "name": name,
                     "domain": co.get("website"),
                     "industry": industry,
+                    "description": co.get("description"),
                     "employee_count": co.get("numberOfEmployees"),
                     "location": co.get("address"),
                     "linkedin_url": co.get("url") or None,
                 })
-                if len(companies) >= limit:
-                    break
+
+            # REAL FIX, 2026-11-05: a taxonomy/keyword match on a niche industry phrase (e.g.
+            # "credit unions, banks", which has no clean taxonomy value in either provider)
+            # still let real mismatches through -- Fiem Industries (Motor Vehicle Manufacturing),
+            # International Diamond Services (Oil and Gas) -- confirmed live even after the
+            # NON_BUYER_INDUSTRIES fix above, which only catches vendor/agency categories, not
+            # "genuinely the wrong industry." Same discipline icp_filters.py's search_crustdata
+            # already uses for exactly this (verify_industry_fit_with_llm's own docstring:
+            # "the keyword match itself is the weak signal, no amount of checking rows after
+            # catches this") -- reused here rather than re-invented. Fails open on any judgment
+            # outage (missing index = kept), never blocks a real run.
+            industry_terms = icp.get("industries") or []
+            if candidates and industry_terms:
+                try:
+                    from app.gtm_os.sourcing.verification import verify_industry_fit_with_llm
+
+                    verdicts = verify_industry_fit_with_llm(db, candidates, industry_terms, notes=icp.get("notes"))
+                    candidates = [c for i, c in enumerate(candidates) if verdicts.get(i, True) is not False]
+                except Exception as e:  # noqa: BLE001 -- a judgment outage must never block a real run
+                    logger.warning("self-serve industry-fit judgment skipped: %s: %s", type(e).__name__, e)
+
+            companies = [{k: v for k, v in c.items() if k != "description"} for c in candidates[:limit]]
 
             if companies:
                 result["companies"] = companies
