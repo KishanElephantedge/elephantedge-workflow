@@ -2,15 +2,25 @@
 website, we figure out who THEY sell to, then run real discovery against that -- no dashboard,
 no login, immediate "here are 10 companies you could reach out to."
 
-WHY A SYNCHRONOUS SINGLE-PAGE FETCH, NOT A MULTI-PAGE CRAWL. Researched how comparable tools do
-this (SignalizeAI, Paminga's aiDiscoverIcps, a public n8n Firecrawl+Gemini workflow) -- the
-common pattern is a few pages (home + product/about), not a deep crawl. But Majji's own stated
-requirement is "within a minute," and Deepline's firecrawl_crawl is an ASYNC job (start, then
-poll for completion) -- too slow for a one-shot landing-page experience. Confirmed on a real test
-case first (2026-11-04): MetriFi's own homepage alone states "For credit unions and banks" in
-plain text -- the single page a visitor already has open is usually enough signal. Falls back to
-Deepline's firecrawl tools later if single-page proves insufficient on more test cases; not
-built speculatively for a problem not yet confirmed live.
+TWO-TIER FETCH, 2026-11-05 (real bug found testing against elephantedge.ai itself, the user's
+own explicit instruction: "run this website in this feature, and see whether that is parsing the
+ICP correctly"). The original single httpx GET worked on MetriFi (server-rendered, 4851 real
+chars) but returned only 118 chars for elephantedge.ai -- just the <title> tag and a stray dev
+placeholder comment ("Add Property > HTML tag method..."), because the real homepage is a JS-
+rendered SPA. The LLM correctly reported low confidence and empty industries on that input --
+not an inference bug, a fetch bug: the real content (an explicit "Industries We Champion" section
+naming AI & SaaS, Cybersecurity, E-Commerce, Manufacturing, Supply Chain & Logistics -- confirmed
+against company-understanding.md's independently-researched ground truth) was never fetched.
+JS-rendered marketing sites (Next.js/Framer/Webflow-with-JS) are common, not a one-off edge case,
+so this can't stay a hard failure routed straight to the template-upload fallback.
+
+Tier 1 (httpx, free, instant) is tried first and used as-is for any genuinely content-bearing
+page. Tier 2 (Deepline's firecrawl_batch_scrape, real but cheap -- ~$0.01/page, see
+deepline_client.py's DEEPLINE_TOOL_COST_USD -- real browser rendering, ~20-50s) fires only when
+tier 1 looks too thin to be real content, confirmed live to pull the actual JS-rendered page.
+MIN_REAL_TEXT_CHARS is deliberately much higher than the old 100-char floor -- 118 chars (a title
+plus one stray sentence) slipped through that threshold and produced a confident-looking but
+empty ICP instead of triggering the fallback that would have gotten the real content.
 
 GROUNDING DISCIPLINE, same as app/phases/partner_icp.py's PARSE_PROMPT: every field is either
 genuinely stated/implied by the fetched text, or null -- never a guessed industry or revenue
@@ -24,6 +34,7 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 
 import httpx
 from sqlalchemy.orm import Session
@@ -38,19 +49,23 @@ _UA = {
 }
 _TIMEOUT_SECONDS = 15
 _MAX_TEXT_CHARS = 8000  # plenty for a homepage; keeps the LLM prompt small and cheap
+# Below this, a page is treated as "likely JS-rendered, not real content" and falls to Firecrawl
+# rather than being handed to the LLM as-is. A title tag alone (elephantedge.ai: 118 chars) must
+# fail this check; a real, if terse, homepage (MetriFi: 4851 chars) must pass it comfortably.
+MIN_REAL_TEXT_CHARS = 400
+_FIRECRAWL_POLL_SECONDS = 3
+_FIRECRAWL_TIMEOUT_SECONDS = 50
 
 
 class WebsiteFetchError(Exception):
     pass
 
 
-def fetch_homepage_text(url: str) -> str:
-    """Fetches the given URL and strips it down to visible text. Raises WebsiteFetchError on
-    any real failure (unreachable, non-HTML, blocked) -- the caller decides how to surface that
-    to the visitor; this never silently returns empty text pretending it succeeded."""
-    if not re.match(r"^https?://", url, re.I):
-        url = f"https://{url}"
-
+def _fetch_homepage_text_httpx(url: str) -> str:
+    """Tier 1: free, instant, works for any server-rendered page. Returns '' (never raises) when
+    the page looks too thin to be real content -- the caller decides whether to escalate to
+    Firecrawl or treat it as a hard failure; raises WebsiteFetchError only for a genuine fetch
+    failure (unreachable, non-HTML, blocked), which Firecrawl is equally unlikely to recover from."""
     try:
         resp = httpx.get(url, headers=_UA, timeout=_TIMEOUT_SECONDS, follow_redirects=True)
         resp.raise_for_status()
@@ -68,11 +83,70 @@ def fetch_homepage_text(url: str) -> str:
     text = re.sub(r"<[^>]+>", " ", html)
     text = re.sub(r"&nbsp;|&amp;|&#39;|&quot;", " ", text)
     text = re.sub(r"\s+", " ", text).strip()
+    return text
 
-    if len(text) < 100:
-        raise WebsiteFetchError(f"{url} returned almost no visible text ({len(text)} chars) -- likely JS-rendered")
 
-    return text[:_MAX_TEXT_CHARS]
+def _fetch_homepage_markdown_firecrawl(url: str) -> str:
+    """Tier 2: real browser rendering via Deepline's firecrawl_batch_scrape, for pages tier 1
+    can't read. Genuinely async (confirmed live, 2026-11-05 -- defaultExecutionMode: 'sync' in
+    its own schema does NOT mean execute_tool blocks until done; the start call returns
+    status:'queued' immediately) -- polls firecrawl_get_batch_scrape_status (free) until the
+    response's `raw` becomes a populated list (done) or a dict with status:'failed', or until
+    _FIRECRAWL_TIMEOUT_SECONDS runs out. Raises WebsiteFetchError in every failure/timeout case."""
+    from app.deepline_client import DeeplineError, DeeplineSpendBlocked, execute_tool
+
+    try:
+        start = execute_tool("firecrawl_batch_scrape", {"urls": [url]})
+    except (DeeplineSpendBlocked, DeeplineError) as e:
+        raise WebsiteFetchError(f"firecrawl could not start for {url}: {e}") from e
+
+    job_id = ((start.get("toolResponse") or {}).get("raw") or {}).get("id")
+    if not job_id:
+        raise WebsiteFetchError(f"firecrawl did not return a job id for {url}")
+
+    deadline = time.monotonic() + _FIRECRAWL_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        time.sleep(_FIRECRAWL_POLL_SECONDS)
+        try:
+            poll = execute_tool("firecrawl_get_batch_scrape_status", {"id": job_id})
+        except (DeeplineSpendBlocked, DeeplineError) as e:
+            raise WebsiteFetchError(f"firecrawl status check failed for {url}: {e}") from e
+        raw = (poll.get("toolResponse") or {}).get("raw")
+        if isinstance(raw, list):
+            if not raw:
+                raise WebsiteFetchError(f"firecrawl returned no pages for {url}")
+            markdown = raw[0].get("markdown") or ""
+            if not markdown.strip():
+                raise WebsiteFetchError(f"firecrawl rendered {url} but returned no text content")
+            return markdown
+        if isinstance(raw, dict) and raw.get("status") == "failed":
+            raise WebsiteFetchError(f"firecrawl job failed for {url}")
+        # otherwise still queued/scraping -- keep polling
+
+    raise WebsiteFetchError(f"firecrawl timed out rendering {url} after {_FIRECRAWL_TIMEOUT_SECONDS}s")
+
+
+def fetch_homepage_text(url: str) -> str:
+    """Fetches the given URL and returns its real text content, trying the fast free path first
+    and only escalating to real browser rendering when that path looks too thin to be genuine
+    content. Raises WebsiteFetchError only when NEITHER tier produces real content -- the caller
+    (the /self-serve/infer-icp route) decides how to surface that to the visitor, typically by
+    routing them to the template-upload fallback."""
+    if not re.match(r"^https?://", url, re.I):
+        url = f"https://{url}"
+
+    text = _fetch_homepage_text_httpx(url)
+    if len(text) >= MIN_REAL_TEXT_CHARS:
+        return text[:_MAX_TEXT_CHARS]
+
+    logger.info("fetch_homepage_text: tier 1 got only %d chars for %s, escalating to firecrawl",
+               len(text), url)
+    markdown = _fetch_homepage_markdown_firecrawl(url)
+    if len(markdown) < MIN_REAL_TEXT_CHARS:
+        raise WebsiteFetchError(
+            f"{url} returned too little real content even after rendering "
+            f"({len(markdown)} chars) -- likely blocked or genuinely empty")
+    return markdown[:_MAX_TEXT_CHARS]
 
 
 INFER_PROMPT = """You are looking at the homepage text of a real company's website. Your job has
