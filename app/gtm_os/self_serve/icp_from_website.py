@@ -232,12 +232,49 @@ company at this website: {url}
 
 Look on their LinkedIn company page, Crunchbase, news coverage, or any other reliable current
 source. A very early-stage startup genuinely may have no public employee count anywhere -- if
-you can't find one, say so honestly rather than guessing a number.
+you can't find one, say so honestly rather than guessing a number. State the number or range
+plainly, and name which source(s) it came from."""
+
+_EMPLOYEE_SIZE_PARSE_PROMPT = """A research assistant was asked to find a company's real employee
+headcount via web search. Here is their raw answer:
+
+{search_answer}
+
+Parse this into a single usable range. If multiple sources disagree, use the range that covers
+the most plausible cluster of values (ignore a single wild outlier). If the answer says it
+couldn't find any public headcount, found is false.
 
 Return JSON exactly:
-{{"found": true|false,
-  "employee_min": <int|null>, "employee_max": <int|null>,
-  "source_note": "<where you found this, e.g. 'LinkedIn: 11-50 employees', or why you couldn't>"}}"""
+{{"found": true|false, "employee_min": <int|null>, "employee_max": <int|null>,
+  "source_note": "<one short phrase on where this came from>"}}"""
+
+
+def search_employee_size_via_claude(db: Session, tenant_id: int, url: str) -> dict | None:
+    """Two calls: (1) Claude's native web_search tool does the actual research (real queries,
+    real sources -- confirmed live against Ramp: a believable multi-source clustered range), then
+    (2) a cheap, search-free follow-up parses that prose answer into a clean {employee_min,
+    employee_max} -- more reliable than asking the search call itself to also hit a strict JSON
+    shape, which tends to narrate its research instead. Returns None (never raises) on any
+    failure; this is a bonus lookup, not a required step."""
+    from app.claude_client import ClaudeError, call_claude_messages
+    from app.llm_client import generate_json
+
+    try:
+        response = call_claude_messages(
+            messages=[{"role": "user", "content": EMPLOYEE_SIZE_SEARCH_PROMPT.format(url=url)}],
+            db=db, tenant_id=tenant_id,
+            tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 3}],
+            max_tokens=1000,
+        )
+        search_answer = "\n".join(
+            block.get("text", "") for block in response.get("content", []) if block.get("type") == "text")
+        if not search_answer.strip():
+            return None
+        return generate_json(_EMPLOYEE_SIZE_PARSE_PROMPT.format(search_answer=search_answer), db, tenant_id,
+                             max_tokens=300)
+    except ClaudeError as e:
+        logger.info("self-serve employee-size Claude web search skipped for %s: %s", url, e)
+        return None
 
 
 def infer_icp_from_website(db: Session, tenant_id: int, url: str) -> dict:
@@ -297,25 +334,23 @@ def infer_icp_from_website(db: Session, tenant_id: int, url: str) -> dict:
     if linkedin_profile and linkedin_profile.get("size_band") and result.get("employee_min") is None:
         result["employee_min"], result["employee_max"] = linkedin_profile["size_band"]
 
-    # LAST RESORT: a real web search (not a direct LinkedIn scrape, which is blocked -- see
-    # call_gemini's own docstring), the same mechanism behind the user's own manual Google AI
-    # Mode test. Only runs when every earlier signal (website text, LinkedIn scrape) came back
-    # with nothing -- it costs real money (~$0.035/request, Google's grounding fee, separate
-    # from normal token cost) and a genuinely early-stage company with no public headcount
-    # anywhere should still come back null rather than loop forever trying to find one.
+    # LAST RESORT: a real web search. Gemini's native "Grounding with Google Search" was tried
+    # first (2026-11-05) but confirmed, with two different API keys, to be gated behind a Google
+    # Cloud billing setting neither key has -- same 429 with or without search, isolating it as
+    # a plan/billing block, not a quota or retry problem. Elephant Edge has real Anthropic
+    # credit, so this uses Claude's own native web_search tool instead -- confirmed live (Ramp:
+    # real multi-source search, a believable clustered range) before being wired in here. Only
+    # runs when every earlier signal (website text, LinkedIn scrape) came back with nothing -- it
+    # costs real money (web_search is ~$0.01/search plus normal token cost, and this prompt lets
+    # the model run a few), and a genuinely early-stage company with no public headcount anywhere
+    # should still come back null rather than loop forever trying to find one.
     if result.get("employee_min") is None:
         try:
-            from app.gemini_client import GeminiError
-            from app.llm_client import generate_json_with_search
-
-            search_prompt = EMPLOYEE_SIZE_SEARCH_PROMPT.format(url=url)
-            search_result = generate_json_with_search(search_prompt, db, tenant_id, max_tokens=500)
-            if search_result.get("found") and search_result.get("employee_min") is not None:
+            search_result = search_employee_size_via_claude(db, tenant_id, url)
+            if search_result and search_result.get("found") and search_result.get("employee_min") is not None:
                 result["employee_min"] = search_result["employee_min"]
                 result["employee_max"] = search_result.get("employee_max")
                 result["employee_size_source"] = search_result.get("source_note")
-        except GeminiError as e:
-            logger.info("self-serve employee-size web search skipped for %s: %s", url, e)
         except Exception as e:  # noqa: BLE001 -- a bonus lookup must never break the main result
             logger.warning("self-serve employee-size web search failed for %s: %s", url, e)
 
