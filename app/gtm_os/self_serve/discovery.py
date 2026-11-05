@@ -1,44 +1,49 @@
 """Runs the self-serve landing page's actual discovery step (2026-11-05, Majji's request): take
 a visitor's inferred-or-uploaded ICP, find them up to 10 real companies to reach out to.
 
-DELIBERATELY NOT A NEW PIPELINE. A real partner (Sandy, Nora, Majji, Angela) already gets
-exactly this -- their own stored ICP, routed across whichever provider (Icypeas, Crustdata-v3)
-actually covers it, qualified by an LLM, capped by a daily quota -- via
-app/gtm_os/plays/icp_filters.py's run_icp_filters(). A visitor on this page is not a different
-kind of search, just a one-off, anonymous partner. So this module's whole job is: give that
-visitor a real (if throwaway) Tenant row, write their ICP into the SAME Parameter row a real
-partner's ICP lives in, and call the SAME run_icp_filters(). No new discovery code, no
-Crustdata-only shortcut -- whatever provider the router picks for a real partner with this ICP
-shape is exactly what a visitor gets too.
+COMPANIES ONLY -- explicit correction, 2026-11-05 (the user: "here we fetch only accounts the
+companies... don't fetch the decision makers... that's the biggest costing for us"). The FIRST
+version of this reused run_icp_filters() wholesale -- the same pipeline a real partner's daily
+run uses -- which does three things this page never needed: (1) a free Jobo lookup plus, for
+anything that misses, a PAID HarvestAPI decision-maker search per company, (2) an LLM qualify()
+call per company, and (3) -- the real bug this surfaced -- a "pool-first" delivery step that
+hands back already-cached companies from OTHER tenants' past runs, matched only on headcount/
+revenue/geography, DELIBERATELY NOT INDUSTRY (see icp_filters.py's own sourcing/pool.py comment).
+A visitor's inferred ICP here has no headcount/revenue bounds (a homepage rarely states them), so
+pool matching had nothing real to filter on and handed back whatever was cached for unrelated
+partners -- confirmed live: an ICP for "credit unions, banks" returned Netomi, Amperity, ChowNow,
+none of them financial institutions. That was never "the provider gave wrong results" -- the
+exact same rendered filters (icypeas_filters_for_icp/crustdata_filters_for_icp, unchanged below)
+were never actually sent to the provider for that run; the pool answered instead.
 
-WHY A DEDICATED TENANT PER SUBMISSION, NOT ONE SHARED "self_serve" TENANT. quota.py's own daily
-target (DEFAULT_DAILY_TARGET = 10, used whenever a tenant has no explicit config) is PER TENANT
-PER DAY. A shared tenant would mean the second visitor on the same day gets 0 companies because
-the first one already spent today's quota -- not a self-serve demo failing to serve one visitor,
-one serving nobody after the first. A dedicated tenant gets a fresh, unconfigured quota (so the
-cap is exactly 10, the system's own default, with no bespoke config needed) and is cheap: it's
-one row, never shown in any tenant listing (there isn't one in this codebase), and nothing else
-in the product ever queries across all tenants.
+THIS VERSION calls the provider directly with the fully rendered filters -- the same industry/
+geography/headcount atoms a real partner's search enforces, reusing icypeas_filters_for_icp /
+crustdata_filters_for_icp (pure, side-effect-free functions, safe to reuse) and the two FREE
+local rejection checks (vendor/agency name match, government/education name-or-industry match).
+No pool lookup, no decision-maker resolution of any kind (free or paid), no qualify(), no
+Company/Contact/GtmLead rows written at all -- this is a one-off teaser list for an anonymous
+visitor, not a CRM record a partner needs to see again, so there is nothing here that needs to
+persist past the submission's own result_summary.
 
-COST. run_icp_filters' own default run_cap_usd=0.25 is kept as this module's default too --
-every real partner run already spends under that ceiling, so a visitor's one-off run costs no
-more than Elephant Edge already pays per partner run. Spend is reserved against
-BILLING_TENANT_ID (Elephant Edge's own account), same as every partner run.
+PROVIDER ROUTING, still not hardcoded to one provider: app/gtm_os/sourcing/planner.rank() scores
+every registered provider against this exact ICP the same way a real partner's run does; this
+just calls the winner's raw search tool directly instead of going through its full play adapter.
 """
 from __future__ import annotations
 
 import logging
 import secrets
-import uuid
 from datetime import datetime
 
 from sqlalchemy.orm import Session
 
-from app.db.models import Batch, Company, Parameter, SelfServeSubmission, Tenant
+from app.db.models import SelfServeSubmission
 
 logger = logging.getLogger(__name__)
 
+BILLING_TENANT_ID = 2  # Elephant Edge's own account -- every paid call here is reserved against it
 DEFAULT_RESULT_LIMIT = 10
+DEFAULT_RUN_CAP_USD = 0.25  # same ceiling run_icp_filters() already defaults every partner run to
 
 
 def new_token() -> str:
@@ -58,24 +63,93 @@ def start_submission(db: Session, icp: dict, source: str, email: str | None = No
     return submission
 
 
-def _create_submission_tenant(db: Session, submission: SelfServeSubmission) -> Tenant:
-    slug = f"self-serve-{uuid.uuid4().hex[:12]}"
-    label = submission.website_url or f"template upload ({submission.email or 'no email'})"
-    tenant = Tenant(name=f"Self-serve: {label}"[:255], slug=slug)
-    db.add(tenant)
-    db.commit()
-    return tenant
+def search_companies_only(db: Session, icp: dict, limit: int = DEFAULT_RESULT_LIMIT,
+                          run_cap_usd: float = DEFAULT_RUN_CAP_USD) -> dict:
+    """Company search, nothing else. Picks the best-covering, healthy, registered provider for
+    this ICP (same ranking a real partner run uses) and calls its raw search tool directly with
+    the fully rendered filters -- no pool, no decision-maker lookup, no qualify. Falls to the
+    next ranked provider only if the first returns nothing (never because it returned something
+    we didn't love -- that would be second-guessing the filters we just asked it to enforce)."""
+    from app.deepline_client import DeeplineError, DeeplineSpendBlocked, execute_tool
+    from app.gtm_os.orchestration.control import ControlPlaneHalted, check_can_run
+    from app.gtm_os.plays.icp_filters import (
+        _looks_like_a_vendor, _looks_like_government_or_education,
+        _normalize_crustdata_row, crustdata_filters_for_icp, icypeas_filters_for_icp,
+    )
+    from app.gtm_os.sourcing.planner import rank
+    from app.spend_ledger import spend_scope
+
+    result = {"companies": [], "provider": None, "stopped": None, "spent_usd": 0.0}
+
+    try:
+        check_can_run(db, BILLING_TENANT_ID)
+    except ControlPlaneHalted as e:
+        result["stopped"] = f"paused: {e}"
+        return result
+
+    ranked = [c for c in rank(db, icp) if c.healthy and c.provider in ("icypeas", "crustdata-v3")]
+    provider_order = [c.provider for c in ranked] or ["icypeas"]
+
+    with spend_scope(db, BILLING_TENANT_ID, f"self_serve:company_search", run_cap_usd=run_cap_usd) as scope:
+        for provider in provider_order:
+            try:
+                if provider == "icypeas":
+                    filters = icypeas_filters_for_icp(icp, db=db, tenant_id=BILLING_TENANT_ID)
+                    response = execute_tool("icypeas_find_companies",
+                                            {"query": filters, "pagination": {"size": max(limit * 2, 10)}})
+                    raw = (response.get("toolResponse") or {}).get("raw") or {}
+                    rows = raw.get("leads") or []
+                else:
+                    filters, _structured = crustdata_filters_for_icp(icp, db=db, tenant_id=BILLING_TENANT_ID)
+                    response = execute_tool("crustdata_v3_company_search",
+                                            {"filters": filters, "limit": max(limit * 2, 10),
+                                             "fields": ["basic_info", "headcount", "revenue", "locations",
+                                                       "funding", "taxonomy"]})
+                    raw = (response.get("toolResponse") or {}).get("raw") or {}
+                    rows = [_normalize_crustdata_row(c) for c in (raw.get("companies") or [])]
+            except DeeplineSpendBlocked as e:
+                result["stopped"] = f"{provider}: budget blocked ({e})"
+                break
+            except DeeplineError as e:
+                logger.warning("self-serve search failed on %s: %s", provider, e)
+                result["stopped"] = f"{provider}: search failed ({e})"
+                continue
+
+            companies = []
+            for co in rows:
+                name = co.get("name") or ""
+                industry = co.get("industry")
+                if _looks_like_a_vendor(name) or _looks_like_government_or_education(name, industry):
+                    continue
+                companies.append({
+                    "name": name,
+                    "domain": co.get("website"),
+                    "industry": industry,
+                    "employee_count": co.get("numberOfEmployees"),
+                    "location": co.get("address"),
+                    "linkedin_url": co.get("url") or None,
+                })
+                if len(companies) >= limit:
+                    break
+
+            if companies:
+                result["companies"] = companies
+                result["provider"] = provider
+                result["stopped"] = None
+                break
+            result["stopped"] = result["stopped"] or f"{provider}: no companies matched these filters"
+
+        result["spent_usd"] = round(scope.spent_usd, 4)
+
+    return result
 
 
-def run_discovery(db: Session, submission: SelfServeSubmission, run_cap_usd: float = 0.25,
-                  pages: int = 3) -> dict:
+def run_discovery(db: Session, submission: SelfServeSubmission, limit: int = DEFAULT_RESULT_LIMIT,
+                  run_cap_usd: float = DEFAULT_RUN_CAP_USD) -> dict:
     """Confirms the email gate (no verification, per Majji -- just "did they type something"),
-    spins up this submission's dedicated tenant, writes its ICP into the exact Parameter row a
-    real partner's ICP lives in, runs the real routed pipeline, and leaves the submission row
-    updated either way (done with a result, or failed with why) so a retry never silently re-runs
-    a run that already spent money."""
-    from app.phases.partner_icp import PARTNER_ICP_PARAMETER_KEY
-
+    runs the companies-only search above against the visitor's confirmed ICP, and leaves the
+    submission row updated either way (done with a result, or failed with why) so a retry never
+    silently re-runs a run that already spent money."""
     if not (submission.email or "").strip():
         raise ValueError("an email is required before running discovery")
     if submission.status == "done":
@@ -85,23 +159,13 @@ def run_discovery(db: Session, submission: SelfServeSubmission, run_cap_usd: flo
     db.commit()
 
     try:
-        tenant = _create_submission_tenant(db, submission)
-        submission.tenant_id = tenant.id
-        db.add(Parameter(tenant_id=tenant.id, key=PARTNER_ICP_PARAMETER_KEY, value=submission.icp,
-                         description="Self-serve landing page: visitor-confirmed ICP"))
-        db.commit()
-
-        from app.gtm_os.plays.icp_filters import run_icp_filters
-
-        run_result = run_icp_filters(db, tenant.id, pages=pages, run_cap_usd=run_cap_usd)
-        companies = get_discovered_companies(db, tenant.id)
-
+        search_result = search_companies_only(db, submission.icp, limit=limit, run_cap_usd=run_cap_usd)
         summary = {
-            "companies": companies,
-            "company_count": len(companies),
-            "provider": (run_result.get("routing") or {}).get("provider"),
-            "spent_usd": run_result.get("spent_usd"),
-            "status": run_result.get("status"),
+            "companies": search_result["companies"],
+            "company_count": len(search_result["companies"]),
+            "provider": search_result["provider"],
+            "spent_usd": search_result["spent_usd"],
+            "stopped": search_result["stopped"],
         }
         submission.status = "done"
         submission.result_summary = summary
@@ -114,30 +178,3 @@ def run_discovery(db: Session, submission: SelfServeSubmission, run_cap_usd: flo
         submission.error = str(e)[:2000]
         db.commit()
         raise
-
-
-def get_discovered_companies(db: Session, tenant_id: int, limit: int = DEFAULT_RESULT_LIMIT) -> list[dict]:
-    """The same 'real accounts, not rejects' filter app/routes/api.py's get_partner_accounts
-    applies for a real partner's dashboard, trimmed to just the fields worth showing an anonymous
-    visitor (no internal ids, no contact/outreach detail -- this page is a teaser, not the CRM)."""
-    from app.gtm_os.plays.lead import STATE_REJECTED, GtmLead
-
-    rejected_company_ids = (
-        db.query(GtmLead.company_id)
-        .filter(GtmLead.tenant_id == tenant_id, GtmLead.state == STATE_REJECTED, GtmLead.company_id.isnot(None))
-    )
-    companies = (
-        db.query(Company).join(Batch).filter(Batch.tenant_id == tenant_id, Company.id.notin_(rejected_company_ids))
-        .order_by(Company.created_at.desc()).limit(limit).all()
-    )
-    return [
-        {
-            "name": c.name,
-            "domain": c.domain,
-            "industry": c.industry,
-            "employee_count": c.employee_count,
-            "location": c.location,
-            "linkedin_url": c.linkedin_url,
-        }
-        for c in companies
-    ]
