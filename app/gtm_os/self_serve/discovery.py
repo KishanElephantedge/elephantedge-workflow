@@ -73,7 +73,7 @@ def search_companies_only(db: Session, icp: dict, limit: int = DEFAULT_RESULT_LI
     from app.deepline_client import DeeplineError, DeeplineSpendBlocked, execute_tool
     from app.gtm_os.orchestration.control import ControlPlaneHalted, check_can_run
     from app.gtm_os.plays.icp_filters import (
-        _looks_like_a_vendor, _looks_like_government_or_education,
+        NON_BUYER_INDUSTRIES, _looks_like_a_vendor, _looks_like_government_or_education,
         _normalize_crustdata_row, crustdata_filters_for_icp, icypeas_filters_for_icp,
     )
     from app.gtm_os.sourcing.planner import rank
@@ -137,6 +137,15 @@ def search_companies_only(db: Session, icp: dict, limit: int = DEFAULT_RESULT_LI
             for co in rows:
                 name = co.get("name") or ""
                 industry = co.get("industry")
+                # REAL FIX, 2026-11-05: crustdata_filters_for_icp() has no NON_BUYER_INDUSTRIES
+                # exclusion at all (confirmed by reading it -- unlike icypeas_filters_for_icp,
+                # it never builds a query-level industry exclude), so a vendor/consultancy whose
+                # NAME doesn't contain a telltale word (CES: "IT Services and IT Consulting",
+                # 5632 employees) still slipped through _looks_like_a_vendor's name-only regex.
+                # Checked here by industry label, provider-agnostic, so this protection applies
+                # no matter which provider search_companies_only ends up using.
+                if industry and industry in NON_BUYER_INDUSTRIES:
+                    continue
                 if _looks_like_a_vendor(name) or _looks_like_government_or_education(name, industry):
                     continue
                 companies.append({
