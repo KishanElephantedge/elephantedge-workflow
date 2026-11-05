@@ -6033,8 +6033,13 @@ def get_self_serve_results(token: str, db: Session = Depends(get_db)):
     submission = db.query(SelfServeSubmission).filter(SelfServeSubmission.token == token).first()
     if submission is None:
         raise HTTPException(status_code=404, detail="no submission with that token")
+    # REAL FIX, 2026-11-05: this never echoed the token back in its own body. The frontend's
+    # step-4 email submit reads it off `results.token` to know which submission to attach the
+    # email to -- fine on a fresh /discover response (which does include it), but a page reload
+    # via a bookmarked/shared ?token= link populated `results` from THIS route instead, leaving
+    # token undefined and showing "Something went wrong" even though the results loaded fine.
     return Response(status_code=200, headers=_SELF_SERVE_CORS_HEADERS, content=json.dumps({
-        "ok": True, "status": submission.status, "error": submission.error,
+        "ok": True, "token": token, "status": submission.status, "error": submission.error,
         **(submission.result_summary or {}),
     }), media_type="application/json")
 
