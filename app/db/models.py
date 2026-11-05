@@ -966,3 +966,35 @@ class PartnerTask(Base):
     created_by = Column(String, nullable=True)  # the internal user's email
     created_at = Column(DateTime, default=datetime.utcnow)
     completed_at = Column(DateTime, nullable=True)
+
+
+class SelfServeSubmission(Base):
+    """A visitor on the public self-serve landing page (2026-11-05, Majji's request): they give
+    us their own website (or an uploaded ICP template), we infer/accept an ICP, capture their
+    email, then run a small real discovery against it -- no login, no dashboard.
+
+    `token`, not `id`, is what the public API exposes -- an opaque, unguessable handle, since
+    every other route in this file trusts the gateway's session auth to scope a tenant/batch id
+    and this is the one deliberately public exception (see app/routes/api.py's
+    /inbound/visitor-ping for the same pattern).
+
+    `tenant_id` points at a real, dedicated Tenant row created for this one submission, so the
+    discovery reuses the exact same ICP/run_icp_filters/Company pipeline every real partner runs
+    through instead of a parallel implementation -- same provider routing, dedup and spend
+    controls, for free. That tenant is never returned by any tenant-listing query in this
+    codebase (there isn't one), so it never shows up anywhere a real partner tenant would.
+    """
+    __tablename__ = "self_serve_submissions"
+
+    id = Column(Integer, primary_key=True)
+    token = Column(String, nullable=False, unique=True)
+    email = Column(String, nullable=True)
+    source = Column(String, nullable=False)  # "website" | "template"
+    website_url = Column(String, nullable=True)
+    icp = Column(JSON, nullable=True)
+    tenant_id = Column(Integer, nullable=True)
+    status = Column(String, nullable=False, default="inferred")  # inferred -> running -> done | failed
+    error = Column(Text, nullable=True)
+    result_summary = Column(JSON, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    discovered_at = Column(DateTime, nullable=True)

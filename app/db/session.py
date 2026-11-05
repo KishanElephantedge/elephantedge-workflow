@@ -1275,3 +1275,24 @@ def ensure_indexes():
         conn.execute(text("ALTER TABLE partner_tasks ADD COLUMN IF NOT EXISTS notes TEXT"))
         conn.execute(text("UPDATE partner_tasks SET status = 'pending' WHERE status IN ('open', 'in_progress')"))
         conn.execute(text("UPDATE partner_tasks SET status = 'completed' WHERE status = 'done'"))
+
+        # self_serve_submissions (2026-11-05) -- public landing-page visitors, see
+        # app/db/models.py's SelfServeSubmission for why this is a dedicated, un-listed tenant
+        # per submission rather than a shared one.
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS self_serve_submissions (
+                id SERIAL PRIMARY KEY,
+                token VARCHAR NOT NULL,
+                email VARCHAR,
+                source VARCHAR NOT NULL,
+                website_url VARCHAR,
+                icp JSON,
+                tenant_id INTEGER,
+                status VARCHAR NOT NULL DEFAULT 'inferred',
+                error TEXT,
+                result_summary JSON,
+                created_at TIMESTAMP DEFAULT now(),
+                discovered_at TIMESTAMP
+            )
+        """))
+        conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ux_self_serve_submissions_token ON self_serve_submissions (token)"))

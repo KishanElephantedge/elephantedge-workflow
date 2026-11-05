@@ -16,7 +16,7 @@ from sqlalchemy import func, or_
 
 from app.cache import active_keys, bump_batch_version, cache_get, cache_set, get_batch_version, mark_active
 from app.claude_client import DEFAULT_MODEL as DEFAULT_CHAT_MODEL, ClaudeError, call_claude_messages
-from app.db.models import AutonomousRun, Batch, Tenant, CalendarBooking, CampaignEvent, CampaignPush, ChatConversation, ChatMessage, Company, Contact, CrmLead, Credential, DailyReview, LinkedinMonitorProfile, LinkedinMonitorSignal, Notification, Parameter, PartnerCompanyRecommendation, PartnerRecommendationMessage, PersonalizedMessage, Proposal, ReverseDiscoveryCandidate, ReviewComment, Score
+from app.db.models import AutonomousRun, Batch, Tenant, CalendarBooking, CampaignEvent, CampaignPush, ChatConversation, ChatMessage, Company, Contact, CrmLead, Credential, DailyReview, LinkedinMonitorProfile, LinkedinMonitorSignal, Notification, Parameter, PartnerCompanyRecommendation, PartnerRecommendationMessage, PersonalizedMessage, Proposal, ReverseDiscoveryCandidate, ReviewComment, Score, SelfServeSubmission
 from app.notifications import create_notification, delete_expired_notifications
 from app.google_calendar_client import GoogleCalendarError
 from app.phases.hiring_signal import has_qualifying_hiring_signal
@@ -5793,6 +5793,135 @@ def get_inbound_visitors(limit: int = 50, resolved_only: bool = True, db: Sessio
         }
         for v in visitors
     ]
+
+
+# ---- Self-serve landing page (2026-11-05, Majji's request) -- a visitor gives us their own
+# website OR fills in a downloadable ICP template, we infer/accept an ICP, they confirm +
+# give an email (no verification, per Majji -- this page is only ever shared by him personally),
+# and we run a real, capped (10 accounts) discovery against it. No login, no dashboard. See
+# app/gtm_os/self_serve/ for the actual pipeline; these routes are thin wrappers over it.
+#
+# PUBLIC, wildcard CORS -- same reasoning as /inbound/visitor-ping above: this is meant to be
+# called from a landing page that may not share the dashboard's own origin, and nothing it
+# returns is sensitive to anyone but the visitor who just submitted it (the response is scoped
+# to the token minted in THIS call chain, never looked up by a guessable id).
+_SELF_SERVE_CORS_HEADERS = {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type",
+}
+
+
+@router.options("/self-serve/{rest_of_path:path}")
+async def options_self_serve(rest_of_path: str):
+    return Response(status_code=200, headers=_SELF_SERVE_CORS_HEADERS)
+
+
+@router.post("/self-serve/infer-icp")
+def post_self_serve_infer_icp(body: dict = Body(...), db: Session = Depends(get_db)):
+    """Step 1 of the website path: fetch the visitor's own homepage, infer who THEY sell to.
+    Billed against Elephant Edge's own account (ELEPHANT_EDGE_TENANT_ID) -- a single-page LLM
+    call costs under $0.01 (see icp_from_website.py's own real test), no different from any other
+    free-tool-style LLM call this backend already makes before a visitor has committed to
+    anything. Returns a clear, actionable error (not a 500) when the site can't be read, so the
+    frontend can route the visitor to the template-upload path instead."""
+    from app.gtm_os.self_serve.icp_from_website import WebsiteFetchError, infer_icp_from_website
+
+    url = (body.get("website_url") or "").strip()
+    if not url:
+        raise HTTPException(status_code=400, detail="website_url is required")
+    try:
+        inferred = infer_icp_from_website(db, ELEPHANT_EDGE_TENANT_ID, url)
+    except WebsiteFetchError as e:
+        return Response(status_code=200, headers=_SELF_SERVE_CORS_HEADERS,
+                        content=json.dumps({"ok": False, "reason": str(e), "fallback": "template"}),
+                        media_type="application/json")
+    return Response(status_code=200, headers=_SELF_SERVE_CORS_HEADERS,
+                    content=json.dumps({"ok": True, "inferred": inferred}), media_type="application/json")
+
+
+@router.get("/self-serve/template")
+def get_self_serve_template():
+    """Step 1 of the manual path: a downloadable CSV with the ICP's real field names and an
+    example row -- see app/gtm_os/self_serve/template.py for why only the LAST row is ever read
+    back on upload."""
+    from app.gtm_os.self_serve.template import template_csv_bytes
+
+    return Response(content=template_csv_bytes(), media_type="text/csv", headers={
+        **_SELF_SERVE_CORS_HEADERS,
+        "Content-Disposition": "attachment; filename=elephant-edge-icp-template.csv",
+    })
+
+
+@router.post("/self-serve/template/parse")
+async def post_self_serve_template_parse(request: Request):
+    """Step 2 of the manual path: the filled-in CSV -> the same ICP shape the website path
+    produces, so both paths converge on one confirm-then-discover step below. Reads the raw
+    multipart body directly rather than FastAPI's File()/UploadFile dependency injection, since
+    this route's only caller is the landing page's own simple upload widget, not a browsable
+    OpenAPI form."""
+    from app.gtm_os.self_serve.template import TemplateParseError, parse_template_csv
+
+    form = await request.form()
+    upload = form.get("file")
+    if upload is None:
+        raise HTTPException(status_code=400, detail="no file uploaded (expected multipart field 'file')")
+    raw = await upload.read()
+    try:
+        icp = parse_template_csv(raw)
+    except TemplateParseError as e:
+        return Response(status_code=200, headers=_SELF_SERVE_CORS_HEADERS,
+                        content=json.dumps({"ok": False, "reason": str(e)}), media_type="application/json")
+    return Response(status_code=200, headers=_SELF_SERVE_CORS_HEADERS,
+                    content=json.dumps({"ok": True, "icp": icp}), media_type="application/json")
+
+
+@router.post("/self-serve/discover")
+def post_self_serve_discover(body: dict = Body(...), db: Session = Depends(get_db)):
+    """The commit step: visitor has seen either the inferred or uploaded ICP, confirmed it (the
+    frontend may have let them edit it first -- this trusts whatever ICP shape it's handed, the
+    same way a real partner's own ICP edit is trusted), and now gives an email. No verification
+    on the email itself, per Majji's explicit instruction -- it exists so we know who used this,
+    not to gate access.
+
+    Runs SYNCHRONOUSLY. A capped, quota=10 run through run_icp_filters is the same shape of call
+    a real partner's own "Find accounts now" button already makes and returns from directly (see
+    POST /gtm-os/partner/discover above) -- not background+poll. If a future ICP shape proves
+    slow enough to need that, this is the point to add it; not built ahead of a problem no real
+    submission has shown yet."""
+    from app.gtm_os.self_serve.discovery import run_discovery, start_submission
+
+    email = (body.get("email") or "").strip()
+    icp = body.get("icp")
+    source = body.get("source") or "website"
+    if not email:
+        raise HTTPException(status_code=400, detail="email is required")
+    if not isinstance(icp, dict) or not icp:
+        raise HTTPException(status_code=400, detail="icp is required")
+
+    submission = start_submission(db, icp, source, email=email, website_url=body.get("website_url"))
+    try:
+        summary = run_discovery(db, submission)
+    except Exception as e:  # noqa: BLE001 -- surface a clear error to the visitor, never a bare 500
+        return Response(status_code=200, headers=_SELF_SERVE_CORS_HEADERS,
+                        content=json.dumps({"ok": False, "token": submission.token, "reason": str(e)}),
+                        media_type="application/json")
+    return Response(status_code=200, headers=_SELF_SERVE_CORS_HEADERS,
+                    content=json.dumps({"ok": True, "token": submission.token, **summary}),
+                    media_type="application/json")
+
+
+@router.get("/self-serve/results/{token}")
+def get_self_serve_results(token: str, db: Session = Depends(get_db)):
+    """Re-fetch a past submission's result by its own opaque token -- lets the landing page
+    survive a refresh without re-running (and re-paying for) discovery."""
+    submission = db.query(SelfServeSubmission).filter(SelfServeSubmission.token == token).first()
+    if submission is None:
+        raise HTTPException(status_code=404, detail="no submission with that token")
+    return Response(status_code=200, headers=_SELF_SERVE_CORS_HEADERS, content=json.dumps({
+        "ok": True, "status": submission.status, "error": submission.error,
+        **(submission.result_summary or {}),
+    }), media_type="application/json")
 
 
 # ---- CRM (V2) -- reads, edits, and deletes real HubSpot data directly (not V1's push-only
