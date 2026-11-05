@@ -5876,6 +5876,25 @@ async def post_self_serve_template_parse(request: Request):
                     content=json.dumps({"ok": True, "icp": icp}), media_type="application/json")
 
 
+@router.post("/self-serve/debug/search-grounding")
+def post_self_serve_debug_search_grounding(body: dict = Body(...), db: Session = Depends(get_db)):
+    """One-off: does Gemini's use_search=True actually return a result, or error/degrade
+    silently -- confirmed null for Ramp (a huge, trivially-findable company) via the normal
+    infer-icp path, 2026-11-05. Calls it directly and surfaces the raw error if any."""
+    from app.gemini_client import GeminiError, call_gemini_json
+    from app.gtm_os.self_serve.icp_from_website import EMPLOYEE_SIZE_SEARCH_PROMPT
+
+    url = body.get("website_url") or "https://ramp.com"
+    prompt = EMPLOYEE_SIZE_SEARCH_PROMPT.format(url=url)
+    try:
+        result = call_gemini_json(prompt, db, ELEPHANT_EDGE_TENANT_ID, max_tokens=500, use_search=True)
+        return Response(status_code=200, headers=_SELF_SERVE_CORS_HEADERS,
+                        content=json.dumps({"ok": True, "result": result}), media_type="application/json")
+    except GeminiError as e:
+        return Response(status_code=200, headers=_SELF_SERVE_CORS_HEADERS,
+                        content=json.dumps({"ok": False, "error": str(e)}), media_type="application/json")
+
+
 @router.post("/self-serve/debug/linkedin-profile")
 def post_self_serve_debug_linkedin_profile(body: dict = Body(...)):
     """One-off: is fetch_public_company_profile actually reachable from THIS deployed backend's
