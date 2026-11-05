@@ -87,8 +87,26 @@ def search_companies_only(db: Session, icp: dict, limit: int = DEFAULT_RESULT_LI
         result["stopped"] = f"paused: {e}"
         return result
 
+    # REAL FIX, 2026-11-05: planner.rank() ties icypeas and crustdata-v3 at an equal coverage
+    # score for an ICP neither has specific history on, and the tie-break (registration order)
+    # put icypeas first -- confirmed live against Elephant Edge's own real ICP (industries: ai,
+    # saas, cybersecurity, e-commerce, manufacturing, supply chain, logistics): Icypeas only
+    # resolved 2 of 7 terms, and mapped the generic word "manufacturing" to a narrow, stale
+    # learned value ("Motor Vehicle Manufacturing" -- a leftover mapping from some past
+    # unrelated partner's run), silently dropping cybersecurity/e-commerce/supply chain/
+    # logistics and returning a car dealership. Crustdata's taxonomy-category CONTAINS-match
+    # degrades far more gracefully on a brand-new ICP shape it has no history with -- it mapped
+    # "manufacturing" to a sensible broad set of real manufacturing sub-categories instead of
+    # one wrong narrow value. A RECURRING daily partner run benefits from Icypeas' cheaper,
+    # tuned-over-time exact-value search; a ONE-OFF self-serve visitor with zero learned history
+    # needs the provider that doesn't gamble on a stale mapping -- so self-serve prefers
+    # crustdata-v3 first when both are viable, falling back to icypeas only if crustdata fails
+    # or returns nothing. This reorders ONLY this self-serve path; planner.rank()'s own output
+    # (and every real partner's run through it) is untouched.
     ranked = [c for c in rank(db, icp) if c.healthy and c.provider in ("icypeas", "crustdata-v3")]
-    provider_order = [c.provider for c in ranked] or ["icypeas"]
+    provider_order = sorted((c.provider for c in ranked), key=lambda p: 0 if p == "crustdata-v3" else 1)
+    if not provider_order:
+        provider_order = ["crustdata-v3", "icypeas"]
 
     with spend_scope(db, BILLING_TENANT_ID, f"self_serve:company_search", run_cap_usd=run_cap_usd) as scope:
         for provider in provider_order:
