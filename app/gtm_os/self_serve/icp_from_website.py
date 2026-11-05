@@ -55,17 +55,30 @@ _MAX_TEXT_CHARS = 8000  # plenty for a homepage; keeps the LLM prompt small and 
 MIN_REAL_TEXT_CHARS = 400
 _FIRECRAWL_POLL_SECONDS = 3
 _FIRECRAWL_TIMEOUT_SECONDS = 50
+_LINKEDIN_COMPANY_RE = re.compile(r"https?://(?:[\w-]+\.)?linkedin\.com/company/[^\s\"'<>)\]]+", re.I)
 
 
 class WebsiteFetchError(Exception):
     pass
 
 
-def _fetch_homepage_text_httpx(url: str) -> str:
-    """Tier 1: free, instant, works for any server-rendered page. Returns '' (never raises) when
-    the page looks too thin to be real content -- the caller decides whether to escalate to
-    Firecrawl or treat it as a hard failure; raises WebsiteFetchError only for a genuine fetch
-    failure (unreachable, non-HTML, blocked), which Firecrawl is equally unlikely to recover from."""
+def _find_linkedin_company_url(raw: str) -> str | None:
+    """Pulled from the RAW fetched content (HTML or markdown) before it's stripped to plain
+    text/truncated -- a plain-text extraction loses href attributes entirely (a link rendered as
+    the word "LinkedIn" has no URL left in visible text), and the real URL is usually only a few
+    hundred bytes into the page (header/footer social links), nowhere near where a long page
+    might get truncated. Used to pull a real, free, declared employee count off the company's own
+    LinkedIn page instead of leaving it null -- see infer_icp_from_website()."""
+    m = _LINKEDIN_COMPANY_RE.search(raw)
+    return m.group(0).rstrip(".,;") if m else None
+
+
+def _fetch_homepage_text_httpx(url: str) -> tuple[str, str | None]:
+    """Tier 1: free, instant, works for any server-rendered page. Returns ('', None) (never
+    raises) when the page looks too thin to be real content -- the caller decides whether to
+    escalate to Firecrawl or treat it as a hard failure; raises WebsiteFetchError only for a
+    genuine fetch failure (unreachable, non-HTML, blocked), which Firecrawl is equally unlikely
+    to recover from."""
     try:
         resp = httpx.get(url, headers=_UA, timeout=_TIMEOUT_SECONDS, follow_redirects=True)
         resp.raise_for_status()
@@ -77,16 +90,17 @@ def _fetch_homepage_text_httpx(url: str) -> str:
         raise WebsiteFetchError(f"{url} did not return HTML (content-type: {content_type!r})")
 
     html = resp.text
+    linkedin_url = _find_linkedin_company_url(html)
     # Strip script/style blocks before stripping tags, or their contents (JS/CSS source) end up
     # as noise in the extracted text.
     html = re.sub(r"<(script|style)[^>]*>.*?</\1>", " ", html, flags=re.I | re.S)
     text = re.sub(r"<[^>]+>", " ", html)
     text = re.sub(r"&nbsp;|&amp;|&#39;|&quot;", " ", text)
     text = re.sub(r"\s+", " ", text).strip()
-    return text
+    return text, linkedin_url
 
 
-def _fetch_homepage_markdown_firecrawl(url: str) -> str:
+def _fetch_homepage_markdown_firecrawl(url: str) -> tuple[str, str | None]:
     """Tier 2: real browser rendering via Deepline's firecrawl_batch_scrape, for pages tier 1
     can't read. Genuinely async (confirmed live, 2026-11-05 -- defaultExecutionMode: 'sync' in
     its own schema does NOT mean execute_tool blocks until done; the start call returns
@@ -118,7 +132,7 @@ def _fetch_homepage_markdown_firecrawl(url: str) -> str:
             markdown = raw[0].get("markdown") or ""
             if not markdown.strip():
                 raise WebsiteFetchError(f"firecrawl rendered {url} but returned no text content")
-            return markdown
+            return markdown, _find_linkedin_company_url(markdown)
         if isinstance(raw, dict) and raw.get("status") == "failed":
             raise WebsiteFetchError(f"firecrawl job failed for {url}")
         # otherwise still queued/scraping -- keep polling
@@ -126,27 +140,27 @@ def _fetch_homepage_markdown_firecrawl(url: str) -> str:
     raise WebsiteFetchError(f"firecrawl timed out rendering {url} after {_FIRECRAWL_TIMEOUT_SECONDS}s")
 
 
-def fetch_homepage_text(url: str) -> str:
-    """Fetches the given URL and returns its real text content, trying the fast free path first
-    and only escalating to real browser rendering when that path looks too thin to be genuine
-    content. Raises WebsiteFetchError only when NEITHER tier produces real content -- the caller
-    (the /self-serve/infer-icp route) decides how to surface that to the visitor, typically by
-    routing them to the template-upload fallback."""
+def fetch_homepage_text(url: str) -> tuple[str, str | None]:
+    """Fetches the given URL and returns (its real text content, its own LinkedIn company URL if
+    found), trying the fast free path first and only escalating to real browser rendering when
+    that path looks too thin to be genuine content. Raises WebsiteFetchError only when NEITHER
+    tier produces real content -- the caller (the /self-serve/infer-icp route) decides how to
+    surface that to the visitor, typically by routing them to the template-upload fallback."""
     if not re.match(r"^https?://", url, re.I):
         url = f"https://{url}"
 
-    text = _fetch_homepage_text_httpx(url)
+    text, linkedin_url = _fetch_homepage_text_httpx(url)
     if len(text) >= MIN_REAL_TEXT_CHARS:
-        return text[:_MAX_TEXT_CHARS]
+        return text[:_MAX_TEXT_CHARS], linkedin_url
 
     logger.info("fetch_homepage_text: tier 1 got only %d chars for %s, escalating to firecrawl",
                len(text), url)
-    markdown = _fetch_homepage_markdown_firecrawl(url)
+    markdown, fc_linkedin_url = _fetch_homepage_markdown_firecrawl(url)
     if len(markdown) < MIN_REAL_TEXT_CHARS:
         raise WebsiteFetchError(
             f"{url} returned too little real content even after rendering "
             f"({len(markdown)} chars) -- likely blocked or genuinely empty")
-    return markdown[:_MAX_TEXT_CHARS]
+    return markdown[:_MAX_TEXT_CHARS], (fc_linkedin_url or linkedin_url)
 
 
 INFER_PROMPT = """You are looking at the homepage text of a real company's website. Your job has
@@ -160,7 +174,7 @@ two parts:
 
 WEBSITE TEXT:
 {page_text}
-
+{linkedin_context}
 Rules:
 - "industries" are the industries of the CUSTOMERS this company would sell to, inferred from
   their positioning (e.g. a company that "designs websites for credit unions and banks" has
@@ -168,11 +182,17 @@ Rules:
 - Only state a revenue or headcount band if the page gives a real basis for it (e.g. "we work
   with 50-500 employee companies," or case studies naming company sizes). Otherwise null --
   guessing a band from nothing is worse than leaving it blank.
-- geographies: only if the page states or clearly implies one (e.g. "in the US", a named city,
-  a currency). Otherwise null.
+- geographies: list EVERY location the page explicitly states (a named office/region/country, a
+  stated "operating regions" or "we serve" list, a named city). If the page lists several
+  offices or regions, include ALL of them, not just one. Only fall back to a weaker signal (a
+  phone country code, a currency symbol) when NO explicit location is stated anywhere on the
+  page. Otherwise null.
 - confidence: "high" if the page explicitly states who they sell to (like MetriFi saying "for
   credit unions and banks"), "medium" if inferred from case studies/examples, "low" if inferred
   only from generic positioning language with no concrete evidence.
+- "evidence" is for internal verification only, never shown to the company itself -- quote the
+  real phrase(s) it's based on, but don't explain your own reasoning process (e.g. never write
+  things like "the presence of a phone code implies..." -- just quote what the page said).
 
 Return JSON exactly:
 {{"company_summary": "<1-2 plain sentences on what this company does>",
@@ -183,15 +203,59 @@ Return JSON exactly:
   "confidence": "high"|"medium"|"low",
   "evidence": "<the specific phrase(s) from the page this was based on>"}}"""
 
+_LINKEDIN_CONTEXT_TEMPLATE = """
+This company's own LinkedIn page (real, independently verified -- not from the website text
+above) states: country={country}, declared employee size band={size_band}, industry={industry}.
+If this conflicts with the website text, prefer the LinkedIn data for the company's OWN country/
+size (not the customer industries you're inferring -- that still comes from the website's own
+positioning).
+"""
+
 
 def infer_icp_from_website(db: Session, tenant_id: int, url: str) -> dict:
-    """The full pipeline: fetch -> infer. Returns the parsed ICP dict plus the raw page text's
-    length (for logging/debugging) and the source url actually fetched (after any redirect)."""
-    page_text = fetch_homepage_text(url)
-    prompt = INFER_PROMPT.format(page_text=page_text)
+    """The full pipeline: fetch -> (free LinkedIn lookup, if the page links to one) -> infer.
+    Returns the parsed ICP dict plus the raw page text's length (for logging/debugging) and the
+    source url actually fetched (after any redirect).
+
+    REAL FIX, 2026-11-05 (found live testing zaylix.si): the LLM correctly refuses to guess an
+    employee count the website never states -- but a free, already-built mechanism
+    (app/phases/company_profile_check.py's fetch_public_company_profile, used elsewhere in this
+    codebase to read a company's own public LinkedIn page) can often get the REAL declared
+    headcount band for free, no paid API, when the website links to its own LinkedIn company
+    page (most do, in the header/footer social links). Also grounds the company's own country
+    more reliably than guessing from a phone number's country code -- the same test case showed
+    the LLM inferring India purely from a '+91' prefix instead of using the page's own stated
+    headquarters."""
+    page_text, linkedin_url = fetch_homepage_text(url)
+
+    linkedin_context = ""
+    linkedin_profile = None
+    if linkedin_url:
+        try:
+            from app.phases.company_profile_check import fetch_public_company_profile
+
+            linkedin_profile = fetch_public_company_profile(linkedin_url)
+        except Exception as e:  # noqa: BLE001 -- this is a free bonus lookup, never a dependency
+            logger.warning("self-serve LinkedIn profile lookup failed for %s: %s", linkedin_url, e)
+        if linkedin_profile:
+            linkedin_context = _LINKEDIN_CONTEXT_TEMPLATE.format(
+                country=linkedin_profile.get("country") or "unknown",
+                size_band=linkedin_profile.get("size_band") or "unknown",
+                industry=linkedin_profile.get("industry") or "unknown")
+
+    prompt = INFER_PROMPT.format(page_text=page_text, linkedin_context=linkedin_context)
     result = generate_json(prompt, db, tenant_id, max_tokens=800)
+
+    # Real LinkedIn data overrides only when the LLM found nothing from the website text itself
+    # -- a page that explicitly states its own size band is still better evidence than LinkedIn's
+    # member count, which is well-documented elsewhere in this codebase to understate fast-growing
+    # companies (see company_profile_check.py's own profile_rejection_reason comment).
+    if linkedin_profile and linkedin_profile.get("size_band") and result.get("employee_min") is None:
+        result["employee_min"], result["employee_max"] = linkedin_profile["size_band"]
+
     result["source_url"] = url
     result["page_text_chars"] = len(page_text)
+    result["linkedin_url"] = linkedin_url
     return result
 
 
