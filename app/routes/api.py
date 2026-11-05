@@ -5876,6 +5876,21 @@ async def post_self_serve_template_parse(request: Request):
                     content=json.dumps({"ok": True, "icp": icp}), media_type="application/json")
 
 
+@router.post("/self-serve/debug/linkedin-profile")
+def post_self_serve_debug_linkedin_profile(body: dict = Body(...)):
+    """One-off: is fetch_public_company_profile actually reachable from THIS deployed backend's
+    own IP right now, or is LinkedIn blocking it -- confirmed blocked (403) from the dev laptop's
+    IP even for Stripe's own page, 2026-11-05. This checks whether Render's IP fares differently
+    before concluding the self-serve employee-size enrichment is broken in production too."""
+    from app.phases.company_profile_check import fetch_public_company_profile
+
+    url = body.get("linkedin_url")
+    profile = fetch_public_company_profile(url)
+    return Response(status_code=200, headers=_SELF_SERVE_CORS_HEADERS,
+                    content=json.dumps({"ok": True, "url": url, "profile": profile}),
+                    media_type="application/json")
+
+
 @router.post("/self-serve/debug/filters")
 def post_self_serve_debug_filters(body: dict = Body(...), db: Session = Depends(get_db)):
     """FREE, no-spend introspection: the exact filter payload search_companies_only() would send
