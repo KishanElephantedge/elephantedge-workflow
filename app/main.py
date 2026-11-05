@@ -31,7 +31,15 @@ app = FastAPI(title="Elephant Edge ABM System")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],  # same shared dashboard frontend as Synefi
+    # http://localhost:5173: the shared dashboard frontend, dev mode.
+    # https://app.elephantedge.ai: same frontend, deployed. Added 2026-11-05 -- every other
+    # page in this app reaches the backend through the gateway's own proxy (/gw/*, same-origin
+    # from the browser's view), so this global allowlist never mattered for them. The public
+    # self-serve page (app/routes/api.py's /self-serve/* routes) is the first thing that calls
+    # this backend directly, cross-origin, from app.elephantedge.ai -- its own route-level
+    # wildcard CORS headers (_SELF_SERVE_CORS_HEADERS) never got a chance to apply, because this
+    # middleware rejects the browser's preflight before the request reaches any route handler.
+    allow_origins=["http://localhost:5173", "https://app.elephantedge.ai"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
