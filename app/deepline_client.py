@@ -247,6 +247,14 @@ DEEPLINE_TOOL_COST_USD = {
     # "unresolved", which would have reproduced the exact empty-search bug this adapter exists
     # to fix, just hidden behind a caught exception instead of an obvious error.
     "crustdata_v3_company_search_autocomplete": lambda p: 0.0,
+    # VERIFIED 2026-11-05 via GET /gtm-os/admin/providers/schema (Deepline's own pricing block):
+    # base scrape is 0.02 credits/page; Crustdata's own pricing block on the same endpoint gives
+    # the $/credit rate (usdPerUnit 0.002 at creditsPerUnit 0.02 -> $0.10/credit), so base scrape
+    # is ~$0.002/page. Estimated at $0.01/page (5x) as a worst-case ceiling to cover JSON/enhanced
+    # mode add-ons ("~0.05 credits/page each") without needing to know in advance which options a
+    # given call used. Self-serve's single-page JS-rendering fallback (icp_from_website.py) is the
+    # only caller today.
+    "firecrawl_batch_scrape": lambda p: 0.01 * len(p.get("urls") or [1]),
 }
 
 
