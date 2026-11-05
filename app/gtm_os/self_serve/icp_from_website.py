@@ -35,6 +35,7 @@ from __future__ import annotations
 import logging
 import re
 import time
+from urllib.parse import urlsplit
 
 import httpx
 from sqlalchemy.orm import Session
@@ -48,7 +49,12 @@ _UA = {
     "Accept-Language": "en-US,en;q=0.9",
 }
 _TIMEOUT_SECONDS = 15
-_MAX_TEXT_CHARS = 8000  # plenty for a homepage; keeps the LLM prompt small and cheap
+# REAL FIX, 2026-11-05: 8000 was too low -- confirmed live on zaylix.si, whose real homepage is
+# 11344 chars (fetched fine via the fast httpx path, no Firecrawl needed), truncating off exactly
+# the footer section ("Operating Regions Across The Globe: India, United States, Canada, Africa")
+# that would have corrected the geography guess. Raised with real headroom for a long page
+# rather than tuned to this one site's exact length.
+_MAX_TEXT_CHARS = 16000
 # Below this, a page is treated as "likely JS-rendered, not real content" and falls to Firecrawl
 # rather than being handed to the LLM as-is. A title tag alone (elephantedge.ai: 118 chars) must
 # fail this check; a real, if terse, homepage (MetriFi: 4851 chars) must pass it comfortably.
@@ -71,6 +77,16 @@ def _find_linkedin_company_url(raw: str) -> str | None:
     LinkedIn page instead of leaving it null -- see infer_icp_from_website()."""
     m = _LINKEDIN_COMPANY_RE.search(raw)
     return m.group(0).rstrip(".,;") if m else None
+
+
+def page_url_base(url: str) -> str:
+    """'zaylix.si' or 'https://zaylix.si/pricing' -> 'https://zaylix.si' -- the scheme+host only,
+    for building a sibling page URL like {base}/contact. Same https-default normalization
+    fetch_homepage_text() applies to a bare domain."""
+    if not re.match(r"^https?://", url, re.I):
+        url = f"https://{url}"
+    parts = urlsplit(url)
+    return f"{parts.scheme}://{parts.netloc}"
 
 
 def _fetch_homepage_text_httpx(url: str) -> tuple[str, str | None]:
@@ -227,6 +243,22 @@ def infer_icp_from_website(db: Session, tenant_id: int, url: str) -> dict:
     the LLM inferring India purely from a '+91' prefix instead of using the page's own stated
     headquarters."""
     page_text, linkedin_url = fetch_homepage_text(url)
+
+    # Free, bounded bonus: confirmed live (zaylix.si) its own LinkedIn link AND its full list of
+    # operating regions ("India, United States, Canada, Africa") live only on /contact, not the
+    # homepage -- raising _MAX_TEXT_CHARS alone didn't help, because the content genuinely isn't
+    # on the page being fetched at all. One extra free httpx GET (fails silently: wrong guess at
+    # the URL, no /contact page, a redirect loop -- any of it, since this is a bonus, not a
+    # required step), and its real text is appended to what the LLM sees, not just mined for a
+    # LinkedIn link.
+    try:
+        base = page_url_base(url)
+        contact_text, contact_linkedin = _fetch_homepage_text_httpx(f"{base}/contact")
+        if len(contact_text) >= MIN_REAL_TEXT_CHARS:
+            page_text = f"{page_text}\n\n--- /contact page ---\n{contact_text[:4000]}"
+        linkedin_url = linkedin_url or contact_linkedin
+    except Exception as e:  # noqa: BLE001
+        logger.info("self-serve /contact lookup skipped for %s: %s", url, e)
 
     linkedin_context = ""
     linkedin_profile = None
