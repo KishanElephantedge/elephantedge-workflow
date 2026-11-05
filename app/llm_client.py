@@ -260,6 +260,20 @@ def generate_text(prompt: str, db: Session, tenant_id: int, max_tokens: int = 20
     return _sanitize_text(result)
 
 
+def generate_json_with_search(prompt: str, db: Session, tenant_id: int, max_tokens: int = 2000) -> dict:
+    """Gemini-only (no Claude fallback -- this codebase has no equivalent grounded-search call
+    for Claude wired up), but still retries across all 6 Gemini models on quota exhaustion, same
+    as generate_json -- a single-model call (what the self-serve employee-size debug route did
+    first) hit a real 429 on just that one model's search-grounding quota and gave up instead of
+    trying the next. Raises GeminiError if every model is exhausted; callers of this (self-serve's
+    employee-size lookup) already treat that as "couldn't determine," not a hard failure."""
+    import functools
+
+    _gate(db, tenant_id)
+    fn = functools.partial(call_gemini_json, use_search=True)
+    return _sanitize(_gemini_with_model_fallback(fn, prompt, db, tenant_id, max_tokens))
+
+
 def generate_json(prompt: str, db: Session, tenant_id: int, max_tokens: int = 2000) -> dict:
     _gate(db, tenant_id)
     if PRIMARY == "gemini":

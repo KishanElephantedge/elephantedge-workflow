@@ -5880,14 +5880,18 @@ async def post_self_serve_template_parse(request: Request):
 def post_self_serve_debug_search_grounding(body: dict = Body(...), db: Session = Depends(get_db)):
     """One-off: does Gemini's use_search=True actually return a result, or error/degrade
     silently -- confirmed null for Ramp (a huge, trivially-findable company) via the normal
-    infer-icp path, 2026-11-05. Calls it directly and surfaces the raw error if any."""
-    from app.gemini_client import GeminiError, call_gemini_json
+    infer-icp path, 2026-11-05: a single-model call hit that one model's own search-grounding
+    quota (429) and gave up instead of trying the next model, same mistake generate_json's own
+    multi-model fallback already exists to avoid. Calls generate_json_with_search (now routes
+    through that same fallback) and surfaces the raw error if every model is exhausted."""
+    from app.gemini_client import GeminiError
     from app.gtm_os.self_serve.icp_from_website import EMPLOYEE_SIZE_SEARCH_PROMPT
+    from app.llm_client import generate_json_with_search
 
     url = body.get("website_url") or "https://ramp.com"
     prompt = EMPLOYEE_SIZE_SEARCH_PROMPT.format(url=url)
     try:
-        result = call_gemini_json(prompt, db, ELEPHANT_EDGE_TENANT_ID, max_tokens=500, use_search=True)
+        result = generate_json_with_search(prompt, db, ELEPHANT_EDGE_TENANT_ID, max_tokens=500)
         return Response(status_code=200, headers=_SELF_SERVE_CORS_HEADERS,
                         content=json.dumps({"ok": True, "result": result}), media_type="application/json")
     except GeminiError as e:

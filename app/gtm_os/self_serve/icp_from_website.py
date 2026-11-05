@@ -305,10 +305,11 @@ def infer_icp_from_website(db: Session, tenant_id: int, url: str) -> dict:
     # anywhere should still come back null rather than loop forever trying to find one.
     if result.get("employee_min") is None:
         try:
-            from app.gemini_client import GeminiError, call_gemini_json
+            from app.gemini_client import GeminiError
+            from app.llm_client import generate_json_with_search
 
             search_prompt = EMPLOYEE_SIZE_SEARCH_PROMPT.format(url=url)
-            search_result = call_gemini_json(search_prompt, db, tenant_id, max_tokens=500, use_search=True)
+            search_result = generate_json_with_search(search_prompt, db, tenant_id, max_tokens=500)
             if search_result.get("found") and search_result.get("employee_min") is not None:
                 result["employee_min"] = search_result["employee_min"]
                 result["employee_max"] = search_result.get("employee_max")
