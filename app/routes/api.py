@@ -5876,6 +5876,34 @@ async def post_self_serve_template_parse(request: Request):
                     content=json.dumps({"ok": True, "icp": icp}), media_type="application/json")
 
 
+@router.post("/self-serve/debug/claude-web-search")
+def post_self_serve_debug_claude_web_search(body: dict = Body(...), db: Session = Depends(get_db)):
+    """One-off: Gemini's search grounding is billing-gated (confirmed live, 2026-11-05 -- same
+    429 with a fresh key, with and without the grounding tool, isolating it as a Google Cloud
+    billing setting, not a code or quota-retry issue). The user has real Anthropic credit --
+    checking whether Claude's own native web_search tool works as the replacement before wiring
+    it into icp_from_website.py for real."""
+    from app.claude_client import ClaudeError, call_claude_messages
+
+    url = body.get("website_url") or "https://ramp.com"
+    try:
+        result = call_claude_messages(
+            messages=[{"role": "user", "content": EMPLOYEE_SIZE_SEARCH_PROMPT_FOR_CLAUDE.format(url=url)}],
+            db=db, tenant_id=ELEPHANT_EDGE_TENANT_ID,
+            tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 3}],
+            max_tokens=1000,
+        )
+        return Response(status_code=200, headers=_SELF_SERVE_CORS_HEADERS,
+                        content=json.dumps({"ok": True, "result": result}), media_type="application/json")
+    except ClaudeError as e:
+        return Response(status_code=200, headers=_SELF_SERVE_CORS_HEADERS,
+                        content=json.dumps({"ok": False, "error": str(e)}), media_type="application/json")
+
+
+EMPLOYEE_SIZE_SEARCH_PROMPT_FOR_CLAUDE = """Search the web for the real, current employee headcount of the company at this website: {url}
+Look on LinkedIn, Crunchbase, or news coverage. State the number/range plainly at the end of your answer, or say clearly if you can't find one."""
+
+
 @router.post("/self-serve/debug/search-grounding")
 def post_self_serve_debug_search_grounding(body: dict = Body(...), db: Session = Depends(get_db)):
     """One-off: does Gemini's use_search=True actually return a result, or error/degrade
