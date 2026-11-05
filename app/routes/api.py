@@ -5911,6 +5911,30 @@ def post_self_serve_discover(body: dict = Body(...), db: Session = Depends(get_d
                     media_type="application/json")
 
 
+@router.post("/self-serve/submissions/{token}/email")
+def post_self_serve_submission_email(token: str, body: dict = Body(...), db: Session = Depends(get_db)):
+    """The visitor's OWN email, collected AFTER they've already seen their matching accounts and
+    chosen to go further (the outreach CTA) -- not a search input, not anything to enrich. It's
+    only ever used later to CC them on the outreach campaign Elephant Edge runs on their behalf,
+    per Majji's original instruction. Just updates the already-completed submission's email in
+    place; never touches run_discovery or any provider -- no new spend, no re-run, no second
+    company search. The first call to /self-serve/discover (with a placeholder email) is what
+    produced the results this is attached to."""
+    email = (body.get("email") or "").strip()
+    if not email or "@" not in email:
+        raise HTTPException(status_code=400, detail="a real email is required")
+
+    submission = db.query(SelfServeSubmission).filter(SelfServeSubmission.token == token).first()
+    if submission is None:
+        raise HTTPException(status_code=404, detail="no submission with that token")
+
+    submission.email = email
+    db.commit()
+    return Response(status_code=200, headers=_SELF_SERVE_CORS_HEADERS,
+                    content=json.dumps({"ok": True, "token": token, "email": email}),
+                    media_type="application/json")
+
+
 @router.get("/self-serve/results/{token}")
 def get_self_serve_results(token: str, db: Session = Depends(get_db)):
     """Re-fetch a past submission's result by its own opaque token -- lets the landing page
