@@ -5876,6 +5876,31 @@ async def post_self_serve_template_parse(request: Request):
                     content=json.dumps({"ok": True, "icp": icp}), media_type="application/json")
 
 
+@router.post("/self-serve/debug/filters")
+def post_self_serve_debug_filters(body: dict = Body(...), db: Session = Depends(get_db)):
+    """FREE, no-spend introspection: the exact filter payload search_companies_only() would send
+    to each provider for a given ICP, with no search actually run. Built 2026-11-05 to verify
+    *why* a self-serve search returned the companies it did -- not internal to the product, just
+    a debugging aid for checking real match quality before calling a run "done"."""
+    from app.gtm_os.plays.icp_filters import crustdata_filters_for_icp, icypeas_filters_for_icp
+    from app.gtm_os.self_serve.discovery import BILLING_TENANT_ID
+    from app.gtm_os.sourcing.planner import rank
+
+    icp = body.get("icp")
+    if not isinstance(icp, dict) or not icp:
+        raise HTTPException(status_code=400, detail="icp is required")
+
+    ranked = [{"provider": c.provider, "score": c.score, "healthy": c.healthy, "executable": c.executable}
+             for c in rank(db, icp)]
+    icypeas_filters = icypeas_filters_for_icp(icp, db=db, tenant_id=BILLING_TENANT_ID)
+    crustdata_filters, crustdata_structured = crustdata_filters_for_icp(icp, db=db, tenant_id=BILLING_TENANT_ID)
+    return Response(status_code=200, headers=_SELF_SERVE_CORS_HEADERS, content=json.dumps({
+        "ok": True, "ranked_providers": ranked,
+        "icypeas_filters": icypeas_filters,
+        "crustdata_filters": crustdata_filters, "crustdata_industry_fully_structured": crustdata_structured,
+    }), media_type="application/json")
+
+
 @router.post("/self-serve/discover")
 def post_self_serve_discover(body: dict = Body(...), db: Session = Depends(get_db)):
     """The commit step: visitor has seen either the inferred or uploaded ICP, confirmed it (the
